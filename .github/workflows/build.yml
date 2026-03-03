@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libglew-dev libglfw3-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+
+      - name: Download ONNX Runtime
+        run: |
+          cd medsam2_da3_lite
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.15.1/onnxruntime-linux-x64-1.15.1.tgz
+          tar xf onnxruntime-linux-x64-1.15.1.tgz
+          rm onnxruntime-linux-x64-1.15.1.tgz
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p package/LiverSurgeryNavi
+          cp build/bin/LiverSurgeryNavi package/LiverSurgeryNavi/
+          cp build/bin/medsam2_da3_lite package/LiverSurgeryNavi/
+          cp medsam2_da3_lite/onnxruntime-linux-x64-1.15.1/lib/libonnxruntime.so* package/LiverSurgeryNavi/
+          cp -r shaders package/LiverSurgeryNavi/
+          cp -r data package/LiverSurgeryNavi/
+          cp README.md LICENSE package/LiverSurgeryNavi/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiverSurgeryNavi-Linux
+          path: package/LiverSurgeryNavi
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ONNX Runtime
+        shell: bash
+        run: |
+          cd medsam2_da3_lite
+          curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.15.1/onnxruntime-win-x64-1.15.1.zip -o ort.zip
+          unzip -q ort.zip
+          rm ort.zip
+
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p package/LiverSurgeryNavi
+          cp build/bin/LiverSurgeryNavi.exe package/LiverSurgeryNavi/
+          cp build/bin/medsam2_da3_lite.exe package/LiverSurgeryNavi/
+          cp medsam2_da3_lite/onnxruntime-win-x64-1.15.1/lib/onnxruntime.dll package/LiverSurgeryNavi/
+          cp -r shaders package/LiverSurgeryNavi/
+          cp -r data package/LiverSurgeryNavi/
+          cp README.md LICENSE package/LiverSurgeryNavi/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiverSurgeryNavi-Windows
+          path: package/LiverSurgeryNavi

@@ -1,0 +1,20 @@
+LiverSurgeryNavi License
+
+Copyright (c) 2026 meimeimei1223
+
+1. Research and Education Use:
+   Free to use, copy, modify, and distribute for non-commercial
+   research and educational purposes, provided this notice is retained.
+
+2. Commercial Use:
+   Any commercial use requires prior written permission from the author.
+   Contact: (あなたのメールアドレス)
+
+3. Disclaimer:
+   This software is provided "as is" without warranty of any kind.
+   This software is NOT approved for clinical use.
+   The author is not liable for any damages arising from its use.
+
+4. Third-Party Libraries:
+   This project includes third-party libraries under their own licenses
+   (MIT, BSD, MPL2, zlib). See third_party/ and win_deps/ directories.
