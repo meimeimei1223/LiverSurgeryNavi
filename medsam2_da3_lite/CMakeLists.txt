@@ -24,7 +24,7 @@ if(WIN32)
     set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/onnxruntime-win-x64-1.15.1"
         CACHE PATH "ONNX Runtime installation path")
 else()
-    set(ONNXRUNTIME_ROOT "/home/meidaikasai/onnxruntime-linux-x64-1.15.1"
+    set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/onnxruntime-linux-x64-1.15.1"
         CACHE PATH "ONNX Runtime installation path")
 endif()
 
