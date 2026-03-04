@@ -172,10 +172,48 @@ inline void initFilePaths() {
     gDepthInputImage = INPUT_IMAGE_PATH + "target.jpg";
 }
 
+enum DepthModelSize {
+    DEPTH_MODEL_SMALL = 0,
+    DEPTH_MODEL_BASE = 1,
+    DEPTH_MODEL_LARGE = 2,
+    DEPTH_MODEL_COUNT
+};
+
+inline int gCurrentDepthModel = DEPTH_MODEL_SMALL;
+
+inline const char* depthModelName(int idx) {
+    switch (idx) {
+    case DEPTH_MODEL_SMALL: return "Small (fast, ~100MB)";
+    case DEPTH_MODEL_BASE:  return "Base (~400MB)";
+    case DEPTH_MODEL_LARGE: return "Large (accurate, ~1.3GB)";
+    default: return "Unknown";
+    }
+}
+
+inline std::string depthModelPath(int idx) {
+    switch (idx) {
+    case DEPTH_MODEL_SMALL: return ONNX_MODELS_PATH + "depth_anything_v3_small.onnx";
+    case DEPTH_MODEL_BASE:  return ONNX_MODELS_PATH + "base/model.onnx";
+    case DEPTH_MODEL_LARGE: return ONNX_MODELS_PATH + "large/model.onnx";
+    default: return ONNX_MODELS_PATH + "depth_anything_v3_small.onnx";
+    }
+}
+
+inline bool isDepthModelAvailable(int idx) {
+    return std::filesystem::exists(depthModelPath(idx));
+}
+
 inline void initDepthRunnerConfig(DepthRunner& depthRunner) {
     depthRunner.config.exePath    = DEPTH_EXE_PATH;
-    depthRunner.config.depthModel = ONNX_MODELS_PATH + "large/model.onnx";
+    depthRunner.config.depthModel = depthModelPath(gCurrentDepthModel);
     depthRunner.config.samEncoder = ONNX_MODELS_PATH + "sam2_hiera_tiny.encoder.onnx";
     depthRunner.config.samDecoder = ONNX_MODELS_PATH + "sam2_hiera_tiny.decoder.onnx";
     depthRunner.config.outputDir  = DEPTH_OUTPUT_PATH;
+}
+
+inline void switchDepthModel(DepthRunner& depthRunner, int modelIdx) {
+    gCurrentDepthModel = modelIdx;
+    depthRunner.config.depthModel = depthModelPath(modelIdx);
+    std::cout << "[DepthModel] Switched to: " << depthModelName(modelIdx)
+              << " (" << depthRunner.config.depthModel << ")" << std::endl;
 }

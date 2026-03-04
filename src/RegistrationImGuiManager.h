@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdio>
 #include <cmath>
+#include "PathConfig.h"
 
 struct RegUIActions {
     std::function<void()> onToggleCamera;
@@ -35,6 +36,7 @@ struct RegUIActions {
     std::function<void()> onRefine;
     std::function<void()> onPoseLibraryToggle;
     std::function<void()> onPoseUndo;
+    std::function<void(int)> onSwitchDepthModel;
 };
 
 struct RegUIState {
@@ -53,6 +55,8 @@ struct RegUIState {
     bool poseLibraryOpen = false;
     bool poseUndoAvailable = false;
     int  poseEntryCount = 0;
+    int  depthModelIdx = 0;
+    bool depthModelAvail[3] = {false, false, false};
     int boardPtCount = 0, objPtCount = 0, targetPtCount = 5;
     bool splitScreen = false;
     bool depthSplitScreen = false;
@@ -466,6 +470,36 @@ private:
         }
 
         ImGui::Indent(16); ImGui::PushItemWidth(-16);
+
+        ImGui::TextColored(colDepth(), "DEPTH MODEL");
+        ImGui::Spacing();
+        {
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f,0.1f,0.13f,1));
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.08f,0.08f,0.11f,1));
+            const char* preview = depthModelName(state.depthModelIdx);
+            if (ImGui::BeginCombo("##depthmodel", preview)) {
+                for (int i = 0; i < DEPTH_MODEL_COUNT; i++) {
+                    bool avail = state.depthModelAvail[i];
+                    bool selected = (state.depthModelIdx == i);
+                    char label[128];
+                    if (avail)
+                        snprintf(label, sizeof(label), "%s", depthModelName(i));
+                    else
+                        snprintf(label, sizeof(label), "%s  [not found]", depthModelName(i));
+                    if (!avail) ImGui::PushStyleColor(ImGuiCol_Text, colDim());
+                    if (ImGui::Selectable(label, selected)) {
+                        if (avail && actions.onSwitchDepthModel) {
+                            actions.onSwitchDepthModel(i);
+                        }
+                    }
+                    if (!avail) ImGui::PopStyleColor();
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopStyleColor(2);
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
         ImVec2 srcStart = ImGui::GetCursorScreenPos();
         ImGui::TextColored(colDepth(), "IMAGE SOURCE");

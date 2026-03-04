@@ -1036,6 +1036,11 @@ void setupUICallbacks() {
         poseUndo();
     };
 
+    a.onSwitchDepthModel = [](int idx) {
+        switchDepthModel(gDepthRunner, idx);
+        gUIManager.state.depthModelIdx = idx;
+    };
+
     a.onPoseLibraryToggle = []() {
         g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
     };
@@ -1278,6 +1283,10 @@ void syncUIState() {
 
     s.clusterVis = g_showClusterVisualization;
     s.correspondenceVis = g_showCorrespondencePoints;
+
+    s.depthModelIdx = gCurrentDepthModel;
+    for (int i = 0; i < DEPTH_MODEL_COUNT; i++)
+        s.depthModelAvail[i] = isDepthModelAvailable(i);
 }
 
 int main()
