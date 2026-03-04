@@ -31,6 +31,7 @@ jobs:
           cp -r shaders package/LiverSurgeryNavi/
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
+          cp -r depth_output package/LiverSurgeryNavi/
           cp README.md LICENSE package/LiverSurgeryNavi/
       - uses: actions/upload-artifact@v4
         with:
@@ -61,6 +62,7 @@ jobs:
           cp -r shaders package/LiverSurgeryNavi/
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
+          cp -r depth_output package/LiverSurgeryNavi/
           cp README.md LICENSE package/LiverSurgeryNavi/
       - uses: actions/upload-artifact@v4
         with:

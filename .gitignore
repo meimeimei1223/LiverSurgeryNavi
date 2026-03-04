@@ -15,7 +15,8 @@ onnxruntime-*/
 *.onnx_data
 *.tar.gz
 bin/
-depth_output/
+depth_output/*.ppm
+depth_output/camera_capture.*
 testImages/
 data/screenshots/
 registration_model/
