@@ -33,14 +33,44 @@ inline std::vector<DepthRunnerPoint> createDefaultSegPoints(int imgWidth, int im
 inline void fallbackLoadExistingOutput(mCutMesh* screenMesh,
                                        int gw, float scale, float depthScale) {
     std::string basePath = DEPTH_OUTPUT_PATH;
-    screenMesh->loadTextureFromFile((basePath + "/original.jpg").c_str());
+    std::string origPath = basePath + "/original.jpg";
+
+    if (!std::filesystem::exists(origPath)) {
+        std::cerr << "[Fallback] No existing output: " << origPath << std::endl;
+        std::cerr << "[Fallback] Using empty flat grid as placeholder." << std::endl;
+        int gh = gw * 9 / 16;
+        screenMesh->loadedImageWidth  = 1280;
+        screenMesh->loadedImageHeight = 720;
+        screenMesh->generateGridPlaneWithSides(gw, gh, 0.05f);
+        for (size_t i = 0; i < screenMesh->mVertices.size(); i++)
+            screenMesh->mVertices[i] *= scale;
+        setUp(*screenMesh);
+        return;
+    }
+
+    screenMesh->loadTextureFromFile(origPath.c_str());
+    if (screenMesh->loadedImageWidth <= 0 || screenMesh->loadedImageHeight <= 0) {
+        std::cerr << "[Fallback] Failed to load texture, using flat grid." << std::endl;
+        int gh = gw * 9 / 16;
+        screenMesh->loadedImageWidth  = 1280;
+        screenMesh->loadedImageHeight = 720;
+        screenMesh->generateGridPlaneWithSides(gw, gh, 0.05f);
+        for (size_t i = 0; i < screenMesh->mVertices.size(); i++)
+            screenMesh->mVertices[i] *= scale;
+        setUp(*screenMesh);
+        return;
+    }
+
     int gh = gw * screenMesh->loadedImageHeight / screenMesh->loadedImageWidth;
-    screenMesh->loadDepthImage(
-        basePath + "/depth_masked_renorm.png",
-        screenMesh->loadedImageWidth, screenMesh->loadedImageHeight
-        );
-    std::vector<float> depths = screenMesh->calculateNormalizedDepth(gw, gh, 0.99f, 0.99f);
-    screenMesh->generateGridPlaneWithDepth(gw, gh, depths, 0.05f, depthScale);
+    std::string depthPath = basePath + "/depth_masked_renorm.png";
+    if (std::filesystem::exists(depthPath)) {
+        screenMesh->loadDepthImage(depthPath, screenMesh->loadedImageWidth, screenMesh->loadedImageHeight);
+        std::vector<float> depths = screenMesh->calculateNormalizedDepth(gw, gh, 0.99f, 0.99f);
+        screenMesh->generateGridPlaneWithDepth(gw, gh, depths, 0.05f, depthScale);
+    } else {
+        std::cerr << "[Fallback] No depth image, using flat grid with texture." << std::endl;
+        screenMesh->generateGridPlaneWithSides(gw, gh, 0.05f);
+    }
 
     for (size_t i = 0; i < screenMesh->mVertices.size(); i++)
         screenMesh->mVertices[i] *= scale;
