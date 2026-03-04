@@ -20,7 +20,7 @@ jobs:
           rm onnxruntime-linux-x64-1.15.1.tgz
       - name: Download ONNX models
         run: |
-          pip install huggingface_hub
+          pip install huggingface_hub onnx protobuf
           mkdir -p models
           python3 -c "
           from huggingface_hub import hf_hub_download
