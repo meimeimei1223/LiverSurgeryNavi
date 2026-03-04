@@ -96,10 +96,16 @@ sudo apt install build-essential cmake libglew-dev libglfw3-dev
 - Visual Studio 2022
 - win_deps/ に GLEW/GLFW 同梱済み
 
-### ONNX Runtime（medsam2_da3_lite 使用時のみ）
+### ONNX Runtime（ソースからビルドする場合のみ）
+ビルド済みパッケージには同梱済みです。ソースからビルドする場合は手動でダウンロードしてください。
+
 https://github.com/microsoft/onnxruntime/releases/tag/v1.15.1
-- Windows: `onnxruntime-win-x64-1.15.1.zip` → `medsam2_da3_lite/onnxruntime-win-x64-1.15.1/`
-- Linux: `onnxruntime-linux-x64-1.15.1.tgz` → `medsam2_da3_lite/onnxruntime-linux-x64-1.15.1/`
+- Windows: `onnxruntime-win-x64-1.15.1.zip`
+- Linux: `onnxruntime-linux-x64-1.15.1.tgz`
+
+```bash
+cmake -B build -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-1.15.1
+```
 
 ## ビルド
 
