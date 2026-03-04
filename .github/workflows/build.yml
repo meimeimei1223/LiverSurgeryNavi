@@ -30,6 +30,7 @@ jobs:
           cp onnxruntime-linux-x64-1.15.1/lib/libonnxruntime.so* package/LiverSurgeryNavi/
           cp -r shaders package/LiverSurgeryNavi/
           cp -r data package/LiverSurgeryNavi/
+          cp -r model package/LiverSurgeryNavi/
           cp README.md LICENSE package/LiverSurgeryNavi/
       - uses: actions/upload-artifact@v4
         with:
@@ -59,6 +60,7 @@ jobs:
           cp onnxruntime-win-x64-1.15.1/lib/onnxruntime.dll package/LiverSurgeryNavi/
           cp -r shaders package/LiverSurgeryNavi/
           cp -r data package/LiverSurgeryNavi/
+          cp -r model package/LiverSurgeryNavi/
           cp README.md LICENSE package/LiverSurgeryNavi/
       - uses: actions/upload-artifact@v4
         with:
