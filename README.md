@@ -1,9 +1,9 @@
 # LiverSurgeryNavi
-肝臓手術ナビゲーションシステム — 3D Registration + Depth Estimation + Segmentation
+Liver Surgery Navigation System — 3D Registration + Depth Estimation + Segmentation
 
-## クイックスタート（ビルド済みパッケージ）
+## Quick Start (Pre-built Package)
 
-[GitHub Actions](https://github.com/meimeimei1223/LiverSurgeryNavi/actions) からビルド済みパッケージをダウンロードできます。
+Download pre-built packages from [GitHub Actions](https://github.com/meimeimei1223/LiverSurgeryNavi/actions).
 
 ```bash
 # Linux
@@ -13,21 +13,21 @@ export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
 ./LiverSurgeryNavi
 ```
 
-パッケージには Depth Anything V3 Small + SAM2 モデルが同梱されており、そのまま起動できます。
+The package includes Depth Anything V3 Small + SAM2 models and runs out of the box.
 
-## 深度推定モデル
+## Depth Estimation Models
 
-UI の「Depth Model」コンボボックスから3種類のモデルを切り替えられます。
+You can switch between 3 models using the "Depth Model" combo box in the UI.
 
-| モデル | サイズ | 推論時間(CPU) | 同梱 |
-|--------|--------|---------------|------|
-| **Small** (デフォルト) | 101MB | ~0.8秒 | ✅ |
-| **Base** | 394MB | ~2.1秒 | 手動DL |
-| **Large** | 1.3GB | ~6.5秒 | 手動DL |
+| Model | Size | Inference (CPU) | Included |
+|-------|------|-----------------|----------|
+| **Small** (default) | 101MB | ~0.8s | Yes |
+| **Base** | 394MB | ~2.1s | Manual download |
+| **Large** | 1.3GB | ~6.5s | Manual download |
 
-Small は同梱済みです。Base / Large を使いたい場合は以下の手順でダウンロードしてください。
+Small is included in the package. To use Base or Large, follow the download instructions below.
 
-### Base モデルのダウンロード (~394MB)
+### Download Base Model (~394MB)
 
 ```bash
 cd LiverSurgeryNavi/onnx_models
@@ -45,7 +45,7 @@ print('Done!')
 "
 ```
 
-### Large モデルのダウンロード (~1.3GB)
+### Download Large Model (~1.3GB)
 
 ```bash
 cd LiverSurgeryNavi/onnx_models
@@ -63,11 +63,11 @@ print('Done!')
 "
 ```
 
-ダウンロード後、UI の「Depth Model」コンボボックスで Base / Large が選択可能になります。
+After downloading, the models will appear in the "Depth Model" combo box in the UI.
 
-## 依存関係
+## Dependencies
 
-### 共通（third_party/ に同梱済み）
+### Bundled (in third_party/)
 - ImGui, GLM, Eigen3, stb, nanoflann, tinyfiledialogs
 
 ### Ubuntu
@@ -77,10 +77,10 @@ sudo apt install build-essential cmake libglew-dev libglfw3-dev
 
 ### Windows
 - Visual Studio 2022
-- win_deps/ に GLEW/GLFW 同梱済み
+- GLEW/GLFW bundled in win_deps/
 
-### ONNX Runtime（ソースからビルドする場合のみ）
-ビルド済みパッケージには同梱済みです。ソースからビルドする場合は手動でダウンロードしてください。
+### ONNX Runtime (only when building from source)
+Pre-built packages already include ONNX Runtime. If building from source, download manually:
 
 https://github.com/microsoft/onnxruntime/releases/tag/v1.15.1
 - Windows: `onnxruntime-win-x64-1.15.1.zip`
@@ -90,7 +90,7 @@ https://github.com/microsoft/onnxruntime/releases/tag/v1.15.1
 cmake -B build -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-1.15.1
 ```
 
-## ビルド
+## Build
 
 ### Ubuntu
 ```
@@ -106,16 +106,16 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-## 実行
+## Run
 ```
 cd build/bin
 ./LiverSurgeryNavi
 ```
 
-## モデルのソース
+## Model Sources
 
-| モデル | ライセンス | ソース |
-|--------|-----------|--------|
+| Model | License | Source |
+|-------|---------|--------|
 | Depth Anything V3 | Apache-2.0 | [onnx-community/depth-anything-v3-*](https://huggingface.co/onnx-community/depth-anything-v3-small) |
 | SAM2 Hiera Tiny | Apache-2.0 | [vietanhdev/segment-anything-2-onnx-models](https://huggingface.co/vietanhdev/segment-anything-2-onnx-models) |
 | ONNX Runtime | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
