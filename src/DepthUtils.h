@@ -25,7 +25,10 @@ inline bool convert3DToImagePixel(const glm::vec3& hitPos3D,
                                   int& outPixelX, int& outPixelY) {
     if (!mesh || mesh->mVertices.empty()) return false;
 
-    // get BB from all vertices
+    int imgW = mesh->loadedImageWidth;
+    int imgH = mesh->loadedImageHeight;
+    if (imgW <= 0 || imgH <= 0) return false;
+
     float minX =  1e30f, maxX = -1e30f;
     float minY =  1e30f, maxY = -1e30f;
     for (size_t i = 0; i < mesh->mVertices.size(); i += 3) {
@@ -41,21 +44,31 @@ inline bool convert3DToImagePixel(const glm::vec3& hitPos3D,
     float rangeY = maxY - minY;
     if (rangeX < 1e-6f || rangeY < 1e-6f) return false;
 
-    // 3D -> normalized (0~1)
-    float u = (hitPos3D.x - minX) / rangeX;   // L->R
-    float v = (maxY - hitPos3D.y) / rangeY;   // T->B (Y flip)
+    float u = (hitPos3D.x - minX) / rangeX;
+    float v = (maxY - hitPos3D.y) / rangeY;
 
-    // -> pixel
-    int imgW = mesh->loadedImageWidth;
-    int imgH = mesh->loadedImageHeight;
+    float imageAspect = (float)imgW / (float)imgH;
+    float meshAspect  = rangeX / rangeY;
+
+    if (meshAspect > imageAspect + 1e-4f) {
+        float scale = meshAspect / imageAspect;
+        float center = 0.5f;
+        u = center + (u - center) / scale;
+    } else if (imageAspect > meshAspect + 1e-4f) {
+        float scale = imageAspect / meshAspect;
+        float center = 0.5f;
+        v = center + (v - center) / scale;
+    }
+
+    u = std::max(0.0f, std::min(1.0f, u));
+    v = std::max(0.0f, std::min(1.0f, v));
+
     outPixelX = static_cast<int>(u * imgW);
     outPixelY = static_cast<int>(v * imgH);
 
-    // clamp
     outPixelX = std::max(0, std::min(outPixelX, imgW - 1));
     outPixelY = std::max(0, std::min(outPixelY, imgH - 1));
 
-    // debug
     std::cout << "[SegPoint] 3D hit: (" << hitPos3D.x << ", " << hitPos3D.y << ", " << hitPos3D.z << ")" << std::endl;
     std::cout << "[SegPoint] BB: X[" << minX << ", " << maxX << "] Y[" << minY << ", " << maxY << "]" << std::endl;
     std::cout << "[SegPoint] u=" << u << " v=" << v << " -> 2D: (" << outPixelX << ", " << outPixelY << ")" << std::endl;
