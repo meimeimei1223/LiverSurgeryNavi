@@ -19,6 +19,45 @@ inline std::string DEPTH_EXE_PATH   = "./medsam2_da3_lite.exe";
 inline std::string DEPTH_EXE_PATH   = "./medsam2_da3_lite";
 #endif
 
+// --- Depth Model Selector ---
+enum DepthModelSize {
+    DEPTH_MODEL_SMALL = 0,
+    DEPTH_MODEL_BASE = 1,
+    DEPTH_MODEL_LARGE = 2,
+    DEPTH_MODEL_COUNT
+};
+
+inline int gCurrentDepthModel = DEPTH_MODEL_SMALL;
+
+inline const char* depthModelName(int idx) {
+    switch (idx) {
+    case DEPTH_MODEL_SMALL: return "Small (fast, ~100MB)";
+    case DEPTH_MODEL_BASE:  return "Base (~400MB)";
+    case DEPTH_MODEL_LARGE: return "Large (accurate, ~1.3GB)";
+    default: return "Unknown";
+    }
+}
+
+inline std::string depthModelPath(int idx) {
+    switch (idx) {
+    case DEPTH_MODEL_SMALL: return ONNX_MODELS_PATH + "depth_anything_v3_small.onnx";
+    case DEPTH_MODEL_BASE:  return ONNX_MODELS_PATH + "base/model.onnx";
+    case DEPTH_MODEL_LARGE: return ONNX_MODELS_PATH + "large/model.onnx";
+    default: return ONNX_MODELS_PATH + "depth_anything_v3_small.onnx";
+    }
+}
+
+inline bool isDepthModelAvailable(int idx) {
+    return std::filesystem::exists(depthModelPath(idx));
+}
+
+inline void switchDepthModel(DepthRunner& depthRunner, int modelIdx) {
+    gCurrentDepthModel = modelIdx;
+    depthRunner.config.depthModel = depthModelPath(modelIdx);
+    std::cout << "[DepthModel] Switched to: " << depthModelName(modelIdx)
+              << " (" << depthModelPath(modelIdx) << ")" << std::endl;
+}
+
 // --- ファイルパス変数 ---
 inline std::string TARGET_FILE_PATH;
 inline std::string OUTPUT_TET_FILE;
@@ -44,7 +83,6 @@ inline std::string gDepthInputImage;
 inline std::string findPath(const std::string& name,
                             const std::string& testFile,
                             const std::vector<std::string>& candidates) {
-    // 環境変数を先にチェック
     std::string envName = "AAA_" + name;
     const char* envVal = std::getenv(envName.c_str());
     if (envVal) {
@@ -54,7 +92,6 @@ inline std::string findPath(const std::string& name,
         return p;
     }
 
-    // 候補から検出
     for (const auto& path : candidates) {
         if (testFile.empty()) {
             if (std::filesystem::exists(path)) {
@@ -69,7 +106,6 @@ inline std::string findPath(const std::string& name,
         }
     }
 
-    // 見つからなければデフォルト（最初の候補）
     std::cerr << "[Path] " << name << ": NOT FOUND, using default: " << candidates.front() << std::endl;
     return candidates.front();
 }
@@ -100,70 +136,67 @@ inline void initPaths() {
     std::cout << "========================================" << std::endl;
 
     MODEL_PATH = findPath("MODEL_PATH", "liver.obj", {
-                                                         "../../../../model/",
-                                                         "../../../model/",
-                                                         "../../model/",
+                                                         "model/",
                                                          "../model/",
-                                                         "model/"
+                                                         "../../model/",
+                                                         "../../../model/",
+                                                         "../../../../model/"
                                                      });
 
     SHADERS_PATH = findPath("SHADERS_PATH", "basic.vert", {
-                                                              "../../../../shaders/",
-                                                              "../../../shaders/",
-                                                              "../../shaders/",
+                                                              "shaders/",
                                                               "../shaders/",
-                                                              "shaders/"
+                                                              "../../shaders/",
+                                                              "../../../shaders/",
+                                                              "../../../../shaders/"
                                                           });
 
     REG_MODEL_PATH = findPath("REG_MODEL_PATH", "reg_liver.obj", {
-                                                                     "../../../../registration_model/",
-                                                                     "../../../registration_model/",
-                                                                     "../../registration_model/",
+                                                                     "registration_model/",
                                                                      "../registration_model/",
-                                                                     "registration_model/"
+                                                                     "../../registration_model/",
+                                                                     "../../../registration_model/",
+                                                                     "../../../../registration_model/"
                                                                  });
 
     INPUT_IMAGE_PATH = findPath("INPUT_IMAGE_PATH", "target.jpg", {
-                                                                      "../../../../input_image/",
-                                                                      "../../../input_image/",
-                                                                      "../../input_image/",
+                                                                      "input_image/",
                                                                       "../input_image/",
-                                                                      "input_image/"
+                                                                      "../../input_image/",
+                                                                      "../../../input_image/",
+                                                                      "../../../../input_image/"
                                                                   });
 
     DEPTH_OUTPUT_PATH = findPath("DEPTH_OUTPUT_PATH", "", {
-                                                              "../../../../depth_output/",
-                                                              "../../../depth_output/",
-                                                              "../../depth_output/",
+                                                              "depth_output/",
                                                               "../depth_output/",
-                                                              "depth_output/"
+                                                              "../../depth_output/",
+                                                              "../../../depth_output/",
+                                                              "../../../../depth_output/"
                                                           });
-    // depth_output は存在しなければ作成
     if (!std::filesystem::exists(DEPTH_OUTPUT_PATH)) {
         std::filesystem::create_directories(DEPTH_OUTPUT_PATH);
         std::cout << "[Path] Created: " << DEPTH_OUTPUT_PATH << std::endl;
     }
 
     ONNX_MODELS_PATH = findPath("ONNX_MODELS_PATH", "depth_anything_v3_small.onnx", {
-                                                                                        "../../../../medsam2_da3_lite/onnx_models/",
-                                                                                        "../../../medsam2_da3_lite/onnx_models/",
-                                                                                        "../../medsam2_da3_lite/onnx_models/",
-                                                                                        "../medsam2_da3_lite/onnx_models/",
-                                                                                        "medsam2_da3_lite/onnx_models/",
+                                                                                        "onnx_models/",
                                                                                         "../onnx_models/",
-                                                                                        "onnx_models/"
+                                                                                        "medsam2_da3_lite/onnx_models/",
+                                                                                        "../medsam2_da3_lite/onnx_models/",
+                                                                                        "../../medsam2_da3_lite/onnx_models/",
+                                                                                        "../../../medsam2_da3_lite/onnx_models/",
+                                                                                        "../../../../medsam2_da3_lite/onnx_models/"
                                                                                     });
 
     DEPTH_EXE_PATH = findExe("DEPTH_EXE_PATH", {
 #ifdef _WIN32
-                                                   // Windows: .exe 拡張子付き
                                                    "./medsam2_da3_lite.exe",
                                                    "medsam2_da3_lite.exe",
                                                    "../bin/medsam2_da3_lite.exe",
                                                    "../../bin/medsam2_da3_lite.exe",
                                                    "../../../bin/medsam2_da3_lite.exe",
-#else \
-    // Linux: 拡張子なし
+#else
                                                    "./medsam2_da3_lite",
                                                    "../../../medsam2_da3_lite/build/medsam2_da3_lite",
                                                    "../../medsam2_da3_lite/build/medsam2_da3_lite",
@@ -207,8 +240,7 @@ inline void initFilePaths() {
 
 inline void initDepthRunnerConfig(DepthRunner& depthRunner) {
     depthRunner.config.exePath    = DEPTH_EXE_PATH;
-    //depthRunner.config.depthModel = ONNX_MODELS_PATH + "depth_anything_v3_small.onnx";
-    depthRunner.config.depthModel = ONNX_MODELS_PATH + "large/model.onnx";  // ← ここだけ変更
+    depthRunner.config.depthModel = depthModelPath(gCurrentDepthModel);
     depthRunner.config.samEncoder = ONNX_MODELS_PATH + "sam2_hiera_tiny.encoder.onnx";
     depthRunner.config.samDecoder = ONNX_MODELS_PATH + "sam2_hiera_tiny.decoder.onnx";
     depthRunner.config.outputDir  = DEPTH_OUTPUT_PATH;
