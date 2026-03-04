@@ -6,7 +6,7 @@ cmake-build-*/
 *.suo
 *.exe
 *.o
-*.obj
+build/**/*.obj
 *.a
 *.so
 *.dylib
@@ -18,3 +18,4 @@ bin/
 depth_output/
 testImages/
 data/screenshots/
+registration_model/
