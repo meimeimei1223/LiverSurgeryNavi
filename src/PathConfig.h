@@ -50,7 +50,6 @@ inline std::string findPath(const std::string& name,
         std::cout << "[Path] " << name << " (env " << envName << "): " << p << std::endl;
         return p;
     }
-
     for (const auto& path : candidates) {
         if (testFile.empty()) {
             if (std::filesystem::exists(path)) {
@@ -64,7 +63,6 @@ inline std::string findPath(const std::string& name,
             }
         }
     }
-
     std::cerr << "[Path] " << name << ": NOT FOUND, using default: " << candidates.front() << std::endl;
     return candidates.front();
 }
@@ -76,14 +74,12 @@ inline std::string findExe(const std::string& name,
         std::cout << "[Path] " << name << " (env): " << envVal << std::endl;
         return envVal;
     }
-
     for (const auto& path : candidates) {
         if (std::filesystem::exists(path)) {
             std::cout << "[Path] " << name << " (auto): " << path << std::endl;
             return path;
         }
     }
-
     std::cerr << "[Path] " << name << ": NOT FOUND" << std::endl;
     return candidates.front();
 }
@@ -94,89 +90,54 @@ inline void initPaths() {
     std::cout << "========================================" << std::endl;
 
     MODEL_PATH = findPath("MODEL_PATH", "liver.obj", {
-        "model/",
-        "./model/",
-        "../model/",
-        "../../model/",
-        "../../../model/",
-        "../../../../model/"
-    });
+                                                         "model/", "../model/", "../../model/", "../../../model/", "../../../../model/"
+                                                     });
 
     SHADERS_PATH = findPath("SHADERS_PATH", "basic.vert", {
-        "shaders/",
-        "./shaders/",
-        "../shaders/",
-        "../../shaders/",
-        "../../../shaders/",
-        "../../../../shaders/"
-    });
+                                                              "shaders/", "../shaders/", "../../shaders/", "../../../shaders/", "../../../../shaders/"
+                                                          });
 
     DATA_PATH = findPath("DATA_PATH", "icons/liver_icon.png", {
-        "data/",
-        "./data/",
-        "../data/",
-        "../../data/",
-        "../../../data/",
-        "../../../../data/"
-    });
+                                                                  "data/", "../data/", "../../data/", "../../../data/", "../../../../data/"
+                                                              });
 
     REG_MODEL_PATH = findPath("REG_MODEL_PATH", "reg_liver.obj", {
-        "registration_model/",
-        "./registration_model/",
-        "../registration_model/",
-        "../../registration_model/",
-        "../../../registration_model/",
-        "../../../../registration_model/"
-    });
+                                                                     "registration_model/", "../registration_model/", "../../registration_model/",
+                                                                     "../../../registration_model/", "../../../../registration_model/"
+                                                                 });
 
     INPUT_IMAGE_PATH = findPath("INPUT_IMAGE_PATH", "target.jpg", {
-        "input_image/",
-        "./input_image/",
-        "../input_image/",
-        "../../input_image/",
-        "../../../input_image/",
-        "../../../../input_image/"
-    });
+                                                                      "input_image/", "../input_image/", "../../input_image/",
+                                                                      "../../../input_image/", "../../../../input_image/"
+                                                                  });
 
     DEPTH_OUTPUT_PATH = findPath("DEPTH_OUTPUT_PATH", "", {
-        "depth_output/",
-        "./depth_output/",
-        "../depth_output/",
-        "../../depth_output/",
-        "../../../depth_output/",
-        "../../../../depth_output/"
-    });
+                                                              "depth_output/", "../depth_output/", "../../depth_output/",
+                                                              "../../../depth_output/", "../../../../depth_output/"
+                                                          });
     if (!std::filesystem::exists(DEPTH_OUTPUT_PATH)) {
         std::filesystem::create_directories(DEPTH_OUTPUT_PATH);
         std::cout << "[Path] Created: " << DEPTH_OUTPUT_PATH << std::endl;
     }
 
     ONNX_MODELS_PATH = findPath("ONNX_MODELS_PATH", "depth_anything_v3_small.onnx", {
-        "models/",
-        "./models/",
-        "medsam2_da3_lite/models/",
-        "../medsam2_da3_lite/models/",
-        "../../medsam2_da3_lite/models/",
-        "../../../medsam2_da3_lite/models/",
-        "../../../../medsam2_da3_lite/models/"
-    });
+                                                                                        "models/", "medsam2_da3_lite/models/", "../medsam2_da3_lite/models/",
+                                                                                        "../../medsam2_da3_lite/models/", "../../../medsam2_da3_lite/models/",
+                                                                                        "../../../../medsam2_da3_lite/models/"
+                                                                                    });
 
     DEPTH_EXE_PATH = findExe("DEPTH_EXE_PATH", {
 #ifdef _WIN32
-        "./medsam2_da3_lite.exe",
-        "medsam2_da3_lite.exe",
-        "../bin/medsam2_da3_lite.exe",
-        "../../bin/medsam2_da3_lite.exe",
-        "../../../bin/medsam2_da3_lite.exe",
+                                                   "./medsam2_da3_lite.exe", "medsam2_da3_lite.exe",
+                                                   "../bin/medsam2_da3_lite.exe", "../../bin/medsam2_da3_lite.exe",
+                                                   "../../../bin/medsam2_da3_lite.exe",
 #else
-        "./medsam2_da3_lite",
-        "medsam2_da3_lite",
-        "../bin/medsam2_da3_lite",
-        "../../bin/medsam2_da3_lite",
-        "../../../bin/medsam2_da3_lite",
-        "../../../medsam2_da3_lite/build/medsam2_da3_lite",
+                                                   "./medsam2_da3_lite", "medsam2_da3_lite",
+                                                   "../bin/medsam2_da3_lite", "../../bin/medsam2_da3_lite",
+                                                   "../../../bin/medsam2_da3_lite",
+                                                   "../../../medsam2_da3_lite/build/medsam2_da3_lite",
 #endif
-    });
+                                               });
 
     std::cout << "========================================" << std::endl;
     std::cout << "Final paths:" << std::endl;
