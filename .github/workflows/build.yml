@@ -58,6 +58,7 @@ jobs:
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
           cp -r depth_output package/LiverSurgeryNavi/
+          cp -r input_image package/LiverSurgeryNavi/
           cp models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/models/
           cp models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/models/
           cp models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/models/
@@ -122,6 +123,7 @@ jobs:
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
           cp -r depth_output package/LiverSurgeryNavi/
+          cp -r input_image package/LiverSurgeryNavi/
           cp models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/models/
           cp models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/models/
           cp models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/models/
