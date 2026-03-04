@@ -526,27 +526,7 @@ static void poseAutoSaveBeforeRegistration() {
 // -------------------------------------------------------
 static void computeUnifiedMetrics() {
     Reg3DCustom::NoOpen3DRegistration reg;
-    // z_threshold: use small fixed fraction of depthScale to include all segmented points
-    // but exclude truly flat background (z≈0)
-    float zThresh = std::max(0.01f, gDepthScale * 0.05f);
-    auto targetCloud = reg.extractFrontFacePoints(*screenMesh, 128, 72, zThresh);
-
-    // 3D boundary visualization: boundary -> g_targetPoints (yellow), interior -> g_cluster2Points (cyan)
-    // g_cluster1Points (green) is preserved for source visible vertices set by HemiAuto
-    if (targetCloud->hasBoundaryDist()) {
-        g_targetPoints.clear();
-        g_cluster2Points.clear();
-        for (size_t i = 0; i < targetCloud->size(); i++) {
-            float bd = targetCloud->boundaryDist[i];
-            if (bd >= 9000.0f) continue;
-            if (bd < 12.0f)
-                g_targetPoints.push_back(targetCloud->points[i]);
-            else
-                g_cluster2Points.push_back(targetCloud->points[i]);
-        }
-        std::cout << "[Boundary3D] boundary=" << g_targetPoints.size()
-                  << " interior=" << g_cluster2Points.size() << std::endl;
-    }
+    auto targetCloud = reg.extractFrontFacePoints(*screenMesh, 128, 72, gDepthScale);
 
     auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
     const auto& verts = liverMesh3D->mVertices;
@@ -681,16 +661,7 @@ static void drawPoseLibraryWindow() {
         ImGui::Text("Entries: %d / %d", (int)g_poseLibrary.entries.size(), g_poseLibrary.maxEntries);
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
         if (ImGui::Button("Export CSV", ImVec2(120, 0))) {
-            auto now = std::chrono::system_clock::now();
-            auto tt = std::chrono::system_clock::to_time_t(now);
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          now.time_since_epoch()) % 1000;
-            std::tm tm = *std::localtime(&tt);
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "pose_library_%04d%02d%02d_%02d%02d%02d_%03d.csv",
-                          tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
-                          tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
-            g_poseLibrary.exportToCsv(buf);
+            g_poseLibrary.exportToCsv("pose_library_export.csv");
         }
         ImGui::Separator();
 
@@ -879,14 +850,6 @@ void setupUICallbacks() {
                 showProgressOverlay);
         }
         showProgressOverlay(1.0f, "Depth complete!");
-        // Boundary distance map: compute + save 2D visualization PNGs
-        g_boundaryDistMap.valid = false;
-        if (ensureBoundaryMap()) {
-            std::string maskPath = DEPTH_OUTPUT_PATH + "segmentation_mask.png";
-            saveBoundaryMapVisualization(DEPTH_OUTPUT_PATH + "boundary_dist_map.png");
-            saveBoundaryOverlayVisualization(maskPath, DEPTH_OUTPUT_PATH + "boundary_overlay.png");
-            std::cout << "[Boundary] 2D visualization saved to depth_output/" << std::endl;
-        }
         gDepthScale = 0.3f;
         clearSegPoints();
         depthSplitScreenMode = false;
@@ -921,9 +884,6 @@ void setupUICallbacks() {
     a.onDepthScaleChanged = [](float v) {
         gDepthScale = v;
         regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-        if (g_showClusterVisualization && registrationHandle.state == RegistrationData::REGISTERED) {
-            computeUnifiedMetrics();
-        }
     };
 
     a.onFullAuto = []() {
@@ -981,11 +941,6 @@ void setupUICallbacks() {
             std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
                                               tumorMesh3D, segmentMesh3D, gbMesh3D};
             NormalRefine::RefineParams params;
-            params.useZWeight      = true;
-            params.zWeightBoundary = 0.05f;
-            params.zWeightInterior = 0.30f;
-            params.boundaryWidth   = 8.0f;
-            params.boundaryBoost   = 3.0f;
             if (NormalRefine::initRefine(g_refineState, liverMesh3D,
                                          g_refineVertexIndices,
                                          screenMesh, organs,
@@ -1831,7 +1786,7 @@ int main()
                          lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday,
                          lt.tm_hour, lt.tm_min, lt.tm_sec, (int)ms.count());
 
-                const char* prefixes[] = {"../../../data/","../../data/","../data/","data/",nullptr};
+                const char* prefixes[] = {"data/","../data/","../../data/","../../../data/","../../../../data/",nullptr};
                 bool saved = false;
                 for (int pi = 0; prefixes[pi]; pi++) {
                     if (std::filesystem::is_directory(std::string(prefixes[pi]))) {
@@ -2004,10 +1959,11 @@ bool initOpenGL()
         auto loadIcon = [](const char* subdir, const char* name) -> unsigned int {
             int w, h, ch;
             const char* prefixes[] = {
-                "../../../data/",
-                "../../data/",
-                "../data/",
                 "data/",
+                "../data/",
+                "../../data/",
+                "../../../data/",
+                "../../../../data/",
                 nullptr
             };
             for (int p = 0; prefixes[p]; p++) {
@@ -2533,8 +2489,6 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
         if (currentMainMode == REGISTRATION_MODE) {
             gDepthScale += 0.05f;
             regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-            if (g_showClusterVisualization && registrationHandle.state == RegistrationData::REGISTERED)
-                computeUnifiedMetrics();
         }
         break;
 
@@ -2543,8 +2497,6 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
             gDepthScale -= 0.05f;
             if (gDepthScale < 0.0f) gDepthScale = 0.0f;
             regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-            if (g_showClusterVisualization && registrationHandle.state == RegistrationData::REGISTERED)
-                computeUnifiedMetrics();
         }
         break;
 
