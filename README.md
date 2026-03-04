@@ -63,23 +63,6 @@ print('Done!')
 "
 ```
 
-### Git LFS を使う場合
-
-```bash
-sudo apt install git-lfs && git lfs install
-
-# Base
-cd LiverSurgeryNavi/onnx_models
-git clone https://huggingface.co/onnx-community/depth-anything-v3-base
-mkdir -p base && mv depth-anything-v3-base/onnx/model.onnx* base/
-rm -rf depth-anything-v3-base
-
-# Large
-git clone https://huggingface.co/onnx-community/depth-anything-v3-large
-mkdir -p large && mv depth-anything-v3-large/onnx/model.onnx* large/
-rm -rf depth-anything-v3-large
-```
-
 ダウンロード後、UI の「Depth Model」コンボボックスで Base / Large が選択可能になります。
 
 ## 依存関係
