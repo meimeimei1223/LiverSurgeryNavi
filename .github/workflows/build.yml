@@ -21,7 +21,7 @@ jobs:
       - name: Download ONNX models
         run: |
           pip install huggingface_hub onnx protobuf
-          mkdir -p models
+          mkdir -p onnx_models
           python3 -c "
           from huggingface_hub import hf_hub_download
           import onnx, os
@@ -30,18 +30,18 @@ jobs:
           try:
               d = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
               m = onnx.load(p)
-              onnx.save(m, 'models/depth_anything_v3_small.onnx', save_as_external_data=False)
+              onnx.save(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
               print('  Converted to single file')
           except Exception:
               import shutil
-              shutil.copy(p, 'models/depth_anything_v3_small.onnx')
+              shutil.copy(p, 'onnx_models/depth_anything_v3_small.onnx')
               print('  Copied single file')
           print('Downloading SAM2 encoder...')
-          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.encoder.onnx', local_dir='models/')
+          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.encoder.onnx', local_dir='onnx_models/')
           print('Downloading SAM2 decoder...')
-          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.decoder.onnx', local_dir='models/')
-          for f in os.listdir('models'):
-              sz = os.path.getsize(os.path.join('models', f))
+          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.decoder.onnx', local_dir='onnx_models/')
+          for f in os.listdir('onnx_models'):
+              sz = os.path.getsize(os.path.join('onnx_models', f))
               print(f'  {f}: {sz/1024/1024:.1f} MB')
           "
       - name: Configure
@@ -50,7 +50,7 @@ jobs:
         run: cmake --build build -j$(nproc)
       - name: Package
         run: |
-          mkdir -p package/LiverSurgeryNavi/models
+          mkdir -p package/LiverSurgeryNavi/onnx_models
           cp build/bin/LiverSurgeryNavi package/LiverSurgeryNavi/
           cp build/bin/medsam2_da3_lite package/LiverSurgeryNavi/
           cp onnxruntime-linux-x64-1.15.1/lib/libonnxruntime.so* package/LiverSurgeryNavi/
@@ -58,13 +58,12 @@ jobs:
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
           cp -r depth_output package/LiverSurgeryNavi/
-          cp -r input_image package/LiverSurgeryNavi/
-          cp models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/models/
-          cp models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/models/
-          cp models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/models/
+          cp onnx_models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/onnx_models/
+          cp onnx_models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/onnx_models/
+          cp onnx_models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/onnx_models/
           cp README.md LICENSE package/LiverSurgeryNavi/
           echo "=== Package contents ==="
-          du -sh package/LiverSurgeryNavi/models/*
+          du -sh package/LiverSurgeryNavi/onnx_models/*
           du -sh package/LiverSurgeryNavi/
       - uses: actions/upload-artifact@v4
         with:
@@ -84,7 +83,7 @@ jobs:
         shell: bash
         run: |
           pip install huggingface_hub onnx
-          mkdir -p models
+          mkdir -p onnx_models
           python3 -c "
           from huggingface_hub import hf_hub_download
           import onnx, os
@@ -93,18 +92,18 @@ jobs:
           try:
               d = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
               m = onnx.load(p)
-              onnx.save(m, 'models/depth_anything_v3_small.onnx', save_as_external_data=False)
+              onnx.save(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
               print('  Converted to single file')
           except Exception:
               import shutil
-              shutil.copy(p, 'models/depth_anything_v3_small.onnx')
+              shutil.copy(p, 'onnx_models/depth_anything_v3_small.onnx')
               print('  Copied single file')
           print('Downloading SAM2 encoder...')
-          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.encoder.onnx', local_dir='models/')
+          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.encoder.onnx', local_dir='onnx_models/')
           print('Downloading SAM2 decoder...')
-          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.decoder.onnx', local_dir='models/')
-          for f in os.listdir('models'):
-              sz = os.path.getsize(os.path.join('models', f))
+          hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.decoder.onnx', local_dir='onnx_models/')
+          for f in os.listdir('onnx_models'):
+              sz = os.path.getsize(os.path.join('onnx_models', f))
               print(f'  {f}: {sz/1024/1024:.1f} MB')
           "
       - name: Configure
@@ -115,7 +114,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          mkdir -p package/LiverSurgeryNavi/models
+          mkdir -p package/LiverSurgeryNavi/onnx_models
           cp build/bin/Release/LiverSurgeryNavi.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/LiverSurgeryNavi.exe package/LiverSurgeryNavi/
           cp build/bin/Release/medsam2_da3_lite.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/medsam2_da3_lite.exe package/LiverSurgeryNavi/
           cp onnxruntime-win-x64-1.15.1/lib/onnxruntime.dll package/LiverSurgeryNavi/
@@ -123,10 +122,9 @@ jobs:
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
           cp -r depth_output package/LiverSurgeryNavi/
-          cp -r input_image package/LiverSurgeryNavi/
-          cp models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/models/
-          cp models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/models/
-          cp models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/models/
+          cp onnx_models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/onnx_models/
+          cp onnx_models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/onnx_models/
+          cp onnx_models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/onnx_models/
           cp README.md LICENSE package/LiverSurgeryNavi/
       - uses: actions/upload-artifact@v4
         with:
