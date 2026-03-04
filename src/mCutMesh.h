@@ -448,7 +448,9 @@ struct mCutMesh {
         mNormals.clear();
         mTexCoords.clear();
         mIndices.clear();
-        float planeWidth = (float)gridWidth / gridHeight;
+        float planeWidth = (loadedImageWidth > 0 && loadedImageHeight > 0)
+                               ? (float)loadedImageWidth / (float)loadedImageHeight
+                               : (float)gridWidth / gridHeight;
         float planeHeight = 1.0f;
         float halfThickness = thickness / 2.0f;
         std::cout << "Generating grid plane with sides: " << (gridWidth+1) << "x" << (gridHeight+1)
@@ -899,7 +901,9 @@ struct mCutMesh {
         mNormals.clear();
         mTexCoords.clear();
         mIndices.clear();
-        float planeWidth = (float)gridWidth / gridHeight;
+        float planeWidth = (loadedImageWidth > 0 && loadedImageHeight > 0)
+                               ? (float)loadedImageWidth / (float)loadedImageHeight
+                               : (float)gridWidth / gridHeight;
         float planeHeight = 1.0f;
         float halfThickness = thickness / 2.0f;
         int expectedSize = (gridWidth + 1) * (gridHeight + 1);
