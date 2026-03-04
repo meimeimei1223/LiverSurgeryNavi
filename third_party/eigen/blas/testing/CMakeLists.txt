@@ -1,13 +1,3 @@
-include(CheckLanguage)
-check_language(Fortran)
-if(CMAKE_Fortran_COMPILER)
-  enable_language(Fortran)
-  set(EIGEN_Fortran_COMPILER_WORKS ON)
-else()
-  set(EIGEN_Fortran_COMPILER_WORKS OFF)
-endif()
-
-if (EIGEN_Fortran_COMPILER_WORKS)
 
 macro(ei_add_blas_test testname)
 
@@ -47,14 +37,4 @@ ei_add_blas_test(zblat3)
 
 # add_custom_target(level1)
 # add_dependencies(level1 sblat1)
-
-# Workaround for gfortran -O3 bug.  The optimization
-# introduces a bug in the calculation of the norm of the error
-# in the complex case.
-if(CMAKE_Fortran_COMPILER_ID MATCHES "GNU")
-  target_compile_options(cblat3 PRIVATE "-O0")
-  target_compile_options(zblat3 PRIVATE "-O0")
-endif()
-
-endif()
 

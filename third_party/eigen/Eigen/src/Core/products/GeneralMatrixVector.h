@@ -10,61 +10,61 @@
 #ifndef EIGEN_GENERAL_MATRIX_VECTOR_H
 #define EIGEN_GENERAL_MATRIX_VECTOR_H
 
-// IWYU pragma: private
-#include "../InternalHeaderCheck.h"
-
 namespace Eigen {
 
 namespace internal {
 
-enum GEMVPacketSizeType { GEMVPacketFull = 0, GEMVPacketHalf, GEMVPacketQuarter };
+enum GEMVPacketSizeType {
+  GEMVPacketFull = 0,
+  GEMVPacketHalf,
+  GEMVPacketQuarter
+};
 
 template <int N, typename T1, typename T2, typename T3>
-struct gemv_packet_cond {
-  typedef T3 type;
-};
+struct gemv_packet_cond { typedef T3 type; };
 
 template <typename T1, typename T2, typename T3>
-struct gemv_packet_cond<GEMVPacketFull, T1, T2, T3> {
-  typedef T1 type;
-};
+struct gemv_packet_cond<GEMVPacketFull, T1, T2, T3> { typedef T1 type; };
 
 template <typename T1, typename T2, typename T3>
-struct gemv_packet_cond<GEMVPacketHalf, T1, T2, T3> {
-  typedef T2 type;
-};
+struct gemv_packet_cond<GEMVPacketHalf, T1, T2, T3> { typedef T2 type; };
 
-template <typename LhsScalar, typename RhsScalar, int PacketSize_ = GEMVPacketFull>
-class gemv_traits {
+template<typename LhsScalar, typename RhsScalar, int _PacketSize=GEMVPacketFull>
+class gemv_traits
+{
   typedef typename ScalarBinaryOpTraits<LhsScalar, RhsScalar>::ReturnType ResScalar;
 
-#define PACKET_DECL_COND_POSTFIX(postfix, name, packet_size)                                               \
-  typedef typename gemv_packet_cond<                                                                       \
-      packet_size, typename packet_traits<name##Scalar>::type, typename packet_traits<name##Scalar>::half, \
-      typename unpacket_traits<typename packet_traits<name##Scalar>::half>::half>::type name##Packet##postfix
+#define PACKET_DECL_COND_PREFIX(prefix, name, packet_size)                        \
+  typedef typename gemv_packet_cond<packet_size,                                  \
+                                    typename packet_traits<name ## Scalar>::type, \
+                                    typename packet_traits<name ## Scalar>::half, \
+                                    typename unpacket_traits<typename packet_traits<name ## Scalar>::half>::half>::type \
+  prefix ## name ## Packet
 
-  PACKET_DECL_COND_POSTFIX(_, Lhs, PacketSize_);
-  PACKET_DECL_COND_POSTFIX(_, Rhs, PacketSize_);
-  PACKET_DECL_COND_POSTFIX(_, Res, PacketSize_);
-#undef PACKET_DECL_COND_POSTFIX
+  PACKET_DECL_COND_PREFIX(_, Lhs, _PacketSize);
+  PACKET_DECL_COND_PREFIX(_, Rhs, _PacketSize);
+  PACKET_DECL_COND_PREFIX(_, Res, _PacketSize);
+#undef PACKET_DECL_COND_PREFIX
 
- public:
+public:
   enum {
-    Vectorizable = unpacket_traits<LhsPacket_>::vectorizable && unpacket_traits<RhsPacket_>::vectorizable &&
-                   int(unpacket_traits<LhsPacket_>::size) == int(unpacket_traits<RhsPacket_>::size),
-    LhsPacketSize = Vectorizable ? unpacket_traits<LhsPacket_>::size : 1,
-    RhsPacketSize = Vectorizable ? unpacket_traits<RhsPacket_>::size : 1,
-    ResPacketSize = Vectorizable ? unpacket_traits<ResPacket_>::size : 1
+        Vectorizable = unpacket_traits<_LhsPacket>::vectorizable &&
+        unpacket_traits<_RhsPacket>::vectorizable &&
+        int(unpacket_traits<_LhsPacket>::size)==int(unpacket_traits<_RhsPacket>::size),
+        LhsPacketSize = Vectorizable ? unpacket_traits<_LhsPacket>::size : 1,
+        RhsPacketSize = Vectorizable ? unpacket_traits<_RhsPacket>::size : 1,
+        ResPacketSize = Vectorizable ? unpacket_traits<_ResPacket>::size : 1
   };
 
-  typedef std::conditional_t<Vectorizable, LhsPacket_, LhsScalar> LhsPacket;
-  typedef std::conditional_t<Vectorizable, RhsPacket_, RhsScalar> RhsPacket;
-  typedef std::conditional_t<Vectorizable, ResPacket_, ResScalar> ResPacket;
+  typedef typename conditional<Vectorizable,_LhsPacket,LhsScalar>::type LhsPacket;
+  typedef typename conditional<Vectorizable,_RhsPacket,RhsScalar>::type RhsPacket;
+  typedef typename conditional<Vectorizable,_ResPacket,ResScalar>::type ResPacket;
 };
+
 
 /* Optimized col-major matrix * vector product:
  * This algorithm processes the matrix per vertical panels,
- * which are then processed horizontally per chunk of 8*PacketSize x 1 vertical segments.
+ * which are then processed horizontaly per chunck of 8*PacketSize x 1 vertical segments.
  *
  * Mixing type logic: C += alpha * A * B
  *  |  A  |  B  |alpha| comments
@@ -75,13 +75,12 @@ class gemv_traits {
  *
  * The same reasoning apply for the transposed case.
  */
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-struct general_matrix_vector_product<Index, LhsScalar, LhsMapper, ColMajor, ConjugateLhs, RhsScalar, RhsMapper,
-                                     ConjugateRhs, Version> {
-  typedef gemv_traits<LhsScalar, RhsScalar> Traits;
-  typedef gemv_traits<LhsScalar, RhsScalar, GEMVPacketHalf> HalfTraits;
-  typedef gemv_traits<LhsScalar, RhsScalar, GEMVPacketQuarter> QuarterTraits;
+template<typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar, typename RhsMapper, bool ConjugateRhs, int Version>
+struct general_matrix_vector_product<Index,LhsScalar,LhsMapper,ColMajor,ConjugateLhs,RhsScalar,RhsMapper,ConjugateRhs,Version>
+{
+  typedef gemv_traits<LhsScalar,RhsScalar> Traits;
+  typedef gemv_traits<LhsScalar,RhsScalar,GEMVPacketHalf> HalfTraits;
+  typedef gemv_traits<LhsScalar,RhsScalar,GEMVPacketQuarter> QuarterTraits;
 
   typedef typename ScalarBinaryOpTraits<LhsScalar, RhsScalar>::ReturnType ResScalar;
 
@@ -97,171 +96,190 @@ struct general_matrix_vector_product<Index, LhsScalar, LhsMapper, ColMajor, Conj
   typedef typename QuarterTraits::RhsPacket RhsPacketQuarter;
   typedef typename QuarterTraits::ResPacket ResPacketQuarter;
 
-  EIGEN_DEVICE_FUNC inline static void run(Index rows, Index cols, const LhsMapper& lhs, const RhsMapper& rhs,
-                                           ResScalar* res, Index resIncr, RhsScalar alpha);
-
-  template <int N>
-  EIGEN_DEVICE_FUNC static EIGEN_ALWAYS_INLINE void process_rows(
-      Index i, Index j2, Index jend, const LhsMapper& lhs, const RhsMapper& rhs, ResScalar* res,
-      const ResPacket& palpha, conj_helper<LhsPacket, RhsPacket, ConjugateLhs, ConjugateRhs>& pcj);
+EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE static void run(
+  Index rows, Index cols,
+  const LhsMapper& lhs,
+  const RhsMapper& rhs,
+        ResScalar* res, Index resIncr,
+  RhsScalar alpha);
 };
 
-// Recursive template unroller for col-major GEMV full-packet row blocks.
-// Unrolls the packet dimension (K = 0..N-1) at compile time, guaranteeing
-// that each accumulator lives in its own register variable.
-template <int K, int N>
-struct gemv_colmajor_unroller {
-  template <typename Packet>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void init_zero(Packet* c) {
-    gemv_colmajor_unroller<K - 1, N>::init_zero(c);
-    c[K] = pzero(Packet{});
-  }
-
-  template <typename LhsPacket, int LhsStride, int Alignment, typename AccPacket, typename RhsPacket,
-            typename ConjHelper, typename LhsMapper, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void madd(AccPacket* c, const LhsMapper& lhs, Index i, Index j,
-                                                         const RhsPacket& b0, ConjHelper& pcj) {
-    gemv_colmajor_unroller<K - 1, N>::template madd<LhsPacket, LhsStride, Alignment>(c, lhs, i, j, b0, pcj);
-    c[K] = pcj.pmadd(lhs.template load<LhsPacket, Alignment>(i + LhsStride * K, j), b0, c[K]);
-  }
-
-  template <typename ResPacket, int ResStride, typename ResScalar>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void store(const ResPacket* c, ResScalar* res, Index i,
-                                                          const ResPacket& palpha) {
-    gemv_colmajor_unroller<K - 1, N>::template store<ResPacket, ResStride>(c, res, i, palpha);
-    pstoreu(res + i + ResStride * K, pmadd(c[K], palpha, ploadu<ResPacket>(res + i + ResStride * K)));
-  }
-};
-
-template <int N>
-struct gemv_colmajor_unroller<0, N> {
-  template <typename Packet>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void init_zero(Packet* c) {
-    c[0] = pzero(Packet{});
-  }
-
-  template <typename LhsPacket, int LhsStride, int Alignment, typename AccPacket, typename RhsPacket,
-            typename ConjHelper, typename LhsMapper, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void madd(AccPacket* c, const LhsMapper& lhs, Index i, Index j,
-                                                         const RhsPacket& b0, ConjHelper& pcj) {
-    c[0] = pcj.pmadd(lhs.template load<LhsPacket, Alignment>(i, j), b0, c[0]);
-  }
-
-  template <typename ResPacket, int ResStride, typename ResScalar>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void store(const ResPacket* c, ResScalar* res, Index i,
-                                                          const ResPacket& palpha) {
-    pstoreu(res + i, pmadd(c[0], palpha, ploadu<ResPacket>(res + i)));
-  }
-};
-
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-template <int N>
-EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE void general_matrix_vector_product<
-    Index, LhsScalar, LhsMapper, ColMajor, ConjugateLhs, RhsScalar, RhsMapper, ConjugateRhs,
-    Version>::process_rows(Index i, Index j2, Index jend, const LhsMapper& lhs, const RhsMapper& rhs, ResScalar* res,
-                           const ResPacket& palpha,
-                           conj_helper<LhsPacket, RhsPacket, ConjugateLhs, ConjugateRhs>& pcj) {
-  enum { LhsAlignment = Unaligned, LhsPacketSize = Traits::LhsPacketSize, ResPacketSize = Traits::ResPacketSize };
-  using Unroller = gemv_colmajor_unroller<N - 1, N>;
-
-  ResPacket c[N];
-  Unroller::init_zero(c);
-  for (Index j = j2; j < jend; ++j) {
-    RhsPacket b0 = pset1<RhsPacket>(rhs(j, 0));
-    Unroller::template madd<LhsPacket, LhsPacketSize, LhsAlignment>(c, lhs, i, j, b0, pcj);
-  }
-  Unroller::template store<ResPacket, ResPacketSize>(c, res, i, palpha);
-}
-
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-EIGEN_DEVICE_FUNC inline void
-general_matrix_vector_product<Index, LhsScalar, LhsMapper, ColMajor, ConjugateLhs, RhsScalar, RhsMapper, ConjugateRhs,
-                              Version>::run(Index rows, Index cols, const LhsMapper& alhs, const RhsMapper& rhs,
-                                            ResScalar* res, Index resIncr, RhsScalar alpha) {
+template<typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar, typename RhsMapper, bool ConjugateRhs, int Version>
+EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void general_matrix_vector_product<Index,LhsScalar,LhsMapper,ColMajor,ConjugateLhs,RhsScalar,RhsMapper,ConjugateRhs,Version>::run(
+  Index rows, Index cols,
+  const LhsMapper& alhs,
+  const RhsMapper& rhs,
+        ResScalar* res, Index resIncr,
+  RhsScalar alpha)
+{
   EIGEN_UNUSED_VARIABLE(resIncr);
-  eigen_internal_assert(resIncr == 1);
+  eigen_internal_assert(resIncr==1);
 
   // The following copy tells the compiler that lhs's attributes are not modified outside this function
-  // This helps GCC to generate proper code.
+  // This helps GCC to generate propoer code.
   LhsMapper lhs(alhs);
 
-  conj_helper<LhsScalar, RhsScalar, ConjugateLhs, ConjugateRhs> cj;
-  conj_helper<LhsPacket, RhsPacket, ConjugateLhs, ConjugateRhs> pcj;
-  conj_helper<LhsPacketHalf, RhsPacketHalf, ConjugateLhs, ConjugateRhs> pcj_half;
-  conj_helper<LhsPacketQuarter, RhsPacketQuarter, ConjugateLhs, ConjugateRhs> pcj_quarter;
+  conj_helper<LhsScalar,RhsScalar,ConjugateLhs,ConjugateRhs> cj;
+  conj_helper<LhsPacket,RhsPacket,ConjugateLhs,ConjugateRhs> pcj;
+  conj_helper<LhsPacketHalf,RhsPacketHalf,ConjugateLhs,ConjugateRhs> pcj_half;
+  conj_helper<LhsPacketQuarter,RhsPacketQuarter,ConjugateLhs,ConjugateRhs> pcj_quarter;
 
   const Index lhsStride = lhs.stride();
   // TODO: for padded aligned inputs, we could enable aligned reads
-  enum {
-    LhsAlignment = Unaligned,
-    ResPacketSize = Traits::ResPacketSize,
-    ResPacketSizeHalf = HalfTraits::ResPacketSize,
-    ResPacketSizeQuarter = QuarterTraits::ResPacketSize,
-    LhsPacketSize = Traits::LhsPacketSize,
-    HasHalf = (int)ResPacketSizeHalf < (int)ResPacketSize,
-    HasQuarter = (int)ResPacketSizeQuarter < (int)ResPacketSizeHalf
+  enum { LhsAlignment = Unaligned,
+         ResPacketSize = Traits::ResPacketSize,
+         ResPacketSizeHalf = HalfTraits::ResPacketSize,
+         ResPacketSizeQuarter = QuarterTraits::ResPacketSize,
+         LhsPacketSize = Traits::LhsPacketSize,
+         HasHalf = (int)ResPacketSizeHalf < (int)ResPacketSize,
+         HasQuarter = (int)ResPacketSizeQuarter < (int)ResPacketSizeHalf
   };
 
-  const Index n8 = rows - 8 * ResPacketSize + 1;
-  const Index n4 = rows - 4 * ResPacketSize + 1;
-  const Index n3 = rows - 3 * ResPacketSize + 1;
-  const Index n2 = rows - 2 * ResPacketSize + 1;
-  const Index n1 = rows - 1 * ResPacketSize + 1;
-  const Index n_half = rows - 1 * ResPacketSizeHalf + 1;
-  const Index n_quarter = rows - 1 * ResPacketSizeQuarter + 1;
+  const Index n8 = rows-8*ResPacketSize+1;
+  const Index n4 = rows-4*ResPacketSize+1;
+  const Index n3 = rows-3*ResPacketSize+1;
+  const Index n2 = rows-2*ResPacketSize+1;
+  const Index n1 = rows-1*ResPacketSize+1;
+  const Index n_half = rows-1*ResPacketSizeHalf+1;
+  const Index n_quarter = rows-1*ResPacketSizeQuarter+1;
 
   // TODO: improve the following heuristic:
-  const Index block_cols = cols < 128 ? cols : (lhsStride * Index(sizeof(LhsScalar)) < 32000 ? Index(16) : Index(4));
+  const Index block_cols = cols<128 ? cols : (lhsStride*sizeof(LhsScalar)<32000?16:4);
   ResPacket palpha = pset1<ResPacket>(alpha);
   ResPacketHalf palpha_half = pset1<ResPacketHalf>(alpha);
   ResPacketQuarter palpha_quarter = pset1<ResPacketQuarter>(alpha);
 
-  for (Index j2 = 0; j2 < cols; j2 += block_cols) {
-    Index jend = numext::mini(j2 + block_cols, cols);
-    Index i = 0;
-    for (; i < n8; i += ResPacketSize * 8) process_rows<8>(i, j2, jend, lhs, rhs, res, palpha, pcj);
-    if (i < n4) {
-      process_rows<4>(i, j2, jend, lhs, rhs, res, palpha, pcj);
-      i += ResPacketSize * 4;
-    }
-    if (i < n3) {
-      process_rows<3>(i, j2, jend, lhs, rhs, res, palpha, pcj);
-      i += ResPacketSize * 3;
-    }
-    if (i < n2) {
-      process_rows<2>(i, j2, jend, lhs, rhs, res, palpha, pcj);
-      i += ResPacketSize * 2;
-    }
-    if (i < n1) {
-      process_rows<1>(i, j2, jend, lhs, rhs, res, palpha, pcj);
-      i += ResPacketSize;
-    }
-    if (HasHalf && i < n_half) {
-      ResPacketHalf c0 = pzero(ResPacketHalf{});
-      for (Index j = j2; j < jend; j += 1) {
-        RhsPacketHalf b0 = pset1<RhsPacketHalf>(rhs(j, 0));
-        c0 = pcj_half.pmadd(lhs.template load<LhsPacketHalf, LhsAlignment>(i + 0, j), b0, c0);
+  for(Index j2=0; j2<cols; j2+=block_cols)
+  {
+    Index jend = numext::mini(j2+block_cols,cols);
+    Index i=0;
+    for(; i<n8; i+=ResPacketSize*8)
+    {
+      ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+                c1 = pset1<ResPacket>(ResScalar(0)),
+                c2 = pset1<ResPacket>(ResScalar(0)),
+                c3 = pset1<ResPacket>(ResScalar(0)),
+                c4 = pset1<ResPacket>(ResScalar(0)),
+                c5 = pset1<ResPacket>(ResScalar(0)),
+                c6 = pset1<ResPacket>(ResScalar(0)),
+                c7 = pset1<ResPacket>(ResScalar(0));
+
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacket b0 = pset1<RhsPacket>(rhs(j,0));
+        c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*0,j),b0,c0);
+        c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*1,j),b0,c1);
+        c2 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*2,j),b0,c2);
+        c3 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*3,j),b0,c3);
+        c4 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*4,j),b0,c4);
+        c5 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*5,j),b0,c5);
+        c6 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*6,j),b0,c6);
+        c7 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*7,j),b0,c7);
       }
-      pstoreu(res + i + ResPacketSizeHalf * 0,
-              pmadd(c0, palpha_half, ploadu<ResPacketHalf>(res + i + ResPacketSizeHalf * 0)));
-      i += ResPacketSizeHalf;
+      pstoreu(res+i+ResPacketSize*0, pmadd(c0,palpha,ploadu<ResPacket>(res+i+ResPacketSize*0)));
+      pstoreu(res+i+ResPacketSize*1, pmadd(c1,palpha,ploadu<ResPacket>(res+i+ResPacketSize*1)));
+      pstoreu(res+i+ResPacketSize*2, pmadd(c2,palpha,ploadu<ResPacket>(res+i+ResPacketSize*2)));
+      pstoreu(res+i+ResPacketSize*3, pmadd(c3,palpha,ploadu<ResPacket>(res+i+ResPacketSize*3)));
+      pstoreu(res+i+ResPacketSize*4, pmadd(c4,palpha,ploadu<ResPacket>(res+i+ResPacketSize*4)));
+      pstoreu(res+i+ResPacketSize*5, pmadd(c5,palpha,ploadu<ResPacket>(res+i+ResPacketSize*5)));
+      pstoreu(res+i+ResPacketSize*6, pmadd(c6,palpha,ploadu<ResPacket>(res+i+ResPacketSize*6)));
+      pstoreu(res+i+ResPacketSize*7, pmadd(c7,palpha,ploadu<ResPacket>(res+i+ResPacketSize*7)));
     }
-    if (HasQuarter && i < n_quarter) {
-      ResPacketQuarter c0 = pzero(ResPacketQuarter{});
-      for (Index j = j2; j < jend; j += 1) {
-        RhsPacketQuarter b0 = pset1<RhsPacketQuarter>(rhs(j, 0));
-        c0 = pcj_quarter.pmadd(lhs.template load<LhsPacketQuarter, LhsAlignment>(i + 0, j), b0, c0);
+    if(i<n4)
+    {
+      ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+                c1 = pset1<ResPacket>(ResScalar(0)),
+                c2 = pset1<ResPacket>(ResScalar(0)),
+                c3 = pset1<ResPacket>(ResScalar(0));
+
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacket b0 = pset1<RhsPacket>(rhs(j,0));
+        c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*0,j),b0,c0);
+        c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*1,j),b0,c1);
+        c2 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*2,j),b0,c2);
+        c3 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*3,j),b0,c3);
       }
-      pstoreu(res + i + ResPacketSizeQuarter * 0,
-              pmadd(c0, palpha_quarter, ploadu<ResPacketQuarter>(res + i + ResPacketSizeQuarter * 0)));
-      i += ResPacketSizeQuarter;
+      pstoreu(res+i+ResPacketSize*0, pmadd(c0,palpha,ploadu<ResPacket>(res+i+ResPacketSize*0)));
+      pstoreu(res+i+ResPacketSize*1, pmadd(c1,palpha,ploadu<ResPacket>(res+i+ResPacketSize*1)));
+      pstoreu(res+i+ResPacketSize*2, pmadd(c2,palpha,ploadu<ResPacket>(res+i+ResPacketSize*2)));
+      pstoreu(res+i+ResPacketSize*3, pmadd(c3,palpha,ploadu<ResPacket>(res+i+ResPacketSize*3)));
+
+      i+=ResPacketSize*4;
     }
-    for (; i < rows; ++i) {
+    if(i<n3)
+    {
+      ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+                c1 = pset1<ResPacket>(ResScalar(0)),
+                c2 = pset1<ResPacket>(ResScalar(0));
+
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacket b0 = pset1<RhsPacket>(rhs(j,0));
+        c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*0,j),b0,c0);
+        c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*1,j),b0,c1);
+        c2 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*2,j),b0,c2);
+      }
+      pstoreu(res+i+ResPacketSize*0, pmadd(c0,palpha,ploadu<ResPacket>(res+i+ResPacketSize*0)));
+      pstoreu(res+i+ResPacketSize*1, pmadd(c1,palpha,ploadu<ResPacket>(res+i+ResPacketSize*1)));
+      pstoreu(res+i+ResPacketSize*2, pmadd(c2,palpha,ploadu<ResPacket>(res+i+ResPacketSize*2)));
+
+      i+=ResPacketSize*3;
+    }
+    if(i<n2)
+    {
+      ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+                c1 = pset1<ResPacket>(ResScalar(0));
+
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacket b0 = pset1<RhsPacket>(rhs(j,0));
+        c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*0,j),b0,c0);
+        c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+LhsPacketSize*1,j),b0,c1);
+      }
+      pstoreu(res+i+ResPacketSize*0, pmadd(c0,palpha,ploadu<ResPacket>(res+i+ResPacketSize*0)));
+      pstoreu(res+i+ResPacketSize*1, pmadd(c1,palpha,ploadu<ResPacket>(res+i+ResPacketSize*1)));
+      i+=ResPacketSize*2;
+    }
+    if(i<n1)
+    {
+      ResPacket c0 = pset1<ResPacket>(ResScalar(0));
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacket b0 = pset1<RhsPacket>(rhs(j,0));
+        c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+0,j),b0,c0);
+      }
+      pstoreu(res+i+ResPacketSize*0, pmadd(c0,palpha,ploadu<ResPacket>(res+i+ResPacketSize*0)));
+      i+=ResPacketSize;
+    }
+    if(HasHalf && i<n_half)
+    {
+      ResPacketHalf c0 = pset1<ResPacketHalf>(ResScalar(0));
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacketHalf b0 = pset1<RhsPacketHalf>(rhs(j,0));
+        c0 = pcj_half.pmadd(lhs.template load<LhsPacketHalf,LhsAlignment>(i+0,j),b0,c0);
+      }
+      pstoreu(res+i+ResPacketSizeHalf*0, pmadd(c0,palpha_half,ploadu<ResPacketHalf>(res+i+ResPacketSizeHalf*0)));
+      i+=ResPacketSizeHalf;
+    }
+    if(HasQuarter && i<n_quarter)
+    {
+      ResPacketQuarter c0 = pset1<ResPacketQuarter>(ResScalar(0));
+      for(Index j=j2; j<jend; j+=1)
+      {
+        RhsPacketQuarter b0 = pset1<RhsPacketQuarter>(rhs(j,0));
+        c0 = pcj_quarter.pmadd(lhs.template load<LhsPacketQuarter,LhsAlignment>(i+0,j),b0,c0);
+      }
+      pstoreu(res+i+ResPacketSizeQuarter*0, pmadd(c0,palpha_quarter,ploadu<ResPacketQuarter>(res+i+ResPacketSizeQuarter*0)));
+      i+=ResPacketSizeQuarter;
+    }
+    for(;i<rows;++i)
+    {
       ResScalar c0(0);
-      for (Index j = j2; j < jend; j += 1) c0 += cj.pmul(lhs(i, j), rhs(j, 0));
-      res[i] += alpha * c0;
+      for(Index j=j2; j<jend; j+=1)
+        c0 += cj.pmul(lhs(i,j), rhs(j,0));
+      res[i] += alpha*c0;
     }
   }
 }
@@ -276,13 +294,12 @@ general_matrix_vector_product<Index, LhsScalar, LhsMapper, ColMajor, ConjugateLh
  *  - alpha is always a complex (or converted to a complex)
  *  - no vectorization
  */
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-struct general_matrix_vector_product<Index, LhsScalar, LhsMapper, RowMajor, ConjugateLhs, RhsScalar, RhsMapper,
-                                     ConjugateRhs, Version> {
-  typedef gemv_traits<LhsScalar, RhsScalar> Traits;
-  typedef gemv_traits<LhsScalar, RhsScalar, GEMVPacketHalf> HalfTraits;
-  typedef gemv_traits<LhsScalar, RhsScalar, GEMVPacketQuarter> QuarterTraits;
+template<typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar, typename RhsMapper, bool ConjugateRhs, int Version>
+struct general_matrix_vector_product<Index,LhsScalar,LhsMapper,RowMajor,ConjugateLhs,RhsScalar,RhsMapper,ConjugateRhs,Version>
+{
+  typedef gemv_traits<LhsScalar,RhsScalar> Traits;
+  typedef gemv_traits<LhsScalar,RhsScalar,GEMVPacketHalf> HalfTraits;
+  typedef gemv_traits<LhsScalar,RhsScalar,GEMVPacketQuarter> QuarterTraits;
 
   typedef typename ScalarBinaryOpTraits<LhsScalar, RhsScalar>::ReturnType ResScalar;
 
@@ -298,100 +315,75 @@ struct general_matrix_vector_product<Index, LhsScalar, LhsMapper, RowMajor, Conj
   typedef typename QuarterTraits::RhsPacket RhsPacketQuarter;
   typedef typename QuarterTraits::ResPacket ResPacketQuarter;
 
-  EIGEN_DEVICE_FUNC static inline void run(Index rows, Index cols, const LhsMapper& lhs, const RhsMapper& rhs,
-                                           ResScalar* res, Index resIncr, ResScalar alpha);
-
-  // Specialized path for when cols < full packet size. Kept noinline to avoid
-  // bloating the main run() function and causing icache pressure.
-  EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE static void run_small_cols(Index rows, Index cols, const LhsMapper& lhs,
-                                                                 const RhsMapper& rhs, ResScalar* res, Index resIncr,
-                                                                 ResScalar alpha);
-
-  // Templated helper that processes N rows in run_small_cols. N is a compile-time
-  // constant; row-dimension unrolling is done via recursive templates to guarantee
-  // full unrolling regardless of compiler heuristics.
-  template <int N>
-  EIGEN_DEVICE_FUNC static EIGEN_ALWAYS_INLINE void process_rows_small_cols(Index i, Index cols, const LhsMapper& lhs,
-                                                                            const RhsMapper& rhs, ResScalar* res,
-                                                                            Index resIncr, ResScalar alpha,
-                                                                            Index halfColBlockEnd,
-                                                                            Index quarterColBlockEnd);
+EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE static void run(
+  Index rows, Index cols,
+  const LhsMapper& lhs,
+  const RhsMapper& rhs,
+        ResScalar* res, Index resIncr,
+  ResScalar alpha);
 };
 
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-EIGEN_DEVICE_FUNC inline void
-general_matrix_vector_product<Index, LhsScalar, LhsMapper, RowMajor, ConjugateLhs, RhsScalar, RhsMapper, ConjugateRhs,
-                              Version>::run(Index rows, Index cols, const LhsMapper& alhs, const RhsMapper& rhs,
-                                            ResScalar* res, Index resIncr, ResScalar alpha) {
-  // When cols < full packet size, the main vectorized loops are empty.
-  // Dispatch to a separate noinline function to avoid polluting the icache.
-  // Only dispatch when cols is large enough that half or quarter packets can be used;
-  // otherwise the helper would just do scalar work with extra function call overhead.
-  enum {
-    LhsPacketSize_ = Traits::LhsPacketSize,
-    MinUsefulCols_ =
-        ((int)QuarterTraits::LhsPacketSize < (int)HalfTraits::LhsPacketSize)
-            ? (int)QuarterTraits::LhsPacketSize
-            : (((int)HalfTraits::LhsPacketSize < (int)Traits::LhsPacketSize) ? (int)HalfTraits::LhsPacketSize
-                                                                             : (int)Traits::LhsPacketSize),
-    HasSubPackets_ = (int)MinUsefulCols_ < (int)LhsPacketSize_
-  };
-  if (HasSubPackets_ && cols >= MinUsefulCols_ && cols < LhsPacketSize_) {
-    run_small_cols(rows, cols, alhs, rhs, res, resIncr, alpha);
-    return;
-  }
-
+template<typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar, typename RhsMapper, bool ConjugateRhs, int Version>
+EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void general_matrix_vector_product<Index,LhsScalar,LhsMapper,RowMajor,ConjugateLhs,RhsScalar,RhsMapper,ConjugateRhs,Version>::run(
+  Index rows, Index cols,
+  const LhsMapper& alhs,
+  const RhsMapper& rhs,
+  ResScalar* res, Index resIncr,
+  ResScalar alpha)
+{
   // The following copy tells the compiler that lhs's attributes are not modified outside this function
-  // This helps GCC to generate proper code.
+  // This helps GCC to generate propoer code.
   LhsMapper lhs(alhs);
 
-  eigen_internal_assert(rhs.stride() == 1);
-  conj_helper<LhsScalar, RhsScalar, ConjugateLhs, ConjugateRhs> cj;
-  conj_helper<LhsPacket, RhsPacket, ConjugateLhs, ConjugateRhs> pcj;
-  conj_helper<LhsPacketHalf, RhsPacketHalf, ConjugateLhs, ConjugateRhs> pcj_half;
-  conj_helper<LhsPacketQuarter, RhsPacketQuarter, ConjugateLhs, ConjugateRhs> pcj_quarter;
+  eigen_internal_assert(rhs.stride()==1);
+  conj_helper<LhsScalar,RhsScalar,ConjugateLhs,ConjugateRhs> cj;
+  conj_helper<LhsPacket,RhsPacket,ConjugateLhs,ConjugateRhs> pcj;
+  conj_helper<LhsPacketHalf,RhsPacketHalf,ConjugateLhs,ConjugateRhs> pcj_half;
+  conj_helper<LhsPacketQuarter,RhsPacketQuarter,ConjugateLhs,ConjugateRhs> pcj_quarter;
 
   // TODO: fine tune the following heuristic. The rationale is that if the matrix is very large,
   //       processing 8 rows at once might be counter productive wrt cache.
-  const Index n8 = lhs.stride() * sizeof(LhsScalar) > 32000 ? 0 : rows - 7;
-  const Index n4 = rows - 3;
-  const Index n2 = rows - 1;
+  const Index n8 = lhs.stride()*sizeof(LhsScalar)>32000 ? 0 : rows-7;
+  const Index n4 = rows-3;
+  const Index n2 = rows-1;
 
   // TODO: for padded aligned inputs, we could enable aligned reads
-  enum {
-    LhsAlignment = Unaligned,
-    ResPacketSize = Traits::ResPacketSize,
-    ResPacketSizeHalf = HalfTraits::ResPacketSize,
-    ResPacketSizeQuarter = QuarterTraits::ResPacketSize,
-    LhsPacketSize = Traits::LhsPacketSize,
-    LhsPacketSizeHalf = HalfTraits::LhsPacketSize,
-    LhsPacketSizeQuarter = QuarterTraits::LhsPacketSize,
-    HasHalf = (int)ResPacketSizeHalf < (int)ResPacketSize,
-    HasQuarter = (int)ResPacketSizeQuarter < (int)ResPacketSizeHalf
+  enum { LhsAlignment = Unaligned,
+         ResPacketSize = Traits::ResPacketSize,
+         ResPacketSizeHalf = HalfTraits::ResPacketSize,
+         ResPacketSizeQuarter = QuarterTraits::ResPacketSize,
+         LhsPacketSize = Traits::LhsPacketSize,
+         LhsPacketSizeHalf = HalfTraits::LhsPacketSize,
+         LhsPacketSizeQuarter = QuarterTraits::LhsPacketSize,
+         HasHalf = (int)ResPacketSizeHalf < (int)ResPacketSize,
+         HasQuarter = (int)ResPacketSizeQuarter < (int)ResPacketSizeHalf
   };
 
-  using UnsignedIndex = std::make_unsigned_t<Index>;
-  const Index fullColBlockEnd = LhsPacketSize * (UnsignedIndex(cols) / LhsPacketSize);
-  const Index halfColBlockEnd = LhsPacketSizeHalf * (UnsignedIndex(cols) / LhsPacketSizeHalf);
-  const Index quarterColBlockEnd = LhsPacketSizeQuarter * (UnsignedIndex(cols) / LhsPacketSizeQuarter);
+  Index i=0;
+  for(; i<n8; i+=8)
+  {
+    ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+              c1 = pset1<ResPacket>(ResScalar(0)),
+              c2 = pset1<ResPacket>(ResScalar(0)),
+              c3 = pset1<ResPacket>(ResScalar(0)),
+              c4 = pset1<ResPacket>(ResScalar(0)),
+              c5 = pset1<ResPacket>(ResScalar(0)),
+              c6 = pset1<ResPacket>(ResScalar(0)),
+              c7 = pset1<ResPacket>(ResScalar(0));
 
-  Index i = 0;
-  for (; i < n8; i += 8) {
-    ResPacket c0 = pzero(ResPacket{}), c1 = pzero(ResPacket{}), c2 = pzero(ResPacket{}), c3 = pzero(ResPacket{}),
-              c4 = pzero(ResPacket{}), c5 = pzero(ResPacket{}), c6 = pzero(ResPacket{}), c7 = pzero(ResPacket{});
+    Index j=0;
+    for(; j+LhsPacketSize<=cols; j+=LhsPacketSize)
+    {
+      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j,0);
 
-    for (Index j = 0; j < fullColBlockEnd; j += LhsPacketSize) {
-      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j, 0);
-
-      c0 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 0, j), b0, c0);
-      c1 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 1, j), b0, c1);
-      c2 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 2, j), b0, c2);
-      c3 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 3, j), b0, c3);
-      c4 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 4, j), b0, c4);
-      c5 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 5, j), b0, c5);
-      c6 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 6, j), b0, c6);
-      c7 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 7, j), b0, c7);
+      c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+0,j),b0,c0);
+      c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+1,j),b0,c1);
+      c2 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+2,j),b0,c2);
+      c3 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+3,j),b0,c3);
+      c4 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+4,j),b0,c4);
+      c5 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+5,j),b0,c5);
+      c6 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+6,j),b0,c6);
+      c7 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+7,j),b0,c7);
     }
     ResScalar cc0 = predux(c0);
     ResScalar cc1 = predux(c1);
@@ -401,274 +393,126 @@ general_matrix_vector_product<Index, LhsScalar, LhsMapper, RowMajor, ConjugateLh
     ResScalar cc5 = predux(c5);
     ResScalar cc6 = predux(c6);
     ResScalar cc7 = predux(c7);
+    for(; j<cols; ++j)
+    {
+      RhsScalar b0 = rhs(j,0);
 
-    for (Index j = fullColBlockEnd; j < cols; ++j) {
-      RhsScalar b0 = rhs(j, 0);
-
-      cc0 += cj.pmul(lhs(i + 0, j), b0);
-      cc1 += cj.pmul(lhs(i + 1, j), b0);
-      cc2 += cj.pmul(lhs(i + 2, j), b0);
-      cc3 += cj.pmul(lhs(i + 3, j), b0);
-      cc4 += cj.pmul(lhs(i + 4, j), b0);
-      cc5 += cj.pmul(lhs(i + 5, j), b0);
-      cc6 += cj.pmul(lhs(i + 6, j), b0);
-      cc7 += cj.pmul(lhs(i + 7, j), b0);
+      cc0 += cj.pmul(lhs(i+0,j), b0);
+      cc1 += cj.pmul(lhs(i+1,j), b0);
+      cc2 += cj.pmul(lhs(i+2,j), b0);
+      cc3 += cj.pmul(lhs(i+3,j), b0);
+      cc4 += cj.pmul(lhs(i+4,j), b0);
+      cc5 += cj.pmul(lhs(i+5,j), b0);
+      cc6 += cj.pmul(lhs(i+6,j), b0);
+      cc7 += cj.pmul(lhs(i+7,j), b0);
     }
-    res[(i + 0) * resIncr] += alpha * cc0;
-    res[(i + 1) * resIncr] += alpha * cc1;
-    res[(i + 2) * resIncr] += alpha * cc2;
-    res[(i + 3) * resIncr] += alpha * cc3;
-    res[(i + 4) * resIncr] += alpha * cc4;
-    res[(i + 5) * resIncr] += alpha * cc5;
-    res[(i + 6) * resIncr] += alpha * cc6;
-    res[(i + 7) * resIncr] += alpha * cc7;
+    res[(i+0)*resIncr] += alpha*cc0;
+    res[(i+1)*resIncr] += alpha*cc1;
+    res[(i+2)*resIncr] += alpha*cc2;
+    res[(i+3)*resIncr] += alpha*cc3;
+    res[(i+4)*resIncr] += alpha*cc4;
+    res[(i+5)*resIncr] += alpha*cc5;
+    res[(i+6)*resIncr] += alpha*cc6;
+    res[(i+7)*resIncr] += alpha*cc7;
   }
-  if (i < n4) {
-    ResPacket c0 = pzero(ResPacket{}), c1 = pzero(ResPacket{}), c2 = pzero(ResPacket{}), c3 = pzero(ResPacket{});
+  for(; i<n4; i+=4)
+  {
+    ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+              c1 = pset1<ResPacket>(ResScalar(0)),
+              c2 = pset1<ResPacket>(ResScalar(0)),
+              c3 = pset1<ResPacket>(ResScalar(0));
 
-    for (Index j = 0; j < fullColBlockEnd; j += LhsPacketSize) {
-      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j, 0);
+    Index j=0;
+    for(; j+LhsPacketSize<=cols; j+=LhsPacketSize)
+    {
+      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j,0);
 
-      c0 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 0, j), b0, c0);
-      c1 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 1, j), b0, c1);
-      c2 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 2, j), b0, c2);
-      c3 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 3, j), b0, c3);
+      c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+0,j),b0,c0);
+      c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+1,j),b0,c1);
+      c2 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+2,j),b0,c2);
+      c3 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+3,j),b0,c3);
     }
     ResScalar cc0 = predux(c0);
     ResScalar cc1 = predux(c1);
     ResScalar cc2 = predux(c2);
     ResScalar cc3 = predux(c3);
+    for(; j<cols; ++j)
+    {
+      RhsScalar b0 = rhs(j,0);
 
-    for (Index j = fullColBlockEnd; j < cols; ++j) {
-      RhsScalar b0 = rhs(j, 0);
-
-      cc0 += cj.pmul(lhs(i + 0, j), b0);
-      cc1 += cj.pmul(lhs(i + 1, j), b0);
-      cc2 += cj.pmul(lhs(i + 2, j), b0);
-      cc3 += cj.pmul(lhs(i + 3, j), b0);
+      cc0 += cj.pmul(lhs(i+0,j), b0);
+      cc1 += cj.pmul(lhs(i+1,j), b0);
+      cc2 += cj.pmul(lhs(i+2,j), b0);
+      cc3 += cj.pmul(lhs(i+3,j), b0);
     }
-    res[(i + 0) * resIncr] += alpha * cc0;
-    res[(i + 1) * resIncr] += alpha * cc1;
-    res[(i + 2) * resIncr] += alpha * cc2;
-    res[(i + 3) * resIncr] += alpha * cc3;
-    i += 4;
+    res[(i+0)*resIncr] += alpha*cc0;
+    res[(i+1)*resIncr] += alpha*cc1;
+    res[(i+2)*resIncr] += alpha*cc2;
+    res[(i+3)*resIncr] += alpha*cc3;
   }
-  if (i < n2) {
-    ResPacket c0 = pzero(ResPacket{}), c1 = pzero(ResPacket{});
+  for(; i<n2; i+=2)
+  {
+    ResPacket c0 = pset1<ResPacket>(ResScalar(0)),
+              c1 = pset1<ResPacket>(ResScalar(0));
 
-    for (Index j = 0; j < fullColBlockEnd; j += LhsPacketSize) {
-      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j, 0);
+    Index j=0;
+    for(; j+LhsPacketSize<=cols; j+=LhsPacketSize)
+    {
+      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j,0);
 
-      c0 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 0, j), b0, c0);
-      c1 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i + 1, j), b0, c1);
+      c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+0,j),b0,c0);
+      c1 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i+1,j),b0,c1);
     }
     ResScalar cc0 = predux(c0);
     ResScalar cc1 = predux(c1);
+    for(; j<cols; ++j)
+    {
+      RhsScalar b0 = rhs(j,0);
 
-    for (Index j = fullColBlockEnd; j < cols; ++j) {
-      RhsScalar b0 = rhs(j, 0);
-
-      cc0 += cj.pmul(lhs(i + 0, j), b0);
-      cc1 += cj.pmul(lhs(i + 1, j), b0);
+      cc0 += cj.pmul(lhs(i+0,j), b0);
+      cc1 += cj.pmul(lhs(i+1,j), b0);
     }
-    res[(i + 0) * resIncr] += alpha * cc0;
-    res[(i + 1) * resIncr] += alpha * cc1;
-    i += 2;
+    res[(i+0)*resIncr] += alpha*cc0;
+    res[(i+1)*resIncr] += alpha*cc1;
   }
-  if (i < rows) {
-    ResPacket c0 = pzero(ResPacket{});
-    ResPacketHalf c0_h = pzero(ResPacketHalf{});
-    ResPacketQuarter c0_q = pzero(ResPacketQuarter{});
-
-    for (Index j = 0; j < fullColBlockEnd; j += LhsPacketSize) {
-      RhsPacket b0 = rhs.template load<RhsPacket, Unaligned>(j, 0);
-      c0 = pcj.pmadd(lhs.template load<LhsPacket, LhsAlignment>(i, j), b0, c0);
+  for(; i<rows; ++i)
+  {
+    ResPacket c0 = pset1<ResPacket>(ResScalar(0));
+    ResPacketHalf c0_h = pset1<ResPacketHalf>(ResScalar(0));
+    ResPacketQuarter c0_q = pset1<ResPacketQuarter>(ResScalar(0));
+    Index j=0;
+    for(; j+LhsPacketSize<=cols; j+=LhsPacketSize)
+    {
+      RhsPacket b0 = rhs.template load<RhsPacket,Unaligned>(j,0);
+      c0 = pcj.pmadd(lhs.template load<LhsPacket,LhsAlignment>(i,j),b0,c0);
     }
     ResScalar cc0 = predux(c0);
     if (HasHalf) {
-      for (Index j = fullColBlockEnd; j < halfColBlockEnd; j += LhsPacketSizeHalf) {
-        RhsPacketHalf b0 = rhs.template load<RhsPacketHalf, Unaligned>(j, 0);
-        c0_h = pcj_half.pmadd(lhs.template load<LhsPacketHalf, LhsAlignment>(i, j), b0, c0_h);
-      }
+      for(; j+LhsPacketSizeHalf<=cols; j+=LhsPacketSizeHalf)
+        {
+          RhsPacketHalf b0 = rhs.template load<RhsPacketHalf,Unaligned>(j,0);
+          c0_h = pcj_half.pmadd(lhs.template load<LhsPacketHalf,LhsAlignment>(i,j),b0,c0_h);
+        }
       cc0 += predux(c0_h);
     }
     if (HasQuarter) {
-      for (Index j = halfColBlockEnd; j < quarterColBlockEnd; j += LhsPacketSizeQuarter) {
-        RhsPacketQuarter b0 = rhs.template load<RhsPacketQuarter, Unaligned>(j, 0);
-        c0_q = pcj_quarter.pmadd(lhs.template load<LhsPacketQuarter, LhsAlignment>(i, j), b0, c0_q);
-      }
+      for(; j+LhsPacketSizeQuarter<=cols; j+=LhsPacketSizeQuarter)
+        {
+          RhsPacketQuarter b0 = rhs.template load<RhsPacketQuarter,Unaligned>(j,0);
+          c0_q = pcj_quarter.pmadd(lhs.template load<LhsPacketQuarter,LhsAlignment>(i,j),b0,c0_q);
+        }
       cc0 += predux(c0_q);
     }
-    for (Index j = quarterColBlockEnd; j < cols; ++j) {
-      cc0 += cj.pmul(lhs(i, j), rhs(j, 0));
+    for(; j<cols; ++j)
+    {
+      cc0 += cj.pmul(lhs(i,j), rhs(j,0));
     }
-    res[i * resIncr] += alpha * cc0;
+    res[i*resIncr] += alpha*cc0;
   }
 }
 
-// Recursive template unroller for process_rows_small_cols.
-// Unrolls the row dimension (K = 0..N-1) at compile time, guaranteeing
-// that each accumulator lives in its own register variable regardless
-// of compiler unrolling heuristics.
-template <int K, int N>
-struct gemv_small_cols_unroller {
-  template <typename LhsPacket, typename AccPacket, int Alignment, typename RhsType, typename ConjHelper,
-            typename LhsMapper, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void madd(AccPacket* acc, const LhsMapper& lhs, Index i, Index j,
-                                                         const RhsType& b0, ConjHelper& pcj) {
-    gemv_small_cols_unroller<K - 1, N>::template madd<LhsPacket, AccPacket, Alignment>(acc, lhs, i, j, b0, pcj);
-    acc[K] = pcj.pmadd(lhs.template load<LhsPacket, Alignment>(i + K, j), b0, acc[K]);
-  }
+} // end namespace internal
 
-  template <typename ResScalar, typename RhsScalar, typename ConjHelper, typename LhsMapper, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void scalar_madd(ResScalar* cc, const LhsMapper& lhs, Index i, Index j,
-                                                                const RhsScalar& b0, ConjHelper& cj) {
-    gemv_small_cols_unroller<K - 1, N>::scalar_madd(cc, lhs, i, j, b0, cj);
-    cc[K] += cj.pmul(lhs(i + K, j), b0);
-  }
+} // end namespace Eigen
 
-  template <typename Scalar, typename Packet>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void predux_accum(Scalar* cc, const Packet* acc) {
-    gemv_small_cols_unroller<K - 1, N>::predux_accum(cc, acc);
-    cc[K] += predux(acc[K]);
-  }
-
-  template <typename Packet>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void init_zero(Packet* acc) {
-    gemv_small_cols_unroller<K - 1, N>::init_zero(acc);
-    acc[K] = pzero(Packet{});
-  }
-
-  template <typename Scalar, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void write_result(Scalar* res, Index resIncr, Index i, Scalar alpha,
-                                                                 const Scalar* cc) {
-    gemv_small_cols_unroller<K - 1, N>::write_result(res, resIncr, i, alpha, cc);
-    res[(i + K) * resIncr] += alpha * cc[K];
-  }
-};
-
-template <int N>
-struct gemv_small_cols_unroller<0, N> {
-  template <typename LhsPacket, typename AccPacket, int Alignment, typename RhsType, typename ConjHelper,
-            typename LhsMapper, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void madd(AccPacket* acc, const LhsMapper& lhs, Index i, Index j,
-                                                         const RhsType& b0, ConjHelper& pcj) {
-    acc[0] = pcj.pmadd(lhs.template load<LhsPacket, Alignment>(i, j), b0, acc[0]);
-  }
-
-  template <typename ResScalar, typename RhsScalar, typename ConjHelper, typename LhsMapper, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void scalar_madd(ResScalar* cc, const LhsMapper& lhs, Index i, Index j,
-                                                                const RhsScalar& b0, ConjHelper& cj) {
-    cc[0] += cj.pmul(lhs(i, j), b0);
-  }
-
-  template <typename Scalar, typename Packet>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void predux_accum(Scalar* cc, const Packet* acc) {
-    cc[0] += predux(acc[0]);
-  }
-
-  template <typename Packet>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void init_zero(Packet* acc) {
-    acc[0] = pzero(Packet{});
-  }
-
-  template <typename Scalar, typename Index>
-  EIGEN_DEVICE_FUNC static EIGEN_STRONG_INLINE void write_result(Scalar* res, Index resIncr, Index i, Scalar alpha,
-                                                                 const Scalar* cc) {
-    res[i * resIncr] += alpha * cc[0];
-  }
-};
-
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-template <int N>
-EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE void
-general_matrix_vector_product<Index, LhsScalar, LhsMapper, RowMajor, ConjugateLhs, RhsScalar, RhsMapper, ConjugateRhs,
-                              Version>::process_rows_small_cols(Index i, Index cols, const LhsMapper& lhs,
-                                                                const RhsMapper& rhs, ResScalar* res, Index resIncr,
-                                                                ResScalar alpha, Index halfColBlockEnd,
-                                                                Index quarterColBlockEnd) {
-  conj_helper<LhsScalar, RhsScalar, ConjugateLhs, ConjugateRhs> cj;
-  conj_helper<LhsPacketHalf, RhsPacketHalf, ConjugateLhs, ConjugateRhs> pcj_half;
-  conj_helper<LhsPacketQuarter, RhsPacketQuarter, ConjugateLhs, ConjugateRhs> pcj_quarter;
-
-  enum {
-    LhsAlignment = Unaligned,
-    ResPacketSizeHalf = HalfTraits::ResPacketSize,
-    ResPacketSizeQuarter = QuarterTraits::ResPacketSize,
-    LhsPacketSizeHalf = HalfTraits::LhsPacketSize,
-    LhsPacketSizeQuarter = QuarterTraits::LhsPacketSize,
-    HasHalf = (int)ResPacketSizeHalf < (int)Traits::ResPacketSize,
-    HasQuarter = (int)ResPacketSizeQuarter < (int)ResPacketSizeHalf
-  };
-
-  using Unroll = gemv_small_cols_unroller<N - 1, N>;
-
-  ResScalar cc[N] = {};
-  if (HasHalf) {
-    ResPacketHalf h[N];
-    Unroll::init_zero(h);
-    for (Index j = 0; j < halfColBlockEnd; j += LhsPacketSizeHalf) {
-      RhsPacketHalf b0 = rhs.template load<RhsPacketHalf, Unaligned>(j, 0);
-      Unroll::template madd<LhsPacketHalf, ResPacketHalf, LhsAlignment>(h, lhs, i, j, b0, pcj_half);
-    }
-    Unroll::predux_accum(cc, h);
-  }
-  if (HasQuarter) {
-    ResPacketQuarter q[N];
-    Unroll::init_zero(q);
-    for (Index j = halfColBlockEnd; j < quarterColBlockEnd; j += LhsPacketSizeQuarter) {
-      RhsPacketQuarter b0 = rhs.template load<RhsPacketQuarter, Unaligned>(j, 0);
-      Unroll::template madd<LhsPacketQuarter, ResPacketQuarter, LhsAlignment>(q, lhs, i, j, b0, pcj_quarter);
-    }
-    Unroll::predux_accum(cc, q);
-  }
-  for (Index j = quarterColBlockEnd; j < cols; ++j) {
-    RhsScalar b0 = rhs(j, 0);
-    Unroll::scalar_madd(cc, lhs, i, j, b0, cj);
-  }
-  Unroll::write_result(res, resIncr, i, alpha, cc);
-}
-
-template <typename Index, typename LhsScalar, typename LhsMapper, bool ConjugateLhs, typename RhsScalar,
-          typename RhsMapper, bool ConjugateRhs, int Version>
-EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void
-general_matrix_vector_product<Index, LhsScalar, LhsMapper, RowMajor, ConjugateLhs, RhsScalar, RhsMapper, ConjugateRhs,
-                              Version>::run_small_cols(Index rows, Index cols, const LhsMapper& alhs,
-                                                       const RhsMapper& rhs, ResScalar* res, Index resIncr,
-                                                       ResScalar alpha) {
-  LhsMapper lhs(alhs);
-  eigen_internal_assert(rhs.stride() == 1);
-
-  enum {
-    LhsPacketSizeHalf = HalfTraits::LhsPacketSize,
-    LhsPacketSizeQuarter = QuarterTraits::LhsPacketSize,
-  };
-
-  using UnsignedIndex = std::make_unsigned_t<Index>;
-  const Index halfColBlockEnd = LhsPacketSizeHalf * (UnsignedIndex(cols) / LhsPacketSizeHalf);
-  const Index quarterColBlockEnd = LhsPacketSizeQuarter * (UnsignedIndex(cols) / LhsPacketSizeQuarter);
-
-  const Index n8 = lhs.stride() * sizeof(LhsScalar) > 32000 ? 0 : rows - 7;
-  const Index n4 = rows - 3;
-  const Index n2 = rows - 1;
-
-  Index i = 0;
-  for (; i < n8; i += 8)
-    process_rows_small_cols<8>(i, cols, lhs, rhs, res, resIncr, alpha, halfColBlockEnd, quarterColBlockEnd);
-  if (i < n4) {
-    process_rows_small_cols<4>(i, cols, lhs, rhs, res, resIncr, alpha, halfColBlockEnd, quarterColBlockEnd);
-    i += 4;
-  }
-  if (i < n2) {
-    process_rows_small_cols<2>(i, cols, lhs, rhs, res, resIncr, alpha, halfColBlockEnd, quarterColBlockEnd);
-    i += 2;
-  }
-  if (i < rows) process_rows_small_cols<1>(i, cols, lhs, rhs, res, resIncr, alpha, halfColBlockEnd, quarterColBlockEnd);
-}
-
-}  // end namespace internal
-
-}  // end namespace Eigen
-
-#endif  // EIGEN_GENERAL_MATRIX_VECTOR_H
+#endif // EIGEN_GENERAL_MATRIX_VECTOR_H
