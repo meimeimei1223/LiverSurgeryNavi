@@ -37,7 +37,7 @@ endif()
 if(EXISTS "${CMAKE_SOURCE_DIR}/win_deps")
     set(WIN_DEPS_DIR "${CMAKE_SOURCE_DIR}/win_deps")
 else()
-    set(WIN_DEPS_DIR "C:/MyGitHubProjcetWin/LiverSurgeryNavi/win_deps")
+    set(WIN_DEPS_DIR "C:/MyGitHubProjcetWin/AAA_Reg3D_ONNX/win_deps")
 endif()
 
 set(INCLUDES_DIR "${WIN_DEPS_DIR}/includes")
@@ -217,12 +217,13 @@ endif()
 # Optimization flags
 # =============================================================================
 if(MSVC)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        target_compile_options(${PROJECT_NAME} PRIVATE /O2 /Ob2 /Oi /Ot /GL)
-        target_link_options(${PROJECT_NAME} PRIVATE /LTCG)
-    else()
-        target_compile_options(${PROJECT_NAME} PRIVATE /Od /Zi)
-    endif()
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Ot /GL>
+        $<$<CONFIG:Debug>:/Od /Zi>
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+    )
 else()
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         target_compile_options(${PROJECT_NAME} PRIVATE -O3 -march=native -DNDEBUG)
