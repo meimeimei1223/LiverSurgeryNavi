@@ -220,18 +220,30 @@ private:
             // 変換失敗時はそのまま使用
         }
 
+        // モデルパスも絶対パスに変換（Windowsで相対パスが壊れるため）
+        auto absPath = [](const std::string& p) -> std::string {
+            try { return std::filesystem::absolute(p).string(); }
+            catch (...) { return p; }
+        };
+
         std::ostringstream s;
         s << "\"" << exe << "\" \"" << img << "\""
-          << " --depth-model \"" << config.depthModel << "\""
-          << " --sam-encoder \"" << config.samEncoder << "\""
-          << " --sam-decoder \"" << config.samDecoder << "\""
-          << " --output \""      << config.outputDir  << "\"";
+          << " --depth-model \"" << absPath(config.depthModel) << "\""
+          << " --sam-encoder \"" << absPath(config.samEncoder) << "\""
+          << " --sam-decoder \"" << absPath(config.samDecoder) << "\""
+          << " --output \""      << absPath(config.outputDir)  << "\"";
         if (config.useCuda) s << " --cuda";
         for (auto& p : pts) {
             s << (p.isForeground ? " --point " : " --bg-point ")
             << (int)p.x << "," << (int)p.y;
         }
+
+#ifdef _WIN32
+        // Windows cmd.exe: 内部にクォートがある場合、全体をクォートで囲む必要がある
+        return "\"" + s.str() + "\"";
+#else
         return s.str();
+#endif
     }
 
     static void ensureDir(const std::string& p) {
