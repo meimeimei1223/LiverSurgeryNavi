@@ -1187,6 +1187,7 @@ void setupUICallbacks() {
     };
 
     a.onSwitchToDeformMode = []() {
+        std::filesystem::create_directories(REG_MODEL_PATH);
         liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
         portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
         veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
@@ -3087,14 +3088,23 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
         break;
 
     case GLFW_KEY_M:
-        std::filesystem::create_directories(REG_MODEL_PATH);
         liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
         portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
         veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
         tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
         segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
         gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
+
         currentMainMode = DEFORM_MODE;
+        break;
+
+        if(currentMainMode == REGISTRATION_MODE) {
+            currentMainMode = DEFORM_MODE;
+            std::cout << "=== Switched to DEFORM_MODE ===" << std::endl;
+        } else {
+            currentMainMode = REGISTRATION_MODE;
+            std::cout << "=== Switched to REGISTRATION_MODE ===" << std::endl;
+        }
         break;
 
     case GLFW_KEY_D:
