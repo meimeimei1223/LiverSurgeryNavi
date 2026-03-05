@@ -151,13 +151,17 @@ inline void initPaths() {
                                                               "../../../../shaders/"
                                                           });
 
-    REG_MODEL_PATH = findPath("REG_MODEL_PATH", "reg_liver.obj", {
-                                                                     "registration_model/",
-                                                                     "../registration_model/",
-                                                                     "../../registration_model/",
-                                                                     "../../../registration_model/",
-                                                                     "../../../../registration_model/"
-                                                                 });
+    REG_MODEL_PATH = findPath("REG_MODEL_PATH", "", {
+                                                        "registration_model/",
+                                                        "../registration_model/",
+                                                        "../../registration_model/",
+                                                        "../../../registration_model/",
+                                                        "../../../../registration_model/"
+                                                    });
+    if (!std::filesystem::exists(REG_MODEL_PATH)) {
+        std::filesystem::create_directories(REG_MODEL_PATH);
+        std::cout << "[Path] Created: " << REG_MODEL_PATH << std::endl;
+    }
 
     INPUT_IMAGE_PATH = findPath("INPUT_IMAGE_PATH", "target.jpg", {
                                                                       "input_image/",
