@@ -521,12 +521,28 @@ static std::vector<mCutMesh*> getOrganList() {
             tumorMesh3D, segmentMesh3D, gbMesh3D};
 }
 
-static void poseAutoSaveBeforeRegistration() {
+static std::vector<std::vector<GLfloat>> g_initOrganVertices;
+static std::vector<std::vector<GLfloat>> g_initOrganNormals;
+
+static void snapshotInitialPose() {
     auto organs = getOrganList();
-    PoseEntry backup;
-    backup.timestamp = PoseLibrary::nowTimestamp();
-    PoseLibrary::snapshotMeshes(backup, organs);
-    g_poseLibrary.autoSaveLastRegistration(backup);
+    g_initOrganVertices.resize(organs.size());
+    g_initOrganNormals.resize(organs.size());
+    for (size_t i = 0; i < organs.size(); i++) {
+        g_initOrganVertices[i] = organs[i]->mVertices;
+        g_initOrganNormals[i]  = organs[i]->mNormals;
+    }
+    std::cout << "[PoseLibrary] Initial pose snapshot saved." << std::endl;
+}
+
+static glm::mat4 computeCurrentTransform() {
+    if (g_initOrganVertices.empty()) return glm::mat4(1.0f);
+    return PoseLibrary::computeTransformFromLiver(
+        g_initOrganVertices[0], liverMesh3D->mVertices);
+}
+
+static void poseAutoSaveBeforeRegistration() {
+    g_poseLibrary.autoSaveLastRegistration(computeCurrentTransform());
 }
 
 // -------------------------------------------------------
@@ -605,7 +621,6 @@ static void poseSaveToLibrary() {
         std::cout << "[PoseLibrary] No registration to save" << std::endl;
         return;
     }
-    auto organs = getOrganList();
     PoseEntry::Method method;
     if (gUIManager.state.regMethod == 0) method = PoseEntry::FULL_AUTO;
     else if (gUIManager.state.regMethod == 1) method = PoseEntry::HEMI_AUTO;
@@ -629,32 +644,34 @@ static void poseSaveToLibrary() {
         registrationHandle.compCount,
         registrationHandle.compSource,
         registrationHandle.compTarget,
-        organs);
+        computeCurrentTransform());
 }
 
 static void poseApplyEntry(int entryId) {
     auto organs = getOrganList();
-    if (g_poseLibrary.applyEntry(entryId, organs)) {
+    if (g_poseLibrary.applyEntry(entryId, g_initOrganVertices, g_initOrganNormals, organs)) {
         registrationHandle.state = RegistrationData::REGISTERED;
         registrationHandle.useRegistration = true;
+        float savedCompRmse = 0.0f;
         for (auto& e : g_poseLibrary.entries) {
             if (e.id == entryId) {
-                registrationHandle.fitness       = e.baseFitness;
-                registrationHandle.icpRmse       = e.baseIcpRmse;
-                registrationHandle.averageError  = e.baseAvgError;
-                registrationHandle.rmse          = e.baseRmse;
-                registrationHandle.maxError      = e.baseMaxError;
-                registrationHandle.scaleFactor   = e.baseScale;
-                registrationHandle.refineCount   = e.refineCount;
+                savedCompRmse                        = e.compRmse;
+                registrationHandle.fitness           = e.baseFitness;
+                registrationHandle.icpRmse           = e.baseIcpRmse;
+                registrationHandle.averageError      = e.baseAvgError;
+                registrationHandle.rmse              = e.baseRmse;
+                registrationHandle.maxError          = e.baseMaxError;
+                registrationHandle.scaleFactor       = e.baseScale;
+                registrationHandle.refineCount       = e.refineCount;
                 registrationHandle.refineInitialRMSE   = e.refineInitialRMSE;
                 registrationHandle.refineBestRMSE      = e.refineBestRMSE;
                 registrationHandle.refineBestIteration = e.refineBestIteration;
-                registrationHandle.compRmse     = e.compRmse;
-                registrationHandle.compAvgError = e.compAvgError;
-                registrationHandle.compMaxError = e.compMaxError;
-                registrationHandle.compCount    = e.compCount;
-                registrationHandle.compSource   = e.corrSource;
-                registrationHandle.compTarget   = e.corrTarget;
+                registrationHandle.compRmse          = e.compRmse;
+                registrationHandle.compAvgError      = e.compAvgError;
+                registrationHandle.compMaxError      = e.compMaxError;
+                registrationHandle.compCount         = e.compCount;
+                registrationHandle.compSource        = e.corrSource;
+                registrationHandle.compTarget        = e.corrTarget;
                 if (e.baseMethod == PoseEntry::FULL_AUTO)
                     gUIManager.state.regMethod = 0;
                 else if (e.baseMethod == PoseEntry::HEMI_AUTO)
@@ -664,12 +681,20 @@ static void poseApplyEntry(int entryId) {
                 break;
             }
         }
+        computeUnifiedMetrics();
+        float reproRmse = registrationHandle.compRmse;
+        float diff = std::abs(reproRmse - savedCompRmse);
+        std::cout << "[PoseLibrary] Reproduction check entry #" << entryId << std::endl;
+        std::cout << "  Saved  CompRMSE: " << savedCompRmse << std::endl;
+        std::cout << "  Repro  CompRMSE: " << reproRmse << std::endl;
+        std::cout << "  Diff:            " << diff
+                  << (diff < 1e-4f ? "  [OK]" : "  [WARN: drift detected]") << std::endl;
     }
 }
 
 static void poseUndo() {
     auto organs = getOrganList();
-    g_poseLibrary.undoToLast(organs);
+    g_poseLibrary.undoToLast(g_initOrganVertices, g_initOrganNormals, organs);
     registrationHandle.state = RegistrationData::REGISTERED;
     registrationHandle.useRegistration = true;
     computeUnifiedMetrics();
@@ -687,7 +712,23 @@ static void drawPoseLibraryWindow() {
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.20f, 0.15f, 0.30f, 1.0f));
 
     if (ImGui::Begin("Pose Library", &g_poseLibrary.showWindow)) {
+        static bool s_importGuard = false;
         ImGui::Text("Entries: %d / %d", (int)g_poseLibrary.entries.size(), g_poseLibrary.maxEntries);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 248);
+        if (ImGui::Button("Import CSV", ImVec2(120, 0)) && !s_importGuard) {
+            s_importGuard = true;
+#ifdef HAS_TINYFILEDIALOGS
+            const char* filters[] = {"*.csv"};
+            const char* selected = tinyfd_openFileDialog(
+                "Import Pose Library CSV", "", 1, filters, "CSV Files (*.csv)", 0);
+            if (selected)
+                g_poseLibrary.importFromCsv(std::string(selected));
+#else
+            std::cerr << "[PoseLibrary] Build with -DHAS_TINYFILEDIALOGS for file picker." << std::endl;
+#endif
+        } else {
+            s_importGuard = false;
+        }
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
         if (ImGui::Button("Export CSV", ImVec2(120, 0))) {
             auto now = std::chrono::system_clock::now();
@@ -1402,6 +1443,8 @@ int main()
     allMeshes.push_back(tumorMesh3D);
     allMeshes.push_back(segmentMesh3D);
     allMeshes.push_back(gbMesh3D);
+
+    snapshotInitialPose();
 
     initScreenMeshWithDepthRunner(gDepthRunner, screenMesh, cameraUse);
 
@@ -2944,6 +2987,170 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
                 gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
 
             std::cout << "=== Registration Complete ===" << std::endl;
+        }
+        break;
+
+    case GLFW_KEY_W:
+        if (currentMainMode == REGISTRATION_MODE) {
+            std::cout << "\n=== Multi-Start FGR with Adaptive Radius ===\n" << std::endl;
+
+            poseAutoSaveBeforeRegistration();
+            resetRegistrationState();
+
+            static Reg3D::BVHTree msFgrBvh;
+            msFgrBvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
+
+            Reg3D::RaycastClusterer clusterer(msFgrBvh);
+            auto clusteringResult = clusterer.performClustering(
+                liverMesh3D->mVertices, liverMesh3D->mIndices);
+
+            Reg3DCustom::NoOpen3DRegistration reg;
+            auto targetCloud = reg.extractFrontFacePoints(
+                *screenMesh, gGridWidth, gGridHeight(), gDepthScale);
+
+            if (targetCloud->size() < 100) {
+                std::cerr << "[W] Not enough target points" << std::endl;
+                break;
+            }
+
+            struct ClusterFGRResult {
+                int clusterId;
+                float fgrFitness;
+                float fgrRmse;
+                std::vector<size_t> vertexIndices;
+                float adaptiveVoxel;
+            };
+
+            std::vector<ClusterFGRResult> fgrResults;
+
+            for (const auto& cluster : clusteringResult.clusters) {
+                if (cluster.visibleVertexIndices.size() < 50) continue;
+
+                glm::vec3 bboxMin(FLT_MAX), bboxMax(-FLT_MAX);
+                for (const auto& v : cluster.visibleVertices) {
+                    bboxMin = glm::min(bboxMin, v);
+                    bboxMax = glm::max(bboxMax, v);
+                }
+                float bboxDiag = glm::length(bboxMax - bboxMin);
+                float adaptiveVoxel = glm::clamp(bboxDiag * 0.05f, 0.3f, 1.5f);
+
+                auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
+                for (int idx : cluster.visibleVertexIndices) {
+                    size_t i = static_cast<size_t>(idx);
+                    if (i * 3 + 2 < liverMesh3D->mVertices.size()) {
+                        glm::vec3 pos(liverMesh3D->mVertices[i*3],
+                                      liverMesh3D->mVertices[i*3+1],
+                                      liverMesh3D->mVertices[i*3+2]);
+                        if (!liverMesh3D->mNormals.empty() && i*3+2 < liverMesh3D->mNormals.size()) {
+                            glm::vec3 nrm(liverMesh3D->mNormals[i*3],
+                                          liverMesh3D->mNormals[i*3+1],
+                                          liverMesh3D->mNormals[i*3+2]);
+                            sourceCloud->addPointWithNormal(pos, nrm);
+                        } else {
+                            sourceCloud->addPoint(pos);
+                        }
+                    }
+                }
+
+                auto sourceDown = reg.preprocess(sourceCloud, adaptiveVoxel, true);
+                auto targetDown = reg.preprocess(targetCloud, adaptiveVoxel, false);
+
+                if (sourceDown->size() < 10 || targetDown->size() < 10) continue;
+
+                auto sourceFpfh = reg.computeFPFH(sourceDown, adaptiveVoxel);
+                auto targetFpfh = reg.computeFPFH(targetDown, adaptiveVoxel);
+
+                auto fgrResult = reg.fastGlobalRegistration(
+                    sourceDown, targetDown, sourceFpfh, targetFpfh, adaptiveVoxel);
+
+                std::cout << "[W] Cluster " << cluster.clusterId
+                          << " bbox=" << bboxDiag
+                          << " voxel=" << adaptiveVoxel
+                          << " fitness=" << fgrResult.fitness
+                          << " rmse=" << fgrResult.inlier_rmse << std::endl;
+
+                fgrResults.push_back({
+                    cluster.clusterId,
+                    fgrResult.fitness,
+                    fgrResult.inlier_rmse,
+                    std::vector<size_t>(cluster.visibleVertexIndices.begin(),
+                                        cluster.visibleVertexIndices.end()),
+                    adaptiveVoxel
+                });
+            }
+
+            if (fgrResults.empty()) {
+                std::cerr << "[W] No valid FGR results" << std::endl;
+                break;
+            }
+
+            std::sort(fgrResults.begin(), fgrResults.end(),
+                      [](const ClusterFGRResult& a, const ClusterFGRResult& b) {
+                          return a.fgrFitness > b.fgrFitness;
+                      });
+
+            int topN = std::min(3, static_cast<int>(fgrResults.size()));
+            std::cout << "\n[W] Running full registration on top " << topN << " clusters..." << std::endl;
+
+            float bestCompRmse = FLT_MAX;
+            int bestClusterId = -1;
+
+            std::vector<std::vector<float>> savedVertices(6), savedNormals(6);
+            std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
+                                              tumorMesh3D, segmentMesh3D, gbMesh3D};
+            for (int m = 0; m < 6; m++) {
+                savedVertices[m] = organs[m]->mVertices;
+                savedNormals[m]  = organs[m]->mNormals;
+            }
+
+            std::vector<float> bestVertices0, bestNormals0;
+
+            for (int i = 0; i < topN; i++) {
+                for (int m = 0; m < 6; m++) {
+                    organs[m]->mVertices = savedVertices[m];
+                    organs[m]->mNormals  = savedNormals[m];
+                }
+
+                std::cout << "\n[W] Candidate " << (i+1) << "/" << topN
+                          << " (cluster " << fgrResults[i].clusterId
+                          << ", fitness=" << fgrResults[i].fgrFitness << ")" << std::endl;
+
+                Reg3DCustom::performRegistrationSingleMesh(
+                    organs, liverMesh3D, fgrResults[i].vertexIndices,
+                    screenMesh, OrbitCam.cameraPos,
+                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
+
+                computeUnifiedMetrics();
+                float compRmse = registrationHandle.compRmse;
+
+                std::cout << "[W] Candidate " << (i+1) << " CompRMSE=" << compRmse << std::endl;
+
+                if (compRmse < bestCompRmse) {
+                    bestCompRmse = compRmse;
+                    bestClusterId = fgrResults[i].clusterId;
+                    bestVertices0 = organs[0]->mVertices;
+                    bestNormals0  = organs[0]->mNormals;
+                    for (int m = 0; m < 6; m++) {
+                        savedVertices[m] = organs[m]->mVertices;
+                        savedNormals[m]  = organs[m]->mNormals;
+                    }
+                }
+            }
+
+            for (int m = 0; m < 6; m++) {
+                organs[m]->mVertices = savedVertices[m];
+                organs[m]->mNormals  = savedNormals[m];
+            }
+
+            gUIManager.state.regMethod = 1;
+            registrationHandle.state = RegistrationData::REGISTERED;
+            registrationHandle.useRegistration = true;
+            computeUnifiedMetrics();
+            poseSaveToLibrary();
+
+            std::cout << "\n[W] Best cluster: " << bestClusterId
+                      << " CompRMSE=" << bestCompRmse << std::endl;
+            std::cout << "=== Multi-Start FGR Complete ===" << std::endl;
         }
         break;
 
