@@ -222,8 +222,12 @@ private:
 
         // モデルパスも絶対パスに変換（Windowsで相対パスが壊れるため）
         auto absPath = [](const std::string& p) -> std::string {
-            try { return std::filesystem::absolute(p).string(); }
-            catch (...) { return p; }
+            std::string r;
+            try { r = std::filesystem::absolute(p).string(); }
+            catch (...) { r = p; }
+            while (!r.empty() && (r.back() == '/' || r.back() == '\\'))
+                r.pop_back();
+            return r;
         };
 
         std::ostringstream s;
