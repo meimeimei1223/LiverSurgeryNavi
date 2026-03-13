@@ -45,9 +45,9 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/medsam2_da3_lite/CMakeLists.txt)
     message(STATUS "=== Building medsam2_da3_lite ===")
     add_subdirectory(${CMAKE_SOURCE_DIR}/medsam2_da3_lite ${PROJECT_BINARY_DIR}/medsam2_da3_lite)
     set_target_properties(medsam2_da3_lite PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/medsam2_da3_lite/bin
+        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin
     )
-    message(STATUS "medsam2_da3_lite -> ${PROJECT_BINARY_DIR}/medsam2_da3_lite/bin/")
+    message(STATUS "medsam2_da3_lite -> ${PROJECT_BINARY_DIR}/bin/")
     message(STATUS "=================================")
     message(STATUS "")
 else()
