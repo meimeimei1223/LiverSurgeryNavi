@@ -1262,12 +1262,13 @@ void setupUICallbacks() {
             mesh->mColor = color;
             setUp(*mesh);
         };
-        reloadMesh(liverMesh3D,   TARGET_FILE_PATH,  glm::vec3(0.8f, 0.2f, 0.2f));
-        reloadMesh(portalMesh3D,  PORTAL_FILE_PATH,  glm::vec3(0.2f, 0.2f, 0.8f));
-        reloadMesh(veinMesh3D,    VEIN_FILE_PATH,    glm::vec3(0.2f, 0.5f, 0.5f));
-        reloadMesh(tumorMesh3D,   TUMOR_FILE_PATH,   glm::vec3(0.8f, 0.5f, 0.5f));
-        reloadMesh(segmentMesh3D, SEGMENT_FILE_PATH, glm::vec3(0.2f, 0.8f, 0.5f));
-        reloadMesh(gbMesh3D,      GB_FILE_PATH,      glm::vec3(0.2f, 0.8f, 0.2f));
+        normalizeAndSavePreReg();
+        reloadMesh(liverMesh3D,   PreReg_TARGET_FILE_PATH,  glm::vec3(0.8f, 0.2f, 0.2f));
+        reloadMesh(portalMesh3D,  PreReg_PORTAL_FILE_PATH,  glm::vec3(0.2f, 0.2f, 0.8f));
+        reloadMesh(veinMesh3D,    PreReg_VEIN_FILE_PATH,    glm::vec3(0.2f, 0.5f, 0.5f));
+        reloadMesh(tumorMesh3D,   PreReg_TUMOR_FILE_PATH,   glm::vec3(0.8f, 0.5f, 0.5f));
+        reloadMesh(segmentMesh3D, PreReg_SEGMENT_FILE_PATH, glm::vec3(0.2f, 0.8f, 0.5f));
+        reloadMesh(gbMesh3D,      PreReg_GB_FILE_PATH,      glm::vec3(0.2f, 0.8f, 0.2f));
 
         allMeshes.clear();
         allMeshes.push_back(liverMesh3D);
@@ -1390,6 +1391,7 @@ int main()
 {
     initPaths();
     initFilePaths();
+    normalizeAndSavePreReg();
     initDepthRunnerConfig(gDepthRunner);
 
     if (!initOpenGL())
@@ -1418,22 +1420,22 @@ int main()
     deformSphereMarker.generate(1.0f, 16, 16);
     deformSphereMarker.setup();
 
-    liverMesh3D = new mCutMesh(liverMesh3D->loadMeshFromFile(TARGET_FILE_PATH.c_str()));
+    liverMesh3D = new mCutMesh(liverMesh3D->loadMeshFromFile(PreReg_TARGET_FILE_PATH.c_str()));
     liverMesh3D->mColor = glm::vec3(0.8f, 0.2f, 0.2f);
     setUp(*liverMesh3D);
-    portalMesh3D = new mCutMesh(portalMesh3D->loadMeshFromFile(PORTAL_FILE_PATH.c_str()));
+    portalMesh3D = new mCutMesh(portalMesh3D->loadMeshFromFile(PreReg_PORTAL_FILE_PATH.c_str()));
     portalMesh3D->mColor = glm::vec3(0.2f, 0.2f, 0.8f);
     setUp(*portalMesh3D);
-    veinMesh3D = new mCutMesh(veinMesh3D->loadMeshFromFile(VEIN_FILE_PATH.c_str()));
+    veinMesh3D = new mCutMesh(veinMesh3D->loadMeshFromFile(PreReg_VEIN_FILE_PATH.c_str()));
     veinMesh3D->mColor = glm::vec3(0.2f, 0.5f, 0.5f);
     setUp(*veinMesh3D);
-    tumorMesh3D = new mCutMesh(tumorMesh3D->loadMeshFromFile(TUMOR_FILE_PATH.c_str()));
+    tumorMesh3D = new mCutMesh(tumorMesh3D->loadMeshFromFile(PreReg_TUMOR_FILE_PATH.c_str()));
     tumorMesh3D->mColor = glm::vec3(0.8f, 0.5f, 0.5f);
     setUp(*tumorMesh3D);
-    segmentMesh3D = new mCutMesh(segmentMesh3D->loadMeshFromFile(SEGMENT_FILE_PATH.c_str()));
+    segmentMesh3D = new mCutMesh(segmentMesh3D->loadMeshFromFile(PreReg_SEGMENT_FILE_PATH.c_str()));
     segmentMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.5f);
     setUp(*segmentMesh3D);
-    gbMesh3D = new mCutMesh(gbMesh3D->loadMeshFromFile(GB_FILE_PATH.c_str()));
+    gbMesh3D = new mCutMesh(gbMesh3D->loadMeshFromFile(PreReg_GB_FILE_PATH.c_str()));
     gbMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.2f);
     setUp(*gbMesh3D);
 
