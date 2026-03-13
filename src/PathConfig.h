@@ -4,6 +4,7 @@
 #include <iostream>
 #include <filesystem>
 #include "DepthRunner.h"
+#include "simple_multi_obj_processor.h"
 
 // --- パス変数（initPaths()で解決される） ---
 inline std::string MODEL_PATH       = "../../../model/";
@@ -69,6 +70,13 @@ inline std::string VEIN_FILE_PATH;
 inline std::string TUMOR_FILE_PATH;
 inline std::string SEGMENT_FILE_PATH;
 inline std::string GB_FILE_PATH;
+
+inline std::string PreReg_TARGET_FILE_PATH;
+inline std::string PreReg_PORTAL_FILE_PATH;
+inline std::string PreReg_VEIN_FILE_PATH;
+inline std::string PreReg_TUMOR_FILE_PATH;
+inline std::string PreReg_SEGMENT_FILE_PATH;
+inline std::string PreReg_GB_FILE_PATH;
 
 inline std::string Reg_TARGET_FILE_PATH;
 inline std::string Reg_PORTAL_FILE_PATH;
@@ -167,7 +175,6 @@ inline void initPaths() {
                                                                       "input_image/",
                                                                       "../input_image/",
                                                                       "../../input_image/",
-                                                                      "../../../input_image/",
                                                                       "../../../../input_image/"
                                                                   });
 
@@ -232,6 +239,13 @@ inline void initFilePaths() {
     SEGMENT_FILE_PATH = MODEL_PATH + "res.obj";
     GB_FILE_PATH      = MODEL_PATH + "gb.obj";
 
+    PreReg_TARGET_FILE_PATH  = REG_MODEL_PATH + "preReg_liver.obj";
+    PreReg_PORTAL_FILE_PATH  = REG_MODEL_PATH + "preReg_portal.obj";
+    PreReg_VEIN_FILE_PATH    = REG_MODEL_PATH + "preReg_vein.obj";
+    PreReg_TUMOR_FILE_PATH   = REG_MODEL_PATH + "preReg_tumor.obj";
+    PreReg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "preReg_res.obj";
+    PreReg_GB_FILE_PATH      = REG_MODEL_PATH + "preReg_gb.obj";
+
     Reg_TARGET_FILE_PATH  = REG_MODEL_PATH + "reg_liver.obj";
     Reg_PORTAL_FILE_PATH  = REG_MODEL_PATH + "reg_portal.obj";
     Reg_VEIN_FILE_PATH    = REG_MODEL_PATH + "reg_vein.obj";
@@ -240,6 +254,68 @@ inline void initFilePaths() {
     Reg_GB_FILE_PATH      = REG_MODEL_PATH + "reg_gb.obj";
 
     gDepthInputImage = INPUT_IMAGE_PATH + "target.jpg";
+}
+
+// --- PreReg正規化 ---
+// liver基準で全臓器を統一正規化し registration_model/preReg_*.obj に保存する。
+// 存在しないOBJはスキップ（vein/tumor/segment/gbは任意）。
+// 毎回実行（同名モデルの上書き対応）。
+inline SimpleOBJ::TransformInfo normalizeAndSavePreReg() {
+    std::cout << "\n[PreReg] Normalizing OBJ files..." << std::endl;
+
+    struct Entry {
+        std::string src;
+        std::string dst;
+    };
+    std::vector<Entry> entries = {
+                                  { TARGET_FILE_PATH,  PreReg_TARGET_FILE_PATH  },
+                                  { PORTAL_FILE_PATH,  PreReg_PORTAL_FILE_PATH  },
+                                  { VEIN_FILE_PATH,    PreReg_VEIN_FILE_PATH    },
+                                  { TUMOR_FILE_PATH,   PreReg_TUMOR_FILE_PATH   },
+                                  { SEGMENT_FILE_PATH, PreReg_SEGMENT_FILE_PATH },
+                                  { GB_FILE_PATH,      PreReg_GB_FILE_PATH      },
+                                  };
+
+    // liver.obj は必須
+    if (!std::filesystem::exists(TARGET_FILE_PATH)) {
+        std::cerr << "[PreReg] ERROR: liver.obj not found: " << TARGET_FILE_PATH << std::endl;
+        return SimpleOBJ::TransformInfo{};
+    }
+
+    // 存在するファイルのみ収集
+    std::vector<std::string> inputPaths;
+    std::vector<std::string> outputPaths;
+    for (const auto& e : entries) {
+        if (std::filesystem::exists(e.src)) {
+            inputPaths.push_back(e.src);
+            outputPaths.push_back(e.dst);
+            std::cout << "[PreReg]   " << e.src << std::endl;
+        } else {
+            std::cout << "[PreReg]   skip (not found): " << e.src << std::endl;
+        }
+    }
+
+    auto result = SimpleOBJ::processMultipleOBJSimple(inputPaths, outputPaths, 5.0, true);
+
+    if (!result.success) {
+        std::cerr << "[PreReg] ERROR: " << result.errorMessage << std::endl;
+        return SimpleOBJ::TransformInfo{};
+    }
+
+    // transform_info.txt に保存（参照用）
+    std::string transformPath = REG_MODEL_PATH + "transform_info.txt";
+    std::ofstream ofs(transformPath);
+    if (ofs.is_open()) {
+        ofs << result.transform.scaleFactor << "\n"
+            << result.transform.translation[0] << " "
+            << result.transform.translation[1] << " "
+            << result.transform.translation[2] << "\n"
+            << result.transform.originalMaxDistance << "\n";
+        std::cout << "[PreReg] transform_info.txt saved: " << transformPath << std::endl;
+    }
+
+    std::cout << "[PreReg] Done. " << result.transform.toString() << std::endl;
+    return result.transform;
 }
 
 inline void initDepthRunnerConfig(DepthRunner& depthRunner) {
