@@ -9,7 +9,10 @@
 
 #include <GL/glew.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <Eigen/Dense>
+
+#include "mCutMesh.h"
 
 namespace Reg3D {
 
@@ -694,11 +697,42 @@ struct RegistrationData {
         REFINING
     };
 
+    enum InitRotPreset {
+        PRESET_FRONT = 0,
+        PRESET_FRONT_L,
+        PRESET_FRONT_R,
+        PRESET_LAT_L,
+        PRESET_TOP,
+        PRESET_LAT_R,
+        PRESET_BACK_L,
+        PRESET_BACK,
+        PRESET_BACK_R,
+        PRESET_COUNT
+    };
+
+    static const char* presetName(InitRotPreset p) {
+        switch (p) {
+        case PRESET_FRONT:   return "Front";
+        case PRESET_FRONT_L: return "Front-L";
+        case PRESET_FRONT_R: return "Front-R";
+        case PRESET_LAT_L:   return "Lat-L";
+        case PRESET_TOP:     return "Top";
+        case PRESET_LAT_R:   return "Lat-R";
+        case PRESET_BACK_L:  return "Back-L";
+        case PRESET_BACK:    return "Back";
+        case PRESET_BACK_R:  return "Back-R";
+        default:             return "Unknown";
+        }
+    }
+
+    InitRotPreset initRotPreset = PRESET_FRONT;
+
     State state = IDLE;
     std::vector<glm::vec3> boardPoints;
     std::vector<glm::vec3> objectPoints;
 
     glm::mat4 registrationMatrix = glm::mat4(1.0f);
+    glm::mat4 appliedTransform    = glm::mat4(1.0f);
     bool useRegistration = false;
     float averageError = 0.0f;
     float rmse = 0.0f;
@@ -787,3 +821,80 @@ struct RegistrationData {
                boardPoints.size() == (size_t)targetPointCount;
     }
 };
+
+inline glm::vec3 computeMeshCentroidFromVertices(const std::vector<GLfloat>& verts) {
+    glm::vec3 sum(0.0f);
+    int count = (int)verts.size() / 3;
+    if (count == 0) return sum;
+    for (int i = 0; i < count; i++) {
+        sum.x += verts[i * 3 + 0];
+        sum.y += verts[i * 3 + 1];
+        sum.z += verts[i * 3 + 2];
+    }
+    return sum / (float)count;
+}
+
+inline glm::mat4 getPresetRotation(
+    RegistrationData::InitRotPreset preset,
+    const glm::vec3& centroid)
+{
+    float yDeg = 0.0f;
+    float xDeg = 0.0f;
+
+    switch (preset) {
+    case RegistrationData::PRESET_FRONT:   yDeg =   0.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_FRONT_L: yDeg =  45.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_FRONT_R: yDeg = -45.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_LAT_L:   yDeg =  90.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_LAT_R:   yDeg = -90.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_BACK_L:  yDeg = 135.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_BACK:    yDeg = 180.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_BACK_R:  yDeg =-135.0f; xDeg =  0.0f; break;
+    case RegistrationData::PRESET_TOP:     yDeg =   0.0f; xDeg =-90.0f; break;
+    default:                               yDeg =   0.0f; xDeg =  0.0f; break;
+    }
+
+    if (yDeg == 0.0f && xDeg == 0.0f)
+        return glm::mat4(1.0f);
+
+    float yRad = glm::radians(yDeg);
+    float xRad = glm::radians(xDeg);
+
+    glm::mat4 toOrigin   = glm::translate(glm::mat4(1.0f), -centroid);
+    glm::mat4 Ry         = glm::rotate(glm::mat4(1.0f), yRad, glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 Rx         = glm::rotate(glm::mat4(1.0f), xRad, glm::vec3(1.0f, 0.0f, 0.0f));
+    glm::mat4 fromOrigin = glm::translate(glm::mat4(1.0f), centroid);
+
+    return fromOrigin * Rx * Ry * toOrigin;
+}
+
+inline void applyMatrixToMeshVerticesAndNormals(
+    mCutMesh* mesh,
+    const glm::mat4& transform)
+{
+    if (!mesh || mesh->mVertices.empty()) return;
+
+    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(transform)));
+
+    for (size_t i = 0; i + 2 < mesh->mVertices.size(); i += 3) {
+        glm::vec4 v(mesh->mVertices[i],
+                    mesh->mVertices[i+1],
+                    mesh->mVertices[i+2], 1.0f);
+        v = transform * v;
+        mesh->mVertices[i]   = v.x;
+        mesh->mVertices[i+1] = v.y;
+        mesh->mVertices[i+2] = v.z;
+    }
+
+    if (!mesh->mNormals.empty()) {
+        for (size_t i = 0; i + 2 < mesh->mNormals.size(); i += 3) {
+            glm::vec3 n(mesh->mNormals[i],
+                        mesh->mNormals[i+1],
+                        mesh->mNormals[i+2]);
+            n = glm::normalize(normalMatrix * n);
+            mesh->mNormals[i]   = n.x;
+            mesh->mNormals[i+1] = n.y;
+            mesh->mNormals[i+2] = n.z;
+        }
+    }
+}

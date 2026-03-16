@@ -17,6 +17,7 @@ struct RegUIActions {
     std::function<void(float)> onDepthScaleChanged;
     std::function<void()> onFullAuto;
     std::function<void()> onHemiAuto;
+    std::function<void(float)> onHemiVoxelChanged;
     std::function<void()> onStartUmeyama;
     std::function<void()> onExecuteUmeyama;
     std::function<void()> onResetRegistration;
@@ -37,6 +38,7 @@ struct RegUIActions {
     std::function<void()> onPoseLibraryToggle;
     std::function<void()> onPoseUndo;
     std::function<void(int)> onSwitchDepthModel;
+    std::function<void(int)> onInitRotPresetChanged;
 };
 
 struct RegUIState {
@@ -94,8 +96,14 @@ struct RegUIState {
     bool clusterVis = false;
     bool correspondenceVis = false;
     float arSavedTimer = 0.0f;
+    float hemiVoxelSize = 0.5f;
+    float idealVoxel1to1  = 0.0f;
+    float idealVoxel1to15 = 0.0f;
+    float idealVoxel1to2  = 0.0f;
     float boardAlpha = 0.7f;
     unsigned int boardIconTex = 0;
+
+    int initRotPreset = 0;
 };
 
 class RegistrationImGuiManager {
@@ -630,6 +638,80 @@ private:
         ImGui::Spacing(); ImGui::Separator();
     }
 
+    void drawInitOrientationPanel() {
+        float childH = 4.0f + ImGui::GetFontSize() + 4.0f  // title row
+                       + 3.0f * (22.0f + 4.0f)               // 3 button rows
+                       + 8.0f;                                // bottom spacing
+
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.06f, 0.10f, 0.5f));
+        ImGui::BeginChild("##initOrient", ImVec2(-1, childH), false);
+
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+        ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 1.0f), "  INITIAL ORIENTATION");
+        ImGui::Spacing();
+
+        float totalW = ImGui::GetContentRegionAvail().x;
+        float btnW   = (totalW - 8.0f) / 3.0f;
+        float btnH   = 22.0f;
+
+        struct PresetBtn { int id; const char* label; };
+        PresetBtn grid[3][3] = {
+                                { {1,"Front-L"}, {0,"Front"}, {2,"Front-R"} },
+                                { {3,"Lat-L"},   {4,"Top"},   {5,"Lat-R"}   },
+                                { {6,"Back-L"},  {7,"Back"},  {8,"Back-R"}  },
+                                };
+
+        ImVec4 colActive   = ImVec4(0.23f, 0.51f, 0.96f, 1.0f);
+        ImVec4 colInactive = ImVec4(0.20f, 0.22f, 0.28f, 1.0f);
+        ImVec4 colHover    = ImVec4(0.18f, 0.28f, 0.48f, 1.0f);
+
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                if (col > 0) ImGui::SameLine(0, 4);
+
+                int pid    = grid[row][col].id;
+                bool isSel = (state.initRotPreset == pid);
+
+                ImGui::PushID(pid + 200);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+
+                if (isSel) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImVec4(colActive.x*0.25f, colActive.y*0.25f, colActive.z*0.25f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                          ImVec4(colActive.x*0.35f, colActive.y*0.35f, colActive.z*0.35f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                          ImVec4(colActive.x*0.45f, colActive.y*0.45f, colActive.z*0.45f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_Text, colActive);
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImVec4(colInactive.x, colInactive.y, colInactive.z, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                          ImVec4(colHover.x, colHover.y, colHover.z, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                          ImVec4(colHover.x*1.2f, colHover.y*1.2f, colHover.z*1.2f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImVec4(0.55f, 0.60f, 0.70f, 1.0f));
+                }
+
+                if (ImGui::Button(grid[row][col].label, ImVec2(btnW, btnH))) {
+                    state.initRotPreset = pid;
+                    if (actions.onInitRotPresetChanged)
+                        actions.onInitRotPresetChanged(pid);
+                }
+
+                ImGui::PopStyleColor(4);
+                ImGui::PopStyleVar();
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
     void drawRegistrationSection() {
         int phase = currentPhase();
         bool regDone = state.regState == 4;
@@ -678,6 +760,8 @@ private:
 
         bool anyP = (state.regState > 0 && state.regState < 4);
 
+        drawInitOrientationPanel();
+
         if(methodButton("Full Auto", "", state.regMethod==0, state.regState, anyP && state.regMethod!=0, state.btnIconTex[RegUIState::ICON_FULL_AUTO])) {
             state.regMethod = 0; if(actions.onFullAuto) actions.onFullAuto();
         }
@@ -689,6 +773,15 @@ private:
             if(methodButton("Hemi Auto", "", state.regMethod==1, state.regState, anyP && state.regMethod!=1, state.btnIconTex[RegUIState::ICON_HEMI_AUTO], hemiW)) {
                 state.regMethod = 1; if(actions.onHemiAuto) actions.onHemiAuto();
             }
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 sz = ImGui::GetItemRectSize();
+                char buf[16]; snprintf(buf, sizeof(buf), "v:%.2f", state.hemiVoxelSize);
+                ImVec2 ts = ImGui::CalcTextSize(buf);
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(p.x + sz.x - ts.x - 6, p.y + (sz.y - ts.y) * 0.5f),
+                    IM_COL32(120,220,160,180), buf);
+            }
             ImGui::SameLine();
             bool isRefining = (state.regState == 5);
             bool refineClickable = state.refineEnabled || isRefining;
@@ -699,6 +792,81 @@ private:
             }
         }
         ImGui::Spacing();
+        if (state.regMethod == 1) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.02f,0.08f,0.04f,0.4f));
+            ImGui::BeginChild("##voxelinfo", ImVec2(-1, 62), false);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+
+            ImGui::TextColored(ImVec4(0.4f,0.8f,0.5f,0.8f), "  Voxel");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.6f,1.0f,0.7f,1.0f), "%.2f", state.hemiVoxelSize);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.3f,0.4f,0.32f,0.7f), "  [UP] +0.05  [DOWN] -0.05");
+
+            ImGui::Spacing();
+
+            {
+                const float vMax = 0.6f;
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                float avail = ImGui::GetContentRegionAvail().x - 8;
+                const float barH = 14.0f;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+
+                ImGui::InvisibleButton("##voxelbar", ImVec2(avail, barH));
+                bool hovered = ImGui::IsItemHovered();
+                bool held    = ImGui::IsItemActive();
+                if ((held && ImGui::IsMouseDown(0)) || ImGui::IsItemClicked(0)) {
+                    float mx = ImGui::GetIO().MousePos.x;
+                    float ratio = (mx - p.x) / avail;
+                    ratio = std::max(0.0f, std::min(1.0f, ratio));
+                    float newVal = ratio * vMax;
+                    newVal = std::round(newVal / 0.05f) * 0.05f;
+                    newVal = std::max(0.05f, newVal);
+                    if (actions.onHemiVoxelChanged) actions.onHemiVoxelChanged(newVal);
+                }
+
+                ImU32 bgCol  = hovered ? IM_COL32(40, 80, 45, 220) : IM_COL32(30, 60, 35, 200);
+                dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + avail, p.y + barH), bgCol, 3.0f);
+
+                float fillRatio = std::min(state.hemiVoxelSize, vMax) / vMax;
+                float curX = p.x + avail * fillRatio;
+                ImU32 fillCol = held ? IM_COL32(100, 210, 120, 200) : IM_COL32(80, 180, 100, 160);
+                dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(curX, p.y + barH), fillCol, 3.0f);
+
+                if (hovered || held) {
+                    float mx = ImGui::GetIO().MousePos.x;
+                    float ratio = std::max(0.0f, std::min(1.0f, (mx - p.x) / avail));
+                    float preview = std::round(ratio * vMax / 0.05f) * 0.05f;
+                    float px2 = p.x + avail * (std::min(preview, vMax) / vMax);
+                    dl->AddLine(ImVec2(px2, p.y), ImVec2(px2, p.y + barH), IM_COL32(255,255,255,160), 1.0f);
+                }
+
+                struct IdealLine { float val; ImU32 col; };
+                IdealLine ideals[3] = {
+                                       { state.idealVoxel1to2,  IM_COL32(255,220, 60,220) },
+                                       { state.idealVoxel1to15, IM_COL32(255,160, 40,220) },
+                                       { state.idealVoxel1to1,  IM_COL32(255, 80, 60,220) },
+                                       };
+                for (auto& il : ideals) {
+                    if (il.val <= 0.0f || il.val > vMax) continue;
+                    float lx = p.x + avail * (il.val / vMax);
+                    dl->AddLine(ImVec2(lx, p.y - 2), ImVec2(lx, p.y + barH + 2), il.col, 2.0f);
+                    char buf[8]; snprintf(buf, sizeof(buf), "%.2f", il.val);
+                    ImVec2 ts = ImGui::CalcTextSize(buf);
+                    float tx = lx - ts.x * 0.5f;
+                    if (tx < p.x) tx = p.x;
+                    if (tx + ts.x > p.x + avail) tx = p.x + avail - ts.x;
+                    dl->AddText(ImVec2(tx, p.y + barH + 3),
+                                (il.col & 0x00FFFFFF) | 0xCC000000, buf);
+                }
+
+                ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + barH + 14));
+            }
+
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+        }
         if(methodButton("Umeyama Manual", "", state.regMethod==2, state.regState, anyP && state.regMethod!=2, state.btnIconTex[RegUIState::ICON_UMEYAMA])) {
             state.regMethod = 2; if(actions.onStartUmeyama) actions.onStartUmeyama();
         }
