@@ -61,6 +61,11 @@ std::vector<glm::vec3>        gUserSegPoints3D;
 std::vector<bool>             gUserSegPointsFG;
 
 float gDepthScale = 0.3f;
+float g_voxelSize = 0.5f;
+float g_idealVoxel1to1  = 0.0f;
+float g_idealVoxel1to15 = 0.0f;
+float g_idealVoxel1to2  = 0.0f;
+static void computeIdealVoxelSizes();
 const float gMeshScale = 10.0f;
 int   gGridWidth = 128;
 
@@ -483,6 +488,9 @@ std::vector<glm::vec3> g_targetPoints;
 bool g_showClusterVisualization = false;
 bool g_showCorrespondencePoints = false;
 
+static std::string g_currentOrientLabel   = "Front";
+static int         g_currentOrientRunCount = 0;
+
 mCutMesh *liverMesh3D;
 mCutMesh *gbMesh3D;
 mCutMesh *portalMesh3D;
@@ -626,25 +634,32 @@ static void poseSaveToLibrary() {
     else if (gUIManager.state.regMethod == 1) method = PoseEntry::HEMI_AUTO;
     else method = PoseEntry::UMEYAMA;
 
-    g_poseLibrary.saveCurrentToLibrary(
-        method,
-        registrationHandle.refineCount,
-        registrationHandle.fitness,
-        registrationHandle.icpRmse,
-        registrationHandle.averageError,
-        registrationHandle.rmse,
-        registrationHandle.maxError,
-        registrationHandle.scaleFactor,
-        registrationHandle.refineInitialRMSE,
-        registrationHandle.refineBestRMSE,
-        registrationHandle.refineBestIteration,
-        registrationHandle.compRmse,
-        registrationHandle.compAvgError,
-        registrationHandle.compMaxError,
-        registrationHandle.compCount,
-        registrationHandle.compSource,
-        registrationHandle.compTarget,
-        computeCurrentTransform());
+    g_currentOrientRunCount++;
+
+    {
+        auto T = computeCurrentTransform();
+        g_poseLibrary.saveCurrentToLibrary(
+            method,
+            registrationHandle.refineCount,
+            registrationHandle.fitness,
+            registrationHandle.icpRmse,
+            registrationHandle.averageError,
+            registrationHandle.rmse,
+            registrationHandle.maxError,
+            registrationHandle.scaleFactor,
+            registrationHandle.refineInitialRMSE,
+            registrationHandle.refineBestRMSE,
+            registrationHandle.refineBestIteration,
+            registrationHandle.compRmse,
+            registrationHandle.compAvgError,
+            registrationHandle.compMaxError,
+            registrationHandle.compCount,
+            registrationHandle.compSource,
+            registrationHandle.compTarget,
+            T,
+            g_currentOrientLabel,
+            g_currentOrientRunCount);
+    }
 }
 
 static void poseApplyEntry(int entryId) {
@@ -748,25 +763,24 @@ static void drawPoseLibraryWindow() {
         ImGui::Columns(8, "pose_cols", true);
         ImGui::SetColumnWidth(0, 26);
         ImGui::SetColumnWidth(1, 80);
-        ImGui::SetColumnWidth(2, 36);
-        ImGui::SetColumnWidth(3, 80);
-        ImGui::SetColumnWidth(4, 55);
+        ImGui::SetColumnWidth(2, 80);
+        ImGui::SetColumnWidth(3, 36);
+        ImGui::SetColumnWidth(4, 80);
         ImGui::SetColumnWidth(5, 50);
         ImGui::SetColumnWidth(6, 42);
         ImGui::SetColumnWidth(7, 34);
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "#");         ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Method");    ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Ref");       ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Comp RMSE"); ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "N");         ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");          ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");          ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");          ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "#");          ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Method");     ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Orient/Run"); ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Ref");        ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Comp RMSE");  ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "N");          ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");           ImGui::NextColumn();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");           ImGui::NextColumn();
         ImGui::Separator();
 
         int deleteId = -1;
         int applyId  = -1;
-        int exportCorrId = -1;
 
         for (size_t i = 0; i < g_poseLibrary.entries.size(); i++) {
             auto& e = g_poseLibrary.entries[i];
@@ -778,12 +792,14 @@ static void drawPoseLibraryWindow() {
 
             ImGui::Text("%d", (int)(i + 1)); ImGui::NextColumn();
 
-            // Method (short name) + tooltip for details
+            // Method + tooltip for details
             ImGui::Text("%s", e.methodStr());
             if (ImGui::IsItemHovered()) {
                 ImGui::BeginTooltip();
                 ImGui::Text("ID: %d", e.id);
                 ImGui::Text("Time: %s", e.timestamp.c_str());
+                ImGui::Text("Orient: %s  Run #%d",
+                            e.initOrientation.c_str(), e.orientRunCount);
                 ImGui::Separator();
                 ImGui::TextColored(ImVec4(1.0f,1.0f,0.5f,1), "=== Unified (Liver visible vs Depth) ===");
                 ImGui::Text("Comp RMSE:  %.6f  (%d pairs)", e.compRmse, e.compCount);
@@ -809,6 +825,15 @@ static void drawPoseLibraryWindow() {
             }
             ImGui::NextColumn();
 
+            // Orient/Run column
+            {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%s #%d",
+                              e.initOrientation.c_str(), e.orientRunCount);
+                ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f), "%s", buf);
+            }
+            ImGui::NextColumn();
+
             // Refine column
             if (e.refineCount > 0) {
                 ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "x%d", e.refineCount);
@@ -818,15 +843,11 @@ static void drawPoseLibraryWindow() {
             ImGui::NextColumn();
 
             ImGui::Text("%.4f", e.compRmse); ImGui::NextColumn();
-            ImGui::Text("%d", e.compCount);   ImGui::NextColumn();
+            ImGui::Text("%d", e.compCount);  ImGui::NextColumn();
 
             ImGui::PushID(e.id);
             if (ImGui::SmallButton("Apply")) {
                 applyId = e.id;
-            }
-            ImGui::NextColumn();
-            if (ImGui::SmallButton("Corr")) {
-                exportCorrId = e.id;
             }
             ImGui::NextColumn();
             if (ImGui::SmallButton("Del")) {
@@ -847,10 +868,6 @@ static void drawPoseLibraryWindow() {
         }
         if (deleteId >= 0) {
             g_poseLibrary.deleteEntry(deleteId);
-        }
-        if (exportCorrId >= 0) {
-            std::string fname = "pose_" + std::to_string(exportCorrId) + "_correspondences.csv";
-            g_poseLibrary.exportCorrespondences(exportCorrId, fname);
         }
 
         ImGui::Separator();
@@ -986,8 +1003,8 @@ void setupUICallbacks() {
         registrationHandle.state = RegistrationData::IDLE;
         OrbitCam.cx = gWindowWidth / 2.0f;
         OrbitCam.cy = gWindowHeight / 2.0f;
-        std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                          tumorMesh3D, segmentMesh3D, gbMesh3D};
+
+        auto organs = getOrganList();
         std::vector<std::string> names = {"Liver","Portal","Vein","Tumor","Segment","Gallbladder"};
         Reg3DCustom::performRegistrationMultiMeshWithScale(
             organs, names, screenMesh, OrbitCam.cameraPos,
@@ -1001,6 +1018,7 @@ void setupUICallbacks() {
         gUIManager.state.regMethod = 1;
         poseAutoSaveBeforeRegistration();
         resetRegistrationState();
+
         static Reg3D::BVHTree bvh;
         bvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
         auto vis = Reg3DCustom::extractVisibleVerticesCustom(
@@ -1009,14 +1027,52 @@ void setupUICallbacks() {
         g_cluster1Points = vis.points;
         g_cluster2Points.clear();
         g_refineVertexIndices = vis.vertexIndices;
-        std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                          tumorMesh3D, segmentMesh3D, gbMesh3D};
+        computeIdealVoxelSizes();
+        auto organs = getOrganList();
         Reg3DCustom::performRegistrationSingleMesh(
             organs, liverMesh3D, vis.vertexIndices,
             screenMesh, OrbitCam.cameraPos,
-            gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
+            gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
         computeUnifiedMetrics();
         poseSaveToLibrary();
+    };
+
+    a.onHemiVoxelChanged = [](float v) {
+        g_voxelSize = v;
+    };
+
+    a.onInitRotPresetChanged = [](int preset) {
+        registrationHandle.initRotPreset =
+            (RegistrationData::InitRotPreset)preset;
+        std::cout << "[InitRot] Preset selected: "
+                  << RegistrationData::presetName(registrationHandle.initRotPreset)
+                  << std::endl;
+
+        g_currentOrientLabel    = RegistrationData::presetName(
+            registrationHandle.initRotPreset);
+        g_currentOrientRunCount = 0;
+
+        auto organs = getOrganList();
+        if (g_initOrganVertices.empty() ||
+            g_initOrganVertices.size() != organs.size()) return;
+
+        for (size_t i = 0; i < organs.size(); i++) {
+            organs[i]->mVertices = g_initOrganVertices[i];
+            organs[i]->mNormals  = g_initOrganNormals[i];
+            setUp(*organs[i]);
+        }
+
+        RegistrationData::InitRotPreset p =
+            (RegistrationData::InitRotPreset)preset;
+        if (p != RegistrationData::PRESET_FRONT) {
+            glm::vec3 centroid =
+                computeMeshCentroidFromVertices(liverMesh3D->mVertices);
+            glm::mat4 R = getPresetRotation(p, centroid);
+            for (auto* m : organs) {
+                applyMatrixToMeshVerticesAndNormals(m, R);
+                setUp(*m);
+            }
+        }
     };
 
     a.onRefine = []() {
@@ -1126,6 +1182,22 @@ void setupUICallbacks() {
         gUIManager.state.regMethod = -1;
         g_refineVertexIndices.clear();
         g_refineState.reset();
+
+        auto organs = getOrganList();
+        if (!g_initOrganVertices.empty() &&
+            g_initOrganVertices.size() == organs.size()) {
+            for (size_t i = 0; i < organs.size(); i++) {
+                organs[i]->mVertices = g_initOrganVertices[i];
+                organs[i]->mNormals  = g_initOrganNormals[i];
+                setUp(*organs[i]);
+            }
+        }
+
+        registrationHandle.initRotPreset = RegistrationData::PRESET_FRONT;
+        gUIManager.state.initRotPreset   = 0;
+        g_currentOrientLabel             = "Front";
+        g_currentOrientRunCount          = 0;
+        std::cout << "[InitRot] Reset to Front" << std::endl;
     };
 
     a.onPoseUndo = []() {
@@ -1306,6 +1378,47 @@ void setupUICallbacks() {
     };
 }
 
+static void computeIdealVoxelSizes() {
+    if (!screenMesh || screenMesh->depthImageData.empty()) {
+        g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f;
+        return;
+    }
+    if (g_refineVertexIndices.empty()) {
+        g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f;
+        return;
+    }
+
+    Reg3DCustom::NoOpen3DRegistration reg;
+    float zThresh = std::max(0.01f, gDepthScale * 0.05f);
+    auto targetCloud = reg.extractFrontFacePoints(*screenMesh, gGridWidth, gGridHeight(), zThresh);
+    size_t T = targetCloud->size();
+    if (T == 0) { g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f; return; }
+
+    auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
+    for (size_t idx : g_refineVertexIndices) {
+        if (idx * 3 + 2 < liverMesh3D->mVertices.size())
+            sourceCloud->addPoint(glm::vec3(liverMesh3D->mVertices[idx*3],
+                                            liverMesh3D->mVertices[idx*3+1],
+                                            liverMesh3D->mVertices[idx*3+2]));
+    }
+    if (sourceCloud->empty()) { g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f; return; }
+
+    auto findVoxelForRatio = [&](float ratio) -> float {
+        float lo = 0.01f, hi = 2.0f;
+        for (int i = 0; i < 20; i++) {
+            float mid = (lo + hi) * 0.5f;
+            auto down = reg.voxelDownSample(sourceCloud, mid);
+            float r = (T > 0) ? (float)down->size() / (float)T : 0.0f;
+            if (r > ratio) lo = mid; else hi = mid;
+        }
+        return (lo + hi) * 0.5f;
+    };
+
+    g_idealVoxel1to1  = findVoxelForRatio(1.0f);
+    g_idealVoxel1to15 = findVoxelForRatio(1.0f / 1.5f);
+    g_idealVoxel1to2  = findVoxelForRatio(0.5f);
+}
+
 void syncUIState() {
     auto& s = gUIManager.state;
     s.mainMode = (currentMainMode == REGISTRATION_MODE) ? 0 : 1;
@@ -1381,6 +1494,10 @@ void syncUIState() {
 
     s.clusterVis = g_showClusterVisualization;
     s.correspondenceVis = g_showCorrespondencePoints;
+    s.hemiVoxelSize = g_voxelSize;
+    s.idealVoxel1to1  = g_idealVoxel1to1;
+    s.idealVoxel1to15 = g_idealVoxel1to15;
+    s.idealVoxel1to2  = g_idealVoxel1to2;
 
     s.depthModelIdx = gCurrentDepthModel;
     for (int i = 0; i < DEPTH_MODEL_COUNT; i++)
@@ -2605,20 +2722,15 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
 
     case GLFW_KEY_UP:
         if (currentMainMode == REGISTRATION_MODE) {
-            gDepthScale += 0.05f;
-            regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-            if (g_showClusterVisualization && registrationHandle.state == RegistrationData::REGISTERED)
-                computeUnifiedMetrics();
+            g_voxelSize += 0.05f;
+            std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
         }
         break;
 
     case GLFW_KEY_DOWN:
         if (currentMainMode == REGISTRATION_MODE) {
-            gDepthScale -= 0.05f;
-            if (gDepthScale < 0.0f) gDepthScale = 0.0f;
-            regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-            if (g_showClusterVisualization && registrationHandle.state == RegistrationData::REGISTERED)
-                computeUnifiedMetrics();
+            g_voxelSize = std::max(0.0f, g_voxelSize - 0.05f);
+            std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
         }
         break;
 
@@ -2835,7 +2947,7 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
                 organs, liverMesh3D, visibility.vertexIndices,
                 screenMesh, OrbitCam.cameraPos,
                 gGridWidth, gGridHeight(),
-                15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
+                15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
 
             std::cout << "=== Camera View Registration Complete ===" << std::endl;
         }
@@ -2986,7 +3098,7 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
             Reg3DCustom::performRegistrationSingleMesh(
                 organs, liverMesh3D, mergedIndices,
                 screenMesh, OrbitCam.cameraPos,
-                gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
+                gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
 
             std::cout << "=== Registration Complete ===" << std::endl;
         }
@@ -3120,7 +3232,7 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
                 Reg3DCustom::performRegistrationSingleMesh(
                     organs, liverMesh3D, fgrResults[i].vertexIndices,
                     screenMesh, OrbitCam.cameraPos,
-                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
+                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
 
                 computeUnifiedMetrics();
                 float compRmse = registrationHandle.compRmse;

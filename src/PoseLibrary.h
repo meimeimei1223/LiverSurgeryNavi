@@ -45,6 +45,10 @@ struct PoseEntry {
     std::vector<glm::vec3> corrSource;  // correspondence pairs for export
     std::vector<glm::vec3> corrTarget;
 
+    // --- Initial orientation preset ---
+    std::string initOrientation = "Front";
+    int orientRunCount = 1;
+
     // --- Transform from initial pose (applied to all organs equally) ---
     glm::mat4 transform = glm::mat4(1.0f);
 
@@ -64,6 +68,7 @@ struct PoseEntry {
 
     std::string label() const {
         std::string s = methodStr();
+        s += "/" + initOrientation + "#" + std::to_string(orientRunCount);
         if (refineCount > 0) {
             s += "+Refine";
             if (refineCount > 1) s += "x" + std::to_string(refineCount);
@@ -121,34 +126,31 @@ public:
         dstCenter /= (float)n;
 
         glm::mat3 H(0.0f);
+        float srcVar = 0.0f;
         for (size_t i = 0; i < n; i++) {
             glm::vec3 s = glm::vec3(initVerts[i*3], initVerts[i*3+1], initVerts[i*3+2]) - srcCenter;
             glm::vec3 d = glm::vec3(curVerts[i*3],  curVerts[i*3+1],  curVerts[i*3+2])  - dstCenter;
             H += glm::outerProduct(d, s);
+            srcVar += glm::dot(s, s);
         }
 
-        // SVD via Jacobi (simple 3x3)
-        // Use glm decomposition via QR-ish approach — approximate for rigid body
-        // For exact SVD we use the cross-covariance directly with glm::mat3
-        // R = H * inverse(H^T * H)^0.5  — use polar decomposition approximation
-        // Since meshes are rigid, we use the standard approach:
-        // build normal equations and extract rotation
-        glm::mat3 Ht = glm::transpose(H);
-        glm::mat3 HtH = Ht * H;
-
-        // Approximate sqrt via eigendecomposition is complex; use iterative polar decomp
         glm::mat3 R = H;
-        for (int iter = 0; iter < 100; iter++) {
+        for (int iter = 0; iter < 200; iter++) {
             glm::mat3 Rinv = glm::inverse(R);
             R = 0.5f * (R + glm::transpose(Rinv));
         }
 
-        glm::vec3 t = dstCenter - R * srcCenter;
+        glm::mat3 RtH = glm::transpose(R) * H;
+        float traceRtH = RtH[0][0] + RtH[1][1] + RtH[2][2];
+        float scale = (srcVar > 1e-8f) ? (traceRtH / srcVar) : 1.0f;
+        scale = glm::clamp(scale, 0.5f, 2.0f);
+
+        glm::vec3 t = dstCenter - scale * R * srcCenter;
 
         glm::mat4 T(1.0f);
-        T[0] = glm::vec4(R[0], 0.0f);
-        T[1] = glm::vec4(R[1], 0.0f);
-        T[2] = glm::vec4(R[2], 0.0f);
+        T[0] = glm::vec4(scale * R[0], 0.0f);
+        T[1] = glm::vec4(scale * R[1], 0.0f);
+        T[2] = glm::vec4(scale * R[2], 0.0f);
         T[3] = glm::vec4(t, 1.0f);
         return T;
     }
@@ -160,6 +162,7 @@ public:
         std::vector<mCutMesh*>& organs)
     {
         glm::mat3 R = glm::mat3(T);
+        glm::mat3 normalMat = glm::transpose(glm::inverse(R));
         for (size_t m = 0; m < organs.size() && m < initVerts.size(); m++) {
             const auto& iv = initVerts[m];
             const auto& in_ = initNormals[m];
@@ -177,7 +180,7 @@ public:
             size_t nn = in_.size() / 3;
             for (size_t i = 0; i < nn; i++) {
                 glm::vec3 n(in_[i*3], in_[i*3+1], in_[i*3+2]);
-                n = glm::normalize(R * n);
+                n = glm::normalize(normalMat * n);
                 mesh->mNormals[i*3]   = n.x;
                 mesh->mNormals[i*3+1] = n.y;
                 mesh->mNormals[i*3+2] = n.z;
@@ -228,7 +231,9 @@ public:
         float compRmse, float compAvgError, float compMaxError, int compCount,
         const std::vector<glm::vec3>& compSrc,
         const std::vector<glm::vec3>& compTgt,
-        const glm::mat4& transform)
+        const glm::mat4& transform,
+        const std::string& initOrientation = "Front",
+        int orientRunCount = 1)
     {
         PoseEntry e;
         e.id              = nextId++;
@@ -251,6 +256,8 @@ public:
         e.corrSource   = compSrc;
         e.corrTarget   = compTgt;
         e.transform    = transform;
+        e.initOrientation = initOrientation;
+        e.orientRunCount  = orientRunCount;
         return e;
     }
 
@@ -274,14 +281,17 @@ public:
         float compRmse, float compAvgError, float compMaxError, int compCount,
         const std::vector<glm::vec3>& compSrc,
         const std::vector<glm::vec3>& compTgt,
-        const glm::mat4& transform)
+        const glm::mat4& transform,
+        const std::string& initOrientation = "Front",
+        int orientRunCount = 1)
     {
         PoseEntry e = buildEntryFromCurrent(
             method, refineCount,
             baseFitness, baseIcpRmse, baseAvgError, baseRmse, baseMaxError, baseScale,
             refineInitRMSE, refineBestRMSE, refineBestIter,
             compRmse, compAvgError, compMaxError, compCount,
-            compSrc, compTgt, transform);
+            compSrc, compTgt, transform,
+            initOrientation, orientRunCount);
         addEntry(e);
     }
 
@@ -301,7 +311,31 @@ public:
                 lastRegistration.timestamp = nowTimestamp();
                 hasLastRegistration = true;
 
+                {
+                    glm::mat3 R = glm::mat3(e.transform);
+                    float det = glm::determinant(R);
+                    float c0 = glm::length(R[0]);
+                    float c1 = glm::length(R[1]);
+                    float c2 = glm::length(R[2]);
+                    std::cout << "[PoseLibrary] Apply transform debug:" << std::endl;
+                    std::cout << "  det(R)=" << det
+                              << "  col_norms=(" << c0 << ", " << c1 << ", " << c2 << ")" << std::endl;
+                    std::cout << "  T[3]= (" << e.transform[3][0] << ", "
+                              << e.transform[3][1] << ", " << e.transform[3][2] << ")" << std::endl;
+                }
+                auto meshBBox = [](const std::vector<GLfloat>& v, const std::string& tag) {
+                    if (v.size() < 3) return;
+                    float mn[3]={v[0],v[1],v[2]}, mx[3]={v[0],v[1],v[2]};
+                    for (size_t i=0; i+2<v.size(); i+=3) {
+                        for(int k=0;k<3;k++){mn[k]=std::min(mn[k],v[i+k]);mx[k]=std::max(mx[k],v[i+k]);}
+                    }
+                    std::cout << tag
+                              << " size=(" << (mx[0]-mn[0]) << ", " << (mx[1]-mn[1]) << ", " << (mx[2]-mn[2]) << ")"
+                              << " center=(" << (mn[0]+mx[0])*0.5f << ", " << (mn[1]+mx[1])*0.5f << ", " << (mn[2]+mx[2])*0.5f << ")" << std::endl;
+                };
+                if (!initVerts.empty()) meshBBox(initVerts[0], "[DEBUG] initVerts[0]");
                 applyTransformToMeshes(e.transform, initVerts, initNormals, organs);
+                if (organs[0] && !organs[0]->mVertices.empty()) meshBBox(organs[0]->mVertices, "[DEBUG] after Apply");
                 activeEntryId = entryId;
                 std::cout << "[PoseLibrary] Applied entry #" << entryId
                           << " (" << e.label() << ")" << std::endl;
@@ -337,6 +371,7 @@ public:
             << "base_fitness,base_icp_rmse,base_corr_avg_error,base_corr_rmse,base_corr_max_error,base_scale,"
             << "refine_initial_rmse,refine_best_rmse,refine_best_iteration,"
             << "comp_rmse,comp_avg_error,comp_max_error,comp_count,"
+            << "init_orientation,orient_run,"
             << "m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33"
             << std::endl;
 
@@ -359,7 +394,9 @@ public:
                 << e.compRmse << ","
                 << e.compAvgError << ","
                 << e.compMaxError << ","
-                << e.compCount;
+                << e.compCount << ","
+                << e.initOrientation << ","
+                << e.orientRunCount;
             for (int col = 0; col < 4; col++)
                 for (int row = 0; row < 4; row++)
                     ofs << "," << e.transform[col][row];
@@ -411,7 +448,12 @@ public:
             e.compAvgError        = std::stof(tok[14]);
             e.compMaxError        = std::stof(tok[15]);
             e.compCount           = std::stoi(tok[16]);
+
             int ti = 17;
+            if (tok.size() >= 35) {
+                e.initOrientation = tok[ti++];
+                e.orientRunCount  = std::stoi(tok[ti++]);
+            }
             for (int col = 0; col < 4; col++)
                 for (int row = 0; row < 4; row++)
                     e.transform[col][row] = std::stof(tok[ti++]);
