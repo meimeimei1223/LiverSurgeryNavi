@@ -1277,7 +1277,8 @@ public:
 
     std::shared_ptr<FeatureSet> computeFPFH(
         std::shared_ptr<PointCloud> cloud,
-        float voxel_size)
+        float voxel_size,
+        bool addNormalNoise = false)
     {
         auto features = std::make_shared<FeatureSet>();
         size_t n = cloud->size();
@@ -1293,7 +1294,17 @@ public:
         float search_radius = voxel_size * 5.0f;
         int max_nn = 100;
 
-        NanoflannAdaptor adaptor(cloud->points);
+        std::shared_ptr<PointCloud> workCloud = cloud;
+        if (addNormalNoise) {
+            workCloud = std::make_shared<PointCloud>(*cloud);
+            static std::mt19937 gen(std::random_device{}());
+            std::normal_distribution<float> noise(0.0f, 0.08f);
+            for (auto& nrm : workCloud->normals) {
+                nrm = glm::normalize(nrm + glm::vec3(noise(gen), noise(gen), noise(gen)));
+            }
+        }
+
+        NanoflannAdaptor adaptor(workCloud->points);
         auto tree = buildKDTree(adaptor);
 
         float radius_sq = search_radius * search_radius;
@@ -1305,7 +1316,7 @@ public:
         for (size_t i = 0; i < n; i++) {
             std::vector<size_t> knn_indices;
             std::vector<float> knn_dists_sq;
-            searchKNN(*tree, cloud->points[i], max_nn, knn_indices, knn_dists_sq);
+            searchKNN(*tree, workCloud->points[i], max_nn, knn_indices, knn_dists_sq);
 
             std::vector<size_t> neighbors;
             std::vector<float> neighbor_dists2;
@@ -1325,13 +1336,13 @@ public:
 
             double hist_incr = 100.0 / static_cast<double>(neighbors.size());
 
-            const glm::vec3& pi = cloud->points[i];
-            const glm::vec3& ni = cloud->normals[i];
+            const glm::vec3& pi = workCloud->points[i];
+            const glm::vec3& ni = workCloud->normals[i];
 
             for (size_t j = 0; j < neighbors.size(); j++) {
                 size_t idx = neighbors[j];
-                const glm::vec3& pj = cloud->points[idx];
-                const glm::vec3& nj = cloud->normals[idx];
+                const glm::vec3& pj = workCloud->points[idx];
+                const glm::vec3& nj = workCloud->normals[idx];
 
                 glm::vec3 dp2p1 = pj - pi;
                 float dp_len = glm::length(dp2p1);
@@ -3459,6 +3470,7 @@ inline bool performRegistrationMultiMeshWithScale(
     }
 
     for (int iter = 0; iter < max_iterations; iter++) {
+        float fitness_change = 0.0f;
         if (g_progressCallback) {
             char msg[128];
             snprintf(msg, sizeof(msg), "Full Auto: Iteration %d / %d", iter + 1, max_iterations);
@@ -3503,7 +3515,7 @@ inline bool performRegistrationMultiMeshWithScale(
 
             std::cout << "\nStep 3: Computing FPFH features..." << std::endl;
             auto targetFpfh = reg.computeFPFH(targetDown, voxel_size);
-            auto sourceFpfh = reg.computeFPFH(sourceDown, voxel_size);
+            auto sourceFpfh = reg.computeFPFH(sourceDown, voxel_size, true);
 
             std::cout << "\nStep 4: Fast Global Registration..." << std::endl;
 
@@ -3529,7 +3541,7 @@ inline bool performRegistrationMultiMeshWithScale(
                 if (targetDown_retry->size() >= 100 && sourceDown_retry->size() >= 100) {
                     try {
                         auto targetFpfh_retry = reg.computeFPFH(targetDown_retry, retry_voxel);
-                        auto sourceFpfh_retry = reg.computeFPFH(sourceDown_retry, retry_voxel);
+                        auto sourceFpfh_retry = reg.computeFPFH(sourceDown_retry, retry_voxel, true);
 
                         auto result_retry = reg.fastGlobalRegistration(
                             sourceDown_retry, targetDown_retry,
@@ -3560,13 +3572,45 @@ inline bool performRegistrationMultiMeshWithScale(
             std::cout << "\nStep 5: ICP refinement..." << std::endl;
             float icp_distance = voxel_size * 0.4f;
 
-            try {
-                result = reg.icpRefinement(sourceDown, targetDown, result.transformation, icp_distance, true);
-                std::cout << "  Final fitness: " << result.fitness << std::endl;
-                std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "  ICP refinement failed: " << e.what() << std::endl;
-                std::cout << "  Continuing with FGR result" << std::endl;
+            {
+                const glm::mat4& T = result.transformation;
+                float off_diag = std::abs(T[0][1]) + std::abs(T[0][2]) + std::abs(T[1][0])
+                                 + std::abs(T[1][2]) + std::abs(T[2][0]) + std::abs(T[2][1]);
+                float diag_dev = std::abs(T[0][0]-1.f) + std::abs(T[1][1]-1.f) + std::abs(T[2][2]-1.f);
+                float trans_mag = std::abs(T[3][0]) + std::abs(T[3][1]) + std::abs(T[3][2]);
+                bool is_identity = (off_diag < 0.01f && diag_dev < 0.01f && trans_mag < 0.5f);
+                if (is_identity) {
+                    std::cout << "  FGR returned near-identity, skipping ICP to avoid divergence" << std::endl;
+                } else {
+                    try {
+                        result = reg.icpRefinement(sourceDown, targetDown, result.transformation, icp_distance, true);
+                        std::cout << "  Final fitness: " << result.fitness << std::endl;
+                        std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cerr << "  ICP refinement failed: " << e.what() << std::endl;
+                        std::cout << "  Continuing with FGR result" << std::endl;
+                    }
+                }
+
+                if (is_identity) {
+                    if (voxel_size != standard_voxel) {
+                        float standard_dist = standard_voxel * 0.4f;
+                        auto evalResult = NoOpen3DRegistration::evaluateCurrentFitness(
+                            *sourceDown_std, *targetDown_std, standard_dist, result.transformation);
+                        result.fitness = evalResult.fitness;
+                        result.inlier_rmse = evalResult.inlier_rmse;
+                    }
+                    final_result = result;
+                    skipped_count++;
+                    consecutive_skips++;
+                    std::cout << "  - Fitness: " << result.fitness << " [FGR-IDENTITY SKIP]" << std::endl;
+                    std::cout << "  - Skipped count: " << skipped_count << "/" << (iter + 1) << std::endl;
+                    if (consecutive_skips >= 3) {
+                        std::cout << "\n  3 consecutive skips." << std::endl;
+                        break;
+                    }
+                    continue;
+                }
             }
 
             if (voxel_size != standard_voxel) {
@@ -3701,6 +3745,7 @@ inline bool performRegistrationMultiMeshWithScale(
                     std::cout << "  New best fitness: " << best_fitness << std::endl;
                 }
 
+                fitness_change = std::abs(current_fitness - prev_fitness);
                 prev_fitness = current_fitness;
 
             } else {
@@ -3711,7 +3756,6 @@ inline bool performRegistrationMultiMeshWithScale(
                 }
             }
 
-            float fitness_change = std::abs(result.fitness - prev_fitness);
 
             std::cout << "\n  Summary:" << std::endl;
             std::cout << "  - Fitness: " << result.fitness;
@@ -3880,7 +3924,8 @@ inline VisibilityResultCustom extractVisibleVerticesCustom(
     int vertexCount = mesh.mVertices.size() / 3;
     result.totalVertices = vertexCount;
 
-    const float EPSILON = 0.01f;
+    std::vector<int> bvhStack;
+    bvhStack.reserve(64);
 
     for (int i = 0; i < vertexCount; i++) {
         glm::vec3 vertex(
@@ -3898,26 +3943,38 @@ inline VisibilityResultCustom extractVisibleVerticesCustom(
         }
 
         float closestHit = FLT_MAX;
-        for (const auto& tri : bvhTree.triangles) {
-            glm::vec3 edge1 = tri.v1 - tri.v0;
-            glm::vec3 edge2 = tri.v2 - tri.v0;
-            glm::vec3 h = glm::cross(rayDir, edge2);
-            float a = glm::dot(edge1, h);
+        bvhStack.clear();
+        bvhStack.push_back(0);
 
-            if (std::abs(a) < 1e-8f) continue;
+        while (!bvhStack.empty()) {
+            int nodeIdx = bvhStack.back();
+            bvhStack.pop_back();
 
-            float f = 1.0f / a;
-            glm::vec3 s = cameraPos - tri.v0;
-            float u = f * glm::dot(s, h);
-            if (u < 0.0f || u > 1.0f) continue;
+            const Reg3D::BVHNode& node = bvhTree.nodes[nodeIdx];
 
-            glm::vec3 q = glm::cross(s, edge1);
-            float v = f * glm::dot(rayDir, q);
-            if (v < 0.0f || u + v > 1.0f) continue;
+            if (!node.bbox.intersectRay(cameraPos, rayDir)) continue;
 
-            float t = f * glm::dot(edge2, q);
-            if (t > EPSILON && t < closestHit) {
-                closestHit = t;
+            if (node.isLeaf()) {
+                for (int ti = 0; ti < node.triangleCount; ti++) {
+                    const Reg3D::Triangle& tri = bvhTree.triangles[node.triangleStart + ti];
+                    glm::vec3 edge1 = tri.v1 - tri.v0;
+                    glm::vec3 edge2 = tri.v2 - tri.v0;
+                    glm::vec3 h = glm::cross(rayDir, edge2);
+                    float a = glm::dot(edge1, h);
+                    if (std::abs(a) < 1e-8f) continue;
+                    float f = 1.0f / a;
+                    glm::vec3 s = cameraPos - tri.v0;
+                    float u = f * glm::dot(s, h);
+                    if (u < 0.0f || u > 1.0f) continue;
+                    glm::vec3 q = glm::cross(s, edge1);
+                    float v = f * glm::dot(rayDir, q);
+                    if (v < 0.0f || u + v > 1.0f) continue;
+                    float t = f * glm::dot(edge2, q);
+                    if (t > 1e-4f && t < closestHit) closestHit = t;
+                }
+            } else {
+                if (node.leftChild >= 0)  bvhStack.push_back(node.leftChild);
+                if (node.rightChild >= 0) bvhStack.push_back(node.rightChild);
             }
         }
 
@@ -4039,7 +4096,9 @@ inline bool performRegistrationSingleMesh(
     float min_fitness_for_convergence = 0.35f,
     bool estimate_scale = true,
     float min_scale_threshold = 0.03f,
-    float zThreshold = 0.3f)
+    float zThreshold = 0.3f,
+    float voxel_size_override = 0.0f,
+    bool skip_source_ds = false)
 {
     std::cout << "\n================================================" << std::endl;
     std::cout << "| Custom Registration (Single Mesh Source)    |" << std::endl;
@@ -4085,8 +4144,8 @@ inline bool performRegistrationSingleMesh(
                     sourceMesh->mVertices[idx * 3 + 2]));
             }
         }
-        float voxel0 = 0.5f;
-        auto srcDown0 = reg.preprocess(sourceCloud0, voxel0, false);
+        float voxel0 = (voxel_size_override > 0.0f) ? voxel_size_override : 0.5f;
+        auto srcDown0 = skip_source_ds ? sourceCloud0 : reg.preprocess(sourceCloud0, voxel0, false);
         auto tgtDown0 = reg.preprocess(targetCloud0, voxel0, false);
         float eval_dist = voxel0 * 0.4f;
         auto evalResult = NoOpen3DRegistration::evaluateCurrentFitness(
@@ -4096,7 +4155,10 @@ inline bool performRegistrationSingleMesh(
         std::cout << "  Initial fitness: " << prev_fitness << std::endl;
     }
 
+    auto targetCloudCached = reg.extractFrontFacePoints(*screenMesh, gridWidth, gridHeight, zThreshold);
+
     for (int iter = 0; iter < max_iterations; iter++) {
+        float fitness_change = 0.0f;
         if (g_progressCallback) {
             char msg[128];
             snprintf(msg, sizeof(msg), "Hemi Auto: Iteration %d / %d", iter + 1, max_iterations);
@@ -4114,9 +4176,12 @@ inline bool performRegistrationSingleMesh(
         }
 
         try {
-            std::cout << "Step 1: Building point clouds..." << std::endl;
+            auto _tIter = std::chrono::high_resolution_clock::now();
 
-            auto targetCloud = reg.extractFrontFacePoints(*screenMesh, gridWidth, gridHeight, zThreshold);
+            std::cout << "Step 1: Building point clouds..." << std::endl;
+            auto _t1s = std::chrono::high_resolution_clock::now();
+
+            auto targetCloud = targetCloudCached;
 
             auto sourceCloud = std::make_shared<PointCloud>();
             for (size_t idx : sourceVertexIndices) {
@@ -4136,23 +4201,25 @@ inline bool performRegistrationSingleMesh(
                     }
                 }
             }
-
             std::cout << "  Source points: " << sourceCloud->size() << std::endl;
             std::cout << "  Target points: " << targetCloud->size() << std::endl;
+            std::cout << "  [Time] Step1: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t1s).count() << " ms" << std::endl;
 
             if (targetCloud->size() < 100 || sourceCloud->size() < 50) {
                 std::cerr << " Error: Not enough points" << std::endl;
                 return false;
             }
 
-            float voxel_size = 0.5f;
+            float voxel_size = (voxel_size_override > 0.0f) ? voxel_size_override : 0.5f;
             std::cout << "\nStep 2: Preprocessing (voxel size: " << voxel_size << ")..." << std::endl;
+            auto _t2s = std::chrono::high_resolution_clock::now();
 
             auto targetDown = reg.preprocess(targetCloud, voxel_size, false);
-            auto sourceDown = reg.preprocess(sourceCloud, voxel_size, true);
+            auto sourceDown = skip_source_ds ? sourceCloud : reg.preprocess(sourceCloud, voxel_size, true);
 
             std::cout << "  Screen points after downsampling: " << targetDown->size() << std::endl;
             std::cout << "  Source points after downsampling: " << sourceDown->size() << std::endl;
+            std::cout << "  [Time] Step2: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t2s).count() << " ms" << std::endl;
 
             if (targetDown->size() < 10 || sourceDown->size() < 10) {
                 std::cerr << " Error: Too few points after downsampling" << std::endl;
@@ -4160,15 +4227,19 @@ inline bool performRegistrationSingleMesh(
             }
 
             std::cout << "\nStep 3: Computing FPFH features..." << std::endl;
+            auto _t3s = std::chrono::high_resolution_clock::now();
             auto targetFpfh = reg.computeFPFH(targetDown, voxel_size);
-            auto sourceFpfh = reg.computeFPFH(sourceDown, voxel_size);
+            auto sourceFpfh = reg.computeFPFH(sourceDown, voxel_size, true);
+            std::cout << "  [Time] Step3: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t3s).count() << " ms" << std::endl;
 
             std::cout << "\nStep 4: Fast Global Registration..." << std::endl;
+            auto _t4s = std::chrono::high_resolution_clock::now();
 
             auto result = reg.fastGlobalRegistration(sourceDown, targetDown, sourceFpfh, targetFpfh, voxel_size);
 
             std::cout << "  Initial fitness: " << result.fitness << std::endl;
             std::cout << "  Initial RMSE: " << result.inlier_rmse << std::endl;
+            std::cout << "  [Time] Step4-FGR: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t4s).count() << " ms" << std::endl;
 
             auto sourceDown_std = sourceDown;
             auto targetDown_std = targetDown;
@@ -4176,6 +4247,7 @@ inline bool performRegistrationSingleMesh(
 
             if (result.fitness < 0.3f) {
                 std::cout << "\n  Low fitness score. Retrying..." << std::endl;
+                auto _t4rs = std::chrono::high_resolution_clock::now();
 
                 float retry_voxel = voxel_size * 1.2f;
                 auto targetDown_retry = reg.preprocess(targetCloud, retry_voxel, false);
@@ -4184,7 +4256,7 @@ inline bool performRegistrationSingleMesh(
                 if (targetDown_retry->size() >= 100 && sourceDown_retry->size() >= 100) {
                     try {
                         auto targetFpfh_retry = reg.computeFPFH(targetDown_retry, retry_voxel);
-                        auto sourceFpfh_retry = reg.computeFPFH(sourceDown_retry, retry_voxel);
+                        auto sourceFpfh_retry = reg.computeFPFH(sourceDown_retry, retry_voxel, true);
 
                         auto result_retry = reg.fastGlobalRegistration(
                             sourceDown_retry, targetDown_retry,
@@ -4203,20 +4275,57 @@ inline bool performRegistrationSingleMesh(
                         std::cerr << "  Retry failed: " << e.what() << std::endl;
                     }
                 }
+                std::cout << "  [Time] Step4-retry: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t4rs).count() << " ms" << std::endl;
             }
 
             std::cout << "\nStep 5: ICP refinement..." << std::endl;
+            auto _t5s = std::chrono::high_resolution_clock::now();
             float icp_distance = voxel_size * 0.4f;
 
-            try {
-                result = reg.icpRefinement(sourceDown, targetDown, result.transformation, icp_distance, true);
-                std::cout << "  Final fitness: " << result.fitness << std::endl;
-                std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "  ICP failed: " << e.what() << std::endl;
+            {
+                const glm::mat4& T = result.transformation;
+                float off_diag = std::abs(T[0][1]) + std::abs(T[0][2]) + std::abs(T[1][0])
+                                 + std::abs(T[1][2]) + std::abs(T[2][0]) + std::abs(T[2][1]);
+                float diag_dev = std::abs(T[0][0]-1.f) + std::abs(T[1][1]-1.f) + std::abs(T[2][2]-1.f);
+                float trans_mag = std::abs(T[3][0]) + std::abs(T[3][1]) + std::abs(T[3][2]);
+                bool is_identity = (off_diag < 0.01f && diag_dev < 0.01f && trans_mag < 0.5f);
+                if (is_identity) {
+                    std::cout << "  FGR returned near-identity, skipping ICP to avoid divergence" << std::endl;
+                } else {
+                    try {
+                        result = reg.icpRefinement(sourceDown, targetDown, result.transformation, icp_distance, true);
+                        std::cout << "  Final fitness: " << result.fitness << std::endl;
+                        std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cerr << "  ICP failed: " << e.what() << std::endl;
+                    }
+                }
+
+                if (is_identity) {
+                    if (voxel_size != standard_voxel) {
+                        float standard_dist = standard_voxel * 0.4f;
+                        auto evalResult = NoOpen3DRegistration::evaluateCurrentFitness(
+                            *sourceDown_std, *targetDown_std, standard_dist, result.transformation);
+                        result.fitness = evalResult.fitness;
+                        result.inlier_rmse = evalResult.inlier_rmse;
+                    }
+                    final_result = result;
+                    skipped_count++;
+                    consecutive_skips++;
+                    std::cout << "  [Time] Step5-ICP: 0 ms" << std::endl;
+                    std::cout << "  - Fitness: " << result.fitness << " [FGR-IDENTITY SKIP]" << std::endl;
+                    std::cout << "  - Skipped count: " << skipped_count << "/" << (iter + 1) << std::endl;
+                    if (consecutive_skips >= 3) {
+                        std::cout << "\n  3 consecutive skips." << std::endl;
+                        break;
+                    }
+                    continue;
+                }
             }
+            std::cout << "  [Time] Step5-ICP: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t5s).count() << " ms" << std::endl;
 
             if (voxel_size != standard_voxel) {
+                auto _t5es = std::chrono::high_resolution_clock::now();
                 float standard_dist = standard_voxel * 0.4f;
                 auto evalResult = NoOpen3DRegistration::evaluateCurrentFitness(
                     *sourceDown_std, *targetDown_std, standard_dist, result.transformation);
@@ -4224,6 +4333,7 @@ inline bool performRegistrationSingleMesh(
                 std::cout << "  Re-evaluated RMSE (standard): " << evalResult.inlier_rmse << std::endl;
                 result.fitness = evalResult.fitness;
                 result.inlier_rmse = evalResult.inlier_rmse;
+                std::cout << "  [Time] Step5-eval: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t5es).count() << " ms" << std::endl;
             }
 
             final_result = result;
@@ -4306,34 +4416,44 @@ inline bool performRegistrationSingleMesh(
                     }
                 }
 
-                for (size_t m = 0; m < organMeshes.size(); m++) {
-                    for (size_t i = 0; i < organMeshes[m]->mVertices.size(); i += 3) {
-                        glm::vec4 vertex(
-                            organMeshes[m]->mVertices[i],
-                            organMeshes[m]->mVertices[i + 1],
-                            organMeshes[m]->mVertices[i + 2],
-                            1.0f);
-                        vertex = glm_transform * vertex;
-                        organMeshes[m]->mVertices[i]     = vertex.x;
-                        organMeshes[m]->mVertices[i + 1] = vertex.y;
-                        organMeshes[m]->mVertices[i + 2] = vertex.z;
-                    }
-
-                    if (!organMeshes[m]->mNormals.empty()) {
-                        glm::mat3 rotation_matrix = glm::mat3(rigid_transform);
-                        for (size_t i = 0; i < organMeshes[m]->mNormals.size(); i += 3) {
-                            glm::vec3 normal(
-                                organMeshes[m]->mNormals[i],
-                                organMeshes[m]->mNormals[i + 1],
-                                organMeshes[m]->mNormals[i + 2]);
-                            normal = glm::normalize(rotation_matrix * normal);
-                            organMeshes[m]->mNormals[i]     = normal.x;
-                            organMeshes[m]->mNormals[i + 1] = normal.y;
-                            organMeshes[m]->mNormals[i + 2] = normal.z;
+                {
+                    auto _t6a = std::chrono::high_resolution_clock::now();
+                    for (size_t m = 0; m < organMeshes.size(); m++) {
+                        for (size_t i = 0; i < organMeshes[m]->mVertices.size(); i += 3) {
+                            glm::vec4 vertex(
+                                organMeshes[m]->mVertices[i],
+                                organMeshes[m]->mVertices[i + 1],
+                                organMeshes[m]->mVertices[i + 2],
+                                1.0f);
+                            vertex = glm_transform * vertex;
+                            organMeshes[m]->mVertices[i]     = vertex.x;
+                            organMeshes[m]->mVertices[i + 1] = vertex.y;
+                            organMeshes[m]->mVertices[i + 2] = vertex.z;
+                        }
+                        if (!organMeshes[m]->mNormals.empty()) {
+                            glm::mat3 rotation_matrix = glm::mat3(rigid_transform);
+                            for (size_t i = 0; i < organMeshes[m]->mNormals.size(); i += 3) {
+                                glm::vec3 normal(
+                                    organMeshes[m]->mNormals[i],
+                                    organMeshes[m]->mNormals[i + 1],
+                                    organMeshes[m]->mNormals[i + 2]);
+                                normal = glm::normalize(rotation_matrix * normal);
+                                organMeshes[m]->mNormals[i]     = normal.x;
+                                organMeshes[m]->mNormals[i + 1] = normal.y;
+                                organMeshes[m]->mNormals[i + 2] = normal.z;
+                            }
                         }
                     }
-
-                    setUp(*organMeshes[m]);
+                    auto _t6b = std::chrono::high_resolution_clock::now();
+                    std::cout << "  [Time] vertex+normal: "
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(_t6b - _t6a).count()
+                              << " ms" << std::endl;
+                    auto _t6c = std::chrono::high_resolution_clock::now();
+                    for (size_t m = 0; m < organMeshes.size(); m++) setUp(*organMeshes[m]);
+                    auto _t6d = std::chrono::high_resolution_clock::now();
+                    std::cout << "  [Time] setUp: "
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(_t6d - _t6c).count()
+                              << " ms" << std::endl;
                 }
 
                 if (current_fitness > best_fitness) {
@@ -4346,6 +4466,7 @@ inline bool performRegistrationSingleMesh(
                     std::cout << "  New best fitness: " << best_fitness << std::endl;
                 }
 
+                fitness_change = std::abs(current_fitness - prev_fitness);
                 prev_fitness = current_fitness;
 
             } else {
@@ -4356,8 +4477,8 @@ inline bool performRegistrationSingleMesh(
                 }
             }
 
-            float fitness_change = std::abs(result.fitness - prev_fitness);
 
+            std::cout << "  [Time] ITER TOTAL: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_tIter).count() << " ms" << std::endl;
             std::cout << "\n  Summary:" << std::endl;
             std::cout << "  - Fitness: " << result.fitness;
             if (should_apply_transform) {
