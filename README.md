@@ -133,5 +133,3 @@ To download only the 3D mesh models without cloning the entire repository:
 | vein.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/vein.obj) |
 | gb.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/gb.obj) |
 | res.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/res.obj) |
-| Icosphere4.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/Icosphere4.obj) |
-| cube.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/cube.obj) |
