@@ -119,3 +119,19 @@ cd build/bin
 | Depth Anything V3 | Apache-2.0 | [onnx-community/depth-anything-v3-*](https://huggingface.co/onnx-community/depth-anything-v3-small) |
 | SAM2 Hiera Tiny | Apache-2.0 | [vietanhdev/segment-anything-2-onnx-models](https://huggingface.co/vietanhdev/segment-anything-2-onnx-models) |
 | ONNX Runtime | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
+
+
+## Download 3D Models Only
+
+To download only the 3D mesh models without cloning the entire repository:
+
+| File | Direct Download |
+|------|----------------|
+| liver.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/liver.obj) |
+| tumor.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/tumor.obj) |
+| portal.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/portal.obj) |
+| vein.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/vein.obj) |
+| gb.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/gb.obj) |
+| res.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/res.obj) |
+| Icosphere4.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/Icosphere4.obj) |
+| cube.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/cube.obj) |
