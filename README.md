@@ -65,10 +65,31 @@ print('Done!')
 
 After downloading, the models will appear in the "Depth Model" combo box in the UI.
 
+## Features
+
+### Registration Methods
+
+| Method | Shortcut | Description |
+|--------|----------|-------------|
+| HemiAuto | UI Button | Hemisphere-based automatic registration |
+| BIPOP-CMA-ES | Shift+V / UI Button | Multi-start CMA-ES optimization (Hansen 2009) |
+| Refine | UI Button | Normal-compatible ICP refinement |
+| Umeyama Manual | UI Button | Manual point-correspondence registration |
+
+### Pose Library
+- Session management (Front#1, Back#1, etc.)
+- Method tracking with BIPOP/Refine cumulative counts
+- Elapsed time measurement and display
+- CSV export with session, bipop_count, refine_count, elapsed_sec columns
+
+### Deformation
+- Sphere Radius slider for deformation control
+
 ## Dependencies
 
 ### Bundled (in third_party/)
 - ImGui, GLM, Eigen3, stb, nanoflann, tinyfiledialogs
+- c-cmaes (Apache-2.0) - CMA-ES optimization library
 
 ### Ubuntu
 ```
@@ -114,11 +135,12 @@ cd build/bin
 
 ## Model Sources
 
-| Model | License | Source |
-|-------|---------|--------|
+| Model/Library | License | Source |
+|---------------|---------|--------|
 | Depth Anything V3 | Apache-2.0 | [onnx-community/depth-anything-v3-*](https://huggingface.co/onnx-community/depth-anything-v3-small) |
 | SAM2 Hiera Tiny | Apache-2.0 | [vietanhdev/segment-anything-2-onnx-models](https://huggingface.co/vietanhdev/segment-anything-2-onnx-models) |
 | ONNX Runtime | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
+| c-cmaes | Apache-2.0 | [CMA-ES/c-cmaes](https://github.com/CMA-ES/c-cmaes) |
 
 
 ## Download 3D Models Only

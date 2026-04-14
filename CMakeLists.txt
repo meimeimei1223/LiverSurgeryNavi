@@ -106,6 +106,15 @@ else()
     message(STATUS "tinyfiledialogs not found - drag & drop only")
 endif()
 
+# c-cmaes (Apache 2.0, Nikolaus Hansen 2014)
+set(CMAES_DIR "${CMAKE_SOURCE_DIR}/third_party/c-cmaes")
+if(EXISTS "${CMAES_DIR}/cmaes.c")
+    list(APPEND SOURCES "${CMAES_DIR}/cmaes.c")
+    message(STATUS "c-cmaes: ${CMAES_DIR}")
+else()
+    message(FATAL_ERROR "c-cmaes not found at ${CMAES_DIR}")
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin)
 
@@ -133,6 +142,7 @@ if(WIN32)
         ${GLM_DIR}
         ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
+        ${CMAES_DIR}
     )
     target_link_directories(${PROJECT_NAME} PRIVATE ${LIBS_DIR})
     target_link_libraries(${PROJECT_NAME} PRIVATE opengl32 glew32s glfw3_mt)
@@ -153,6 +163,7 @@ else()
         ${OPENGL_INCLUDE_DIR}
         ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
+        ${CMAES_DIR}
     )
     target_link_libraries(${PROJECT_NAME} PRIVATE
         ${OPENGL_LIBRARIES}

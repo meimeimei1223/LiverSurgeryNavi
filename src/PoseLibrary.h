@@ -18,13 +18,16 @@
 struct PoseEntry {
     int id = -1;
 
-    enum Method { FULL_AUTO = 0, HEMI_AUTO = 1, UMEYAMA = 2 };
-    Method baseMethod = FULL_AUTO;
+    enum Method { FULL_AUTO=0, HEMI_AUTO=1, UMEYAMA=2, BIPOP_CMAES=3, REFINE=4 };
+    Method baseMethod = HEMI_AUTO;
+
+    int sessionId   = 1;
+    int bipopCount  = 0;
     int refineCount = 0;
+    float elapsedSec = 0.0f;
 
     std::string timestamp;
 
-    // --- Base registration metrics ---
     float baseFitness    = 0.0f;
     float baseIcpRmse    = 0.0f;
     float baseAvgError   = 0.0f;
@@ -32,47 +35,44 @@ struct PoseEntry {
     float baseMaxError   = 0.0f;
     float baseScale      = 1.0f;
 
-    // --- Refine metrics (valid only when refineCount > 0) ---
     float refineInitialRMSE  = 0.0f;
     float refineBestRMSE     = 0.0f;
     int   refineBestIteration = 0;
 
-    // --- Unified comparison metrics (all-organ vs depth, all correspondences) ---
     float compRmse     = 0.0f;
     float compAvgError = 0.0f;
     float compMaxError = 0.0f;
     int   compCount    = 0;
-    std::vector<glm::vec3> corrSource;  // correspondence pairs for export
+    std::vector<glm::vec3> corrSource;
     std::vector<glm::vec3> corrTarget;
 
-    // --- Initial orientation preset ---
     std::string initOrientation = "Front";
     int orientRunCount = 1;
 
-    // --- Transform from initial pose (applied to all organs equally) ---
     glm::mat4 transform = glm::mat4(1.0f);
 
-    float finalRmse() const {
-        // Unified comparison RMSE (same method for all entries)
-        return compRmse;
-    }
+    float finalRmse() const { return compRmse; }
 
     const char* methodStr() const {
         switch (baseMethod) {
-        case FULL_AUTO: return "FullAuto";
-        case HEMI_AUTO: return "HemiAuto";
-        case UMEYAMA:   return "Umeyama";
+        case FULL_AUTO:   return "FullAuto";
+        case HEMI_AUTO:   return "HemiAuto";
+        case UMEYAMA:     return "Umeyama";
+        case BIPOP_CMAES: return "BIPOP";
+        case REFINE:      return "Refine";
         }
         return "Unknown";
     }
 
+    std::string sessionLabel() const {
+        return initOrientation + "#" + std::to_string(orientRunCount);
+    }
+
     std::string label() const {
         std::string s = methodStr();
-        s += "/" + initOrientation + "#" + std::to_string(orientRunCount);
-        if (refineCount > 0) {
-            s += "+Refine";
-            if (refineCount > 1) s += "x" + std::to_string(refineCount);
-        }
+        s += "/" + sessionLabel();
+        if (bipopCount > 0)  s += "+Bx"  + std::to_string(bipopCount);
+        if (refineCount > 0) s += "+Rx" + std::to_string(refineCount);
         return s;
     }
 };
@@ -80,22 +80,15 @@ struct PoseEntry {
 class PoseLibrary {
 public:
     std::vector<PoseEntry> entries;
-    int maxEntries = 50;
+    int maxEntries = 100;
     int nextId     = 1;
 
-    // --- Last registration auto-saved (for undo) ---
     PoseEntry lastRegistration;
     bool hasLastRegistration = false;
 
-    // --- Currently applied entry (for highlighting) ---
     int activeEntryId = -1;
+    bool showWindow   = false;
 
-    // --- UI state ---
-    bool showWindow = false;
-
-    // -------------------------------------------------------
-    // Snapshot helpers
-    // -------------------------------------------------------
     static std::string nowTimestamp() {
         auto now = std::chrono::system_clock::now();
         std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -189,9 +182,6 @@ public:
         }
     }
 
-    // -------------------------------------------------------
-    //  Auto-save on every registration completion
-    // -------------------------------------------------------
     void autoSaveLastRegistration(const glm::mat4& transform) {
         lastRegistration = PoseEntry();
         lastRegistration.transform = transform;
@@ -200,9 +190,6 @@ public:
         std::cout << "[PoseLibrary] Undo snapshot saved" << std::endl;
     }
 
-    // -------------------------------------------------------
-    //  Undo = restore lastRegistration
-    // -------------------------------------------------------
     bool undoToLast(
         const std::vector<std::vector<GLfloat>>& initVerts,
         const std::vector<std::vector<GLfloat>>& initNormals,
@@ -218,12 +205,12 @@ public:
         return true;
     }
 
-    // -------------------------------------------------------
-    //  Manual save to library (user presses key)
-    // -------------------------------------------------------
     PoseEntry buildEntryFromCurrent(
         PoseEntry::Method method,
+        int sessionId,
+        int bipopCount,
         int refineCount,
+        float elapsedSec,
         float baseFitness, float baseIcpRmse,
         float baseAvgError, float baseRmse, float baseMaxError,
         float baseScale,
@@ -238,7 +225,10 @@ public:
         PoseEntry e;
         e.id              = nextId++;
         e.baseMethod      = method;
+        e.sessionId       = sessionId;
+        e.bipopCount      = bipopCount;
         e.refineCount     = refineCount;
+        e.elapsedSec      = elapsedSec;
         e.timestamp       = nowTimestamp();
         e.baseFitness     = baseFitness;
         e.baseIcpRmse     = baseIcpRmse;
@@ -268,12 +258,16 @@ public:
         std::cout << "[PoseLibrary] Added entry #" << entry.id
                   << " (" << entry.label()
                   << ", CompRMSE=" << entry.compRmse
+                  << ", elapsed=" << entry.elapsedSec << "s"
                   << "). Library size: " << entries.size() << std::endl;
     }
 
     void saveCurrentToLibrary(
         PoseEntry::Method method,
+        int sessionId,
+        int bipopCount,
         int refineCount,
+        float elapsedSec,
         float baseFitness, float baseIcpRmse,
         float baseAvgError, float baseRmse, float baseMaxError,
         float baseScale,
@@ -286,7 +280,7 @@ public:
         int orientRunCount = 1)
     {
         PoseEntry e = buildEntryFromCurrent(
-            method, refineCount,
+            method, sessionId, bipopCount, refineCount, elapsedSec,
             baseFitness, baseIcpRmse, baseAvgError, baseRmse, baseMaxError, baseScale,
             refineInitRMSE, refineBestRMSE, refineBestIter,
             compRmse, compAvgError, compMaxError, compCount,
@@ -295,9 +289,6 @@ public:
         addEntry(e);
     }
 
-    // -------------------------------------------------------
-    //  Apply a library entry
-    // -------------------------------------------------------
     bool applyEntry(
         int entryId,
         const std::vector<std::vector<GLfloat>>& initVerts,
@@ -346,9 +337,6 @@ public:
         return false;
     }
 
-    // -------------------------------------------------------
-    //  Delete an entry
-    // -------------------------------------------------------
     void deleteEntry(int entryId) {
         entries.erase(
             std::remove_if(entries.begin(), entries.end(),
@@ -357,9 +345,6 @@ public:
         if (activeEntryId == entryId) activeEntryId = -1;
     }
 
-    // -------------------------------------------------------
-    //  Export to CSV (Python-friendly)
-    // -------------------------------------------------------
     bool exportToCsv(const std::string& filepath) const {
         std::ofstream ofs(filepath);
         if (!ofs.is_open()) {
@@ -367,7 +352,7 @@ public:
             return false;
         }
 
-        ofs << "id,method,refine_count,timestamp,"
+        ofs << "id,session,session_id,method,bipop_count,refine_count,elapsed_sec,timestamp,"
             << "base_fitness,base_icp_rmse,base_corr_avg_error,base_corr_rmse,base_corr_max_error,base_scale,"
             << "refine_initial_rmse,refine_best_rmse,refine_best_iteration,"
             << "comp_rmse,comp_avg_error,comp_max_error,comp_count,"
@@ -375,12 +360,16 @@ public:
             << "m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33"
             << std::endl;
 
-        ofs << std::fixed << std::setprecision(8);
+        ofs << std::fixed << std::setprecision(6);
 
         for (const auto& e : entries) {
             ofs << e.id << ","
-                << e.label() << ","
+                << e.sessionLabel() << ","
+                << e.sessionId << ","
+                << e.methodStr() << ","
+                << e.bipopCount << ","
                 << e.refineCount << ","
+                << e.elapsedSec << ","
                 << e.timestamp << ","
                 << e.baseFitness << ","
                 << e.baseIcpRmse << ","
@@ -416,7 +405,7 @@ public:
         }
 
         std::string line;
-        std::getline(ifs, line); // skip header
+        std::getline(ifs, line);
 
         int count = 0;
         while (std::getline(ifs, line)) {
@@ -425,35 +414,37 @@ public:
             std::vector<std::string> tok;
             std::string field;
             while (std::getline(ss, field, ',')) tok.push_back(field);
-            if (tok.size() < 33) continue;
+            if (tok.size() < 35) continue;
 
             PoseEntry e;
-            e.id           = nextId++;
-            std::string lbl = tok[1];
-            if      (lbl.find("FullAuto") != std::string::npos) e.baseMethod = PoseEntry::FULL_AUTO;
-            else if (lbl.find("HemiAuto") != std::string::npos) e.baseMethod = PoseEntry::HEMI_AUTO;
-            else                                                 e.baseMethod = PoseEntry::UMEYAMA;
-            e.refineCount         = std::stoi(tok[2]);
-            e.timestamp           = tok[3];
-            e.baseFitness         = std::stof(tok[4]);
-            e.baseIcpRmse         = std::stof(tok[5]);
-            e.baseAvgError        = std::stof(tok[6]);
-            e.baseRmse            = std::stof(tok[7]);
-            e.baseMaxError        = std::stof(tok[8]);
-            e.baseScale           = std::stof(tok[9]);
-            e.refineInitialRMSE   = std::stof(tok[10]);
-            e.refineBestRMSE      = std::stof(tok[11]);
-            e.refineBestIteration = std::stoi(tok[12]);
-            e.compRmse            = std::stof(tok[13]);
-            e.compAvgError        = std::stof(tok[14]);
-            e.compMaxError        = std::stof(tok[15]);
-            e.compCount           = std::stoi(tok[16]);
-
-            int ti = 17;
-            if (tok.size() >= 35) {
-                e.initOrientation = tok[ti++];
-                e.orientRunCount  = std::stoi(tok[ti++]);
-            }
+            e.id = nextId++;
+            std::string mstr = tok[3];
+            if      (mstr == "HemiAuto")   e.baseMethod = PoseEntry::HEMI_AUTO;
+            else if (mstr == "BIPOP")      e.baseMethod = PoseEntry::BIPOP_CMAES;
+            else if (mstr == "Refine")     e.baseMethod = PoseEntry::REFINE;
+            else if (mstr == "Umeyama")    e.baseMethod = PoseEntry::UMEYAMA;
+            else                           e.baseMethod = PoseEntry::FULL_AUTO;
+            e.sessionId           = std::stoi(tok[2]);
+            e.bipopCount          = std::stoi(tok[4]);
+            e.refineCount         = std::stoi(tok[5]);
+            e.elapsedSec          = std::stof(tok[6]);
+            e.timestamp           = tok[7];
+            e.baseFitness         = std::stof(tok[8]);
+            e.baseIcpRmse         = std::stof(tok[9]);
+            e.baseAvgError        = std::stof(tok[10]);
+            e.baseRmse            = std::stof(tok[11]);
+            e.baseMaxError        = std::stof(tok[12]);
+            e.baseScale           = std::stof(tok[13]);
+            e.refineInitialRMSE   = std::stof(tok[14]);
+            e.refineBestRMSE      = std::stof(tok[15]);
+            e.refineBestIteration = std::stoi(tok[16]);
+            e.compRmse            = std::stof(tok[17]);
+            e.compAvgError        = std::stof(tok[18]);
+            e.compMaxError        = std::stof(tok[19]);
+            e.compCount           = std::stoi(tok[20]);
+            e.initOrientation     = tok[21];
+            e.orientRunCount      = std::stoi(tok[22]);
+            int ti = 23;
             for (int col = 0; col < 4; col++)
                 for (int row = 0; row < 4; row++)
                     e.transform[col][row] = std::stof(tok[ti++]);
@@ -467,37 +458,22 @@ public:
         return count > 0;
     }
 
-    // -------------------------------------------------------
-    //  Export correspondence pairs for a single entry (Python analysis)
-    // -------------------------------------------------------
     bool exportCorrespondences(int entryId, const std::string& filepath) const {
         for (const auto& e : entries) {
             if (e.id == entryId) {
                 std::ofstream ofs(filepath);
                 if (!ofs.is_open()) return false;
-
-                ofs << "source_x,source_y,source_z,target_x,target_y,target_z,distance"
-                    << std::endl;
+                ofs << "source_x,source_y,source_z,target_x,target_y,target_z,distance" << std::endl;
                 ofs << std::fixed << std::setprecision(8);
-
                 for (size_t i = 0; i < e.corrSource.size() && i < e.corrTarget.size(); i++) {
                     float d = glm::distance(e.corrSource[i], e.corrTarget[i]);
-                    ofs << e.corrSource[i].x << ","
-                        << e.corrSource[i].y << ","
-                        << e.corrSource[i].z << ","
-                        << e.corrTarget[i].x << ","
-                        << e.corrTarget[i].y << ","
-                        << e.corrTarget[i].z << ","
+                    ofs << e.corrSource[i].x << "," << e.corrSource[i].y << "," << e.corrSource[i].z << ","
+                        << e.corrTarget[i].x << "," << e.corrTarget[i].y << "," << e.corrTarget[i].z << ","
                         << d << std::endl;
                 }
-
-                std::cout << "[PoseLibrary] Exported " << e.corrSource.size()
-                          << " correspondences for entry #" << entryId
-                          << " to " << filepath << std::endl;
                 return true;
             }
         }
         return false;
     }
-
 };
