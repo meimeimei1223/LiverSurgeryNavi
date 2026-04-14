@@ -175,6 +175,7 @@ inline void initPaths() {
                                                                       "input_image/",
                                                                       "../input_image/",
                                                                       "../../input_image/",
+                                                                      "../../../input_image/",     // ← 追加
                                                                       "../../../../input_image/"
                                                                   });
 
@@ -295,7 +296,7 @@ inline SimpleOBJ::TransformInfo normalizeAndSavePreReg() {
         }
     }
 
-    auto result = SimpleOBJ::processMultipleOBJSimple(inputPaths, outputPaths, 5.0, true);
+    auto result = SimpleOBJ::processMultipleOBJSimple(inputPaths, outputPaths, 6.0, true);
 
     if (!result.success) {
         std::cerr << "[PreReg] ERROR: " << result.errorMessage << std::endl;

@@ -6,6 +6,7 @@
 #include <limits>
 #include <ctime>
 #include <functional>
+#include <random>
 
 #define GLEW_STATIC
 #include <GL/glew.h>
@@ -47,6 +48,7 @@
 #include "imgui_impl_opengl3.h"
 #include "RegistrationImGuiManager.h"
 #include "PoseLibrary.h"
+#include "CmaesUtils.h"
 
 CameraPreview gCameraPreview;
 
@@ -61,7 +63,7 @@ std::vector<glm::vec3>        gUserSegPoints3D;
 std::vector<bool>             gUserSegPointsFG;
 
 float gDepthScale = 0.3f;
-float g_voxelSize = 0.5f;
+float g_voxelSize = 0.3f;
 float g_idealVoxel1to1  = 0.0f;
 float g_idealVoxel1to15 = 0.0f;
 float g_idealVoxel1to2  = 0.0f;
@@ -80,6 +82,7 @@ RegistrationImGuiManager gUIManager;
 glm::vec3 hit_position;
 int hit_index;
 bool isDragging;
+float gGroupRadius = 0.5f;
 
 glm::mat4 model(1.0), view(1.0), projection(1.0);
 glm::vec3 objPos = glm::vec3(0.0f, 0.0f, 0.0f);
@@ -311,7 +314,12 @@ public:
             velocity = glm::vec3(0.0f);
             time = 0.0f;
 
-            physicsObject->smartGrab(hit.position, 0.5f);
+            float grabThreshold = 1.0f;
+            if (physicsObject && !physicsObject->handleGroups.empty()) {
+                for (const auto& g : physicsObject->handleGroups)
+                    grabThreshold = std::max(grabThreshold, g.radius);
+            }
+            physicsObject->smartGrab(hit.position, grabThreshold);
             isDragging = true;
         }
     }
@@ -491,6 +499,15 @@ bool g_showCorrespondencePoints = false;
 static std::string g_currentOrientLabel   = "Front";
 static int         g_currentOrientRunCount = 0;
 
+static float                             g_bestSessionCompRmse   = FLT_MAX;
+static std::vector<std::vector<GLfloat>> g_bestSessionVertices;
+static std::vector<std::vector<GLfloat>> g_bestSessionNormals;
+
+static int  g_sessionId      = 1;
+static int  g_sessionBipopN  = 0;
+static int  g_sessionRefineN = 0;
+static std::chrono::steady_clock::time_point g_stepStartTime = std::chrono::steady_clock::now();
+
 mCutMesh *liverMesh3D;
 mCutMesh *gbMesh3D;
 mCutMesh *portalMesh3D;
@@ -561,10 +578,23 @@ static void poseAutoSaveBeforeRegistration() {
 // but current vertex POSITIONS are read — so the metric reflects the
 // actual mesh geometry while keeping the source population identical.
 // -------------------------------------------------------
+/* CMA-ESループ中はtrue → computeUnifiedMetrics等の詳細ログを抑制 */
+bool g_quietMetrics = false;
+
 static void computeUnifiedMetrics() {
     Reg3DCustom::NoOpen3DRegistration reg;
     float zThresh = std::max(0.01f, gDepthScale * 0.05f);
+
+    /* CMA-ESループ中はextractFrontFacePointsの出力も抑制 */
+    std::streambuf* oldBuf = nullptr;
+    std::ostringstream devNull;
+    if (g_quietMetrics) {
+        oldBuf = std::cout.rdbuf(devNull.rdbuf());
+    }
     auto targetCloud = reg.extractFrontFacePoints(*screenMesh, gGridWidth, gGridHeight(), zThresh);
+    if (g_quietMetrics && oldBuf) {
+        std::cout.rdbuf(oldBuf);
+    }
 
     if (targetCloud->hasBoundaryDist()) {
         g_targetPoints.clear();
@@ -577,8 +607,9 @@ static void computeUnifiedMetrics() {
             else
                 g_cluster2Points.push_back(targetCloud->points[i]);
         }
-        std::cout << "[Boundary3D] boundary=" << g_targetPoints.size()
-                  << " interior=" << g_cluster2Points.size() << std::endl;
+        if (!g_quietMetrics)
+            std::cout << "[Boundary3D] boundary=" << g_targetPoints.size()
+                      << " interior=" << g_cluster2Points.size() << std::endl;
     }
 
     auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
@@ -616,12 +647,26 @@ static void computeUnifiedMetrics() {
     registrationHandle.compSource   = std::move(src_pts);
     registrationHandle.compTarget   = std::move(tgt_pts);
 
-    std::cout << std::defaultfloat << std::setprecision(6);
-    std::cout << "[UnifiedMetrics T->S] Target: " << targetCloud->size()
-              << "  Matched: " << registrationHandle.compCount
-              << "  RMSE: " << registrationHandle.compRmse
-              << "  AvgErr: " << registrationHandle.compAvgError
-              << "  MaxErr: " << registrationHandle.compMaxError << std::endl;
+    if (!g_quietMetrics) {
+        std::cout << std::defaultfloat << std::setprecision(6);
+        std::cout << "[UnifiedMetrics T->S] Target: " << targetCloud->size()
+                  << "  Matched: " << registrationHandle.compCount
+                  << "  RMSE: " << registrationHandle.compRmse
+                  << "  AvgErr: " << registrationHandle.compAvgError
+                  << "  MaxErr: " << registrationHandle.compMaxError << std::endl;
+    }
+}
+
+static void startNewSession() {
+    g_sessionId++;
+    g_sessionBipopN  = 0;
+    g_sessionRefineN = 0;
+    g_bestSessionCompRmse = FLT_MAX;
+    g_bestSessionVertices.clear();
+    g_bestSessionNormals.clear();
+    g_currentOrientRunCount = 0;
+    g_stepStartTime = std::chrono::steady_clock::now();
+    std::cout << "[Session] New session #" << g_sessionId << std::endl;
 }
 
 static void poseSaveToLibrary() {
@@ -629,18 +674,49 @@ static void poseSaveToLibrary() {
         std::cout << "[PoseLibrary] No registration to save" << std::endl;
         return;
     }
+
+    float elapsedSec = std::chrono::duration<float>(
+                           std::chrono::steady_clock::now() - g_stepStartTime).count();
+
+    float currentRmse = registrationHandle.compRmse;
+    auto organs = getOrganList();
+
     PoseEntry::Method method;
-    if (gUIManager.state.regMethod == 0) method = PoseEntry::FULL_AUTO;
-    else if (gUIManager.state.regMethod == 1) method = PoseEntry::HEMI_AUTO;
-    else method = PoseEntry::UMEYAMA;
+    int rm = gUIManager.state.regMethod;
+    if      (rm == 0) method = PoseEntry::FULL_AUTO;
+    else if (rm == 1) method = PoseEntry::HEMI_AUTO;
+    else if (rm == 2) method = PoseEntry::UMEYAMA;
+    else if (rm == 3) method = PoseEntry::BIPOP_CMAES;
+    else              method = PoseEntry::HEMI_AUTO;
 
-    g_currentOrientRunCount++;
+    if (registrationHandle.refineCount > 0 &&
+        registrationHandle.refineCount > g_sessionRefineN) {
+        method = PoseEntry::REFINE;
+        g_sessionRefineN = registrationHandle.refineCount;
+    }
 
-    {
+    if (currentRmse <= g_bestSessionCompRmse) {
+        g_currentOrientRunCount++;
+        if (currentRmse < g_bestSessionCompRmse) {
+            g_bestSessionCompRmse = currentRmse;
+            g_bestSessionVertices.resize(organs.size());
+            g_bestSessionNormals.resize(organs.size());
+            for (size_t i = 0; i < organs.size(); i++) {
+                g_bestSessionVertices[i] = organs[i]->mVertices;
+                g_bestSessionNormals[i]  = organs[i]->mNormals;
+            }
+            std::cout << "[Session] New best CompRMSE: " << currentRmse << std::endl;
+        } else {
+            std::cout << "[Session] Same CompRMSE: " << currentRmse << " (converging)" << std::endl;
+        }
+
         auto T = computeCurrentTransform();
         g_poseLibrary.saveCurrentToLibrary(
             method,
+            g_sessionId,
+            g_sessionBipopN,
             registrationHandle.refineCount,
+            elapsedSec,
             registrationHandle.fitness,
             registrationHandle.icpRmse,
             registrationHandle.averageError,
@@ -659,6 +735,25 @@ static void poseSaveToLibrary() {
             T,
             g_currentOrientLabel,
             g_currentOrientRunCount);
+
+    } else {
+        std::cout << "[Session] CompRMSE degraded: "
+                  << currentRmse << " > best " << g_bestSessionCompRmse
+                  << " -> reverting" << std::endl;
+
+        if (!g_bestSessionVertices.empty() &&
+            g_bestSessionVertices.size() == organs.size()) {
+            for (size_t i = 0; i < organs.size(); i++) {
+                organs[i]->mVertices = g_bestSessionVertices[i];
+                organs[i]->mNormals  = g_bestSessionNormals[i];
+                setUp(*organs[i]);
+            }
+            registrationHandle.state = RegistrationData::REGISTERED;
+            registrationHandle.useRegistration = true;
+            computeUnifiedMetrics();
+            std::cout << "[Session] Reverted. CompRMSE restored: "
+                      << registrationHandle.compRmse << std::endl;
+        }
     }
 }
 
@@ -691,8 +786,12 @@ static void poseApplyEntry(int entryId) {
                     gUIManager.state.regMethod = 0;
                 else if (e.baseMethod == PoseEntry::HEMI_AUTO)
                     gUIManager.state.regMethod = 1;
-                else
+                else if (e.baseMethod == PoseEntry::UMEYAMA)
                     gUIManager.state.regMethod = 2;
+                else if (e.baseMethod == PoseEntry::BIPOP_CMAES)
+                    gUIManager.state.regMethod = 3;
+                else
+                    gUIManager.state.regMethod = 1;
                 break;
             }
         }
@@ -721,34 +820,34 @@ static void poseUndo() {
 static void drawPoseLibraryWindow() {
     if (!g_poseLibrary.showWindow) return;
 
-    ImGui::SetNextWindowSize(ImVec2(560, 400), ImGuiCond_FirstUseEver);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.08f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.12f, 0.10f, 0.18f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.20f, 0.15f, 0.30f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(640, 420), ImGuiCond_FirstUseEver);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,      ImVec4(0.06f,0.06f,0.08f,0.95f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,       ImVec4(0.12f,0.10f,0.18f,1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.20f,0.15f,0.30f,1.0f));
 
     if (ImGui::Begin("Pose Library", &g_poseLibrary.showWindow)) {
-        static bool s_importGuard = false;
-        ImGui::Text("Entries: %d / %d", (int)g_poseLibrary.entries.size(), g_poseLibrary.maxEntries);
+        ImGui::Text("Entries: %d / %d  |  Session #%d",
+                    (int)g_poseLibrary.entries.size(), g_poseLibrary.maxEntries, g_sessionId);
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 248);
-        if (ImGui::Button("Import CSV", ImVec2(120, 0)) && !s_importGuard) {
-            s_importGuard = true;
+        {
+            static bool s_importGuard = false;
+            if (ImGui::Button("Import CSV", ImVec2(120,0)) && !s_importGuard) {
+                s_importGuard = true;
 #ifdef HAS_TINYFILEDIALOGS
-            const char* filters[] = {"*.csv"};
-            const char* selected = tinyfd_openFileDialog(
-                "Import Pose Library CSV", "", 1, filters, "CSV Files (*.csv)", 0);
-            if (selected)
-                g_poseLibrary.importFromCsv(std::string(selected));
+                const char* filters[] = {"*.csv"};
+                const char* sel = tinyfd_openFileDialog(
+                    "Import Pose Library CSV","",1,filters,"CSV Files (*.csv)",0);
+                if (sel) g_poseLibrary.importFromCsv(std::string(sel));
 #else
-            std::cerr << "[PoseLibrary] Build with -DHAS_TINYFILEDIALOGS for file picker." << std::endl;
+                std::cerr << "[PoseLibrary] Build with -DHAS_TINYFILEDIALOGS for file picker." << std::endl;
 #endif
-        } else {
-            s_importGuard = false;
+            } else { s_importGuard = false; }
         }
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
-        if (ImGui::Button("Export CSV", ImVec2(120, 0))) {
+        if (ImGui::Button("Export CSV", ImVec2(120,0))) {
             auto now = std::chrono::system_clock::now();
-            auto tt = std::chrono::system_clock::to_time_t(now);
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto tt  = std::chrono::system_clock::to_time_t(now);
+            auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
                           now.time_since_epoch()) % 1000;
             std::tm tm = *std::localtime(&tt);
             char buf[64];
@@ -759,130 +858,145 @@ static void drawPoseLibraryWindow() {
         }
         ImGui::Separator();
 
-        // Header
-        ImGui::Columns(8, "pose_cols", true);
+        // # | Session | Method | BIPOP | Refine | CompRMSE | N | Time | [Apply]
+        ImGui::Columns(9, "pose_cols", true);
         ImGui::SetColumnWidth(0, 26);
-        ImGui::SetColumnWidth(1, 80);
-        ImGui::SetColumnWidth(2, 80);
-        ImGui::SetColumnWidth(3, 36);
-        ImGui::SetColumnWidth(4, 80);
-        ImGui::SetColumnWidth(5, 50);
-        ImGui::SetColumnWidth(6, 42);
-        ImGui::SetColumnWidth(7, 34);
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "#");          ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Method");     ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Orient/Run"); ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Ref");        ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Comp RMSE");  ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "N");          ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");           ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "");           ImGui::NextColumn();
+        ImGui::SetColumnWidth(1, 76);
+        ImGui::SetColumnWidth(2, 66);
+        ImGui::SetColumnWidth(3, 42);
+        ImGui::SetColumnWidth(4, 42);
+        ImGui::SetColumnWidth(5, 76);
+        ImGui::SetColumnWidth(6, 44);
+        ImGui::SetColumnWidth(7, 44);
+        ImGui::SetColumnWidth(8, 46);
+
+        auto hc = ImVec4(0.7f,0.7f,0.7f,1);
+        ImGui::TextColored(hc, "#");        ImGui::NextColumn();
+        ImGui::TextColored(hc, "Session");  ImGui::NextColumn();
+        ImGui::TextColored(hc, "Method");   ImGui::NextColumn();
+        ImGui::TextColored(hc, "BIPOP");    ImGui::NextColumn();
+        ImGui::TextColored(hc, "Refine");   ImGui::NextColumn();
+        ImGui::TextColored(hc, "CompRMSE"); ImGui::NextColumn();
+        ImGui::TextColored(hc, "N");        ImGui::NextColumn();
+        ImGui::TextColored(hc, "Time");     ImGui::NextColumn();
+        ImGui::TextColored(hc, "");         ImGui::NextColumn();
         ImGui::Separator();
 
-        int deleteId = -1;
-        int applyId  = -1;
+        int applyId = -1;
+        int prevSessionId = -1;
 
         for (size_t i = 0; i < g_poseLibrary.entries.size(); i++) {
             auto& e = g_poseLibrary.entries[i];
             bool isActive = (e.id == g_poseLibrary.activeEntryId);
 
-            if (isActive) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.3f, 1.0f));
-            }
-
-            ImGui::Text("%d", (int)(i + 1)); ImGui::NextColumn();
-
-            // Method + tooltip for details
-            ImGui::Text("%s", e.methodStr());
-            if (ImGui::IsItemHovered()) {
-                ImGui::BeginTooltip();
-                ImGui::Text("ID: %d", e.id);
-                ImGui::Text("Time: %s", e.timestamp.c_str());
-                ImGui::Text("Orient: %s  Run #%d",
-                            e.initOrientation.c_str(), e.orientRunCount);
+            if (prevSessionId >= 0 && e.sessionId != prevSessionId) {
+                ImGui::Columns(1);
+                ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.3f,0.3f,0.5f,0.8f));
                 ImGui::Separator();
-                ImGui::TextColored(ImVec4(1.0f,1.0f,0.5f,1), "=== Unified (Liver visible vs Depth) ===");
-                ImGui::Text("Comp RMSE:  %.6f  (%d pairs)", e.compRmse, e.compCount);
-                ImGui::Text("Comp AvgErr: %.6f", e.compAvgError);
-                ImGui::Text("Comp MaxErr: %.6f", e.compMaxError);
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "--- Base Registration ---");
-                ImGui::Text("Fitness (ICP): %.6f", e.baseFitness);
-                ImGui::Text("ICP RMSE: %.6f", e.baseIcpRmse);
-                ImGui::Text("Corr. RMSE (sampled): %.6f", e.baseRmse);
-                ImGui::Text("Corr. AvgErr: %.6f", e.baseAvgError);
-                ImGui::Text("Corr. MaxErr: %.6f", e.baseMaxError);
-                ImGui::Text("Scale: %.4f", e.baseScale);
-                if (e.refineCount > 0) {
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "--- Refine ---");
-                    ImGui::Text("Refine Count: %d", e.refineCount);
-                    ImGui::Text("Refine Init RMSE (full): %.6f", e.refineInitialRMSE);
-                    ImGui::Text("Refine Best RMSE (full): %.6f", e.refineBestRMSE);
-                    ImGui::Text("Refine Best Iter: %d", e.refineBestIteration);
-                }
-                ImGui::EndTooltip();
+                ImGui::PopStyleColor();
+                ImGui::Columns(9, "pose_cols", true);
+                ImGui::SetColumnWidth(0, 26);
+                ImGui::SetColumnWidth(1, 76);
+                ImGui::SetColumnWidth(2, 66);
+                ImGui::SetColumnWidth(3, 42);
+                ImGui::SetColumnWidth(4, 42);
+                ImGui::SetColumnWidth(5, 76);
+                ImGui::SetColumnWidth(6, 44);
+                ImGui::SetColumnWidth(7, 44);
+                ImGui::SetColumnWidth(8, 46);
             }
+            prevSessionId = e.sessionId;
+
+            if (isActive) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f,1.0f,0.3f,1.0f));
+
+            ImGui::Text("%d", (int)(i+1)); ImGui::NextColumn();
+
+            ImGui::TextColored(ImVec4(0.55f,0.80f,1.0f,1.0f), "%s", e.sessionLabel().c_str());
             ImGui::NextColumn();
 
-            // Orient/Run column
             {
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%s #%d",
-                              e.initOrientation.c_str(), e.orientRunCount);
-                ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f), "%s", buf);
+                ImVec4 mc = ImVec4(0.85f,0.85f,0.85f,1);
+                if (e.baseMethod == PoseEntry::HEMI_AUTO)   mc = ImVec4(0.94f,0.56f,0.19f,1);
+                if (e.baseMethod == PoseEntry::BIPOP_CMAES) mc = ImVec4(0.94f,0.56f,0.19f,1);
+                if (e.baseMethod == PoseEntry::REFINE)      mc = ImVec4(0.13f,0.77f,0.37f,1);
+                if (e.baseMethod == PoseEntry::UMEYAMA)     mc = ImVec4(0.55f,0.80f,1.0f,1);
+                ImGui::TextColored(mc, "%s", e.methodStr());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    ImGui::Text("ID: %d  Session: %s", e.id, e.sessionLabel().c_str());
+                    ImGui::Text("Timestamp: %s", e.timestamp.c_str());
+                    ImGui::Text("Elapsed: %.3f s", e.elapsedSec);
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1,1,0.5f,1), "=== Unified Metrics ===");
+                    ImGui::Text("Comp RMSE:   %.6f  (%d pairs)", e.compRmse, e.compCount);
+                    ImGui::Text("Comp AvgErr: %.6f", e.compAvgError);
+                    ImGui::Text("Comp MaxErr: %.6f", e.compMaxError);
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "--- Base Registration ---");
+                    ImGui::Text("Fitness (ICP): %.6f", e.baseFitness);
+                    ImGui::Text("ICP RMSE:      %.6f", e.baseIcpRmse);
+                    ImGui::Text("Corr. RMSE:    %.6f", e.baseRmse);
+                    ImGui::Text("Corr. AvgErr:  %.6f", e.baseAvgError);
+                    ImGui::Text("Corr. MaxErr:  %.6f", e.baseMaxError);
+                    ImGui::Text("Scale:         %.4f", e.baseScale);
+                    if (e.refineCount > 0) {
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.13f,0.77f,0.37f,1), "--- Refine ---");
+                        ImGui::Text("Count:     %d",   e.refineCount);
+                        ImGui::Text("Init RMSE: %.6f", e.refineInitialRMSE);
+                        ImGui::Text("Best RMSE: %.6f", e.refineBestRMSE);
+                        ImGui::Text("Best Iter: %d",   e.refineBestIteration);
+                    }
+                    ImGui::EndTooltip();
+                }
             }
             ImGui::NextColumn();
 
-            // Refine column
-            if (e.refineCount > 0) {
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "x%d", e.refineCount);
-            } else {
-                ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "-");
-            }
+            if (e.bipopCount > 0)
+                ImGui::TextColored(ImVec4(0.94f,0.56f,0.19f,0.9f), "x%d", e.bipopCount);
+            else
+                ImGui::TextColored(ImVec4(0.3f,0.3f,0.3f,1), "---");
+            ImGui::NextColumn();
+
+            if (e.refineCount > 0)
+                ImGui::TextColored(ImVec4(0.13f,0.77f,0.37f,0.9f), "x%d", e.refineCount);
+            else
+                ImGui::TextColored(ImVec4(0.3f,0.3f,0.3f,1), "---");
             ImGui::NextColumn();
 
             ImGui::Text("%.4f", e.compRmse); ImGui::NextColumn();
-            ImGui::Text("%d", e.compCount);  ImGui::NextColumn();
+            ImGui::Text("%d",   e.compCount); ImGui::NextColumn();
 
-            ImGui::PushID(e.id);
-            if (ImGui::SmallButton("Apply")) {
-                applyId = e.id;
+            {
+                char tbuf[16];
+                if (e.elapsedSec < 100.0f)
+                    std::snprintf(tbuf, sizeof(tbuf), "%.1fs", e.elapsedSec);
+                else
+                    std::snprintf(tbuf, sizeof(tbuf), "%ds", (int)e.elapsedSec);
+                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1), "%s", tbuf);
             }
             ImGui::NextColumn();
-            if (ImGui::SmallButton("Del")) {
-                deleteId = e.id;
-            }
+
+            ImGui::PushID(e.id);
+            if (ImGui::SmallButton("Apply")) applyId = e.id;
             ImGui::PopID();
             ImGui::NextColumn();
 
-            if (isActive) {
-                ImGui::PopStyleColor();
-            }
+            if (isActive) ImGui::PopStyleColor();
         }
 
         ImGui::Columns(1);
 
-        if (applyId >= 0) {
-            poseApplyEntry(applyId);
-        }
-        if (deleteId >= 0) {
-            g_poseLibrary.deleteEntry(deleteId);
-        }
+        if (applyId >= 0) poseApplyEntry(applyId);
 
         ImGui::Separator();
         ImGui::Spacing();
 
-        // Bottom buttons
         float bw = (ImGui::GetContentRegionAvail().x - 8) / 2.0f;
         bool canUndo = g_poseLibrary.hasLastRegistration;
-
         if (!canUndo) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
-        if (ImGui::Button("Undo", ImVec2(bw, 28))) {
-            if (canUndo) poseUndo();
-        }
+        if (ImGui::Button("Undo", ImVec2(bw, 28))) { if (canUndo) poseUndo(); }
         if (!canUndo) ImGui::PopStyleVar();
-
         ImGui::SameLine();
         if (ImGui::Button("Clear All", ImVec2(bw, 28))) {
             g_poseLibrary.entries.clear();
@@ -1016,10 +1130,13 @@ void setupUICallbacks() {
     a.onHemiAuto = []() {
         if (currentMainMode != REGISTRATION_MODE) return;
         gUIManager.state.regMethod = 1;
+        g_stepStartTime  = std::chrono::steady_clock::now();
+        g_sessionBipopN  = 0;
+        g_sessionRefineN = 0;
         poseAutoSaveBeforeRegistration();
         resetRegistrationState();
 
-        static Reg3D::BVHTree bvh;
+        Reg3D::BVHTree bvh;
         bvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
         auto vis = Reg3DCustom::extractVisibleVerticesCustom(
             *liverMesh3D, bvh, OrbitCam.cameraPos, OrbitCam.cameraTarget);
@@ -1042,15 +1159,15 @@ void setupUICallbacks() {
     };
 
     a.onInitRotPresetChanged = [](int preset) {
+        startNewSession();
         registrationHandle.initRotPreset =
             (RegistrationData::InitRotPreset)preset;
         std::cout << "[InitRot] Preset selected: "
                   << RegistrationData::presetName(registrationHandle.initRotPreset)
                   << std::endl;
 
-        g_currentOrientLabel    = RegistrationData::presetName(
-            registrationHandle.initRotPreset);
-        g_currentOrientRunCount = 0;
+        g_currentOrientLabel = RegistrationData::presetName(registrationHandle.initRotPreset);
+        std::cout << "[Session] New session: " << g_currentOrientLabel << std::endl;
 
         auto organs = getOrganList();
         if (g_initOrganVertices.empty() ||
@@ -1082,7 +1199,7 @@ void setupUICallbacks() {
                 std::cerr << "[Refine] No visible vertex indices." << std::endl;
                 return;
             }
-            // Save before refine starts
+            g_stepStartTime = std::chrono::steady_clock::now();
             poseAutoSaveBeforeRegistration();
             std::cout << "\n=== Normal-Compatible Refinement START ===" << std::endl;
             std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
@@ -1135,6 +1252,106 @@ void setupUICallbacks() {
         }
     };
 
+    a.onBipopCmaes = []() {
+        if (currentMainMode != REGISTRATION_MODE) return;
+        if (registrationHandle.compRmse == 0.0f) {
+            std::cerr << "[UI] No registration yet. Run HemiAuto first." << std::endl;
+            return;
+        }
+        g_stepStartTime = std::chrono::steady_clock::now();
+        g_sessionBipopN++;
+        gUIManager.state.regMethod = 3;
+        std::cout << "\n=== BIPOP-CMA-ES Multi-Start (UI Button) ===" << std::endl;
+        poseAutoSaveBeforeRegistration();
+        auto organs = getOrganList();
+        computeUnifiedMetrics();
+        float rmse_before = registrationHandle.compRmse;
+        std::cout << "[Shift+V] Current compRMSE: " << rmse_before << std::endl;
+
+        std::vector<std::vector<GLfloat>> start_v(organs.size());
+        std::vector<std::vector<GLfloat>> start_n(organs.size());
+        for (size_t i = 0; i < organs.size(); i++) {
+            if (organs[i]) { start_v[i] = organs[i]->mVertices; start_n[i] = organs[i]->mNormals; }
+        }
+
+        float best_rmse = rmse_before;
+        std::vector<std::vector<GLfloat>> best_v = start_v;
+        std::vector<std::vector<GLfloat>> best_n = start_n;
+
+        const int N_STARTS = 10;
+        std::mt19937 rng(std::random_device{}());
+        std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+
+        for (int run = 0; run < N_STARTS; run++) {
+            for (size_t i = 0; i < organs.size(); i++) {
+                if (organs[i]) { organs[i]->mVertices = start_v[i]; organs[i]->mNormals = start_n[i]; setUp(*organs[i]); }
+            }
+
+            CmaesRefine::Params p;
+            p.verbose        = true;
+            p.log_every      = 100;
+            p.save_debug_jpg = false;
+
+            float tx_perturb = 0, ty_perturb = 0, tz_perturb = 0;
+            float rx_perturb = 0, ry_perturb = 0, rz_perturb = 0;
+            float sc_perturb = 1.0f;
+            std::string regime;
+
+            if (run % 2 == 0) {
+                p.sigma0 = 0.3 + dist01(rng) * 0.4;
+                tx_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
+                ty_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
+                tz_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
+                rx_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
+                ry_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
+                rz_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
+                sc_perturb = 0.95f + dist01(rng) * 0.10f;
+                regime = "Regime2(local)";
+            } else {
+                p.sigma0 = 0.5 + dist01(rng) * 0.5;
+                tx_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
+                ty_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
+                tz_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
+                rx_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
+                ry_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
+                rz_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
+                sc_perturb = 0.90f + dist01(rng) * 0.20f;
+                regime = "Regime1(global)";
+            }
+
+            if (run > 0) {
+                CmaesRefine::applyIncrementalSRT(organs, tx_perturb, ty_perturb, tz_perturb,
+                                                 rx_perturb, ry_perturb, rz_perturb, sc_perturb);
+                for (size_t i = 0; i < organs.size(); i++) if (organs[i]) setUp(*organs[i]);
+            }
+
+            std::cout << "[BIPOP] Run " << (run+1) << "/" << N_STARTS << "  " << regime
+                      << "  sigma0=" << std::fixed << std::setprecision(2) << p.sigma0 << std::endl;
+
+            CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
+                                                     gGridWidth, gGridHeight(), gDepthScale, p);
+            computeUnifiedMetrics();
+            float rmse_run = registrationHandle.compRmse;
+            std::cout << "[BIPOP] Run " << (run+1) << " compRMSE=" << std::setprecision(6) << rmse_run
+                      << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+
+            if (rmse_run < best_rmse) {
+                best_rmse = rmse_run;
+                for (size_t i = 0; i < organs.size(); i++) {
+                    if (organs[i]) { best_v[i] = organs[i]->mVertices; best_n[i] = organs[i]->mNormals; }
+                }
+            }
+        }
+
+        for (size_t i = 0; i < organs.size(); i++) {
+            if (organs[i]) { organs[i]->mVertices = best_v[i]; organs[i]->mNormals = best_n[i]; setUp(*organs[i]); }
+        }
+        computeUnifiedMetrics();
+        std::cout << "[BIPOP] Best: " << rmse_before << " -> " << best_rmse
+                  << (best_rmse < rmse_before ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+        poseSaveToLibrary();
+    };
+
     a.onStartUmeyama = []() {
         if (currentMainMode != REGISTRATION_MODE) return;
         gUIManager.state.regMethod = 2;
@@ -1177,6 +1394,7 @@ void setupUICallbacks() {
     };
 
     a.onResetRegistration = []() {
+        startNewSession();
         registrationHandle.resetTransformOnly();
         splitScreenMode = false;
         gUIManager.state.regMethod = -1;
@@ -1196,7 +1414,6 @@ void setupUICallbacks() {
         registrationHandle.initRotPreset = RegistrationData::PRESET_FRONT;
         gUIManager.state.initRotPreset   = 0;
         g_currentOrientLabel             = "Front";
-        g_currentOrientRunCount          = 0;
         std::cout << "[InitRot] Reset to Front" << std::endl;
     };
 
@@ -1285,6 +1502,10 @@ void setupUICallbacks() {
         deformHandlPlace.reset();
         if (multiBody) { multiBody->fullReset(); multiBody->setRigidMode(true); multiBody->initPhysics(); }
         deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
+    };
+
+    a.onHandleRadiusChanged = [](float r) {
+        gGroupRadius = r;
     };
 
     a.onSaveAR = []() { saveARimage = true; };
@@ -1486,6 +1707,7 @@ void syncUIState() {
     }
     s.handleGroups = multiBody ? (int)multiBody->handleGroups.size() : 0;
     s.maxHandleGroups = SoftBody::MAX_HANDLE_GROUPS;
+    s.handleRadius = gGroupRadius;
 
     for (int i = 0; i < 6; i++)
         s.organs[i].alpha = meshAlphaValues[i];
@@ -1863,14 +2085,12 @@ int main()
 
             if (deformHandlPlace.state != DeformHandlPlaceData::PLANECUT_MODE)
                 for (size_t g = 0; g < multiBody->handleGroups.size(); g++) {
-                    auto positions = multiBody->getHandleGroupPositions(g);
+                    glm::vec3 center = multiBody->handleGroups[g].centerPosition;
+                    float radius = multiBody->handleGroups[g].radius;
+                    glm::vec3 worldPos = glm::vec3(model * glm::vec4(center, 1.0f));
                     glm::vec3 color = getPointColor(g, true);
-
-                    for (const auto& pos : positions) {
-                        glm::vec3 worldPos = glm::vec3(model * glm::vec4(pos, 1.0f));
-                        deformSphereMarker.draw(shaderProgram, worldPos, color, 0.2f,
-                                                view, projection, OrbitCam.cameraPos);
-                    }
+                    deformSphereMarker.draw(shaderProgram, worldPos, color, radius,
+                                            view, projection, OrbitCam.cameraPos);
                 }
 
             shaderProgram.use();
@@ -2377,7 +2597,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                     std::cout << ">>> Selecting handle point #" << (expectedIndex + 1)
                               << "/" << SoftBody::MAX_HANDLE_GROUPS << std::endl;
 
-                    gGrabber->placeSphere(xpos, ypos, 1.0f);
+                    gGrabber->placeSphere(xpos, ypos, gGroupRadius);
 
                     if (hit_index >= 0) {
                         deformHandlPlace.softbodyPoints.push_back(hit_position);
@@ -2911,19 +3131,94 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
         break;
 
     case GLFW_KEY_O:
-        if(currentMainMode == REGISTRATION_MODE) {
+        if (currentMainMode == REGISTRATION_MODE && (mode & GLFW_MOD_SHIFT)) {
+            /* Shift+O: depth scale grid search + HemiAuto */
+            std::cout << "\n=== Depth Scale Grid Search + HemiAuto (Shift+O) ===" << std::endl;
+            poseAutoSaveBeforeRegistration();
+
+            auto organs = getOrganList();
+            if (g_initOrganVertices.empty() || g_initOrganVertices.size() != organs.size()) {
+                std::cerr << "[Shift+O] No initial pose available." << std::endl;
+                break;
+            }
+
+            const float scales[] = { 0.15f, 0.20f, 0.25f, 0.30f, 0.35f, 0.40f, 0.50f };
+            const int   nScales  = (int)(sizeof(scales) / sizeof(scales[0]));
+
+            float bestScale = gDepthScale;
+            float bestRmse  = FLT_MAX;
+            std::vector<std::vector<GLfloat>> bestVerts(organs.size());
+            std::vector<std::vector<GLfloat>> bestNorms(organs.size());
+
+            for (int si = 0; si < nScales; si++) {
+                float ds = scales[si];
+
+                for (size_t i = 0; i < organs.size(); i++) {
+                    organs[i]->mVertices = g_initOrganVertices[i];
+                    organs[i]->mNormals  = g_initOrganNormals[i];
+                    setUp(*organs[i]);
+                }
+                regenerateDepthMesh(screenMesh, ds, gMeshScale);
+                resetRegistrationState();
+
+                Reg3D::BVHTree bvh;
+                bvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
+                auto vis = Reg3DCustom::extractVisibleVerticesCustom(
+                    *liverMesh3D, bvh, OrbitCam.cameraPos, OrbitCam.cameraTarget);
+                if (vis.cloud->size() < 50) {
+                    std::cout << "[Shift+O] scale=" << ds << "  skip (few points)" << std::endl;
+                    continue;
+                }
+                g_cluster1Points      = vis.points;
+                g_cluster2Points.clear();
+                g_refineVertexIndices = vis.vertexIndices;
+                computeIdealVoxelSizes();
+                Reg3DCustom::performRegistrationSingleMesh(
+                    organs, liverMesh3D, vis.vertexIndices,
+                    screenMesh, OrbitCam.cameraPos,
+                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, ds, g_voxelSize);
+                computeUnifiedMetrics();
+                float rmse = registrationHandle.compRmse;
+                std::cout << "[Shift+O] scale=" << ds << "  compRMSE=" << rmse << std::endl;
+
+                if (rmse < bestRmse) {
+                    bestRmse  = rmse;
+                    bestScale = ds;
+                    for (size_t i = 0; i < organs.size(); i++) {
+                        bestVerts[i] = organs[i]->mVertices;
+                        bestNorms[i] = organs[i]->mNormals;
+                    }
+                }
+            }
+
+            gDepthScale = bestScale;
+            regenerateDepthMesh(screenMesh, bestScale, gMeshScale);
+            for (size_t i = 0; i < organs.size(); i++) {
+                organs[i]->mVertices = bestVerts[i];
+                organs[i]->mNormals  = bestNorms[i];
+                setUp(*organs[i]);
+            }
+            computeUnifiedMetrics();
+            std::cout << "[Shift+O] Best: scale=" << bestScale
+                      << "  compRMSE=" << bestRmse << std::endl;
+
+            g_bestSessionCompRmse = FLT_MAX;
+            g_bestSessionVertices.clear();
+            g_bestSessionNormals.clear();
+            registrationHandle.state = RegistrationData::REGISTERED;
+            registrationHandle.useRegistration = true;
+            poseSaveToLibrary();
+
+        } else if (currentMainMode == REGISTRATION_MODE) {
+            /* Key O: camera view registration */
             std::cout << "\n============================================" << std::endl;
             std::cout << "  Camera View-Based Registration (Custom)" << std::endl;
             std::cout << "============================================\n" << std::endl;
 
             resetRegistrationState();
 
-            std::cout << "Step 1: Building BVH..." << std::endl;
-            static Reg3D::BVHTree cameraBvhTree;
+            Reg3D::BVHTree cameraBvhTree;
             cameraBvhTree.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-            std::cout << "  BVH nodes: " << cameraBvhTree.nodes.size() << std::endl;
-
-            std::cout << "\nStep 2: Extracting visible vertices from camera view..." << std::endl;
 
             auto visibility = Reg3DCustom::extractVisibleVerticesCustom(
                 *liverMesh3D, cameraBvhTree,
@@ -2938,8 +3233,6 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
             g_cluster1Points = visibility.points;
             g_cluster2Points.clear();
             g_refineVertexIndices = visibility.vertexIndices;
-
-            std::cout << "\nStep 3: Starting iterative registration..." << std::endl;
 
             std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D, tumorMesh3D, segmentMesh3D, gbMesh3D};
 
@@ -3064,7 +3357,7 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
 
             resetRegistrationState();
 
-            static Reg3D::BVHTree convergenceBvhTree;
+            Reg3D::BVHTree convergenceBvhTree;
             convergenceBvhTree.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
 
             Reg3D::RaycastClusterer clusterer(convergenceBvhTree);
@@ -3111,7 +3404,7 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
             poseAutoSaveBeforeRegistration();
             resetRegistrationState();
 
-            static Reg3D::BVHTree msFgrBvh;
+            Reg3D::BVHTree msFgrBvh;
             msFgrBvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
 
             Reg3D::RaycastClusterer clusterer(msFgrBvh);
@@ -3275,9 +3568,143 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
         break;
 
     case GLFW_KEY_V:
-        g_showClusterVisualization = !g_showClusterVisualization;
-        std::cout << "Cluster visualization: "
-                  << (g_showClusterVisualization ? "ON" : "OFF") << std::endl;
+        if (currentMainMode == REGISTRATION_MODE && (mode & GLFW_MOD_SHIFT)) {
+            std::cout << "\n=== BIPOP-CMA-ES Multi-Start (Shift+V) ===" << std::endl;
+            if (registrationHandle.compRmse == 0.0f) {
+                std::cerr << "[Shift+V] No registration yet. Run HemiAuto first." << std::endl;
+                break;
+            }
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUIManager.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            auto organs = getOrganList();
+            computeUnifiedMetrics();
+            float rmse_before = registrationHandle.compRmse;
+            std::cout << "[Shift+V] Current compRMSE: " << rmse_before << std::endl;
+
+            /* 現在の頂点をスナップショット */
+            std::vector<std::vector<GLfloat>> start_v(organs.size());
+            std::vector<std::vector<GLfloat>> start_n(organs.size());
+            for (size_t i = 0; i < organs.size(); i++) {
+                if (organs[i]) {
+                    start_v[i] = organs[i]->mVertices;
+                    start_n[i] = organs[i]->mNormals;
+                }
+            }
+
+            float best_rmse = rmse_before;
+            std::vector<std::vector<GLfloat>> best_v = start_v;
+            std::vector<std::vector<GLfloat>> best_n = start_n;
+
+            const int N_STARTS = 10;
+            std::mt19937 rng(std::random_device{}());
+            std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+
+            for (int run = 0; run < N_STARTS; run++) {
+                /* 毎回start_vに戻す */
+                for (size_t i = 0; i < organs.size(); i++) {
+                    if (organs[i]) {
+                        organs[i]->mVertices = start_v[i];
+                        organs[i]->mNormals  = start_n[i];
+                        setUp(*organs[i]);
+                    }
+                }
+
+                CmaesRefine::Params p;
+                p.verbose        = true;
+                p.log_every      = 100;
+                p.save_debug_jpg = false;
+                p.maxgen         = 300;
+                p.tx_range = 1.0f; p.ty_range = 1.0f; p.tz_range = 1.0f;
+                p.rx_range = 20.0f; p.ry_range = 20.0f; p.rz_range = 20.0f;
+                p.scale_lo = 0.85f; p.scale_hi = 1.15f;
+
+                float tx_perturb = 0.0f, ty_perturb = 0.0f, tz_perturb = 0.0f;
+                float rx_perturb = 0.0f, ry_perturb = 0.0f, rz_perturb = 0.0f;
+                float sc_perturb = 1.0f;
+                std::string regime;
+
+                if (run == 0) {
+                    /* Run 0: 摂動なし・sigma0小（精密ベースライン） */
+                    p.sigma0 = 0.2;
+                    regime = "Baseline";
+                } else if (run <= 4) {
+                    /* Run 1-4: Regime 2（小sigma0・小摂動・局所探索） */
+                    p.sigma0 = 0.05f + dist01(rng) * 0.25f; /* 0.05〜0.30 */
+                    tx_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
+                    ty_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
+                    tz_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
+                    rx_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
+                    ry_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
+                    rz_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
+                    sc_perturb = 0.95f + dist01(rng) * 0.10f; /* 0.95〜1.05 */
+                    regime = "Regime2(local)";
+                } else {
+                    /* Run 5-9: Regime 1（大sigma0・大摂動・広域探索） */
+                    p.sigma0 = 0.30f + dist01(rng) * 0.50f; /* 0.30〜0.80 */
+                    tx_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
+                    ty_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
+                    tz_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
+                    rx_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
+                    ry_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
+                    rz_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
+                    sc_perturb = 0.90f + dist01(rng) * 0.20f; /* 0.90〜1.10 */
+                    regime = "Regime1(global)";
+                }
+
+                /* 初期摂動を適用 */
+                if (run > 0) {
+                    CmaesRefine::applyIncrementalSRT(organs,
+                                                     tx_perturb, ty_perturb, tz_perturb,
+                                                     rx_perturb, ry_perturb, rz_perturb,
+                                                     sc_perturb);
+                    for (size_t i = 0; i < organs.size(); i++)
+                        if (organs[i]) setUp(*organs[i]);
+                }
+
+                std::cout << "[Shift+V] Run " << (run+1) << "/" << N_STARTS
+                          << "  " << regime
+                          << "  sigma0=" << std::fixed << std::setprecision(2) << p.sigma0
+                          << std::endl;
+
+                CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
+                                                         gGridWidth, gGridHeight(), gDepthScale, p);
+                computeUnifiedMetrics();
+                float rmse_run = registrationHandle.compRmse;
+                std::cout << "[Shift+V] Run " << (run+1)
+                          << " compRMSE=" << std::setprecision(6) << rmse_run
+                          << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+
+                if (rmse_run < best_rmse) {
+                    best_rmse = rmse_run;
+                    for (size_t i = 0; i < organs.size(); i++) {
+                        if (organs[i]) {
+                            best_v[i] = organs[i]->mVertices;
+                            best_n[i] = organs[i]->mNormals;
+                        }
+                    }
+                }
+            }
+
+            /* ベスト姿勢を適用 */
+            for (size_t i = 0; i < organs.size(); i++) {
+                if (organs[i]) {
+                    organs[i]->mVertices = best_v[i];
+                    organs[i]->mNormals  = best_n[i];
+                    setUp(*organs[i]);
+                }
+            }
+            computeUnifiedMetrics();
+            std::cout << "[Shift+V] Best: " << rmse_before
+                      << " -> " << best_rmse
+                      << (best_rmse < rmse_before ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+            poseSaveToLibrary();
+        } else {
+            g_showClusterVisualization = !g_showClusterVisualization;
+            std::cout << "Cluster visualization: "
+                      << (g_showClusterVisualization ? "ON" : "OFF") << std::endl;
+        }
         break;
 
     case GLFW_KEY_G:
@@ -3457,6 +3884,89 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
         break;
 
     case GLFW_KEY_C:
+        if(currentMainMode == REGISTRATION_MODE){
+            if (mode & GLFW_MOD_SHIFT) {
+                /* Shift+C = CMA-ES only（現在の姿勢からそのまま精密化） */
+                std::cout << "\n=== CMA-ES Only (Shift+C) ===" << std::endl;
+                if (registrationHandle.compRmse == 0.0f) {
+                    std::cerr << "[Shift+C] No registration yet. Run HemiAuto first." << std::endl;
+                    break;
+                }
+                poseAutoSaveBeforeRegistration();
+                auto organs = getOrganList();
+                computeUnifiedMetrics();
+                float rmse_before = registrationHandle.compRmse;
+                std::cout << "[Shift+C] Current compRMSE: " << rmse_before << std::endl;
+
+                CmaesRefine::Params p;
+                p.verbose   = true;
+                p.log_every = 30;
+                p.save_debug_jpg = false;
+                p.tx_range = 1.0f;
+                p.ty_range = 1.0f;
+                p.tz_range = 1.0f;
+                p.rx_range = 20.0f;
+                p.ry_range = 20.0f;
+                p.rz_range = 20.0f;
+                p.scale_lo = 0.85f;
+                p.scale_hi = 1.15f;
+                CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
+                                                         gGridWidth, gGridHeight(), gDepthScale, p);
+                computeUnifiedMetrics();
+                std::cout << "[Shift+C] Result: " << rmse_before
+                          << " -> " << registrationHandle.compRmse
+                          << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+                poseSaveToLibrary();
+            } else {
+                /* Key C = HemiAuto + CMA-ES */
+                std::cout << "\n=== HemiAuto + CMA-ES Mode (Key C) ===" << std::endl;
+                gUIManager.state.regMethod = 1;
+                poseAutoSaveBeforeRegistration();
+                resetRegistrationState();
+
+                Reg3D::BVHTree bvhC;
+                bvhC.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
+                auto visC = Reg3DCustom::extractVisibleVerticesCustom(
+                    *liverMesh3D, bvhC, OrbitCam.cameraPos, OrbitCam.cameraTarget);
+                if (visC.cloud->size() < 50) {
+                    std::cerr << "[Key C] Not enough visible points" << std::endl;
+                    break;
+                }
+                g_cluster1Points = visC.points;
+                g_cluster2Points.clear();
+                g_refineVertexIndices = visC.vertexIndices;
+                computeIdealVoxelSizes();
+                {
+                    auto organs = getOrganList();
+                    Reg3DCustom::performRegistrationSingleMesh(
+                        organs, liverMesh3D, visC.vertexIndices,
+                        screenMesh, OrbitCam.cameraPos,
+                        gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
+                    computeUnifiedMetrics();
+                    float rmse_before = registrationHandle.compRmse;
+                    std::cout << "[Key C] HemiAuto compRMSE: " << rmse_before << std::endl;
+
+                    CmaesRefine::Params p;
+                    p.verbose   = true;
+                    p.log_every = 30;
+                    p.tx_range = 1.0f;
+                    p.ty_range = 1.0f;
+                    p.tz_range = 1.0f;
+                    p.rx_range = 20.0f;
+                    p.ry_range = 20.0f;
+                    p.rz_range = 20.0f;
+                    p.scale_lo = 0.85f;
+                    p.scale_hi = 1.15f;
+                    CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
+                                                             gGridWidth, gGridHeight(), gDepthScale, p);
+                    computeUnifiedMetrics();
+                    std::cout << "[Key C] Result: " << rmse_before
+                              << " -> " << registrationHandle.compRmse
+                              << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+                    poseSaveToLibrary();
+                }
+            }
+        }
         if(currentMainMode == DEFORM_MODE){
             deformHandlPlace.reset();
             if (multiBody) {
@@ -3508,8 +4018,78 @@ void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
         }
         break;
 
+    case GLFW_KEY_E:
+        if(currentMainMode == REGISTRATION_MODE){
+            bool shiftHeld = (mode & GLFW_MOD_SHIFT) != 0;
+            if (shiftHeld) {
+                std::cout << "\n=== HemiAuto + 2D Silhouette CMA-ES (Shift+E) ===" << std::endl;
+            } else {
+                std::cout << "\n=== HemiAuto + Boundary-Weighted CMA-ES (Key E) ===" << std::endl;
+            }
+            gUIManager.state.regMethod = 1;
+            poseAutoSaveBeforeRegistration();
+            resetRegistrationState();
+
+            Reg3D::BVHTree bvhE;
+            bvhE.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
+            auto visE = Reg3DCustom::extractVisibleVerticesCustom(
+                *liverMesh3D, bvhE, OrbitCam.cameraPos, OrbitCam.cameraTarget);
+            if (visE.cloud->size() < 50) {
+                std::cerr << "[Key E] Not enough visible points" << std::endl;
+                break;
+            }
+            g_cluster1Points = visE.points;
+            g_cluster2Points.clear();
+            g_refineVertexIndices = visE.vertexIndices;
+            computeIdealVoxelSizes();
+            {
+                auto organs = getOrganList();
+                Reg3DCustom::performRegistrationSingleMesh(
+                    organs, liverMesh3D, visE.vertexIndices,
+                    screenMesh, OrbitCam.cameraPos,
+                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
+                computeUnifiedMetrics();
+                float rmse_before = registrationHandle.compRmse;
+
+                CmaesRefine::Params p;
+                p.verbose     = true;
+                p.log_every   = 30;
+                /* 広範囲探索パラメータ */
+                p.tx_range = 1.0f;
+                p.ty_range = 1.0f;
+                p.tz_range = 1.0f;
+                p.rx_range = 20.0f;
+                p.ry_range = 20.0f;
+                p.rz_range = 20.0f;
+                p.scale_lo = 0.85f;
+                p.scale_hi = 1.15f;
+                if (shiftHeld) {
+                    p.use_silhouette_2d = true;
+                    p.alpha_silhouette  = 1.0f;
+                    p.alpha_3d          = 0.3f;
+                    p.silhouette_step   = 4;
+                    std::cout << "[Shift+E] HemiAuto compRMSE: " << rmse_before << std::endl;
+                } else {
+                    p.use_boundary_weight = true;
+                    p.boundary_width      = 12.0f;
+                    p.boundary_boost      = 3.0f;
+                    std::cout << "[Key E] HemiAuto compRMSE: " << rmse_before << std::endl;
+                }
+                CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
+                                                         gGridWidth, gGridHeight(), gDepthScale, p);
+                computeUnifiedMetrics();
+                std::string label = shiftHeld ? "[Shift+E]" : "[Key E]";
+                std::cout << label << " Result: " << rmse_before
+                          << " -> " << registrationHandle.compRmse
+                          << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+                poseSaveToLibrary();
+            }
+        }
+        break;
+
     }
 }
+
 
 void glfw_OnFramebufferSize(GLFWwindow* window, int width, int height)
 {
@@ -3544,9 +4124,10 @@ void showFPS(GLFWwindow* window)
         double aspectRatio = (double)gWindowWidth / (double)gWindowHeight;
 
         std::ostringstream outs;
-        outs.precision(2);
+        outs.precision(3);
         outs << std::fixed
-
+             << "FPS: " << fps << "    "
+             << "Frame Time: " << msPerFrame << " (ms)    "
              << "Window: " << gWindowWidth << "x" << gWindowHeight << "    "
              << "Aspect: " << aspectWidth << ":" << aspectHeight
              << " (" << aspectRatio << ")";

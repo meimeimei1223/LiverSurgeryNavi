@@ -17,4 +17,10 @@ Copyright (c) 2026 MEIDAI KASAI MD
 
 4. Third-Party Libraries:
    This project includes third-party libraries under their own licenses
-   (MIT, BSD, MPL2, zlib). See third_party/ and win_deps/ directories.
+   (MIT, BSD, MPL2, zlib, Apache-2.0). See third_party/ and win_deps/ directories.
+
+   c-cmaes (third_party/c-cmaes/):
+     Copyright (C) 1996, 2003-2010 Nikolaus Hansen
+     Licensed under Apache License 2.0 or GNU LGPL 2.1+
+     This project uses it under Apache License 2.0
+     Source: https://github.com/CMA-ES/c-cmaes

@@ -1088,15 +1088,10 @@ void SoftBody::reapplyHandleConstraints() {
 
 int SoftBody::findHandleGroupAtPosition(const glm::vec3& position, float threshold) {
     for (size_t g = 0; g < handleGroups.size(); g++) {
-        for (int vertIdx : handleGroups[g].vertices) {
-            glm::vec3 vertPos(positions[vertIdx * 3],
-                              positions[vertIdx * 3 + 1],
-                              positions[vertIdx * 3 + 2]);
-            float dist = glm::length(position - vertPos);
-
-            if (dist <= threshold) {
-                return g;
-            }
+        handleGroups[g].updateCenterPosition(positions);
+        float dist = glm::length(position - handleGroups[g].centerPosition);
+        if (dist <= threshold) {
+            return static_cast<int>(g);
         }
     }
     return -1;

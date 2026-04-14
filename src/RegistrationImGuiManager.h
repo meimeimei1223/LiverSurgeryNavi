@@ -16,6 +16,7 @@ struct RegUIActions {
     std::function<void()> onUndoSegPoint;
     std::function<void(float)> onDepthScaleChanged;
     std::function<void()> onFullAuto;
+    std::function<void()> onBipopCmaes;
     std::function<void()> onHemiAuto;
     std::function<void(float)> onHemiVoxelChanged;
     std::function<void()> onStartUmeyama;
@@ -29,6 +30,7 @@ struct RegUIActions {
     std::function<void()> onHandlePlaceMode;
     std::function<void()> onDeformMode;
     std::function<void()> onFullReset;
+    std::function<void(float)> onHandleRadiusChanged;
     std::function<void()> onStartFromDepth;
     std::function<void()> onSaveAR;
     std::function<void(int)> onToggleOrgan;
@@ -73,6 +75,7 @@ struct RegUIState {
 
     int deformState = 0;
     int handleGroups = 0, maxHandleGroups = 4;
+    float handleRadius = 0.5f;
 
     struct OrganInfo { const char* name; float alpha; ImVec4 color; };
     OrganInfo organs[6] = {
@@ -639,9 +642,9 @@ private:
     }
 
     void drawInitOrientationPanel() {
-        float childH = 4.0f + ImGui::GetFontSize() + 4.0f  // title row
-                       + 3.0f * (22.0f + 4.0f)               // 3 button rows
-                       + 8.0f;                                // bottom spacing
+        float childH = 4.0f + ImGui::GetFontSize() + 4.0f
+                       + 3.0f * (22.0f + 4.0f)
+                       + 8.0f;
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.06f, 0.10f, 0.5f));
         ImGui::BeginChild("##initOrient", ImVec2(-1, childH), false);
@@ -668,13 +671,10 @@ private:
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
                 if (col > 0) ImGui::SameLine(0, 4);
-
                 int pid    = grid[row][col].id;
                 bool isSel = (state.initRotPreset == pid);
-
                 ImGui::PushID(pid + 200);
                 ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-
                 if (isSel) {
                     ImGui::PushStyleColor(ImGuiCol_Button,
                                           ImVec4(colActive.x*0.25f, colActive.y*0.25f, colActive.z*0.25f, 1));
@@ -693,13 +693,11 @@ private:
                     ImGui::PushStyleColor(ImGuiCol_Text,
                                           ImVec4(0.55f, 0.60f, 0.70f, 1.0f));
                 }
-
                 if (ImGui::Button(grid[row][col].label, ImVec2(btnW, btnH))) {
                     state.initRotPreset = pid;
                     if (actions.onInitRotPresetChanged)
                         actions.onInitRotPresetChanged(pid);
                 }
-
                 ImGui::PopStyleColor(4);
                 ImGui::PopStyleVar();
                 ImGui::PopID();
@@ -729,7 +727,6 @@ private:
 
         if (!regPhaseActive_ && state.mainMode == 0) {
             drawSectionWithBar("REGISTRATION", colReg(), false, false, false);
-
             ImGui::Indent(16);
             if (!state.depthDone) {
                 ImGui::TextColored(ImVec4(0.18f,0.19f,0.22f,1), "  Run Depth first");
@@ -762,56 +759,36 @@ private:
 
         drawInitOrientationPanel();
 
-        if(methodButton("Full Auto", "", state.regMethod==0, state.regState, anyP && state.regMethod!=0, state.btnIconTex[RegUIState::ICON_FULL_AUTO])) {
-            state.regMethod = 0; if(actions.onFullAuto) actions.onFullAuto();
+        // --- STAGE 1: Hemi Auto ---
+        if(glowButton("Hemi Auto", colReg(), anyP && state.regMethod!=1, -1, 52, state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
+            state.regMethod = 1; if(actions.onHemiAuto) actions.onHemiAuto();
         }
-        ImGui::Spacing();
         {
-            float totalW = ImGui::GetContentRegionAvail().x;
-            float hemiW = (totalW - 4) * 0.64f;
-            float refW  = (totalW - 4) * 0.36f;
-            if(methodButton("Hemi Auto", "", state.regMethod==1, state.regState, anyP && state.regMethod!=1, state.btnIconTex[RegUIState::ICON_HEMI_AUTO], hemiW)) {
-                state.regMethod = 1; if(actions.onHemiAuto) actions.onHemiAuto();
-            }
-            {
-                ImVec2 p = ImGui::GetItemRectMin();
-                ImVec2 sz = ImGui::GetItemRectSize();
-                char buf[16]; snprintf(buf, sizeof(buf), "v:%.2f", state.hemiVoxelSize);
-                ImVec2 ts = ImGui::CalcTextSize(buf);
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(p.x + sz.x - ts.x - 6, p.y + (sz.y - ts.y) * 0.5f),
-                    IM_COL32(120,220,160,180), buf);
-            }
-            ImGui::SameLine();
-            bool isRefining = (state.regState == 5);
-            bool refineClickable = state.refineEnabled || isRefining;
-            const char* refLabel = isRefining ? "Stop" : "Refine";
-            ImVec4 refCol = isRefining ? colRed() : colReg();
-            if(colorButton(refLabel, refineClickable ? refCol : colDim(), false, !refineClickable, refW, 36)) {
-                if(actions.onRefine) actions.onRefine();
-            }
+            ImVec2 p = ImGui::GetItemRectMin();
+            ImVec2 sz = ImGui::GetItemRectSize();
+            char buf[16]; snprintf(buf, sizeof(buf), "v:%.2f", state.hemiVoxelSize);
+            ImVec2 ts = ImGui::CalcTextSize(buf);
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(p.x + sz.x - ts.x - 6, p.y + (sz.y - ts.y) * 0.5f),
+                IM_COL32(120,220,160,180), buf);
         }
         ImGui::Spacing();
         if (state.regMethod == 1) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.02f,0.08f,0.04f,0.4f));
             ImGui::BeginChild("##voxelinfo", ImVec2(-1, 62), false);
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
-
             ImGui::TextColored(ImVec4(0.4f,0.8f,0.5f,0.8f), "  Voxel");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.6f,1.0f,0.7f,1.0f), "%.2f", state.hemiVoxelSize);
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.3f,0.4f,0.32f,0.7f), "  [UP] +0.05  [DOWN] -0.05");
-
             ImGui::Spacing();
-
             {
                 const float vMax = 0.6f;
                 ImVec2 p = ImGui::GetCursorScreenPos();
                 float avail = ImGui::GetContentRegionAvail().x - 8;
                 const float barH = 14.0f;
                 ImDrawList* dl = ImGui::GetWindowDrawList();
-
                 ImGui::InvisibleButton("##voxelbar", ImVec2(avail, barH));
                 bool hovered = ImGui::IsItemHovered();
                 bool held    = ImGui::IsItemActive();
@@ -824,15 +801,12 @@ private:
                     newVal = std::max(0.05f, newVal);
                     if (actions.onHemiVoxelChanged) actions.onHemiVoxelChanged(newVal);
                 }
-
                 ImU32 bgCol  = hovered ? IM_COL32(40, 80, 45, 220) : IM_COL32(30, 60, 35, 200);
                 dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + avail, p.y + barH), bgCol, 3.0f);
-
                 float fillRatio = std::min(state.hemiVoxelSize, vMax) / vMax;
                 float curX = p.x + avail * fillRatio;
                 ImU32 fillCol = held ? IM_COL32(100, 210, 120, 200) : IM_COL32(80, 180, 100, 160);
                 dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(curX, p.y + barH), fillCol, 3.0f);
-
                 if (hovered || held) {
                     float mx = ImGui::GetIO().MousePos.x;
                     float ratio = std::max(0.0f, std::min(1.0f, (mx - p.x) / avail));
@@ -840,7 +814,6 @@ private:
                     float px2 = p.x + avail * (std::min(preview, vMax) / vMax);
                     dl->AddLine(ImVec2(px2, p.y), ImVec2(px2, p.y + barH), IM_COL32(255,255,255,160), 1.0f);
                 }
-
                 struct IdealLine { float val; ImU32 col; };
                 IdealLine ideals[3] = {
                                        { state.idealVoxel1to2,  IM_COL32(255,220, 60,220) },
@@ -859,18 +832,38 @@ private:
                     dl->AddText(ImVec2(tx, p.y + barH + 3),
                                 (il.col & 0x00FFFFFF) | 0xCC000000, buf);
                 }
-
                 ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + barH + 14));
             }
-
             ImGui::EndChild();
             ImGui::PopStyleColor();
             ImGui::Spacing();
         }
+
+        // --- STAGE 2: BIPOP-CMA-ES ---
+        {
+            bool bipopDisabled = !state.useRegistration;
+            if(glowButton("BIPOP-CMA-ES  [Shift+V]", colReg(), bipopDisabled, -1, 52)) {
+                state.regMethod = 0; if(actions.onBipopCmaes) actions.onBipopCmaes();
+            }
+        }
+        ImGui::Spacing();
+
+        // --- Refine ---
+        {
+            bool isRefining = (state.regState == 5);
+            bool refineClickable = state.refineEnabled || isRefining;
+            const char* refLabel = isRefining ? "Stop" : "Refine";
+            ImVec4 refCol = isRefining ? colRed() : colReg();
+            if(colorButton(refLabel, refineClickable ? refCol : colDim(), false, !refineClickable, -1, 36)) {
+                if(actions.onRefine) actions.onRefine();
+            }
+        }
+        ImGui::Spacing();
+
+        // --- Manual Registration: Umeyama ---
         if(methodButton("Umeyama Manual", "", state.regMethod==2, state.regState, anyP && state.regMethod!=2, state.btnIconTex[RegUIState::ICON_UMEYAMA])) {
             state.regMethod = 2; if(actions.onStartUmeyama) actions.onStartUmeyama();
         }
-
         if (state.regMethod == 2 && state.regState >= 1 && state.regState <= 3 && !state.splitScreen) {
             ImGui::Spacing();
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f,0.02f,0.01f,1));
@@ -879,11 +872,9 @@ private:
             else if(state.regState == 2) ImGui::TextColored(colMuted(), "  LEFT: click liver points");
             else if(state.regState == 3) ImGui::TextColored(colGreen(), "  Ready! Click Execute");
             ImGui::Spacing();
-            drawColoredPointProgress("Board", state.boardPtCount, state.targetPtCount,
-                                     state.regState == 1);
+            drawColoredPointProgress("Board", state.boardPtCount, state.targetPtCount, state.regState == 1);
             ImGui::Spacing();
-            drawColoredPointProgress("Object", state.objPtCount, state.targetPtCount,
-                                     state.regState == 2);
+            drawColoredPointProgress("Object", state.objPtCount, state.targetPtCount, state.regState == 2);
             ImGui::Spacing();
             float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
             bool canUndo = (state.boardPtCount + state.objPtCount) > 0;
@@ -1010,6 +1001,28 @@ private:
         if(state.deformState == 1) {
             ImGui::Spacing();
             drawProgress("Handle Groups", state.handleGroups, state.maxHandleGroups, colDeform());
+            ImGui::Spacing();
+            bool locked = state.handleGroups > 0;
+            ImGui::TextColored(locked ? colMuted() : colDeform(), "Sphere Radius");
+            if (locked) {
+                ImGui::PushStyleColor(ImGuiCol_SliderGrab,       ImVec4(0.25f,0.26f,0.32f,1));
+                ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.25f,0.26f,0.32f,1));
+                ImGui::PushStyleColor(ImGuiCol_FrameBg,          ImVec4(0.08f,0.08f,0.10f,1));
+                ImGui::PushStyleColor(ImGuiCol_Text,             colMuted());
+                float r = state.handleRadius;
+                ImGui::SliderFloat("##hr", &r, 0.3f, 3.0f, "%.2f");
+                ImGui::PopStyleColor(4);
+            } else {
+                ImVec4 cd = colDeform();
+                ImGui::PushStyleColor(ImGuiCol_SliderGrab,       cd);
+                ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, cd);
+                ImGui::PushStyleColor(ImGuiCol_FrameBg,          ImVec4(0.1f,0.1f,0.13f,1));
+                float r = state.handleRadius;
+                if (ImGui::SliderFloat("##hr", &r, 0.3f, 3.0f, "%.2f")) {
+                    if (actions.onHandleRadiusChanged) actions.onHandleRadiusChanged(r);
+                }
+                ImGui::PopStyleColor(3);
+            }
         }
         ImGui::Spacing(); ImGui::Spacing();
         if(colorButton("Reset All", colRed())) { if(actions.onFullReset) actions.onFullReset(); }
@@ -1085,7 +1098,6 @@ private:
             if(i % 2 != 0) ImGui::SameLine();
             auto& o = state.organs[i]; bool vis = o.alpha > 0.01f;
             ImGui::PushID(i);
-
             if(vis) {
                 ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(o.color.x*0.14f,o.color.y*0.14f,o.color.z*0.14f,1));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(o.color.x*0.22f,o.color.y*0.22f,o.color.z*0.22f,1));
@@ -1096,10 +1108,8 @@ private:
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.11f,0.12f,0.15f,1));
             }
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-
             const char* aStr = o.alpha < 0.01f ? "OFF" : (o.alpha < 0.75f ? "50%" : "ON");
             ImVec2 btnPos = ImGui::GetCursorScreenPos();
-
             char lbl[64]; snprintf(lbl, sizeof(lbl), "       %s %s", o.name, aStr);
             if (o.alpha < 0.01f) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.42f, 0.48f, 1));
@@ -1109,7 +1119,6 @@ private:
             }
             bool clicked = ImGui::Button(lbl, ImVec2(bw, bh));
             ImGui::PopStyleColor();
-
             if (state.organIconTex[i] != 0) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 float iconY = btnPos.y + (bh - iconSz) * 0.5f;
@@ -1119,10 +1128,8 @@ private:
                     ImVec2(btnPos.x + 6, iconY),
                     ImVec2(btnPos.x + 6 + iconSz, iconY + iconSz),
                     ImVec2(0,0), ImVec2(1,1),
-                    IM_COL32(255, 255, 255, (int)(iconAlpha * 255))
-                    );
+                    IM_COL32(255, 255, 255, (int)(iconAlpha * 255)));
             }
-
             if(clicked) { if(actions.onToggleOrgan) actions.onToggleOrgan(i); }
             ImGui::PopStyleVar(); ImGui::PopStyleColor(3); ImGui::PopID();
         }
@@ -1131,7 +1138,6 @@ private:
         {
             float halfW = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
             float halfH = bh;
-
             bool bVis = state.boardAlpha > 0.01f;
             ImVec4 bc = {0.75f, 0.75f, 0.75f, 1};
             if(bVis) {
@@ -1220,7 +1226,6 @@ private:
                               |ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar
                               |ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoFocusOnAppearing|ImGuiWindowFlags_NoNav;
         const float sc = 2.0f;
-
         {
             ImGui::SetNextWindowPos(ImVec2(windowWidth*0.5f,30),0,ImVec2(0.5f,0));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(30,16));
