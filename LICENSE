@@ -1,26 +1,248 @@
-LiverSurgeryNavi License
-
+LiverSurgeryNavi Source-Available License
 Copyright (c) 2026 MEIDAI KASAI MD
+All rights reserved.
 
-1. Research and Education Use:
-   Free to use, copy, modify, and distribute for non-commercial
-   research and educational purposes, provided this notice is retained.
+This source code is made available for VIEWING AND EVALUATION ONLY.
 
-2. Commercial Use:
-   Any commercial use requires prior written permission from the author.
-   Contact: meidai1223@gmail.com
 
-3. Disclaimer:
-   This software is provided "as is" without warranty of any kind.
-   This software is NOT approved for clinical use.
-   The author is not liable for any damages arising from its use.
+1. PERMITTED USES
 
-4. Third-Party Libraries:
-   This project includes third-party libraries under their own licenses
-   (MIT, BSD, MPL2, zlib, Apache-2.0). See third_party/ and win_deps/ directories.
+   a) Viewing the source code for academic study and personal
+      reference.
 
-   c-cmaes (third_party/c-cmaes/):
-     Copyright (C) 1996, 2003-2010 Nikolaus Hansen
-     Licensed under Apache License 2.0 or GNU LGPL 2.1+
-     This project uses it under Apache License 2.0
-     Source: https://github.com/CMA-ES/c-cmaes
+   b) Citing this work in academic publications using the citation
+      specified in Section 3.
+
+   c) Evaluating the pre-built binaries for non-clinical research
+      use within your own institution, subject to Section 5.
+
+
+2. PROHIBITED USES
+
+   a) Copying, forking, or redistributing the source code or any
+      portion thereof, except for private backup purposes.
+
+   b) Modifying the source code for any purpose without prior
+      written permission from the author. This restriction does
+      NOT apply to third-party components, which remain governed
+      by their own licenses as described in Section 6.
+
+   c) Creating derivative works based on this code.
+
+   d) Using this software or any derivative in any commercial
+      product or service.
+
+   e) Using this software or any derivative for clinical
+      diagnosis, treatment, or any form of medical decision
+      making involving human subjects.
+
+   f) Reverse engineering, decompiling, or disassembling the
+      pre-built binaries.
+
+   g) Removing, altering, or obscuring any copyright notices,
+      author attribution, or license text.
+
+
+3. CITATION REQUIREMENT
+
+   Any academic publication, presentation, report, thesis, or
+   public communication that references this work, its methods,
+   or its results must include the following citation:
+
+      Kasai, M. (2026). LiverSurgeryNavi: A liver surgery
+      navigation system with non-rigid registration. [Software].
+      https://github.com/meimeimei1223/LiverSurgeryNavi
+
+   Citation is required regardless of whether the work is used,
+   evaluated, or only discussed.
+
+
+4. PATENT NOTICE
+
+   The author is actively pursuing patent protection on certain
+   algorithms and methods contained in this software.
+
+   This license does NOT grant any patent rights, express or
+   implied, by estoppel or otherwise. No patent license is
+   conveyed by the act of publishing, distributing, or providing
+   access to this source code.
+
+   Any party wishing to practice patented algorithms contained
+   herein, in any context other than internal academic research
+   within a single institution, must obtain a separate patent
+   license from the author.
+
+
+5. COMMERCIAL AND CLINICAL USE
+
+   Any of the following uses require prior written permission
+   from the author:
+
+   a) Any commercial use of any kind.
+
+   b) Clinical use on human patients, including but not limited
+      to diagnosis, surgical planning, intraoperative guidance,
+      or post-operative evaluation.
+
+   c) Use in the development, testing, validation, or regulatory
+      submission of any medical device or medical software
+      product.
+
+   d) Use by for-profit entities, including internal research
+      and development.
+
+   e) Use in grant applications where the software is to be
+      commercialized.
+
+   For licensing inquiries, contact: meidai1223@gmail.com
+
+
+6. THIRD-PARTY COMPONENTS
+
+   This project incorporates third-party libraries governed by
+   their own respective licenses. Use of this software requires
+   compliance with each of these licenses. The restrictions in
+   Sections 1 and 2 of this license do NOT apply to third-party
+   components; those components remain governed solely by their
+   original licenses.
+
+   All original copyright notices, license texts, and attribution
+   statements within third_party/ and win_deps/ directories must
+   be preserved.
+
+   The following third-party components are included:
+
+   a) Eigen (Linear Algebra Library)
+      Location: third_party/eigen/
+      License: Mozilla Public License, version 2.0 (MPL 2.0)
+      Source: https://eigen.tuxfamily.org/
+      License text: third_party/eigen/COPYING.MPL2
+
+      MPL 2.0 NOTICE: The Eigen source files in third_party/eigen/
+      are subject to the Mozilla Public License, version 2.0. If
+      you modify any Eigen source file, you must make your
+      modifications available under MPL 2.0. Using Eigen as an
+      unmodified library through its public header interface does
+      not require any portion of this project to be released under
+      MPL 2.0.
+
+   b) c-cmaes (CMA-ES Optimization Library)
+      Location: third_party/c-cmaes/
+      Copyright (C) 1996, 2003-2010 Nikolaus Hansen
+      License: Dual-licensed under Apache License 2.0 OR
+               GNU Lesser General Public License 2.1 or later
+      This project uses c-cmaes under the Apache License 2.0.
+      Source: https://github.com/CMA-ES/c-cmaes
+
+   c) Dear ImGui (Immediate Mode Graphical User Interface)
+      Location: third_party/imgui/
+      Copyright (c) 2014-2024 Omar Cornut
+      License: MIT License
+
+   d) nanoflann (KD-Tree Nearest Neighbor Library)
+      Location: third_party/nanoflann/
+      Copyright 2011-2024 Jose Luis Blanco (joseluisblancoc@gmail.com)
+      License: BSD 2-Clause License
+
+   e) stb (Single-file public domain libraries)
+      Location: third_party/stb/
+      Author: Sean Barrett
+      License: MIT License OR Public Domain (dual license)
+
+   f) tinyobjloader (Wavefront OBJ File Loader)
+      Location: third_party/tinyobjloader/
+      Copyright (c) 2012-2019 Syoyo Fujita and contributors
+      License: MIT License
+
+   g) tinyfiledialogs (Cross-platform File Dialog Library)
+      Location: third_party/tinyfiledialogs/
+      Copyright (c) 2014-2024 Guillaume Vareille
+      License: zlib License
+
+   h) GLM (OpenGL Mathematics)
+      Location: third_party/glm/
+      Copyright (c) 2005-2024 G-Truc Creation
+      License: MIT License (Happy Bunny License / MIT License)
+
+   Additional third-party components may exist in win_deps/ for
+   Windows builds. Each retains its original license terms.
+
+
+7. NO WARRANTY
+
+   THIS SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTY OF ANY
+   KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+   THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+   PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+   THE AUTHOR MAKES NO REPRESENTATION OR WARRANTY THAT THE
+   SOFTWARE IS FREE OF DEFECTS, VIRUSES, OR OTHER HARMFUL
+   COMPONENTS, OR THAT IT WILL OPERATE UNINTERRUPTED OR
+   ERROR-FREE.
+
+
+8. NOT FOR CLINICAL USE
+
+   THIS SOFTWARE HAS NOT BEEN REVIEWED, CLEARED, OR APPROVED BY
+   THE PHARMACEUTICALS AND MEDICAL DEVICES AGENCY (PMDA) OF
+   JAPAN, THE U.S. FOOD AND DRUG ADMINISTRATION (FDA), THE
+   EUROPEAN MEDICINES AGENCY (EMA), OR ANY OTHER REGULATORY
+   AUTHORITY.
+
+   THIS SOFTWARE IS NOT A MEDICAL DEVICE AND IS NOT INTENDED TO
+   DIAGNOSE, TREAT, CURE, OR PREVENT ANY DISEASE.
+
+   THIS SOFTWARE MUST NOT BE USED FOR ANY CLINICAL DECISION
+   MAKING OR IN ANY CLINICAL WORKFLOW INVOLVING HUMAN PATIENTS.
+
+
+9. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO
+   EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+   (INCLUDING BUT NOT LIMITED TO PROCUREMENT OF SUBSTITUTE
+   GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+   SUCH DAMAGE.
+
+   THIS LIMITATION APPLIES TO ANY DAMAGE ARISING FROM CLINICAL,
+   COMMERCIAL, OR OTHER UNAUTHORIZED USE OF THE SOFTWARE.
+
+
+10. TERMINATION
+
+    Any violation of the terms of this license automatically
+    terminates all rights granted hereunder. Upon termination,
+    the violating party must cease all use of the software and
+    destroy all copies in their possession, including any
+    derivative works or backups.
+
+
+11. GOVERNING LAW
+
+    This license shall be governed by and construed in
+    accordance with the laws of Japan, without regard to
+    conflict of law principles. Any dispute arising from this
+    license shall be subject to the exclusive jurisdiction of
+    the courts of Sapporo, Hokkaido, Japan.
+
+
+12. ENTIRE AGREEMENT
+
+    This license constitutes the entire agreement between the
+    parties with respect to the software. No amendment or
+    modification of this license shall be binding unless in
+    writing and signed by the author.
+
+
+CONTACT
+
+    For licensing inquiries, collaboration requests, commercial
+    use, or clinical use permissions:
+
+    MEIDAI KASAI MD
+    Email: meidai1223@gmail.com
