@@ -141,17 +141,3 @@ cd build/bin
 | SAM2 Hiera Tiny | Apache-2.0 | [vietanhdev/segment-anything-2-onnx-models](https://huggingface.co/vietanhdev/segment-anything-2-onnx-models) |
 | ONNX Runtime | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
 | c-cmaes | Apache-2.0 | [CMA-ES/c-cmaes](https://github.com/CMA-ES/c-cmaes) |
-
-
-## Download 3D Models Only
-
-To download only the 3D mesh models without cloning the entire repository:
-
-| File | Direct Download |
-|------|----------------|
-| liver.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/liver.obj) |
-| tumor.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/tumor.obj) |
-| portal.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/portal.obj) |
-| vein.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/vein.obj) |
-| gb.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/gb.obj) |
-| res.obj | [Download](https://github.com/meimeimei1223/LiverSurgeryNavi/raw/main/model/res.obj) |
