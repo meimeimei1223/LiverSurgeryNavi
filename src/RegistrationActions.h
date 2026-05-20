@@ -568,6 +568,16 @@ inline glm::vec3 cyclicHsv2rgb(float h, float s, float v) {
 inline uint32_t g_trialSeed = 20260420u;  // master seed (デフォルト値)
 inline uint32_t g_callIdx   = 0;           // trial 内の連番 (run* で auto-increment)
 
+// =========================================================
+//  AutoQCR (Alt+Ctrl+P) consume-and-clear globals
+// ---------------------------------------------------------
+//  Phase 1 観察用: runQuadCyclicRansac が末尾で publish する RANSAC prealign の
+//  scale 値。AutoQCR の loop で各 trial 前に -1 (sentinel) にクリアし、
+//  trial 後に値を読み取って TrialResult.prealignScale に記録する。
+//  [0.85, 1.10] 外の trial は top-5 ログで [scale-bias?] と注記される。
+// =========================================================
+inline float g_lastQcrPrealignScale = -1.0f;
+
 // trial を新規開始 (master seed リセット + callIdx=0)
 inline void resetTrialSeed(uint32_t s = 20260420u) {
     g_trialSeed = s;
@@ -2626,8 +2636,10 @@ getValidSubsetsK5(int kSectors, int minSpread) {
 //    採用 3 sector のみ g_cyclicPairValid[i]=1 で書き込み、他 21 sector
 //    は valid=0。Shift+P / Ctrl+P と同じ viz loop が 3 つだけ描画する。
 // =========================================================
-inline void runQuadCyclicRansac() {
-    std::cout << "\n=== QuadCyclic-RANSAC Registration (Shift+Ctrl+P) ===" << std::endl;
+inline void runQuadCyclicRansac(bool lock_scale = false) {
+    std::cout << "\n=== QuadCyclic-RANSAC Registration (Shift+Ctrl+P)"
+              << (lock_scale ? "  [6-DoF rigid]" : "  [7-DoF T+R+S]")
+              << " ===" << std::endl;
 
     // Phase 1: シード固定 (Ctrl+P と同じ)
     const uint32_t fgr_seed = g_trialSeed + g_callIdx;
@@ -3228,6 +3240,24 @@ inline void runQuadCyclicRansac() {
                                                 glm::vec3(bestT[2]) / estScale
                                                 ) : glm::mat3(bestT);
 
+    // ---- 9.5. 6-DoF lock (AutoQCR の checkbox=ON から伝搬) ----
+    //   lock_scale=true のとき: bestT から scale を剥がし、estScale=1.0 に上書き。
+    //   これで rigid (DICOM mm + metric depth → SE(3)) として扱われ、Ctrl+G を
+    //   何度叩いても size_ratio が暴走しない(=論文 defensible)。
+    if (lock_scale && estScale > 1e-6f) {
+        const float origScale = estScale;
+        // bestT を R3pure + translation のみで再構築 (scale 列を unit に)
+        glm::mat4 rigid(1.0f);
+        rigid[0] = glm::vec4(R3pure[0], 0.0f);
+        rigid[1] = glm::vec4(R3pure[1], 0.0f);
+        rigid[2] = glm::vec4(R3pure[2], 0.0f);
+        rigid[3] = bestT[3];   // translation 列は保持
+        bestT    = rigid;
+        estScale = 1.0f;
+        std::cout << "[Shift+Ctrl+P/6-DoF] Scale lock: estScale "
+                  << origScale << " -> 1.000" << std::endl;
+    }
+
     for (auto* m : organs) {
         if (!m) continue;
         for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
@@ -3287,7 +3317,7 @@ inline void runQuadCyclicRansac() {
             1,
             RegRatios::convergence(),
             0.35f,
-            true, 0.03f,
+            !lock_scale, 0.03f,    // estimate_scale: 6-DoF lock 時は false
             RegRatios::zThresh(),
             RegRatios::voxel());
     } catch (const std::exception& e) {
@@ -3307,6 +3337,10 @@ inline void runQuadCyclicRansac() {
               << "  mask=" << LiverLeftRightLabel::quadrantMaskString(med.mask)
               << "  (RANSAC chamfer was " << bestScore << ")"
               << " ===" << std::endl;
+
+    // Phase 1 観察用: RANSAC prealign の estScale を publish。
+    // AutoQCR の loop 側が consume-and-clear で読み取る。
+    g_lastQcrPrealignScale = estScale;
 
     g_callIdx++;
 }

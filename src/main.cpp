@@ -48,6 +48,8 @@
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
 
 #include <filesystem>
+#include <fstream>     // Shift+M snapshot README.txt 生成用
+#include <chrono>      // Shift+M snapshot timestamp 用 (transitively 入っているはずだが明示)
 #include "AppContext.h"
 #include "ImageSession.h"
 #include "MaskPicker.h"
@@ -1021,6 +1023,7 @@ static void showFPS(GLFWwindow* window);
 static void snapshotInitialPose();
 static void restoreInitialPose();
 static void applyInitRotation(bool startNewSession);   // Phase 2 拡張: preset + position 適用
+static void runAutoQuadCyclicRansac(bool lock_scale = false);   // Alt+Ctrl+P / AutoQCR ボタン: 9 ORIENT preset 自動探索 + ベスト 1 採用 (lock_scale=true で 6-DoF rigid)
 static void computeTargetSubsetAabbs();                // Phase 2 拡張: target cloud の AABB を 3 通り (full/+X/-X) 計算
 static void computeSourceLiverSubsetAabbs();           // Phase 2 拡張 v2: source liver の AABB を 3 通り計算
 
@@ -1644,7 +1647,35 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                   << std::endl;
         break;
     case GLFW_KEY_P:
-        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
+        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_ALT)) {
+            // ---- Alt+Ctrl+P : AutoQuadCyclic-RANSAC (Auto Orient Sweep) ----
+            //   Apply Init Pose で確定した QUADRANT を固定したまま、ORIENT
+            //   (preset) を 9 個試行し、最も compRmse が良いものを採用して
+            //   PoseLibrary に 1 件だけ追加する。
+            //
+            //   9 個の preset は QUADRANT の左右成分で選ばれる:
+            //     右側のみ → Right 中心 9 (画面左 3 列、FAR 含)
+            //     左側のみ → Left  中心 9 (画面右 3 列、FAR 含)
+            //     両側     → Base  中心 9 (画面中央 3 列)
+            //
+            //   loop 中は PoseLibrary に一切触らず、Session reject 機構の
+            //   介入もないため、連打しても Library が荒れない。
+            //
+            //   注意: mods 判定順序は Alt+Ctrl > Shift+Ctrl > Ctrl > Shift > 単独。
+            //         Alt+Ctrl の組合せが先に拾われるよう必ずこの位置 (一番先)
+            //         に置くこと。
+            //
+            //   想定ワークフロー:
+            //     UI で preset/quadrant 設定 → Apply Init Pose
+            //       ↓
+            //     Alt+Ctrl+P  (この関数。9 ORIENT × 1 QUAD = 9 trial)
+            //       ↓
+            //     Ctrl+G      (V3R refinement)
+            //
+            //   lock_scale: UI チェックボックス (Hemi Auto の下の AutoQCR 行の
+            //               "6-DoF" チェック) の値を見る。チェック ON で rigid。
+            runAutoQuadCyclicRansac(gUI.state.autoQcrLockScale);
+        } else if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ---- Shift+Ctrl+P : QuadCyclic-RANSAC --------------------------
             //   Ctrl+P と同じ AR ∩ silh ∩ quad 前処理を使うが、matching を
             //   「24 sector 全部対 48 パターン cyclic shift」ではなく
@@ -1653,9 +1684,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             //   逸れていても inlier 3 つで初期姿勢を確保できる。
             //   ハイパラは v1 ハードコード (g_qcrSubsetK / g_qcrMinSpreadSec
             //   / g_qcrTopKCandidates)、将来 UI 露出予定。
-            //   注意: mods の判定順は Shift+Ctrl > Ctrl > Shift > 単独で、
-            //   Shift+Ctrl の組合せが先に拾われるよう必ずこの位置 (Ctrl
-            //   単独より先) に置くこと。
+            //   注意: mods の判定順は Alt+Ctrl > Shift+Ctrl > Ctrl > Shift > 単独で、
+            //   Shift+Ctrl の組合せが Ctrl 単独より先に拾われるよう必ずこの位置
+            //   (Ctrl 単独より先) に置くこと。
             if (!g_liverRegion.valid()) {
                 std::cout << "[Shift+Ctrl+P] LiverRegion (Shift+R) not yet computed,"
                           << " auto-running..." << std::endl;
@@ -2104,6 +2135,139 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
 
             std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm + OpenGL flip"
                       << "  (scale = CT_diag / current_diag, Z negate)" << std::endl;
+
+            // -----------------------------------------------------------------
+            //  Snapshot: 再現性のため Run Depth 入力一式 + 出力 STL を
+            //            REG_MODEL_PATH/snapshot_YYYYMMDD_HHMMSS/ にコピー
+            //
+            //  動機: depth_output/ は次の Run Depth で上書きされるため、
+            //        この時点で評価につながる入力 (OBJ/intrinsics/mask 等) を
+            //        まとめて保管しておかないと再現できない。
+            //
+            //  方針: STL 出力に成功してもしなくても可能な範囲で保存し、
+            //        snapshot 作成自体が失敗しても STL は既に保存済みなので
+            //        ログのみ出して継続する (best-effort)。
+            // -----------------------------------------------------------------
+            try {
+                // intrinsics タグの自動判別 (Run Depth と同じロジック)
+                std::string srcTag = "k4a";
+                if      (g_intrinsicsSource == 2) srcTag = "custom";
+                else if (g_intrinsicsSource == 3) srcTag = "calib";
+
+                // timestamp YYYYMMDD_HHMMSS
+                auto now = std::chrono::system_clock::now();
+                std::time_t t = std::chrono::system_clock::to_time_t(now);
+                std::tm tmLocal{};
+#ifdef _WIN32
+                localtime_s(&tmLocal, &t);
+#else
+                localtime_r(&t, &tmLocal);
+#endif
+                char tsBuf[32];
+                std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmLocal);
+
+                std::string snapDir = REG_MODEL_PATH + "snapshot_" + tsBuf + "/";
+                std::filesystem::create_directories(snapDir);
+
+                // コピー候補一覧 (存在しないものはスキップ、害なし)
+                const std::vector<std::string> srcFiles = {
+                    // registration target cloud (主役)
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
+                    // full cloud (board display 用)
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
+                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
+                    // camera K と入力画像/マスク
+                    DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
+                    DEPTH_OUTPUT_PATH + "original_rectified.jpg",
+                    DEPTH_OUTPUT_PATH + "segmentation_mask.png",
+                    DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
+                    DEPTH_OUTPUT_PATH + "texture.png",
+                    // 直前に出した STL も同梱
+                    REG_MODEL_PATH + "tumor_cam_mm.stl",
+                    REG_MODEL_PATH + "liver_cam_mm.stl",
+                };
+
+                int copiedCount = 0;
+                int missingCount = 0;
+                std::vector<std::string> missing;
+                for (const auto& src : srcFiles) {
+                    std::filesystem::path srcPath(src);
+                    if (!std::filesystem::exists(srcPath)) {
+                        ++missingCount;
+                        missing.push_back(srcPath.filename().string());
+                        continue;
+                    }
+                    std::filesystem::path dstPath =
+                        std::filesystem::path(snapDir) / srcPath.filename();
+                    try {
+                        std::filesystem::copy_file(
+                            srcPath, dstPath,
+                            std::filesystem::copy_options::overwrite_existing);
+                        ++copiedCount;
+                    } catch (const std::exception& e) {
+                        std::cerr << "[Shift+M] copy failed: " << src
+                                  << " -> " << dstPath
+                                  << " : " << e.what() << std::endl;
+                    }
+                }
+
+                // README.txt (メタ情報 + 復元手順)
+                {
+                    std::ofstream readme(snapDir + "README.txt");
+                    if (readme.is_open()) {
+                        readme << "Snapshot created: " << tsBuf << "\n"
+                               << "Intrinsics tag (g_intrinsicsSource="
+                               << g_intrinsicsSource << "): " << srcTag << "\n"
+                               << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
+                               << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
+                               << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
+                               << "\n"
+                               << "Source paths at capture time:\n"
+                               << "  DEPTH_OUTPUT_PATH = " << DEPTH_OUTPUT_PATH << "\n"
+                               << "  REG_MODEL_PATH    = " << REG_MODEL_PATH << "\n"
+                               << "\n"
+                               << "Restore example (bash):\n"
+                               << "  SNAP=\"" << snapDir << "\"\n"
+                               << "  DEST=\"" << DEPTH_OUTPUT_PATH << "\"\n"
+                               << "  cp \"$SNAP\"/pc_metric_pinhole_masked_" << srcTag << ".obj        \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/pc_metric_pinhole_masked_" << srcTag << ".mtl        \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/pc_metric_pinhole_full_"   << srcTag << "_light.obj  \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/pc_metric_pinhole_full_"   << srcTag << "_light.mtl  \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/intrinsics_"               << srcTag << ".txt        \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/original_rectified.jpg                  \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/segmentation_mask.png                   \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/instrument_segmentation_mask.png        \"$DEST\"/\n"
+                               << "  cp \"$SNAP\"/texture.png                             \"$DEST\"/\n"
+                               << "  # GUI 起動 -> 自動的に最新 OBJ を再ロード\n"
+                               << "\n"
+                               << "STL outputs (already saved directly to REG_MODEL_PATH):\n"
+                               << "  tumor_cam_mm.stl\n"
+                               << "  liver_cam_mm.stl\n";
+                        readme.close();
+                        ++copiedCount;
+                    }
+                }
+
+                std::cout << "[Shift+M] Snapshot saved: " << snapDir
+                          << "  (" << copiedCount << " files copied, "
+                          << missingCount << " missing)" << std::endl;
+                if (missingCount > 0) {
+                    std::cout << "[Shift+M] Missing in snapshot (skipped):";
+                    for (const auto& m : missing) {
+                        std::cout << "\n  - " << m;
+                    }
+                    std::cout << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[Shift+M] Snapshot creation failed: " << e.what()
+                          << "  (STL export was successful, only snapshot failed)"
+                          << std::endl;
+            }
         } else {
             if (liverMesh3D)   liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
             if (portalMesh3D)  portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
@@ -5741,6 +5905,13 @@ static void setupUICallbacks() {
         runIterativeAutoProbe(K);
     };
 
+    // AutoQCR ボタン: チェック値 (lock_scale) を渡して 9 trial sweep を実行。
+    //   - lock_scale=true  : 6-DoF rigid (scale=1 固定、論文推奨)
+    //   - lock_scale=false : 7-DoF (scale 推定 ON、現状互換)
+    a.onAutoQCR = [](bool lockScale) {
+        runAutoQuadCyclicRansac(lockScale);
+    };
+
     a.onInitRotPresetChanged = [](int preset) {
         // Phase 2: 幾何ベース Initial Orientation (preset = 9 通りの回転)。
         //   - 患者ごとに肝臓自身の解剖軸を基準にするので、同じプリセットが
@@ -6264,6 +6435,428 @@ static void applyInitRotation(bool startNewSession) {
             g_dbgSourceBB_valid  = true;
         }
     }
+}
+
+// =========================================================
+//  runAutoQuadCyclicRansac (Alt+Ctrl+P)
+// ---------------------------------------------------------
+//  想定ワークフロー:
+//      [Apply Init Pose] (preset + quadrant を確定)
+//          ↓
+//      [Alt+Ctrl+P]      ← この関数: ORIENT を 9 通り試行 → ベスト採用
+//          ↓
+//      [Ctrl+G]          (V3R refinement で詰める)
+//
+//  ユーザが Apply Init Pose で選んだ QUADRANT は loop 中も固定し、
+//  ORIENT (preset) だけを QUADRANT の左右成分に応じて選ばれた 9 個に対して
+//  試行し、unified compRmse が最小のものを採択する。
+//
+//  QUADRANT → 中心 preset グループ:
+//    右側のみ (AR/PR/AR+PR=0x1/0x4/0x5)  → Right 中心 (画面左 3 列、FAR 含)
+//    左側のみ (AL/PL/AL+PL=0x2/0x8/0xA)  → Left  中心 (画面右 3 列、FAR 含)
+//    両側 (QUAD_ALL=0xF や混合)          → Base  中心 (画面中央 3 列)
+//
+//  UI レイアウト (Anatomical: Left=patient's right):
+//     行1: Up-R+  Up-R   Up    Up-L   Up-L+
+//     行2: Right+ Right  Base  Left   Left+
+//     行3: Dn-R+  Dn-R   Down  Dn-L   Dn-L+
+//
+//  AutoProbe (PoseLibrary.h::runAutoProbe) と同じ「baseV/baseN から復元 →
+//  姿勢変更 → 登録実行」のループ構造を借りるが、AutoProbe が全 probe を
+//  PoseLibrary に投入するのに対し、こちらは loop 中は PoseLibrary に一切
+//  触らず、最後にベスト pose だけ 1 件追加する。これにより:
+//    - PoseLibrary の汚染がゼロ (9 件のゴミが残らない)
+//    - Session reject 機構の介入もない (loop 終了後の 1 回だけ通る)
+//    - 連打しても Library が荒れない
+//
+//  採択指標 (現状): registrationHandle.compRmse 最小 (low is better)。
+//  top-5 は std::cout にダンプするのみで Library には入れない。
+//
+//  実行時間目安: 1 trial ~0.26s × 9 = 約 2.5s (実機ログから推定)。
+//
+//  lock_scale 引数 (Phase 2):
+//      false : 7-DoF (T+R+Scale) — 現状互換、scale 推定 ON
+//      true  : 6-DoF (rigid SE(3)) — scale を 1 に固定。Init Pose で AABB
+//              を合わせた前提で、以後 scale は推定しない。
+//              論文的に defensible (DICOM mm + metric depth → rigid)
+//              + CMA-ES の拡大発散 failure mode を回避する。
+//
+//  注: 既存の Shift+Ctrl+P key handler は一切変更しない (互換性)。
+//      AutoQCR ボタン / Alt+Ctrl+P / UI チェックボックスで 6/7-DoF 切替。
+// =========================================================
+static void runAutoQuadCyclicRansac(bool lock_scale) {
+    std::cout << "\n=== AutoQuadCyclic-RANSAC (Alt+Ctrl+P)"
+              << (lock_scale ? "  [6-DoF rigid]" : "  [7-DoF T+R+Scale]")
+              << " ===" << std::endl;
+
+    // ---- 0. 前提条件 -----------------------------------------------------
+    auto organs = getOrganList();
+    if (organs.empty() || !organs[0] || !liverMesh3D) {
+        std::cerr << "[AutoQCR] No liver mesh available" << std::endl;
+        return;
+    }
+    if (g_initOrganVertices.empty() ||
+        g_initOrganVertices.size() != organs.size()) {
+        std::cerr << "[AutoQCR] g_initOrganVertices not snapshotted. "
+                  << "Press 'Apply Init Pose' first to capture initial state."
+                  << std::endl;
+        return;
+    }
+
+    // 解剖ラベルは applyInitRotation 内で auto-trigger されるが、
+    // 15 回のループに入る前に一度だけ走らせておく方が無駄な再計算を
+    // 避けられる (Region/LR/CC は preset/mask に独立)。
+    if (!g_liverRegion.valid()) {
+        std::cout << "[AutoQCR] LiverRegion (Shift+R) not yet computed, auto-running..."
+                  << std::endl;
+        recomputeLiverRegion();
+    }
+    if (!g_liverLR.valid()) {
+        std::cout << "[AutoQCR] LiverLR (Y) not yet computed, auto-running..."
+                  << std::endl;
+        recomputeLiverLR();
+    }
+    if (!g_liverCC.valid()) {
+        std::cout << "[AutoQCR] LiverCC (Shift+H) not yet computed, auto-running..."
+                  << std::endl;
+        recomputeLiverCC();
+    }
+
+    // ---- 1. 状態スナップ (loop 終了後の Library save 前に best 復元用) ---
+    //   ・元の Shift+Ctrl+P と同じく Undo snapshot は 1 個 (loop 全体で 1 件)
+    //   ・QUADRANT は Apply Init Pose で確定された値を loop 中固定。
+    //     applyInitRotation 自体は g_activeQuadrantMask を変更しないので
+    //     原則として書き換わらないはずだが、各 trial 前に明示復元する
+    //     ことで安全側に倒す (将来の applyInitRotation 改修への防御)。
+    //   ・preset は trial ごとに切り替え、終了後に元に戻す。
+    poseAutoSaveBeforeRegistration();
+
+    const RegistrationData::InitRotPreset saved_preset =
+        registrationHandle.initRotPreset;
+    const uint8_t  saved_mask          = g_activeQuadrantMask;
+    const uint32_t saved_callIdx_start = g_callIdx;
+
+    // ---- 2. パターン定義 (QUADRANT に応じて 9 パターンを選択) -----------
+    //   UI レイアウト (Anatomical: Left=patient's right):
+    //     行1: Up-R+  Up-R   Up    Up-L   Up-L+
+    //     行2: Right+ Right  Base  Left   Left+
+    //     行3: Dn-R+  Dn-R   Down  Dn-L   Dn-L+
+    //
+    //   選択されている QUADRANT mask の左右成分を見て中心グループを選ぶ:
+    //     右側のみ (AR/PR/AR+PR)        → Right 中心: 左の 3 列 (FAR 含む)
+    //     左側のみ (AL/PL/AL+PL)        → Left  中心: 右の 3 列 (FAR 含む)
+    //     両側含む (QUAD_ALL や混合)     → Base  中心: 中央の 3 列
+    //
+    //   bit 配置: AR=0x1 (bit0), AL=0x2 (bit1), PR=0x4 (bit2), PL=0x8 (bit3)
+    static const RegistrationData::InitRotPreset kPresetsRight[] = {
+        // Right 中心: 画面左 3 列 (患者の右側 / FAR 含む)
+        RegistrationData::PRESET_BASE_UP_R_FAR,  // Up-R+
+        RegistrationData::PRESET_BASE_UP_R,      // Up-R
+        RegistrationData::PRESET_BASE_UP,        // Up
+        RegistrationData::PRESET_BASE_R_FAR,     // Right+
+        RegistrationData::PRESET_BASE_R,         // Right
+        RegistrationData::PRESET_BASE,           // Base
+        RegistrationData::PRESET_BASE_DN_R_FAR,  // Dn-R+
+        RegistrationData::PRESET_BASE_DN_R,      // Dn-R
+        RegistrationData::PRESET_BASE_DN,        // Down
+    };
+    static const RegistrationData::InitRotPreset kPresetsLeft[] = {
+        // Left 中心: 画面右 3 列 (患者の左側 / FAR 含む)
+        RegistrationData::PRESET_BASE_UP,        // Up
+        RegistrationData::PRESET_BASE_UP_L,      // Up-L
+        RegistrationData::PRESET_BASE_UP_L_FAR,  // Up-L+
+        RegistrationData::PRESET_BASE,           // Base
+        RegistrationData::PRESET_BASE_L,         // Left
+        RegistrationData::PRESET_BASE_L_FAR,     // Left+
+        RegistrationData::PRESET_BASE_DN,        // Down
+        RegistrationData::PRESET_BASE_DN_L,      // Dn-L
+        RegistrationData::PRESET_BASE_DN_L_FAR,  // Dn-L+
+    };
+    static const RegistrationData::InitRotPreset kPresetsBase[] = {
+        // Base 中心: 画面中央 3 列 (左右両側ある / QUAD_ALL の標準探索)
+        RegistrationData::PRESET_BASE_UP_R,      // Up-R
+        RegistrationData::PRESET_BASE_UP,        // Up
+        RegistrationData::PRESET_BASE_UP_L,      // Up-L
+        RegistrationData::PRESET_BASE_R,         // Right
+        RegistrationData::PRESET_BASE,           // Base
+        RegistrationData::PRESET_BASE_L,         // Left
+        RegistrationData::PRESET_BASE_DN_R,      // Dn-R
+        RegistrationData::PRESET_BASE_DN,        // Down
+        RegistrationData::PRESET_BASE_DN_L,      // Dn-L
+    };
+
+    // QUADRANT mask の左右成分判定
+    const bool hasRight = (saved_mask & (LiverLeftRightLabel::QUAD_AR
+                                       | LiverLeftRightLabel::QUAD_PR)) != 0;
+    const bool hasLeft  = (saved_mask & (LiverLeftRightLabel::QUAD_AL
+                                       | LiverLeftRightLabel::QUAD_PL)) != 0;
+
+    const RegistrationData::InitRotPreset* kPresets = nullptr;
+    const char* groupName = "";
+    if (hasRight && !hasLeft) {
+        kPresets  = kPresetsRight;
+        groupName = "Right-centered (image left 3 cols)";
+    } else if (hasLeft && !hasRight) {
+        kPresets  = kPresetsLeft;
+        groupName = "Left-centered (image right 3 cols)";
+    } else {
+        // 両側含む or QUAD_ALL or 空 (空は本来上で弾かれるが防御)
+        kPresets  = kPresetsBase;
+        groupName = "Base-centered (center 3 cols)";
+    }
+    constexpr int kNumPresets = 9;  // 3 グループとも 9 個固定
+
+    std::cout << "[AutoQCR] Locked QUADRANT = "
+              << LiverLeftRightLabel::quadrantMaskString(saved_mask)
+              << "  (0x" << std::hex << (unsigned)saved_mask << std::dec << ")"
+              << "  -- preset group: " << groupName
+              << "  (" << kNumPresets << " trials)"
+              << std::endl;
+
+    // 新セッション (Auto loop 全体で 1 つ) を開始
+    poseStartNewSession();
+    g_currentOrientLabel = lock_scale ? "AutoQCR6" : "AutoQCR7";
+    g_currentOrientRunCount = 0;
+
+    // ---- 3. Best 候補保持用バッファ -------------------------------------
+    struct TrialResult {
+        int             preset_idx     = -1;
+        const char*     preset_name    = "";
+        RegistrationData::InitRotPreset preset = RegistrationData::PRESET_BASE;
+        bool            valid          = false;  // REGISTERED reached?
+        float           compRmse       = FLT_MAX;
+        float           compIoU2D      = 0.0f;
+        // Phase 1 観察用: runQuadCyclicRansac が publish した RANSAC prealign の
+        // estScale。1.0 から離れているほど scale bias がかかっている疑いが強い。
+        // 論文的合理範囲は [0.85, 1.10]、CMA-ES 救済特性を加味すると下方向は
+        // 寛容、上方向は厳しめ。
+        float           prealignScale  = -1.0f;
+        // best 再現用に organs の vertices/normals を保存
+        std::vector<std::vector<GLfloat>> verts;
+        std::vector<std::vector<GLfloat>> norms;
+        // registrationHandle を best に書き戻すための値
+        float baseFitness = 0.0f, baseIcpRmse = 0.0f;
+        float baseAvgError = 0.0f, baseRmse = 0.0f;
+        float baseMaxError = 0.0f, baseScale = 1.0f;
+        float compAvgError = 0.0f, compMaxError = 0.0f;
+        int   compCount    = 0;
+    };
+
+    TrialResult              bestTrial;     // 最良 1 個
+    std::vector<TrialResult> topNSummary;   // ログ用 (top-5)
+    topNSummary.reserve(8);
+
+    auto wall_t0 = std::chrono::steady_clock::now();
+    int  reg_count = 0;  // REGISTERED 状態に達した試行数
+
+    // ---- 4. 9 trial ループ (ORIENT preset を 9 個、QUADRANT 固定) -------
+    for (int pi = 0; pi < kNumPresets; pi++) {
+        const RegistrationData::InitRotPreset preset = kPresets[pi];
+        const char* presetName = RegistrationData::presetName(preset);
+        const int trial_idx = pi + 1;
+
+        std::cout << "\n[AutoQCR " << trial_idx << "/" << kNumPresets << "]"
+                  << "  ORIENT=" << presetName
+                  << "  QUAD=" << LiverLeftRightLabel::quadrantMaskString(saved_mask)
+                  << std::endl;
+
+        // (a) preset を設定、quadrant は固定値で常に復元
+        registrationHandle.initRotPreset = preset;
+        g_activeQuadrantMask             = saved_mask;
+
+        // (b) g_initOrganVertices から復元 + 姿勢適用
+        //     startNewSession=false  (loop 全体で 1 セッション)
+        applyInitRotation(/*startNewSession=*/false);
+
+        // (c) Shift+Ctrl+P と同じ流儀で stepStartTime をリセット
+        g_stepStartTime  = std::chrono::steady_clock::now();
+        g_sessionBipopN  = 0;
+
+        // (d) registration 実行 (PoseLibrary には一切触らない)
+        //     Phase 1 観察用: runQuadCyclicRansac が末尾で publish する
+        //     g_lastQcrPrealignScale を新規 trial 前に sentinel (-1) にクリア。
+        //     trial 内で値が書き換わらなかった場合は -1 のまま読まれる (anomaly
+        //     検出用)。
+        //     lock_scale=true のときは内部で scale=1 固定 (rigid 6-DoF)。
+        g_lastQcrPrealignScale = -1.0f;
+        try {
+            runQuadCyclicRansac(lock_scale);
+        } catch (const std::exception& e) {
+            std::cerr << "[AutoQCR " << trial_idx << "/" << kNumPresets
+                      << "] runQuadCyclicRansac threw: " << e.what()
+                      << "  (skipping this trial)" << std::endl;
+            continue;
+        }
+
+        // (e) REGISTERED に達したか確認
+        if (registrationHandle.state != RegistrationData::REGISTERED) {
+            std::cout << "[AutoQCR " << trial_idx << "/" << kNumPresets
+                      << "] Not REGISTERED  (likely empty quadrant or "
+                      << "insufficient visible verts); skipping." << std::endl;
+            continue;
+        }
+        reg_count++;
+
+        // (f) 結果を取り出して bestTrial と比較
+        //     consume-and-clear: scale を取得後、global を即クリアして次 trial
+        //     に持ち越さない (PoseLibrary の g_lastRimRmse パターンと同じ)。
+        const float trialScale = g_lastQcrPrealignScale;
+        g_lastQcrPrealignScale = -1.0f;
+
+        TrialResult tr;
+        tr.preset_idx    = pi;
+        tr.preset_name   = presetName;
+        tr.preset        = preset;
+        tr.valid         = true;
+        tr.compRmse      = registrationHandle.compRmse;
+        tr.compIoU2D     = registrationHandle.compIoU2D;
+        tr.prealignScale = trialScale;
+        tr.baseFitness   = registrationHandle.fitness;
+        tr.baseIcpRmse   = registrationHandle.icpRmse;
+        tr.baseAvgError  = registrationHandle.averageError;
+        tr.baseRmse      = registrationHandle.rmse;
+        tr.baseMaxError  = registrationHandle.maxError;
+        tr.baseScale     = registrationHandle.scaleFactor;
+        tr.compAvgError  = registrationHandle.compAvgError;
+        tr.compMaxError  = registrationHandle.compMaxError;
+        tr.compCount     = registrationHandle.compCount;
+
+        std::cout << "[AutoQCR " << trial_idx << "/" << kNumPresets
+                  << "] RMSE=" << tr.compRmse
+                  << "  IoU2D=" << tr.compIoU2D
+                  << "  scale=" << tr.prealignScale
+                  << std::endl;
+
+        const bool isBest = (tr.compRmse < bestTrial.compRmse);
+
+        // top-N サマリ更新 (compRmse 昇順、最大 5 件)
+        {
+            // 軽量: O(N) 挿入。verts/norms は best 候補にだけ載せて
+            //       メモリを節約する。
+            TrialResult slim = tr;
+            slim.verts.clear();
+            slim.norms.clear();
+            topNSummary.push_back(slim);
+            std::sort(topNSummary.begin(), topNSummary.end(),
+                      [](const TrialResult& a, const TrialResult& b) {
+                          return a.compRmse < b.compRmse;
+                      });
+            if (topNSummary.size() > 5) topNSummary.resize(5);
+        }
+
+        if (isBest) {
+            // best 候補: verts/norms をスナップ
+            tr.verts.resize(organs.size());
+            tr.norms.resize(organs.size());
+            for (size_t i = 0; i < organs.size(); i++) {
+                if (organs[i]) {
+                    tr.verts[i] = organs[i]->mVertices;
+                    tr.norms[i] = organs[i]->mNormals;
+                }
+            }
+            bestTrial = std::move(tr);
+            std::cout << "[AutoQCR " << trial_idx << "/" << kNumPresets
+                      << "] *** NEW BEST *** RMSE=" << bestTrial.compRmse
+                      << "  scale=" << bestTrial.prealignScale
+                      << "  (ORIENT=" << bestTrial.preset_name << ")"
+                      << std::endl;
+        }
+    }
+
+    auto wall_t1 = std::chrono::steady_clock::now();
+    const float wall_sec = std::chrono::duration<float>(wall_t1 - wall_t0).count();
+
+    // ---- 5. 結果サマリ ---------------------------------------------------
+    std::cout << "\n=== AutoQCR Complete ===" << std::endl;
+    std::cout << "[AutoQCR] Trials: " << reg_count << "/" << kNumPresets
+              << " reached REGISTERED  (wall=" << wall_sec << "s, ~"
+              << (reg_count > 0 ? (wall_sec / reg_count) : 0.0f)
+              << "s/trial)" << std::endl;
+
+    if (!bestTrial.valid) {
+        std::cerr << "[AutoQCR] No valid trial; nothing to apply. "
+                  << "Restoring saved preset/mask." << std::endl;
+        registrationHandle.initRotPreset = saved_preset;
+        g_activeQuadrantMask             = saved_mask;
+        return;
+    }
+
+    // top-N ログ (PoseLibrary には載せない — 診断用)
+    //   scale 列を追加: Phase 1 観察用。1.0 付近が論文的に望ましく、
+    //   scale > 1.0 寄りの解は後段の CMA-ES で救えない傾向がある。
+    //   "[scale-bias?]" 注記は scale が論文的合理範囲 [0.85, 1.10] 外の
+    //   trial に付ける (まだ採択判定には使わない — 観察のみ)。
+    std::cout << "[AutoQCR] top-" << topNSummary.size()
+              << " (rank by compRMSE, scale observation):" << std::endl;
+    for (size_t r = 0; r < topNSummary.size(); r++) {
+        const auto& t = topNSummary[r];
+        const bool scaleOutOfRange = (t.prealignScale > 0.0f) &&
+                                     (t.prealignScale < 0.85f || t.prealignScale > 1.10f);
+        std::cout << "    #" << (r + 1) << "  ORIENT=" << t.preset_name
+                  << "  RMSE=" << t.compRmse
+                  << "  IoU2D=" << t.compIoU2D
+                  << "  scale=" << t.prealignScale
+                  << (scaleOutOfRange ? "  [scale-bias?]" : "")
+                  << std::endl;
+    }
+    std::cout << "[AutoQCR] *** WINNER *** ORIENT=" << bestTrial.preset_name
+              << "  QUAD=" << LiverLeftRightLabel::quadrantMaskString(saved_mask)
+              << "  RMSE=" << bestTrial.compRmse
+              << "  IoU2D=" << bestTrial.compIoU2D
+              << "  scale=" << bestTrial.prealignScale
+              << std::endl;
+
+    // ---- 6. best 結果を organs に書き戻す --------------------------------
+    for (size_t i = 0; i < organs.size(); i++) {
+        if (!organs[i]) continue;
+        organs[i]->mVertices = bestTrial.verts[i];
+        organs[i]->mNormals  = bestTrial.norms[i];
+        setUp(*organs[i]);
+    }
+    registrationHandle.state           = RegistrationData::REGISTERED;
+    registrationHandle.useRegistration = true;
+    registrationHandle.fitness         = bestTrial.baseFitness;
+    registrationHandle.icpRmse         = bestTrial.baseIcpRmse;
+    registrationHandle.averageError    = bestTrial.baseAvgError;
+    registrationHandle.rmse            = bestTrial.baseRmse;
+    registrationHandle.maxError        = bestTrial.baseMaxError;
+    registrationHandle.scaleFactor     = bestTrial.baseScale;
+    registrationHandle.compRmse        = bestTrial.compRmse;
+    registrationHandle.compAvgError    = bestTrial.compAvgError;
+    registrationHandle.compMaxError    = bestTrial.compMaxError;
+    registrationHandle.compIoU2D       = bestTrial.compIoU2D;
+    registrationHandle.compCount       = bestTrial.compCount;
+
+    // best trial 時の preset を「現在の選択」として残す。
+    //   QUADRANT は loop 中固定なので saved_mask のまま。
+    //   PoseLibrary entry の orient 表示と一致させるため。
+    registrationHandle.initRotPreset = bestTrial.preset;
+    g_activeQuadrantMask             = saved_mask;
+    g_currentOrientLabel = std::string(lock_scale ? "AutoQCR6/" : "AutoQCR7/")
+                         + bestTrial.preset_name;
+    if (saved_mask != LiverLeftRightLabel::QUAD_ALL) {
+        g_currentOrientLabel += " @ ";
+        g_currentOrientLabel +=
+            LiverLeftRightLabel::quadrantMaskString(saved_mask);
+    }
+
+    // metrics は best 候補と一致するはずだが、念のため再計算で同期。
+    // (compRmse/IoU が drift していたら以後の比較が壊れる)
+    computeUnifiedMetrics();
+    g_metricsValid = true;
+
+    // ---- 7. PoseLibrary に 1 件だけ追加 ---------------------------------
+    //   - poseSaveToLibrary は session-best と比較するが、session を loop
+    //     開始時に reset しているので必ず accept される。
+    //   - mask 引数で entry のラベルが "AutoQCR/<orient>" 形式になる。
+    gUI.state.regMethod = 1;  // HemiAuto と同じ表示扱い
+    poseSaveToLibrary(SaveCriterion::RMSE, saved_mask);
+
+    std::cout << "[AutoQCR] PoseLibrary entry added "
+              << "(ORIENT=" << bestTrial.preset_name
+              << ", QUAD=" << LiverLeftRightLabel::quadrantMaskString(saved_mask)
+              << ", callIdx range=" << saved_callIdx_start
+              << ".." << (g_callIdx - 1) << ")" << std::endl;
 }
 
 static void snapshotInitialPose() {

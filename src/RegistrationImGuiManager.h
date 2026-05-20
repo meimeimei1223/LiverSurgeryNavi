@@ -60,6 +60,10 @@ struct RegUIActions {
     std::function<void()> onPoseUndo;
     std::function<void()> onAutoProbe;
     std::function<void(int)> onIterativeAutoProbe;  // (K) — calls runAutoProbe() K times
+    // AutoQCR (Alt+Ctrl+P): 9-preset 自動 sweep。bool 引数は lock_scale
+    // (true=6-DoF rigid、false=7-DoF T+R+S)。RegUIState::autoQcrLockScale
+    // から渡る。チェックボックス default ON = 6-DoF (論文推奨、CMA-ES 発散回避)。
+    std::function<void(bool)> onAutoQCR;
     std::function<void(int)> onSwitchDepthModel;
     std::function<void(int)> onInitRotPresetChanged;
     std::function<void(int)> onInitRotPositionChanged;   // Phase 2: 重心位置 selector (legacy, deprecated)
@@ -180,6 +184,10 @@ struct RegUIState {
     float idealVoxel1to15 = 0.0f;
     float idealVoxel1to2  = 0.0f;
     int   iterCycles = 9;   // IterAutoProbe: number of cycles
+    // AutoQCR (Alt+Ctrl+P) 6-DoF/7-DoF 切替。
+    //   true  (default) = 6-DoF rigid (論文推奨、CMA-ES 発散回避)
+    //   false           = 7-DoF T+R+Scale (Shift+Ctrl+P 互換挙動)
+    bool  autoQcrLockScale = true;
     float boardAlpha = 0.7f;
     float targetAlpha = 0.5f;
     unsigned int boardIconTex = 0;
@@ -1286,6 +1294,62 @@ private:
             ImGui::SameLine(0.0f, gap);
             if(glowButton("AutoProbe", colReg(), anyP, -1, 52, 0)) {
                 if(actions.onAutoProbe) actions.onAutoProbe();
+            }
+        }
+        ImGui::Spacing();
+
+        // ----------------------------------------------------------------
+        //  AutoQCR (Alt+Ctrl+P): 9-preset 自動 sweep + 6-DoF/7-DoF 切替
+        // ----------------------------------------------------------------
+        //  Hemi Auto / AutoProbe 行の直下に同じ寸法で配置。左 2/3 が
+        //  AutoQCR ボタン、右 1/3 が 6-DoF lock チェックボックス。
+        //  チェック ON (default) = rigid (DICOM mm + metric depth)、
+        //  チェック OFF = 7-DoF T+R+Scale (Shift+Ctrl+P 互換)。
+        {
+            float totalW = ImGui::GetContentRegionAvail().x;
+            float gap2 = ImGui::GetStyle().ItemSpacing.x;
+            float wAutoQcr = totalW * (2.0f / 3.0f) - gap2;
+            const char* label = state.autoQcrLockScale
+                                    ? "AutoQCR  6-DoF"
+                                    : "AutoQCR  7-DoF";
+            bool anyP2 = (state.cameraState == 2 || state.hasLocalImage);
+            if(glowButton(label, colReg(), anyP2, wAutoQcr, 52, 0)) {
+                if(actions.onAutoQCR) actions.onAutoQCR(state.autoQcrLockScale);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "AutoQCR (Alt+Ctrl+P): 9-preset QuadCyclic-RANSAC sweep\n"
+                    "QUADRANT は Apply Init Pose で決定済みの値で固定し、\n"
+                    "ORIENT preset 9 個を自動試行して compRMSE 最小の解を採用。\n"
+                    "\n"
+                    "右隣のチェック ON (default) = 6-DoF rigid:\n"
+                    "  scale=1 強制。CMA-ES の size_ratio 発散を回避。\n"
+                    "  論文 defensible (CT mm + metric depth → SE(3))。\n"
+                    "\n"
+                    "チェック OFF = 7-DoF T+R+Scale:\n"
+                    "  Shift+Ctrl+P 単発と同じ挙動。scale を観察するモード。\n"
+                    "\n"
+                    "実行時間: 約 3-4 秒 (1 trial 0.38s × 9)。");
+            }
+
+            ImGui::SameLine(0.0f, gap2);
+            // 6-DoF checkbox (右側 1/3)
+            bool lockScale = state.autoQcrLockScale;
+            if (ImGui::Checkbox("6-DoF", &lockScale)) {
+                // RegUIState は const 参照では渡らないため、
+                // const_cast せずトグルだけしておく(次フレームの sync で
+                // 反映される設計でも OK だが、即時反映が欲しいので直接書く)。
+                const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON  : AutoQCR を 6-DoF rigid で実行 (scale=1 固定)\n"
+                    "OFF : AutoQCR を 7-DoF T+R+Scale で実行 (scale 推定)\n"
+                    "\n"
+                    "Default ON 推奨。Ctrl+G を後段で繰り返すとき、\n"
+                    "scale=1 起点なら size_ratio 1.0-1.05 で安定。\n"
+                    "7-DoF だと RANSAC が scale=1.5x 級の解を選ぶ\n"
+                    "ことがあり、CMA-ES はそれを縮められない。");
             }
         }
         ImGui::Spacing();
