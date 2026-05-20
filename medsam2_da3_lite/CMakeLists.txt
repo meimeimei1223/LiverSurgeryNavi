@@ -3,18 +3,32 @@ project(medsam2_da3_lite LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(USE_CUDA "Enable CUDA support" OFF)
-
+##option(USE_CUDA "Enable CUDA support" OFF)
+option(USE_CUDA "Enable CUDA support" ON)
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_options(/wd4819 /wd4267 /wd4244 /wd4996 /MP /utf-8)
 endif()
 
+# ORT distribution selection.
+# Two pre-extracted variants live under the project root:
+#   onnxruntime-{linux,win}-x64-1.15.1/         (CPU-only)
+#   onnxruntime-{linux,win}-x64-gpu-1.15.1/     (CUDA + TensorRT EP)
+# USE_CUDA picks the GPU build at configure time. Switching requires a
+# fresh `cmake` (the path is baked into BUILD_RPATH below).
 if(WIN32)
-    set(ORT_NAME "onnxruntime-win-x64-1.15.1")
+    if(USE_CUDA)
+        set(ORT_NAME "onnxruntime-win-x64-gpu-1.15.1")
+    else()
+        set(ORT_NAME "onnxruntime-win-x64-1.15.1")
+    endif()
     set(ORT_ARCHIVE_EXT "zip")
 else()
-    set(ORT_NAME "onnxruntime-linux-x64-1.15.1")
+    if(USE_CUDA)
+        set(ORT_NAME "onnxruntime-linux-x64-gpu-1.15.1")
+    else()
+        set(ORT_NAME "onnxruntime-linux-x64-1.15.1")
+    endif()
     set(ORT_ARCHIVE_EXT "tgz")
 endif()
 
@@ -25,9 +39,13 @@ if(NOT EXISTS ${ONNXRUNTIME_ROOT})
     message(FATAL_ERROR
         "ONNX Runtime not found at: ${ONNXRUNTIME_ROOT}\n"
         "Please download from: https://github.com/microsoft/onnxruntime/releases/tag/v1.15.1\n"
-        "  Windows: onnxruntime-win-x64-1.15.1.zip -> ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime-win-x64-1.15.1/\n"
-        "  Linux:   onnxruntime-linux-x64-1.15.1.tgz\n"
-        "Or set -DONNXRUNTIME_ROOT=/path/to/onnxruntime")
+        "  Windows (CPU): onnxruntime-win-x64-1.15.1.zip\n"
+        "  Windows (GPU): onnxruntime-win-x64-gpu-1.15.1.zip\n"
+        "  Linux   (CPU): onnxruntime-linux-x64-1.15.1.tgz\n"
+        "  Linux   (GPU): onnxruntime-linux-x64-gpu-1.15.1.tgz\n"
+        "Extract under ${CMAKE_CURRENT_SOURCE_DIR}/\n"
+        "Or set -DONNXRUNTIME_ROOT=/path/to/onnxruntime\n"
+        "USE_CUDA=${USE_CUDA}  (controls which variant is required)")
 endif()
 
 set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_ROOT}/include)
@@ -50,6 +68,10 @@ add_library(medsam2_da3_lite_lib STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/image_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/depth_anything_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sam2_segmentor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ply_exporter.cpp   # ← 追加
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/obj_exporter.cpp   # ← 追加
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/image_utils.hpp
+
 )
 
 target_include_directories(medsam2_da3_lite_lib PUBLIC
@@ -85,6 +107,7 @@ install(TARGETS medsam2_da3_lite DESTINATION bin)
 message(STATUS "")
 message(STATUS "=== medsam2_da3_lite Build Configuration ===")
 message(STATUS "ONNX Runtime: ${ONNXRUNTIME_ROOT}")
+message(STATUS "ORT variant:  ${ORT_NAME}")
 message(STATUS "CUDA Support: ${USE_CUDA}")
 message(STATUS "Platform:     ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Compiler:     ${CMAKE_CXX_COMPILER_ID}")

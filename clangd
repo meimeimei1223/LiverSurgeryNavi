@@ -1,0 +1,16 @@
+# =====================================================================
+#  .clangd — Suppress all diagnostics for PoseLibrary.h
+# ---------------------------------------------------------------------
+#  PoseLibrary.h is designed to be included AFTER RegistrationActions.h
+#  in main.cpp (see comment in PoseLibrary.h:534-540). When clangd
+#  parses the header standalone, symbols like g_trialSeed and
+#  computeUnifiedMetrics aren't visible.
+#
+#  Real build (g++ via cmake/make) is unaffected.
+# =====================================================================
+
+If:
+  PathMatch: '.*PoseLibrary\.h$'
+
+Diagnostics:
+  Suppress: ['*']

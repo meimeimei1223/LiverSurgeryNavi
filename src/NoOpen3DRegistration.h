@@ -27,11 +27,43 @@ extern std::function<void(float, const char*)> g_progressCallback;
 
 namespace Reg3DCustom {
 
+// ============================================================
+// FGR determinism control (reproducibility protocol)
+// ------------------------------------------------------------
+// When g_fgrSeed != 0, the FGR tuple-test RNG and (optional)
+// FPFH normal-noise RNG are seeded with the specified value,
+// producing deterministic results across calls.
+// When g_fgrSeed == 0 (default), std::random_device is used,
+// preserving the original non-deterministic behavior.
+//
+// Typical use:
+//   Reg3DCustom::setFgrSeed(42);   // before a HemiAuto call
+//   ...run HemiAuto...
+//   Reg3DCustom::setFgrSeed(0);    // restore default
+//
+// Note: value 0 is the sentinel for "non-deterministic mode",
+// so seed=0 cannot be used as a real seed. For mt19937 this
+// is acceptable since seed=0 is conventionally avoided.
+// ============================================================
+inline unsigned g_fgrSeed = 0;
+
+inline void setFgrSeed(unsigned seed) {
+    g_fgrSeed = seed;
+    if (seed != 0) {
+        std::cout << "[FGR] Deterministic seed set: " << seed << std::endl;
+    } else {
+        std::cout << "[FGR] Reverted to non-deterministic mode" << std::endl;
+    }
+}
+
+inline unsigned getFgrSeed() { return g_fgrSeed; }
+
 struct PointCloud {
     std::vector<glm::vec3> points;
     std::vector<glm::vec3> normals;
     std::vector<glm::vec3> colors;
     std::vector<float>     boundaryDist;
+    std::vector<float>     instrumentDist;   // distance (in pixels) to nearest instrument pixel
 
     size_t size()  const { return points.size(); }
     bool   empty() const { return points.empty(); }
@@ -41,6 +73,7 @@ struct PointCloud {
         normals.clear();
         colors.clear();
         boundaryDist.clear();
+        instrumentDist.clear();
     }
 
     void reserve(size_t n) {
@@ -64,10 +97,51 @@ struct PointCloud {
         colors.push_back(c);
     }
 
-    bool hasNormals()      const { return !normals.empty()      && normals.size()      == points.size(); }
-    bool hasColors()       const { return !colors.empty()       && colors.size()        == points.size(); }
-    bool hasBoundaryDist() const { return !boundaryDist.empty() && boundaryDist.size() == points.size(); }
+    bool hasNormals()        const { return !normals.empty()        && normals.size()        == points.size(); }
+    bool hasColors()         const { return !colors.empty()         && colors.size()         == points.size(); }
+    bool hasBoundaryDist()   const { return !boundaryDist.empty()   && boundaryDist.size()   == points.size(); }
+    bool hasInstrumentDist() const { return !instrumentDist.empty() && instrumentDist.size() == points.size(); }
 };
+
+// ============================================================
+// Target-cloud cache (for OBJ-based target mesh integration)
+// ------------------------------------------------------------
+// When set (non-null), extractFrontFacePoints returns this cached
+// cloud directly instead of running the grid-based extraction.
+// This lets main.cpp inject an OBJ-derived PointCloud once at
+// startup, transparently rerouting all 15+ existing call sites
+// to use it without touching any of them.
+//
+// Typical use in main.cpp:
+//   auto cloud = Reg3DCustom::extractTargetFromOBJ(...);
+//   Reg3DCustom::setCachedTargetCloud(cloud);
+//
+// To revert to the grid path:
+//   Reg3DCustom::clearCachedTargetCloud();
+// ============================================================
+inline std::shared_ptr<PointCloud>& getCachedTargetCloudSlot() {
+    static std::shared_ptr<PointCloud> s_cache;
+    return s_cache;
+}
+
+inline void setCachedTargetCloud(std::shared_ptr<PointCloud> cloud) {
+    getCachedTargetCloudSlot() = cloud;
+    std::cout << "[TargetCache] injected target cloud ("
+              << (cloud ? cloud->size() : 0) << " points)" << std::endl;
+}
+
+inline void clearCachedTargetCloud() {
+    getCachedTargetCloudSlot().reset();
+    std::cout << "[TargetCache] cleared" << std::endl;
+}
+
+inline bool hasCachedTargetCloud() {
+    return (bool)getCachedTargetCloudSlot();
+}
+
+inline std::shared_ptr<PointCloud> getCachedTargetCloud() {
+    return getCachedTargetCloudSlot();
+}
 
 struct RegistrationResult {
     glm::mat4 transformation = glm::mat4(1.0f);
@@ -267,6 +341,17 @@ public:
         int gridHeight,
         float z_threshold = 0.1f)
     {
+        // ---- OBJ integration: if cache is set, return it directly ----
+        if (hasCachedTargetCloud()) {
+            auto cached = getCachedTargetCloud();
+            std::cout << "  [Cached] returning injected target cloud ("
+                      << cached->size() << " points, boundaryDist: "
+                      << (cached->hasBoundaryDist() ? "YES" : "NO") << ")"
+                      << std::endl;
+            return cached;
+        }
+        // ---- End of integration hook; existing grid path follows ----
+
         auto cloud = std::make_shared<PointCloud>();
 
         int frontVertexCount = (gridWidth + 1) * (gridHeight + 1);
@@ -988,7 +1073,12 @@ private:
         int number_of_trial = ncorr * 100;
         int cnt = 0;
 
-        static std::mt19937 gen(std::random_device{}());
+        // FGR determinism: use g_fgrSeed if non-zero, else random_device.
+        // Note: "static" removed — each advancedMatching call now gets
+        // a fresh generator. With g_fgrSeed != 0, same seed → same result.
+        std::mt19937 gen(g_fgrSeed != 0
+                             ? g_fgrSeed
+                             : std::random_device{}());
         std::uniform_int_distribution<int> dist(0, ncorr - 1);
 
         std::vector<std::pair<int, int>> corres_tuple;
@@ -1297,7 +1387,11 @@ public:
         std::shared_ptr<PointCloud> workCloud = cloud;
         if (addNormalNoise) {
             workCloud = std::make_shared<PointCloud>(*cloud);
-            static std::mt19937 gen(std::random_device{}());
+            // Same seed control as tuple test (rarely active: only when
+            // addNormalNoise=true; included for completeness)
+            std::mt19937 gen(g_fgrSeed != 0
+                                 ? g_fgrSeed
+                                 : std::random_device{}());
             std::normal_distribution<float> noise(0.0f, 0.08f);
             for (auto& nrm : workCloud->normals) {
                 nrm = glm::normalize(nrm + glm::vec3(noise(gen), noise(gen), noise(gen)));
@@ -3579,20 +3673,52 @@ inline bool performRegistrationMultiMeshWithScale(
                 float diag_dev = std::abs(T[0][0]-1.f) + std::abs(T[1][1]-1.f) + std::abs(T[2][2]-1.f);
                 float trans_mag = std::abs(T[3][0]) + std::abs(T[3][1]) + std::abs(T[3][2]);
                 bool is_identity = (off_diag < 0.01f && diag_dev < 0.01f && trans_mag < 0.5f);
+
+                // 修正: identity でも ICP を試す。FGR が役立たない場面では prealign
+                // 後の center-of-mass alignment 状態から ICP が単独で局所最適に降りる
+                // チャンスがある。ただし ICP の探索半径を広めに取る:
+                //   通常 voxel*0.4 は「すでに近い対応」しか拾えず、FGR-identity
+                //   状態の partial alignment では対応 0 に陥りやすい。
+                //   voxel*1.5 まで広げて attractive-ICP として動かす。
+                // 発散判定は RMSE 基準: ICP の目的関数は RMSE 最小化なので、RMSE が
+                // 改善していれば局所的には正方向に動いている。fitness (対応数比率)
+                // が下がるのは「広い対応の中から本当に合ったものだけ残った」結果で、
+                // 必ずしも悪化ではない。ICP 後 RMSE が悪化 (>1.5x) または対応が
+                // ゼロになった場合のみ revert。
+                float local_icp_distance = is_identity ? voxel_size * 1.5f : icp_distance;
                 if (is_identity) {
-                    std::cout << "  FGR returned near-identity, skipping ICP to avoid divergence" << std::endl;
-                } else {
-                    try {
-                        result = reg.icpRefinement(sourceDown, targetDown, result.transformation, icp_distance, true);
-                        std::cout << "  Final fitness: " << result.fitness << std::endl;
-                        std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
-                    } catch (const std::exception& e) {
-                        std::cerr << "  ICP refinement failed: " << e.what() << std::endl;
-                        std::cout << "  Continuing with FGR result" << std::endl;
+                    std::cout << "  [FGR-identity] using widened ICP radius "
+                              << local_icp_distance << " (= voxel*1.5)" << std::endl;
+                }
+                auto preIcp = result;
+                bool icp_tried = false;
+                bool icp_diverged = false;
+                try {
+                    result = reg.icpRefinement(sourceDown, targetDown, result.transformation, local_icp_distance, true);
+                    std::cout << "  Final fitness: " << result.fitness << std::endl;
+                    std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
+                    icp_tried = true;
+                    if (is_identity) {
+                        bool fitness_zero  = (result.fitness == 0.0f);
+                        bool rmse_worsened = (preIcp.inlier_rmse > 0.0f &&
+                                              result.inlier_rmse > preIcp.inlier_rmse * 1.5f);
+                        if (fitness_zero || rmse_worsened) {
+                            std::cout << "  ICP from FGR-identity diverged (fitness "
+                                      << preIcp.fitness << " -> " << result.fitness
+                                      << ", RMSE " << preIcp.inlier_rmse << " -> "
+                                      << result.inlier_rmse << "), reverting" << std::endl;
+                            result = preIcp;
+                            icp_diverged = true;
+                        }
                     }
+                } catch (const std::exception& e) {
+                    std::cerr << "  ICP refinement failed: " << e.what() << std::endl;
+                    result = preIcp;
+                    icp_diverged = true;
                 }
 
-                if (is_identity) {
+                // identity かつ ICP も発散/失敗 → 旧スキップ ロジックに従う
+                if (is_identity && icp_diverged) {
                     if (voxel_size != standard_voxel) {
                         float standard_dist = standard_voxel * 0.4f;
                         auto evalResult = NoOpen3DRegistration::evaluateCurrentFitness(
@@ -3610,6 +3736,12 @@ inline bool performRegistrationMultiMeshWithScale(
                         break;
                     }
                     continue;
+                }
+                // identity だったが ICP が改善した、または non-identity → 通常フロー継続
+                if (is_identity && icp_tried && !icp_diverged) {
+                    std::cout << "  [FGR-IDENTITY but ICP converged: " << preIcp.fitness
+                              << " -> " << result.fitness << "]" << std::endl;
+                    consecutive_skips = 0;  // 改善したので連続スキップはリセット
                 }
             }
 
@@ -4157,6 +4289,50 @@ inline bool performRegistrationSingleMesh(
 
     auto targetCloudCached = reg.extractFrontFacePoints(*screenMesh, gridWidth, gridHeight, zThreshold);
 
+    // ============================================================
+    //  ★ 最適化 2: Target voxel down + FPFH を iter ループの前で 1 回計算 ★
+    //  ----------------------------------------------------------------
+    //  各 iter で source 側はメッシュ姿勢が変わるが、target 側 (screenMesh
+    //  の点群) は完全に不変。よって target の voxel down と FPFH は
+    //  iter に依存しない → 1 回計算してキャッシュすれば全 iter で再利用可。
+    //
+    //  retry path (low fitness 時) は voxel_size を 1.2 倍にして再計算する
+    //  ので、その voxel_size 用のキャッシュも作る。
+    //
+    //  数学的に同じ計算を 1 回にまとめるだけで、結果は bit-identical。
+    //  Sanity: voxel_size_override が iter ごとに変わらない設計だから安全。
+    //
+    //  期待効果: target voxel + FPFH = 25-40ms × (avg 3 iter × retry 含み 4 回計算)
+    //           = 100-160ms / probe 削減。N=108 で 11-17 秒削減。
+    // ============================================================
+    const float kTargetCacheVoxelStd   = (voxel_size_override > 0.0f) ? voxel_size_override : 0.5f;
+    const float kTargetCacheVoxelRetry = kTargetCacheVoxelStd * 1.2f;
+    std::shared_ptr<PointCloud> g_targetDownStd_cache;
+    std::shared_ptr<FeatureSet> g_targetFpfhStd_cache;
+    std::shared_ptr<PointCloud> g_targetDownRetry_cache;
+    std::shared_ptr<FeatureSet> g_targetFpfhRetry_cache;
+    {
+        auto _tcs = std::chrono::high_resolution_clock::now();
+        std::cout << "\n[TargetCache] Pre-computing target voxel + FPFH (std + retry)..." << std::endl;
+        std::cout << "  std voxel:   " << kTargetCacheVoxelStd << std::endl;
+        std::cout << "  retry voxel: " << kTargetCacheVoxelRetry << std::endl;
+
+        g_targetDownStd_cache = reg.preprocess(targetCloudCached, kTargetCacheVoxelStd, false);
+        if (g_targetDownStd_cache && g_targetDownStd_cache->size() >= 10) {
+            g_targetFpfhStd_cache = reg.computeFPFH(g_targetDownStd_cache, kTargetCacheVoxelStd);
+        }
+        g_targetDownRetry_cache = reg.preprocess(targetCloudCached, kTargetCacheVoxelRetry, false);
+        if (g_targetDownRetry_cache && g_targetDownRetry_cache->size() >= 10) {
+            g_targetFpfhRetry_cache = reg.computeFPFH(g_targetDownRetry_cache, kTargetCacheVoxelRetry);
+        }
+        auto _tce = std::chrono::high_resolution_clock::now();
+        std::cout << "  [TargetCache] built in "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(_tce - _tcs).count()
+                  << " ms (std=" << (g_targetDownStd_cache ? g_targetDownStd_cache->size() : 0)
+                  << " pts, retry=" << (g_targetDownRetry_cache ? g_targetDownRetry_cache->size() : 0)
+                  << " pts)" << std::endl;
+    }
+
     for (int iter = 0; iter < max_iterations; iter++) {
         float fitness_change = 0.0f;
         if (g_progressCallback) {
@@ -4214,7 +4390,17 @@ inline bool performRegistrationSingleMesh(
             std::cout << "\nStep 2: Preprocessing (voxel size: " << voxel_size << ")..." << std::endl;
             auto _t2s = std::chrono::high_resolution_clock::now();
 
-            auto targetDown = reg.preprocess(targetCloud, voxel_size, false);
+            // ★ 最適化 2: target は事前計算したキャッシュを再利用。
+            // source 側はメッシュ姿勢が変わるので毎 iter 計算。
+            std::shared_ptr<PointCloud> targetDown;
+            if (g_targetDownStd_cache && std::abs(voxel_size - kTargetCacheVoxelStd) < 1e-6f) {
+                targetDown = g_targetDownStd_cache;
+                std::cout << "  [TargetCache] HIT (std voxel=" << voxel_size << ")" << std::endl;
+            } else {
+                // 想定外: voxel_size_override が変わる事はないが念のためフォールバック
+                targetDown = reg.preprocess(targetCloud, voxel_size, false);
+                std::cout << "  [TargetCache] MISS (voxel=" << voxel_size << ")" << std::endl;
+            }
             auto sourceDown = skip_source_ds ? sourceCloud : reg.preprocess(sourceCloud, voxel_size, true);
 
             std::cout << "  Screen points after downsampling: " << targetDown->size() << std::endl;
@@ -4228,7 +4414,14 @@ inline bool performRegistrationSingleMesh(
 
             std::cout << "\nStep 3: Computing FPFH features..." << std::endl;
             auto _t3s = std::chrono::high_resolution_clock::now();
-            auto targetFpfh = reg.computeFPFH(targetDown, voxel_size);
+            // ★ 最適化 2: target FPFH もキャッシュから。
+            std::shared_ptr<FeatureSet> targetFpfh;
+            if (g_targetFpfhStd_cache && targetDown == g_targetDownStd_cache) {
+                targetFpfh = g_targetFpfhStd_cache;
+                std::cout << "  [TargetCache] FPFH HIT" << std::endl;
+            } else {
+                targetFpfh = reg.computeFPFH(targetDown, voxel_size);
+            }
             auto sourceFpfh = reg.computeFPFH(sourceDown, voxel_size, true);
             std::cout << "  [Time] Step3: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t3s).count() << " ms" << std::endl;
 
@@ -4250,12 +4443,26 @@ inline bool performRegistrationSingleMesh(
                 auto _t4rs = std::chrono::high_resolution_clock::now();
 
                 float retry_voxel = voxel_size * 1.2f;
-                auto targetDown_retry = reg.preprocess(targetCloud, retry_voxel, false);
+                // ★ 最適化 2: retry の target もキャッシュから (1.2倍 voxel)。
+                std::shared_ptr<PointCloud> targetDown_retry;
+                std::shared_ptr<FeatureSet> targetFpfh_retry_cached;
+                if (g_targetDownRetry_cache &&
+                    std::abs(retry_voxel - kTargetCacheVoxelRetry) < 1e-6f) {
+                    targetDown_retry = g_targetDownRetry_cache;
+                    targetFpfh_retry_cached = g_targetFpfhRetry_cache;
+                    std::cout << "  [TargetCache] RETRY HIT (voxel=" << retry_voxel << ")" << std::endl;
+                } else {
+                    targetDown_retry = reg.preprocess(targetCloud, retry_voxel, false);
+                    std::cout << "  [TargetCache] RETRY MISS (voxel=" << retry_voxel << ")" << std::endl;
+                }
                 auto sourceDown_retry = reg.preprocess(sourceCloud, retry_voxel, true);
 
                 if (targetDown_retry->size() >= 100 && sourceDown_retry->size() >= 100) {
                     try {
-                        auto targetFpfh_retry = reg.computeFPFH(targetDown_retry, retry_voxel);
+                        // ★ 最適化 2: target FPFH retry もキャッシュから
+                        auto targetFpfh_retry = targetFpfh_retry_cached
+                                                    ? targetFpfh_retry_cached
+                                                    : reg.computeFPFH(targetDown_retry, retry_voxel);
                         auto sourceFpfh_retry = reg.computeFPFH(sourceDown_retry, retry_voxel, true);
 
                         auto result_retry = reg.fastGlobalRegistration(
@@ -4289,19 +4496,43 @@ inline bool performRegistrationSingleMesh(
                 float diag_dev = std::abs(T[0][0]-1.f) + std::abs(T[1][1]-1.f) + std::abs(T[2][2]-1.f);
                 float trans_mag = std::abs(T[3][0]) + std::abs(T[3][1]) + std::abs(T[3][2]);
                 bool is_identity = (off_diag < 0.01f && diag_dev < 0.01f && trans_mag < 0.5f);
+
+                // 修正 (Iter Probe variant): identity でも ICP を試す。
+                // FGR-identity 時は ICP 探索半径を広くして attractive ICP に。
+                // 発散判定は RMSE 基準。
+                float local_icp_distance = is_identity ? voxel_size * 1.5f : icp_distance;
                 if (is_identity) {
-                    std::cout << "  FGR returned near-identity, skipping ICP to avoid divergence" << std::endl;
-                } else {
-                    try {
-                        result = reg.icpRefinement(sourceDown, targetDown, result.transformation, icp_distance, true);
-                        std::cout << "  Final fitness: " << result.fitness << std::endl;
-                        std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
-                    } catch (const std::exception& e) {
-                        std::cerr << "  ICP failed: " << e.what() << std::endl;
+                    std::cout << "  [FGR-identity] using widened ICP radius "
+                              << local_icp_distance << " (= voxel*1.5)" << std::endl;
+                }
+                auto preIcp = result;
+                bool icp_tried = false;
+                bool icp_diverged = false;
+                try {
+                    result = reg.icpRefinement(sourceDown, targetDown, result.transformation, local_icp_distance, true);
+                    std::cout << "  Final fitness: " << result.fitness << std::endl;
+                    std::cout << "  Final RMSE: " << result.inlier_rmse << std::endl;
+                    icp_tried = true;
+                    if (is_identity) {
+                        bool fitness_zero  = (result.fitness == 0.0f);
+                        bool rmse_worsened = (preIcp.inlier_rmse > 0.0f &&
+                                              result.inlier_rmse > preIcp.inlier_rmse * 1.5f);
+                        if (fitness_zero || rmse_worsened) {
+                            std::cout << "  ICP from FGR-identity diverged (fitness "
+                                      << preIcp.fitness << " -> " << result.fitness
+                                      << ", RMSE " << preIcp.inlier_rmse << " -> "
+                                      << result.inlier_rmse << "), reverting" << std::endl;
+                            result = preIcp;
+                            icp_diverged = true;
+                        }
                     }
+                } catch (const std::exception& e) {
+                    std::cerr << "  ICP failed: " << e.what() << std::endl;
+                    result = preIcp;
+                    icp_diverged = true;
                 }
 
-                if (is_identity) {
+                if (is_identity && icp_diverged) {
                     if (voxel_size != standard_voxel) {
                         float standard_dist = standard_voxel * 0.4f;
                         auto evalResult = NoOpen3DRegistration::evaluateCurrentFitness(
@@ -4315,11 +4546,16 @@ inline bool performRegistrationSingleMesh(
                     std::cout << "  [Time] Step5-ICP: 0 ms" << std::endl;
                     std::cout << "  - Fitness: " << result.fitness << " [FGR-IDENTITY SKIP]" << std::endl;
                     std::cout << "  - Skipped count: " << skipped_count << "/" << (iter + 1) << std::endl;
-                    if (consecutive_skips >= 3) {
-                        std::cout << "\n  3 consecutive skips." << std::endl;
+                    if (consecutive_skips >= 2) {
+                        std::cout << "\n  2 consecutive skips, terminating early." << std::endl;
                         break;
                     }
                     continue;
+                }
+                if (is_identity && icp_tried && !icp_diverged) {
+                    std::cout << "  [FGR-IDENTITY but ICP converged: " << preIcp.fitness
+                              << " -> " << result.fitness << "]" << std::endl;
+                    consecutive_skips = 0;
                 }
             }
             std::cout << "  [Time] Step5-ICP: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-_t5s).count() << " ms" << std::endl;
@@ -4350,8 +4586,9 @@ inline bool performRegistrationSingleMesh(
                 skipped_count++;
                 consecutive_skips++;
 
-                if (consecutive_skips >= 3) {
-                    std::cout << "\n  3 consecutive skips." << std::endl;
+                // ★ 最適化 1: Early termination (2 連続 skip で break)
+                if (consecutive_skips >= 2) {
+                    std::cout << "\n  2 consecutive skips, terminating early." << std::endl;
                     break;
                 }
             }
@@ -4449,9 +4686,16 @@ inline bool performRegistrationSingleMesh(
                               << std::chrono::duration_cast<std::chrono::milliseconds>(_t6b - _t6a).count()
                               << " ms" << std::endl;
                     auto _t6c = std::chrono::high_resolution_clock::now();
-                    for (size_t m = 0; m < organMeshes.size(); m++) setUp(*organMeshes[m]);
+                    // ★ Phase 1 高速化: iter 内の setUp はスキップ。
+                    // setUp は GL VBO/NBO/EBO を再生成するだけで、registration 計算
+                    // (extractFrontFacePoints, extractVisibleVerticesCustom, computeFPFH,
+                    //  fastGlobalRegistration, icpRefinement) は全て CPU 側の
+                    // mVertices / mNormals 配列を直接読むため、iter 中の VBO 更新は
+                    // 計算結果に影響しない。描画用 VBO は iter loop の外
+                    // (関数末尾の line ~4621) で 1 回だけ更新すれば足りる。
+                    // for (size_t m = 0; m < organMeshes.size(); m++) setUp(*organMeshes[m]);
                     auto _t6d = std::chrono::high_resolution_clock::now();
-                    std::cout << "  [Time] setUp: "
+                    std::cout << "  [Time] setUp (skipped): "
                               << std::chrono::duration_cast<std::chrono::milliseconds>(_t6d - _t6c).count()
                               << " ms" << std::endl;
                 }

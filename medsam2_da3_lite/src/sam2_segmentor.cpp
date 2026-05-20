@@ -25,23 +25,69 @@ SAM2Segmentor::SAM2Segmentor(
     
     sessionOptions_.SetIntraOpNumThreads(4);
     sessionOptions_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    
-    if (useCuda) {
-#ifdef USE_CUDA
-        OrtCUDAProviderOptions cudaOptions;
-        sessionOptions_.AppendExecutionProvider_CUDA(cudaOptions);
-        std::cout << "Using CUDA" << std::endl;
-#else
-        std::cerr << "Warning: CUDA not available, using CPU" << std::endl;
-#endif
-    }
-    
-    //encoderSession_ = std::make_unique<Ort::Session>(env_, encoderPath.c_str(), sessionOptions_);
-    //decoderSession_ = std::make_unique<Ort::Session>(env_, decoderPath.c_str(), sessionOptions_);
 
-    encoderSession_ = std::make_unique<Ort::Session>(env_, ORT_MODEL_PATH(encoderPath), sessionOptions_);
-    decoderSession_ = std::make_unique<Ort::Session>(env_, ORT_MODEL_PATH(decoderPath), sessionOptions_);
-    std::cout << "SAM2 Segmentor loaded successfully" << std::endl;
+    // ------------------------------------------------------------------
+    //  CUDA execution provider with automatic CPU fallback.
+    //  Same logic as DepthAnythingV3 -- see that file for the full
+    //  rationale comment. SAM2 differs in that it owns TWO sessions
+    //  (encoder + decoder); both must be created with the same
+    //  options object so we treat them as an atomic pair.
+    // ------------------------------------------------------------------
+    bool cudaUsed      = false;
+    bool cudaAttempted = false;
+
+#ifdef USE_CUDA
+    if (useCuda) {
+        cudaAttempted = true;
+        try {
+            OrtCUDAProviderOptions cudaOptions;
+            sessionOptions_.AppendExecutionProvider_CUDA(cudaOptions);
+            encoderSession_ = std::make_unique<Ort::Session>(
+                env_, ORT_MODEL_PATH(encoderPath), sessionOptions_);
+            decoderSession_ = std::make_unique<Ort::Session>(
+                env_, ORT_MODEL_PATH(decoderPath), sessionOptions_);
+            cudaUsed = true;
+            std::cout << "Using CUDA" << std::endl;
+        } catch (const Ort::Exception& e) {
+            std::cerr << "[SAM2] CUDA initialization failed: " << e.what()
+                      << "  -- falling back to CPU" << std::endl;
+            // Reset both sessions; if the encoder succeeded but the
+            // decoder threw, we still want a fully CPU pair below for
+            // consistency.
+            encoderSession_.reset();
+            decoderSession_.reset();
+        }
+    }
+#else
+    if (useCuda) {
+        std::cerr << "Warning: CUDA not available (USE_CUDA=OFF build),"
+                  << " using CPU" << std::endl;
+    }
+#endif
+
+    if (!encoderSession_ || !decoderSession_) {
+        if (cudaAttempted) {
+            // Fresh SessionOptions for CPU retry (see DA3 ctor comment).
+            Ort::SessionOptions cpuOpts;
+            cpuOpts.SetIntraOpNumThreads(4);
+            cpuOpts.SetGraphOptimizationLevel(
+                GraphOptimizationLevel::ORT_ENABLE_ALL);
+            encoderSession_ = std::make_unique<Ort::Session>(
+                env_, ORT_MODEL_PATH(encoderPath), cpuOpts);
+            decoderSession_ = std::make_unique<Ort::Session>(
+                env_, ORT_MODEL_PATH(decoderPath), cpuOpts);
+        } else {
+            // Reuse pristine sessionOptions_ for legacy byte-equivalent
+            // CPU behaviour.
+            encoderSession_ = std::make_unique<Ort::Session>(
+                env_, ORT_MODEL_PATH(encoderPath), sessionOptions_);
+            decoderSession_ = std::make_unique<Ort::Session>(
+                env_, ORT_MODEL_PATH(decoderPath), sessionOptions_);
+        }
+    }
+
+    std::cout << "SAM2 Segmentor loaded successfully"
+              << (cudaUsed ? " (CUDA)" : " (CPU)") << std::endl;
 }
 
 void SAM2Segmentor::printModelInfo() const {

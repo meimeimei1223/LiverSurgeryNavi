@@ -3,8 +3,6 @@
  * @file FileDropHandler.h
  * @brief ローカル画像のドラッグ＆ドロップ / ファイルピッカー対応
  *
- * ドロップ/選択された画像は CameraPreview::loadLocalImageAsFrozen() で
- * frozen 状態にロードされ、既存の FG/BG クリック → Key I/K フローに合流する。
  *
  * 使い方:
  *   initOpenGL() 内で: glfwSetDropCallback(gWindow, glfw_onFileDrop);

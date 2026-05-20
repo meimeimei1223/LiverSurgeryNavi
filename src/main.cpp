@@ -1,12 +1,14 @@
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <vector>
 #include <string>
 #include <cmath>
 #include <limits>
-#include <ctime>
 #include <functional>
 #include <random>
+#include <algorithm>
+#include <numeric>
 
 #define GLEW_STATIC
 #include <GL/glew.h>
@@ -14,2353 +16,3132 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include "ShaderProgram.h"
-#include "MeshDataTypes.h"
-#include "VoxelTetrahedralizer.h"
-#include "SoftBody.h"
-#include "TetoMeshData.h"
 #include "Sphere.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#include <ctime>
 
+// SimpleCameraをSTB_IMAGE_IMPLEMENTATIONが有効な間にインクルード
+#include "SimpleCamera.hpp"
+
+#undef STB_IMAGE_IMPLEMENTATION
+#undef STB_IMAGE_WRITE_IMPLEMENTATION
+
+#include "CameraPreview.h"
 #include "mCutMesh.h"
-#include "RegistrationUI.h"
-#include "FullSphereCameraWithTarget.h"
 #include "MeshDrawing.h"
-#include "NoOpen3DRegistration.h"
-#include "NormalCompatibleRefine.h"
-#include "DepthRunner.h"
-#include <filesystem>
-#include "PathConfig.h"
-#include "CameraAndDepth.h"
-
-#include "UmeyamaUtils.h"
+#include "FullSphereCameraWithTarget.h"
 #include "DepthUtils.h"
-#include "InteractionHelpers.h"
-#include "FileDropHandler.h"
+#include "IoUDebugDump.h"   // IoUDebug::dump (Shift+I)
+#include "RegistrationCore.h"
+#include "NoOpen3DRegistration.h"
+
+#include "OBJTargetExtraction.h"
+#include "MeshCleanup.h"
+#include "AR.h"
+#include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
+
+#include <filesystem>
+#include "AppContext.h"
+#include "ImageSession.h"
+#include "MaskPicker.h"
+#include "DepthRunner.h"
+#include "PathConfig.h"
+#include "LiverRegionLabel.h"     // Shift+R/Shift+T: 肝臓領域 (anterior/rim/posterior) ラベリング
+#include "LiverLeftRightLabel.h"  // Y/Shift+Y: 肝臓左右ラベリング (pure-R/boundary/pure-L)
+#include "LiverCranioCaudalLabel.h"  // Shift+H: 肝臓頭尾ラベリング (cranial/caudal) — Phase 1
+
+#ifdef HAS_TINYFILEDIALOGS
+#include "tinyfiledialogs.h"
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "RegistrationImGuiManager.h"
-#include "PoseLibrary.h"
-#include "CmaesUtils.h"
+#include "UmeyamaController.h"
+// PoseLibrary.h は RegistrationActions.h の後で include する
+// (RegistrationActions.h 内の inline computeUnifiedMetrics 定義を見えてからで
+//  ないと、PoseLibrary.h の inline 関数本体が unresolved になるため)
 
-CameraPreview gCameraPreview;
+// キャリブレーション結果（外部exe calibration_tool から読み込み）
+struct CalibResult {
+    double fx=0, fy=0, cx=0, cy=0, k1=0, k2=0;
+    int width=0, height=0;
+    double rmsError=0;
+    int numImages=0;
+    bool valid=false;
+    std::string message;
+};
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+int gWindowWidth  = 1280;
+int gWindowHeight = 720;
+GLFWwindow* gWindow = nullptr;
 
-DepthRunner gDepthRunner;
-
-std::vector<DepthRunnerPoint> gUserSegPoints;
-std::vector<glm::vec3>        gUserSegPoints3D;
-std::vector<bool>             gUserSegPointsFG;
-
-float gDepthScale = 0.3f;
-float g_voxelSize = 0.3f;
-float g_idealVoxel1to1  = 0.0f;
-float g_idealVoxel1to15 = 0.0f;
-float g_idealVoxel1to2  = 0.0f;
-static void computeIdealVoxelSizes();
-const float gMeshScale = 10.0f;
-int   gGridWidth = 128;
-
-int gWindowWidth = 1280, gWindowHeight = 720;
-GLFWwindow* gWindow = NULL;
-
-std::string gDroppedFilePath = "";
-bool        gFileDropped     = false;
-
-RegistrationImGuiManager gUIManager;
-
-glm::vec3 hit_position;
-int hit_index;
-bool isDragging;
-float gGroupRadius = 0.5f;
-
-glm::mat4 model(1.0), view(1.0), projection(1.0);
-glm::vec3 objPos = glm::vec3(0.0f, 0.0f, 0.0f);
-
-glm::vec3 bunnyPos = glm::vec3(0.0f, 0.0f, 0.0f);
-
-void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode);
-void glfw_OnFramebufferSize(GLFWwindow* window, int width, int height);
-void glfw_onMouseMoveOrbit(GLFWwindow* window, double posX, double posY);
-void glfw_onMouseScroll(GLFWwindow* window, double deltaX, double deltaY);
-void mouse_button_callback(GLFWwindow* window, int button, int action, int mods);
-bool initOpenGL();
-void showFPS(GLFWwindow* window);
-void setupUICallbacks();
-
-static GLuint g_sceneTexForProgress = 0;
-static bool g_sceneTexAllocated = false;
-
-void captureSceneForProgress() {
-    if (g_sceneTexForProgress == 0) {
-        glGenTextures(1, &g_sceneTexForProgress);
-        glBindTexture(GL_TEXTURE_2D, g_sceneTexForProgress);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    } else {
-        glBindTexture(GL_TEXTURE_2D, g_sceneTexForProgress);
-    }
-    glReadBuffer(GL_BACK);
-    if (!g_sceneTexAllocated) {
-        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, gWindowWidth, gWindowHeight, 0);
-        g_sceneTexAllocated = true;
-    } else {
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, gWindowWidth, gWindowHeight);
-    }
-    glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-void showProgressOverlay(float progress, const char* message) {
-    if (!gWindow) return;
-
-    static GLuint sProg = 0, sVAO = 0, sVBO = 0;
-    static GLint sLocColor = -1;
-
-    if (sProg == 0) {
-        const char* vsSrc =
-            "#version 330 core\n"
-            "layout(location=0) in vec2 aPos;\n"
-            "void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }\n";
-        const char* fsSrc =
-            "#version 330 core\n"
-            "uniform vec4 uColor;\n"
-            "out vec4 FragColor;\n"
-            "void main(){ FragColor = uColor; }\n";
-        auto compile = [](GLenum type, const char* src) -> GLuint {
-            GLuint s = glCreateShader(type);
-            glShaderSource(s, 1, &src, nullptr);
-            glCompileShader(s);
-            return s;
-        };
-        GLuint vs = compile(GL_VERTEX_SHADER, vsSrc);
-        GLuint fs = compile(GL_FRAGMENT_SHADER, fsSrc);
-        sProg = glCreateProgram();
-        glAttachShader(sProg, vs);
-        glAttachShader(sProg, fs);
-        glLinkProgram(sProg);
-        glDeleteShader(vs);
-        glDeleteShader(fs);
-        sLocColor = glGetUniformLocation(sProg, "uColor");
-
-        glGenVertexArrays(1, &sVAO);
-        glGenBuffers(1, &sVBO);
-        glBindVertexArray(sVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, sVBO);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 12, nullptr, GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-        glBindVertexArray(0);
-    }
-
-    auto drawRect = [&](float px, float py, float pw, float ph, float r, float g, float b, float a) {
-        float x0 = px / gWindowWidth * 2.0f - 1.0f;
-        float y0 = 1.0f - py / gWindowHeight * 2.0f;
-        float x1 = (px+pw) / gWindowWidth * 2.0f - 1.0f;
-        float y1 = 1.0f - (py+ph) / gWindowHeight * 2.0f;
-        float verts[] = { x0,y0, x1,y0, x1,y1, x0,y0, x1,y1, x0,y1 };
-        glBindBuffer(GL_ARRAY_BUFFER, sVBO);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-        glUniform4f(sLocColor, r, g, b, a);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-    };
-
-    float barW = 380.0f, barH = 20.0f;
-    float padX = 20.0f, padY = 18.0f;
-    float boxW = barW + padX * 2;
-    float boxH = barH + padY * 2;
-    float bx = (gWindowWidth - boxW) * 0.5f;
-    float by = (gWindowHeight - boxH) * 0.5f;
-
-    GLboolean prevDepth, prevBlend;
-    glGetBooleanv(GL_DEPTH_TEST, &prevDepth);
-    glGetBooleanv(GL_BLEND, &prevBlend);
-
-    static GLuint sRestoreProg = 0, sRestoreVAO = 0, sRestoreVBO = 0;
-    static GLint sRestoreTexLoc = -1;
-    if (sRestoreProg == 0) {
-        const char* rvs =
-            "#version 330 core\n"
-            "layout(location=0) in vec2 aPos;\n"
-            "out vec2 uv;\n"
-            "void main(){ uv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
-        const char* rfs =
-            "#version 330 core\n"
-            "uniform sampler2D tex;\n"
-            "in vec2 uv;\n"
-            "out vec4 FragColor;\n"
-            "void main(){ FragColor = texture(tex, uv); }\n";
-        auto comp = [](GLenum t, const char* s) -> GLuint {
-            GLuint sh = glCreateShader(t);
-            glShaderSource(sh, 1, &s, nullptr);
-            glCompileShader(sh);
-            return sh;
-        };
-        GLuint vs2 = comp(GL_VERTEX_SHADER, rvs);
-        GLuint fs2 = comp(GL_FRAGMENT_SHADER, rfs);
-        sRestoreProg = glCreateProgram();
-        glAttachShader(sRestoreProg, vs2);
-        glAttachShader(sRestoreProg, fs2);
-        glLinkProgram(sRestoreProg);
-        glDeleteShader(vs2);
-        glDeleteShader(fs2);
-        sRestoreTexLoc = glGetUniformLocation(sRestoreProg, "tex");
-        float quad[] = { -1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1 };
-        glGenVertexArrays(1, &sRestoreVAO);
-        glGenBuffers(1, &sRestoreVBO);
-        glBindVertexArray(sRestoreVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, sRestoreVBO);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-        glBindVertexArray(0);
-    }
-
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glUseProgram(sRestoreProg);
-    glBindVertexArray(sRestoreVAO);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_sceneTexForProgress);
-    glUniform1i(sRestoreTexLoc, 0);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindVertexArray(0);
-
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    glUseProgram(sProg);
-    glBindVertexArray(sVAO);
-
-    drawRect(bx, by, boxW, boxH, 0.08f, 0.08f, 0.12f, 0.92f);
-    drawRect(bx+1, by+1, boxW-2, 1, 0.4f, 0.4f, 0.5f, 0.8f);
-    drawRect(bx+1, by+boxH-2, boxW-2, 1, 0.4f, 0.4f, 0.5f, 0.8f);
-    drawRect(bx, by, 1, boxH, 0.4f, 0.4f, 0.5f, 0.8f);
-    drawRect(bx+boxW-1, by, 1, boxH, 0.4f, 0.4f, 0.5f, 0.8f);
-    drawRect(bx+padX, by+padY, barW, barH, 0.15f, 0.15f, 0.2f, 1.0f);
-    float fillW = barW * glm::clamp(progress, 0.0f, 1.0f);
-    if (fillW > 0)
-        drawRect(bx+padX, by+padY, fillW, barH, 0.2f, 0.7f, 0.4f, 1.0f);
-
-    glBindVertexArray(0);
-    glUseProgram(0);
-    if (prevDepth) glEnable(GL_DEPTH_TEST);
-    if (!prevBlend) glDisable(GL_BLEND);
-
-    glfwSwapBuffers(gWindow);
-
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glUseProgram(sRestoreProg);
-    glBindVertexArray(sRestoreVAO);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_sceneTexForProgress);
-    glUniform1i(sRestoreTexLoc, 0);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindVertexArray(0);
-    glUseProgram(0);
-    if (prevDepth) glEnable(GL_DEPTH_TEST);
-    if (!prevBlend) glDisable(GL_BLEND);
-
-}
+glm::mat4 model(1.0f), view(1.0f), projection(1.0f);
+glm::vec3 objPos(0.0f);
 
 FullSphereCamera OrbitCam;
 
-class Grabber {
-public:
-    Grabber() :
-        physicsObject(nullptr),
-        grabDistance(0.0f),
-        prevPosition(0.0f),
-        velocity(0.0f),
-        time(0.0f)
-    {}
-
-    void setPhysicsObject(SoftBody* object) {
-        physicsObject = object;
-    }
-
-    void startGrab(float screenX, float screenY) {
-        if (!physicsObject) return;
-
-        RayCast::Ray worldRay = RayCast::screenToRay(screenX, screenY, view, projection,
-                                                     glm::vec4(0, 0, gWindowWidth, gWindowHeight));
-
-        glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), bunnyPos);
-        glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
-
-        RayCast::Ray localRay;
-        localRay.origin = glm::vec3(invModelMatrix * glm::vec4(worldRay.origin, 1.0f));
-        localRay.direction = glm::normalize(glm::vec3(invModelMatrix * glm::vec4(worldRay.direction, 0.0f)));
-
-        RayCast::RayHit hit = RayCast::intersectMesh(localRay, *physicsObject);
-
-        if (hit.hit) {
-            glm::vec4 worldHitPos = modelMatrix * glm::vec4(hit.position, 1.0f);
-            hit_position = glm::vec3(worldHitPos);
-            grabDistance = glm::length(hit_position - worldRay.origin);
-            prevPosition = hit_position;
-            velocity = glm::vec3(0.0f);
-            time = 0.0f;
-
-            float grabThreshold = 1.0f;
-            if (physicsObject && !physicsObject->handleGroups.empty()) {
-                for (const auto& g : physicsObject->handleGroups)
-                    grabThreshold = std::max(grabThreshold, g.radius);
-            }
-            physicsObject->smartGrab(hit.position, grabThreshold);
-            isDragging = true;
-        }
-    }
-
-    bool hitTest(float screenX, float screenY) {
-        if (!physicsObject) return false;
-        RayCast::Ray worldRay = RayCast::screenToRay(screenX, screenY, view, projection,
-                                                     glm::vec4(0, 0, gWindowWidth, gWindowHeight));
-        glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), bunnyPos);
-        glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
-        RayCast::Ray localRay;
-        localRay.origin = glm::vec3(invModelMatrix * glm::vec4(worldRay.origin, 1.0f));
-        localRay.direction = glm::normalize(glm::vec3(invModelMatrix * glm::vec4(worldRay.direction, 0.0f)));
-        RayCast::RayHit hit = RayCast::intersectMesh(localRay, *physicsObject);
-        return hit.hit;
-    }
-
-    void moveGrab(float screenX, float screenY, float deltaTime) {
-        if (!physicsObject || !isDragging) return;
-
-        RayCast::Ray worldRay = RayCast::screenToRay(screenX, screenY, view, projection,
-                                                     glm::vec4(0, 0, gWindowWidth, gWindowHeight));
-
-        glm::vec3 newPosition = worldRay.origin + worldRay.direction * grabDistance;
-
-        if (time > 0.0f) {
-            velocity = (newPosition - prevPosition) / time;
-        }
-
-        hit_position = newPosition;
-
-        glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), bunnyPos);
-        glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
-        glm::vec3 localPos = glm::vec3(invModelMatrix * glm::vec4(newPosition, 1.0f));
-        glm::vec3 localVel = glm::vec3(invModelMatrix * glm::vec4(velocity, 0.0f));
-
-        physicsObject->smartMove(localPos, localVel);
-
-        prevPosition = newPosition;
-        time = deltaTime;
-    }
-
-    void endGrab() {
-        if (physicsObject) {
-            glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), bunnyPos);
-            glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
-            glm::vec3 localPos = glm::vec3(invModelMatrix * glm::vec4(hit_position, 1.0f));
-            glm::vec3 localVel = glm::vec3(invModelMatrix * glm::vec4(velocity, 0.0f));
-
-            physicsObject->smartEndGrab(localPos, localVel);
-        }
-        isDragging = false;
-    }
-
-    void placeSphere(float screenX, float screenY, float groupRadius = 1.0f) {
-        if (!physicsObject) return;
-
-        RayCast::Ray worldRay = RayCast::screenToRay(screenX, screenY, view, projection,
-                                                     glm::vec4(0, 0, gWindowWidth, gWindowHeight));
-
-        glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), bunnyPos);
-        glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
-
-        RayCast::Ray localRay;
-        localRay.origin = glm::vec3(invModelMatrix * glm::vec4(worldRay.origin, 1.0f));
-        localRay.direction = glm::normalize(glm::vec3(invModelMatrix * glm::vec4(worldRay.direction, 0.0f)));
-
-        RayCast::RayHit hit = RayCast::intersectMesh(localRay, *physicsObject);
-
-        if (hit.hit) {
-
-            physicsObject->createHandleGroup(hit.position, groupRadius);
-
-            glm::vec4 worldHitPos = modelMatrix * glm::vec4(hit.position, 1.0f);
-            hit_position = glm::vec3(worldHitPos);
-            hit_index = physicsObject->handleGroups.size() - 1;
-
-            std::cout << "Created handle group with radius " << groupRadius
-                      << " at position: " << hit.position.x << ", "
-                      << hit.position.y << ", " << hit.position.z << std::endl;
-        } else {
-            hit_index = -1;
-        }
-
-        isDragging = false;
-    }
-
-    void update(float deltaTime) {
-        time += deltaTime;
-    }
-
-private:
-    SoftBody* physicsObject;
-    float grabDistance;
-    glm::vec3 prevPosition;
-    glm::vec3 velocity;
-    float time;
-};
-
-Grabber* gGrabber = nullptr;
-
-SoftBody *multiBody;
-
-constexpr int DEFAULT_GRID_SIZE = 10;
-
-struct DeformHandlPlaceData {
-    enum State {
-        RIGID_MODE,
-        HANDLE_PLACE_MODE,
-        DEFORM_MODE,
-        PLANECUT_MODE
-    };
-
-    State state = RIGID_MODE;
-    std::vector<glm::vec3> softbodyPoints;
-
-    void reset() {
-        softbodyPoints.clear();
-        state = RIGID_MODE;
-
-        if (multiBody) {
-            multiBody->fullReset();
-        }
-
-        std::cout << "HandlePlace data reset with full mesh restoration" << std::endl;
-    }
-};
-
 RegistrationData registrationHandle;
-NormalRefine::RefineState g_refineState;
-PoseLibrary g_poseLibrary;
-std::vector<size_t> g_refineVertexIndices;
-DeformHandlPlaceData deformHandlPlace;
-SphereMesh deformSphereMarker;
-SphereMesh registrationSphereMarker;
-
-enum MainMode {
-    REGISTRATION_MODE,
-    DEFORM_MODE
-};
-
-mCutMesh *screenMesh;
-mCutMesh *arMesh;
-
-inline int gGridHeight() {
-    if (screenMesh && screenMesh->loadedImageWidth > 0 && screenMesh->loadedImageHeight > 0)
-        return gGridWidth * screenMesh->loadedImageHeight / screenMesh->loadedImageWidth;
-    return gGridWidth * 9 / 16;
-}
-
-inline void resetBoundaryMap() {
-    g_boundaryDistMap.valid = false;
-    std::string maskPath = DEPTH_OUTPUT_PATH + std::string("segmentation_mask.png");
-    if (std::filesystem::exists(maskPath))
-        loadMaskAndComputeBoundaryMap(maskPath);
-}
-
-MainMode currentMainMode = REGISTRATION_MODE;
-
-bool saveARimage = false;
-bool deformInit = false;
-
-GLuint g_arPreviewTex = 0;
-bool g_showARPreview = false;
-int g_arPreviewW = 0;
-int g_arPreviewH = 0;
-std::string g_arPreviewPath;
-
 std::function<void(float, const char*)> g_progressCallback = nullptr;
 
 std::vector<glm::vec3> g_cluster1Points;
 std::vector<glm::vec3> g_cluster2Points;
 std::vector<glm::vec3> g_targetPoints;
+std::vector<glm::vec3> g_rejectedBoundaryPoints;   // 器具マスクで棄却された偽境界
+std::vector<glm::vec3> g_visibleSourcePoints;      // SilhouetteHemi 全可視ソース頂点
+std::vector<glm::vec3> g_silhouetteSourcePoints;   // SilhouetteHemi シルエット絞り込み後
 bool g_showClusterVisualization = false;
-bool g_showCorrespondencePoints = false;
+bool g_showBoundaryCandidates   = false;
+bool g_showSourceVisualization  = false;
+bool g_quietMetrics             = false;
 
-static std::string g_currentOrientLabel   = "Front";
-static int         g_currentOrientRunCount = 0;
+mCutMesh* liverMesh3D   = nullptr;
+mCutMesh* portalMesh3D  = nullptr;
+mCutMesh* veinMesh3D    = nullptr;
+mCutMesh* tumorMesh3D   = nullptr;
+mCutMesh* segmentMesh3D = nullptr;
+mCutMesh* gbMesh3D      = nullptr;
+mCutMesh* screenMesh    = nullptr;
+mCutMesh* boardMesh3D   = nullptr;  // テクスチャ付き表示用メッシュ（full OBJ）
 
-static float                             g_bestSessionCompRmse   = FLT_MAX;
-static std::vector<std::vector<GLfloat>> g_bestSessionVertices;
-static std::vector<std::vector<GLfloat>> g_bestSessionNormals;
+int   gGridWidth  = 128;
+float gDepthScale = 0.3f;
+float g_voxelSize = 0.3f;
 
-static int  g_sessionId      = 1;
-static int  g_sessionBipopN  = 0;
-static int  g_sessionRefineN = 0;
-static std::chrono::steady_clock::time_point g_stepStartTime = std::chrono::steady_clock::now();
 
-mCutMesh *liverMesh3D;
-mCutMesh *gbMesh3D;
-mCutMesh *portalMesh3D;
-mCutMesh *veinMesh3D;
-mCutMesh *tumorMesh3D;
-mCutMesh *segmentMesh3D;
-
+bool      isDragging   = false;
+int       hit_index    = -1;
+glm::vec3 hit_position(0.0f);
 std::vector<mCutMesh*> allMeshes;
+float scaleSpeed = 1.1f;
 
-std::vector<float> meshAlphaValues = {
-    0.8f,
-    0.9f,
-    0.9f,
-    0.9f,
-    0.5f,
-    0.5f,
-    0.7f
+// AR variables moved to AppContext
+
+float                          g_silhouetteCosThreshold = 0.02f;
+std::string                    g_objSourcePath;
+Reg3DCustom::CameraIntrinsics  g_intrinsics;
+
+// =========================================================
+//  Scene scale (for size-invariant registration parameters)
+// ---------------------------------------------------------
+//  After prealignSourceToTarget() runs, source and target are
+//  approximately the same size. g_sceneDiag captures that size
+//  (AABB diagonal of the target, in metric units). All distance
+//  / voxel / search parameters in the registration pipeline are
+//  derived from it via constants in RegistrationActions.h, so
+//  the scene works directly in meters with no display scaling.
+// =========================================================
+float       g_sceneDiag         = 1.0f;
+glm::mat4   g_lastOrganTransform = glm::mat4(1.0f);  // similarity transform applied at last setup
+bool        g_hasLastOrganTransform = false;
+
+// =========================================================
+//  Original CT-mm diagonals of liver/tumor as loaded from model/*.obj
+// ---------------------------------------------------------
+//  Captured ONCE at startup, immediately after the .obj files are
+//  loaded into liverMesh3D / tumorMesh3D and BEFORE any prealign or
+//  registration touches them. Used by Shift+M to compute the inverse
+//  scale needed to bring the registered mesh back to true CT-mm size:
+//
+//      SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag
+//
+//  This is invariant across:
+//    - prealignSourceToTarget (uniform scale s_prealign)
+//    - any subsequent registration (CMA-ES, hand alignment, ICP)
+//    - manual user nudges
+//  as long as the operations stay in the rigid-similarity family.
+//  We use the LIVER diag (not tumor) because liver is ~10x larger and
+//  therefore numerically more stable; the same scale factor is applied
+//  to all organs since they all share the same transform chain.
+// =========================================================
+float       g_originalLiverDiagMm = 0.0f;  // diag(liver.obj) in CT mm, set once at startup
+float       g_originalTumorDiagMm = 0.0f;  // diag(tumor.obj) in CT mm, set once at startup
+bool        g_hasOriginalDiags    = false;
+
+// =========================================================
+//  Target subset AABB (Phase 2 拡張: 重心 Position に応じた initial scale)
+//  ---------------------------------------------------------
+//  target cloud (screenMesh の頂点) を world X 軸の中点で左右に分割し、
+//  3 つの AABB を保持する:
+//    g_targetAabbFull : 全体 (Position=Center で使用)
+//    g_targetAabbXneg : world -X 半分 (画面の左 = radiology 慣例「患者の右」 = Position=Right)
+//    g_targetAabbXpos : world +X 半分 (画面の右 = radiology 慣例「患者の左」 = Position=Left)
+//
+//  Position 選択時、liver mesh を「g_targetAabbFull.diag → subset.diag」の
+//  比率でスケールダウン + 重心を subset.center に平行移動する。
+//
+//  これにより、UI で "Right" を選ぶと、肝臓は target の left half (= 画面の左) の
+//  AABB に合わせてスケール + 配置される (radiology: 患者の右側)。
+//
+//  下流影響:
+//   - Shift+M: g_originalLiverDiagMm / current_liver_diag で復元するので
+//     Position 変更で liver_diag が変わっても自動的に正しい scale で復元される
+//   - AutoProbe / HemiAuto / CMA-ES: 現在の liver state を起点に動作するので影響なし
+//   - PoseLibrary: 現在の transform を記録するので影響なし
+//                  g_currentOrientLabel に "Base @ Right" の形式で position も記録
+// =========================================================
+struct TargetSubsetAabb {
+    glm::vec3 min    = glm::vec3(0.0f);   // ★チャット 10: AABB 最小コーナー (BB 描画用)
+    glm::vec3 max    = glm::vec3(0.0f);   // ★チャット 10: AABB 最大コーナー
+    glm::vec3 center = glm::vec3(0.0f);   // AABB midpoint = 0.5*(min+max)
+    glm::vec3 mean   = glm::vec3(0.0f);   // vertex mean (info)
+    float     diag   = 0.0f;
+    bool      valid  = false;
 };
+TargetSubsetAabb g_targetAabbFull;
+TargetSubsetAabb g_targetAabbXpos;   // world +X half (画面右)
+TargetSubsetAabb g_targetAabbXneg;   // world -X half (画面左)
 
-bool splitScreenMode = false;
-bool depthSplitScreenMode = false;
-FullSphereCamera OrbitCamLeft_Target;
-FullSphereCamera OrbitCamRight_Screen;
+// 初期化時 (prealign 後) または target 再構築時に呼ぶ。
+// screenMesh.mVertices から AABB を計算する。
+static void computeTargetSubsetAabbs() {
+    g_targetAabbFull.valid = false;
+    g_targetAabbXpos.valid = false;
+    g_targetAabbXneg.valid = false;
 
-bool cameraUse = false;
-
-mCutMesh *cutterMesh = nullptr;
-
-float scaleSpeed = 1.1;
-
-// -------------------------------------------------------
-// Pose Library helpers
-// -------------------------------------------------------
-static std::vector<mCutMesh*> getOrganList() {
-    return {liverMesh3D, portalMesh3D, veinMesh3D,
-            tumorMesh3D, segmentMesh3D, gbMesh3D};
-}
-
-static std::vector<std::vector<GLfloat>> g_initOrganVertices;
-static std::vector<std::vector<GLfloat>> g_initOrganNormals;
-
-static void snapshotInitialPose() {
-    auto organs = getOrganList();
-    g_initOrganVertices.resize(organs.size());
-    g_initOrganNormals.resize(organs.size());
-    for (size_t i = 0; i < organs.size(); i++) {
-        g_initOrganVertices[i] = organs[i]->mVertices;
-        g_initOrganNormals[i]  = organs[i]->mNormals;
-    }
-    std::cout << "[PoseLibrary] Initial pose snapshot saved." << std::endl;
-}
-
-static glm::mat4 computeCurrentTransform() {
-    if (g_initOrganVertices.empty()) return glm::mat4(1.0f);
-    return PoseLibrary::computeTransformFromLiver(
-        g_initOrganVertices[0], liverMesh3D->mVertices);
-}
-
-static void poseAutoSaveBeforeRegistration() {
-    g_poseLibrary.autoSaveLastRegistration(computeCurrentTransform());
-}
-
-// -------------------------------------------------------
-// Unified comparison metric computation
-// Same method for ALL entries: Liver visible vertices → depth front face
-// Visible vertex INDICES are LOCKED at first call after registration.
-// On subsequent calls (refine, manual save), the same indices are reused
-// but current vertex POSITIONS are read — so the metric reflects the
-// actual mesh geometry while keeping the source population identical.
-// -------------------------------------------------------
-/* CMA-ESループ中はtrue → computeUnifiedMetrics等の詳細ログを抑制 */
-bool g_quietMetrics = false;
-
-static void computeUnifiedMetrics() {
-    Reg3DCustom::NoOpen3DRegistration reg;
-    float zThresh = std::max(0.01f, gDepthScale * 0.05f);
-
-    /* CMA-ESループ中はextractFrontFacePointsの出力も抑制 */
-    std::streambuf* oldBuf = nullptr;
-    std::ostringstream devNull;
-    if (g_quietMetrics) {
-        oldBuf = std::cout.rdbuf(devNull.rdbuf());
-    }
-    auto targetCloud = reg.extractFrontFacePoints(*screenMesh, gGridWidth, gGridHeight(), zThresh);
-    if (g_quietMetrics && oldBuf) {
-        std::cout.rdbuf(oldBuf);
-    }
-
-    if (targetCloud->hasBoundaryDist()) {
-        g_targetPoints.clear();
-        g_cluster2Points.clear();
-        for (size_t i = 0; i < targetCloud->size(); i++) {
-            float bd = targetCloud->boundaryDist[i];
-            if (bd >= 9000.0f) continue;
-            if (bd < 12.0f)
-                g_targetPoints.push_back(targetCloud->points[i]);
-            else
-                g_cluster2Points.push_back(targetCloud->points[i]);
-        }
-        if (!g_quietMetrics)
-            std::cout << "[Boundary3D] boundary=" << g_targetPoints.size()
-                      << " interior=" << g_cluster2Points.size() << std::endl;
-    }
-
-    auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
-    const auto& verts = liverMesh3D->mVertices;
-    for (size_t i = 0; i + 2 < verts.size(); i += 3) {
-        sourceCloud->addPoint(glm::vec3(verts[i], verts[i + 1], verts[i + 2]));
-    }
-
-    Reg3DCustom::NanoflannAdaptor sourceAdaptor(sourceCloud->points);
-    auto tree = Reg3DCustom::buildKDTree(sourceAdaptor);
-    float max_dist_sq = 1.0f * 1.0f;
-
-    std::vector<glm::vec3> src_pts, tgt_pts;
-    float totalErr = 0.0f, sumSq = 0.0f, maxErr = 0.0f;
-    for (size_t i = 0; i < targetCloud->size(); i++) {
-        glm::vec3 tgtPt = targetCloud->points[i];
-        size_t nnIdx; float dist_sq;
-        if (Reg3DCustom::searchKNN1(*tree, tgtPt, nnIdx, dist_sq)) {
-            if (dist_sq < max_dist_sq) {
-                float d = std::sqrt(dist_sq);
-                tgt_pts.push_back(tgtPt);
-                src_pts.push_back(sourceCloud->points[nnIdx]);
-                totalErr += d;
-                sumSq += d * d;
-                if (d > maxErr) maxErr = d;
-            }
-        }
-    }
-    float n = tgt_pts.empty() ? 1.0f : (float)tgt_pts.size();
-
-    registrationHandle.compRmse     = std::sqrt(sumSq / n);
-    registrationHandle.compAvgError = totalErr / n;
-    registrationHandle.compMaxError = maxErr;
-    registrationHandle.compCount    = (int)tgt_pts.size();
-    registrationHandle.compSource   = std::move(src_pts);
-    registrationHandle.compTarget   = std::move(tgt_pts);
-
-    if (!g_quietMetrics) {
-        std::cout << std::defaultfloat << std::setprecision(6);
-        std::cout << "[UnifiedMetrics T->S] Target: " << targetCloud->size()
-                  << "  Matched: " << registrationHandle.compCount
-                  << "  RMSE: " << registrationHandle.compRmse
-                  << "  AvgErr: " << registrationHandle.compAvgError
-                  << "  MaxErr: " << registrationHandle.compMaxError << std::endl;
-    }
-}
-
-static void startNewSession() {
-    g_sessionId++;
-    g_sessionBipopN  = 0;
-    g_sessionRefineN = 0;
-    g_bestSessionCompRmse = FLT_MAX;
-    g_bestSessionVertices.clear();
-    g_bestSessionNormals.clear();
-    g_currentOrientRunCount = 0;
-    g_stepStartTime = std::chrono::steady_clock::now();
-    std::cout << "[Session] New session #" << g_sessionId << std::endl;
-}
-
-static void poseSaveToLibrary() {
-    if (registrationHandle.state != RegistrationData::REGISTERED) {
-        std::cout << "[PoseLibrary] No registration to save" << std::endl;
+    if (!screenMesh || screenMesh->mVertices.empty()) {
+        std::cerr << "[TargetAABB] screenMesh empty; skipping AABB computation"
+                  << std::endl;
         return;
     }
 
-    float elapsedSec = std::chrono::duration<float>(
-                           std::chrono::steady_clock::now() - g_stepStartTime).count();
-
-    float currentRmse = registrationHandle.compRmse;
-    auto organs = getOrganList();
-
-    PoseEntry::Method method;
-    int rm = gUIManager.state.regMethod;
-    if      (rm == 0) method = PoseEntry::FULL_AUTO;
-    else if (rm == 1) method = PoseEntry::HEMI_AUTO;
-    else if (rm == 2) method = PoseEntry::UMEYAMA;
-    else if (rm == 3) method = PoseEntry::BIPOP_CMAES;
-    else              method = PoseEntry::HEMI_AUTO;
-
-    if (registrationHandle.refineCount > 0 &&
-        registrationHandle.refineCount > g_sessionRefineN) {
-        method = PoseEntry::REFINE;
-        g_sessionRefineN = registrationHandle.refineCount;
+    const auto& V = screenMesh->mVertices;
+    const int nV  = (int)(V.size() / 3);
+    if (nV < 3) {
+        std::cerr << "[TargetAABB] too few vertices (" << nV << "); skipping"
+                  << std::endl;
+        return;
     }
 
-    if (currentRmse <= g_bestSessionCompRmse) {
-        g_currentOrientRunCount++;
-        if (currentRmse < g_bestSessionCompRmse) {
-            g_bestSessionCompRmse = currentRmse;
-            g_bestSessionVertices.resize(organs.size());
-            g_bestSessionNormals.resize(organs.size());
-            for (size_t i = 0; i < organs.size(); i++) {
-                g_bestSessionVertices[i] = organs[i]->mVertices;
-                g_bestSessionNormals[i]  = organs[i]->mNormals;
-            }
-            std::cout << "[Session] New best CompRMSE: " << currentRmse << std::endl;
+    // 全体の AABB + mean (vertex 平均 = 真の重心)
+    glm::vec3 mn( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum_all(0.0f);
+    for (int i = 0; i < nV; i++) {
+        glm::vec3 p(V[i*3], V[i*3+1], V[i*3+2]);
+        mn = glm::min(mn, p);
+        mx = glm::max(mx, p);
+        sum_all += p;
+    }
+    g_targetAabbFull.min    = mn;
+    g_targetAabbFull.max    = mx;
+    g_targetAabbFull.center = 0.5f * (mn + mx);
+    g_targetAabbFull.mean   = sum_all / (float)nV;
+    g_targetAabbFull.diag   = glm::length(mx - mn);
+    g_targetAabbFull.valid  = (g_targetAabbFull.diag > 1e-9f);
+
+    // X 軸中点 (= AABB midpoint の x) で 2 分割
+    const float x_mid = g_targetAabbFull.center.x;
+
+    glm::vec3 mn_P( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx_P(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum_P(0.0f);
+    glm::vec3 mn_N( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx_N(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum_N(0.0f);
+    int n_P = 0, n_N = 0;
+    for (int i = 0; i < nV; i++) {
+        glm::vec3 p(V[i*3], V[i*3+1], V[i*3+2]);
+        if (p.x >= x_mid) {
+            mn_P = glm::min(mn_P, p);
+            mx_P = glm::max(mx_P, p);
+            sum_P += p;
+            n_P++;
         } else {
-            std::cout << "[Session] Same CompRMSE: " << currentRmse << " (converging)" << std::endl;
+            mn_N = glm::min(mn_N, p);
+            mx_N = glm::max(mx_N, p);
+            sum_N += p;
+            n_N++;
         }
+    }
+    if (n_P > 0) {
+        g_targetAabbXpos.center = 0.5f * (mn_P + mx_P);
+        g_targetAabbXpos.mean   = sum_P / (float)n_P;
+        g_targetAabbXpos.diag   = glm::length(mx_P - mn_P);
+        g_targetAabbXpos.valid  = (g_targetAabbXpos.diag > 1e-9f);
+    }
+    if (n_N > 0) {
+        g_targetAabbXneg.center = 0.5f * (mn_N + mx_N);
+        g_targetAabbXneg.mean   = sum_N / (float)n_N;
+        g_targetAabbXneg.diag   = glm::length(mx_N - mn_N);
+        g_targetAabbXneg.valid  = (g_targetAabbXneg.diag > 1e-9f);
+    }
 
-        auto T = computeCurrentTransform();
-        g_poseLibrary.saveCurrentToLibrary(
-            method,
-            g_sessionId,
-            g_sessionBipopN,
-            registrationHandle.refineCount,
-            elapsedSec,
-            registrationHandle.fitness,
-            registrationHandle.icpRmse,
-            registrationHandle.averageError,
-            registrationHandle.rmse,
-            registrationHandle.maxError,
-            registrationHandle.scaleFactor,
-            registrationHandle.refineInitialRMSE,
-            registrationHandle.refineBestRMSE,
-            registrationHandle.refineBestIteration,
-            registrationHandle.compRmse,
-            registrationHandle.compAvgError,
-            registrationHandle.compMaxError,
-            registrationHandle.compCount,
-            registrationHandle.compSource,
-            registrationHandle.compTarget,
-            T,
-            g_currentOrientLabel,
-            g_currentOrientRunCount);
+    std::cout << "[TargetAABB] full : c_aabb=(" << g_targetAabbFull.center.x << ","
+              << g_targetAabbFull.center.y << "," << g_targetAabbFull.center.z
+              << ") mean=(" << g_targetAabbFull.mean.x << ","
+              << g_targetAabbFull.mean.y << "," << g_targetAabbFull.mean.z
+              << ") diag=" << g_targetAabbFull.diag << "  n=" << nV << std::endl;
+    std::cout << "[TargetAABB] +X   : c_aabb=(" << g_targetAabbXpos.center.x << ","
+              << g_targetAabbXpos.center.y << "," << g_targetAabbXpos.center.z
+              << ") mean=(" << g_targetAabbXpos.mean.x << ","
+              << g_targetAabbXpos.mean.y << "," << g_targetAabbXpos.mean.z
+              << ") diag=" << g_targetAabbXpos.diag << "  n=" << n_P
+              << "  (= Position 'Left' in radiology)" << std::endl;
+    std::cout << "[TargetAABB] -X   : c_aabb=(" << g_targetAabbXneg.center.x << ","
+              << g_targetAabbXneg.center.y << "," << g_targetAabbXneg.center.z
+              << ") mean=(" << g_targetAabbXneg.mean.x << ","
+              << g_targetAabbXneg.mean.y << "," << g_targetAabbXneg.mean.z
+              << ") diag=" << g_targetAabbXneg.diag << "  n=" << n_N
+              << "  (= Position 'Right' in radiology)" << std::endl;
+}
 
+// =========================================================
+//  Source liver subset AABB (Phase 2 拡張 v2)
+//  ---------------------------------------------------------
+//  Source mesh (liver) の頂点を world X 軸の中点で左右に分割し、
+//  3 通りの AABB を保持する。target subset AABB との「対応する半分どうし」
+//  でスケール・位置をマッチさせるために使う:
+//
+//    Position=Right (患者の右):
+//      scale = target_-X.diag / source_-X.diag
+//      → source の右半分のサイズを、target の右半分 (world -X) に合わせる
+//
+//    Position=Left (患者の左):
+//      scale = target_+X.diag / source_+X.diag
+//      → source の左半分のサイズを、target の左半分 (world +X) に合わせる
+//
+//    Position=Center:
+//      scale = target_full.diag / source_full.diag = 1.0 (prealign 済みのため)
+//
+//  これによって「ターゲットが片側だけしか見えない (occlusion 等)」状況でも、
+//  source の対応する半分のサイズに合わせるので、source 全体の縮尺が崩れない。
+//
+//  ※ snapshotInitialPose() の直後 (= prealign 済みの state) で計算する。
+//  ※ world X 軸の中点で分割するのは、prealign 後 liver centroid ≈ target centroid
+//     のため、source の +X/-X 半分が解剖学的な左右半分にほぼ対応する。
+// =========================================================
+struct SourceSubsetAabb {
+    glm::vec3 min    = glm::vec3(0.0f);   // ★チャット 10: AABB 最小コーナー (回転後 AABB 計算用)
+    glm::vec3 max    = glm::vec3(0.0f);   // ★チャット 10: AABB 最大コーナー
+    glm::vec3 center = glm::vec3(0.0f);   // AABB midpoint = 0.5*(min+max)
+    glm::vec3 mean   = glm::vec3(0.0f);   // vertex mean (旧コード後方互換のため残置)
+    float     diag   = 0.0f;
+    bool      valid  = false;
+};
+SourceSubsetAabb g_sourceLiverAabbFull;
+SourceSubsetAabb g_sourceLiverAabbXpos;   // world +X half (画面右、患者の左)
+SourceSubsetAabb g_sourceLiverAabbXneg;   // world -X half (画面左、患者の右)
+
+// g_initOrganVertices は後の行で正式定義されるが、computeSourceLiverSubsetAabbs()
+// から参照するため、ここで前方宣言する (extern)。
+extern std::vector<std::vector<GLfloat>> g_initOrganVertices;
+
+static void computeSourceLiverSubsetAabbs() {
+    g_sourceLiverAabbFull.valid = false;
+    g_sourceLiverAabbXpos.valid = false;
+    g_sourceLiverAabbXneg.valid = false;
+
+    // organs[0] = liver と仮定 (Phase 1 から一貫)
+    if (g_initOrganVertices.empty() || g_initOrganVertices[0].empty()) {
+        std::cerr << "[SourceAABB] g_initOrganVertices empty; skipping" << std::endl;
+        return;
+    }
+
+    const auto& V = g_initOrganVertices[0];
+    const int nV  = (int)(V.size() / 3);
+    if (nV < 3) {
+        std::cerr << "[SourceAABB] too few vertices (" << nV << "); skipping"
+                  << std::endl;
+        return;
+    }
+
+    // 全体の AABB + mean (vertex 平均 = 真の重心)
+    glm::vec3 mn( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum_all(0.0f);
+    for (int i = 0; i < nV; i++) {
+        glm::vec3 p(V[i*3], V[i*3+1], V[i*3+2]);
+        mn = glm::min(mn, p);
+        mx = glm::max(mx, p);
+        sum_all += p;
+    }
+    g_sourceLiverAabbFull.min    = mn;
+    g_sourceLiverAabbFull.max    = mx;
+    g_sourceLiverAabbFull.center = 0.5f * (mn + mx);
+    g_sourceLiverAabbFull.mean   = sum_all / (float)nV;
+    g_sourceLiverAabbFull.diag   = glm::length(mx - mn);
+    g_sourceLiverAabbFull.valid  = (g_sourceLiverAabbFull.diag > 1e-9f);
+
+    const float x_mid = g_sourceLiverAabbFull.center.x;
+
+    glm::vec3 mn_P( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx_P(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum_P(0.0f);
+    glm::vec3 mn_N( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx_N(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum_N(0.0f);
+    int n_P = 0, n_N = 0;
+    for (int i = 0; i < nV; i++) {
+        glm::vec3 p(V[i*3], V[i*3+1], V[i*3+2]);
+        if (p.x >= x_mid) {
+            mn_P = glm::min(mn_P, p);
+            mx_P = glm::max(mx_P, p);
+            sum_P += p;
+            n_P++;
+        } else {
+            mn_N = glm::min(mn_N, p);
+            mx_N = glm::max(mx_N, p);
+            sum_N += p;
+            n_N++;
+        }
+    }
+    if (n_P > 0) {
+        g_sourceLiverAabbXpos.min    = mn_P;
+        g_sourceLiverAabbXpos.max    = mx_P;
+        g_sourceLiverAabbXpos.center = 0.5f * (mn_P + mx_P);
+        g_sourceLiverAabbXpos.mean   = sum_P / (float)n_P;
+        g_sourceLiverAabbXpos.diag   = glm::length(mx_P - mn_P);
+        g_sourceLiverAabbXpos.valid  = (g_sourceLiverAabbXpos.diag > 1e-9f);
+    }
+    if (n_N > 0) {
+        g_sourceLiverAabbXneg.min    = mn_N;
+        g_sourceLiverAabbXneg.max    = mx_N;
+        g_sourceLiverAabbXneg.center = 0.5f * (mn_N + mx_N);
+        g_sourceLiverAabbXneg.mean   = sum_N / (float)n_N;
+        g_sourceLiverAabbXneg.diag   = glm::length(mx_N - mn_N);
+        g_sourceLiverAabbXneg.valid  = (g_sourceLiverAabbXneg.diag > 1e-9f);
+    }
+
+    std::cout << "[SourceAABB] full : c_aabb=(" << g_sourceLiverAabbFull.center.x << ","
+              << g_sourceLiverAabbFull.center.y << "," << g_sourceLiverAabbFull.center.z
+              << ") mean=(" << g_sourceLiverAabbFull.mean.x << ","
+              << g_sourceLiverAabbFull.mean.y << "," << g_sourceLiverAabbFull.mean.z
+              << ") diag=" << g_sourceLiverAabbFull.diag << "  n=" << nV << std::endl;
+    std::cout << "[SourceAABB] +X   : c_aabb=(" << g_sourceLiverAabbXpos.center.x << ","
+              << g_sourceLiverAabbXpos.center.y << "," << g_sourceLiverAabbXpos.center.z
+              << ") mean=(" << g_sourceLiverAabbXpos.mean.x << ","
+              << g_sourceLiverAabbXpos.mean.y << "," << g_sourceLiverAabbXpos.mean.z
+              << ") diag=" << g_sourceLiverAabbXpos.diag << "  n=" << n_P
+              << "  (= source half for Position 'Left')" << std::endl;
+    std::cout << "[SourceAABB] -X   : c_aabb=(" << g_sourceLiverAabbXneg.center.x << ","
+              << g_sourceLiverAabbXneg.center.y << "," << g_sourceLiverAabbXneg.center.z
+              << ") mean=(" << g_sourceLiverAabbXneg.mean.x << ","
+              << g_sourceLiverAabbXneg.mean.y << "," << g_sourceLiverAabbXneg.mean.z
+              << ") diag=" << g_sourceLiverAabbXneg.diag << "  n=" << n_N
+              << "  (= source half for Position 'Right')" << std::endl;
+}
+
+// =========================================================
+//  Source liver subset AABB (Step 1: dynamic mask-based version)
+//  ---------------------------------------------------------
+//  任意の 4-quadrant ビットマスクから on-demand に subset AABB を計算する。
+//  Ctrl+G の g_activeQuadrantMask を流用するため、Initial Orientation 側で
+//  も同じ解剖学的 4 象限分割を使えるようにする (チャット 9 で確定した
+//  「チェックボックス方式」)。
+//
+//  入力:
+//    mask          : QUAD_AR / QUAD_AL / QUAD_PR / QUAD_PL の OR (任意組合せ)
+//    region_labels : g_liverRegion.labels (ANTERIOR_CORE / RIM / POSTERIOR)
+//    lr_labels     : g_liverLR.labels     (PURE_RIGHT / BOUNDARY / PURE_LEFT)
+//
+//  戻り値:
+//    SourceSubsetAabb (mask が示す頂点集合の center / mean / diag / valid)
+//
+//  特例:
+//    mask == QUAD_ALL  : 高速パス、g_sourceLiverAabbFull をそのまま返す
+//                        (旧 POS_CENTER と byte-identical を保証)
+//    mask == QUAD_NONE : valid=false の空 AABB を返す (UI 側で警告)
+//    subset 頂点数 = 0 : valid=false の空 AABB を返す
+//
+//  ※ g_initOrganVertices[0] (prealign 済みの初期姿勢) から計算する。
+//    現在の liverMesh3D が transform 済みでも、結果は initial pose 基準。
+// =========================================================
+static SourceSubsetAabb computeSourceLiverSubsetAabbFromMask(
+    uint8_t mask,
+    const std::vector<uint8_t>& region_labels,
+    const std::vector<uint8_t>& lr_labels)
+{
+    SourceSubsetAabb out;   // default: valid=false
+
+    // QUAD_ALL 高速パス: 既存の g_sourceLiverAabbFull をそのまま返す。
+    // → 旧 POS_CENTER と完全同一の数値を返すので byte-identical 検証可能。
+    if (mask == LiverLeftRightLabel::QUAD_ALL) {
+        return g_sourceLiverAabbFull;
+    }
+
+    // 入力 sanity check
+    if (g_initOrganVertices.empty() || g_initOrganVertices[0].empty()) {
+        std::cerr << "[SourceAABB/Mask] g_initOrganVertices empty" << std::endl;
+        return out;
+    }
+    if (region_labels.empty() || lr_labels.empty() ||
+        region_labels.size() != lr_labels.size()) {
+        std::cerr << "[SourceAABB/Mask] labels not ready (region="
+                  << region_labels.size() << " lr=" << lr_labels.size() << ")"
+                  << std::endl;
+        return out;
+    }
+    if ((mask & LiverLeftRightLabel::QUAD_ALL) == 0) {
+        // QUAD_NONE: 空集合
+        return out;
+    }
+
+    // mask に基づく頂点 index 集合を取得 (Ctrl+G と同じ関数で同じ集合)
+    auto subset_idx = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+        region_labels, lr_labels, mask);
+    if (subset_idx.empty()) {
+        return out;
+    }
+
+    const auto& V = g_initOrganVertices[0];
+    const int   nV = (int)(V.size() / 3);
+    if ((int)region_labels.size() != nV) {
+        std::cerr << "[SourceAABB/Mask] label size mismatch: labels="
+                  << region_labels.size() << " nV=" << nV << std::endl;
+        return out;
+    }
+
+    // AABB + mean を計算
+    glm::vec3 mn( FLT_MAX,  FLT_MAX,  FLT_MAX);
+    glm::vec3 mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    glm::vec3 sum(0.0f);
+    int n_used = 0;
+    for (int idx : subset_idx) {
+        if (idx < 0 || idx >= nV) continue;
+        glm::vec3 p(V[idx*3], V[idx*3+1], V[idx*3+2]);
+        mn = glm::min(mn, p);
+        mx = glm::max(mx, p);
+        sum += p;
+        n_used++;
+    }
+    if (n_used == 0) {
+        return out;
+    }
+
+    out.min    = mn;
+    out.max    = mx;
+    out.center = 0.5f * (mn + mx);
+    out.mean   = sum / (float)n_used;
+    out.diag   = glm::length(mx - mn);
+    out.valid  = (out.diag > 1e-9f);
+    return out;
+}
+
+// =========================================================
+//  Reference length L (median NN distance of target cloud)
+// ---------------------------------------------------------
+//  L characterizes the local sampling resolution of the target
+//  point cloud. It is the natural reference length for:
+//      - voxel size (5L, Open3D / Zhou 2018)
+//      - FPFH search radius (25L = 5*voxel, Rusu 2009)
+//      - FGR distance threshold (2.5L = 0.5*voxel, Zhou 2016)
+//      - ICP correspondence distance (~7.5L = 1.5*voxel, Open3D)
+//
+//  Computed once after target cloud setup; updated whenever the
+//  target is rebuilt.
+// =========================================================
+float       g_referenceL        = 0.01f;  // safe default; overwritten in setupObjScene
+
+// =========================================================
+//  Apply scene-scale-relative camera/UI parameters
+// ---------------------------------------------------------
+//  Camera radius, pan/zoom sensitivities, and clamp ranges are
+//  in mesh length units. Originally tuned at sceneDiag ≈ 7.36;
+//  we re-scale them whenever sceneDiag changes (e.g. after
+//  setupObjScene). Angular sensitivities (rotation, scaleSpeed)
+//  are NOT touched because they are unitless ratios.
+// =========================================================
+constexpr float kRefSceneDiagCamera = 7.36f;  // matches RegRatios::kRefSceneDiag
+
+inline void applySceneScaleToCamera() {
+    const float r = g_sceneDiag / kRefSceneDiagCamera;
+
+    // Camera radius (current view distance + initial value used on Reset)
+    OrbitCam.gRadius          = 11.35f * r;
+    OrbitCam.InitialRadius    = 11.35f * r;
+    OrbitCam.minRadius        =  2.0f  * r;
+    OrbitCam.maxRadius        = 80.0f  * r;
+
+    // Pan & zoom step sizes (length per pixel / scroll tick)
+    OrbitCam.LIGHT_MOUSE_SENSITIVITY = 0.01f * r;
+    OrbitCam.ZOOM_SENSITIVITY        = -1.0  * r;
+
+    // MOUSE_SENSITIVITY (rotation, rad/pixel) and SCALE_SPEED (multiplier)
+    // are scale-invariant -- DO NOT touch.
+
+    std::cout << "[applySceneScaleToCamera] r=" << r
+              << "  gRadius=" << OrbitCam.gRadius
+              << "  pan=" << OrbitCam.LIGHT_MOUSE_SENSITIVITY
+              << "  zoom=" << OrbitCam.ZOOM_SENSITIVITY
+              << "  clamp=[" << OrbitCam.minRadius << "," << OrbitCam.maxRadius << "]"
+              << std::endl;
+}
+
+extern mCutMesh* liverMesh3D;
+#include "RegistrationActions.h"
+#include "PoseLibrary.h"   // RegistrationActions.h の後ろで include
+#include "RimPairSampling.h"   // [Phase C] colored RIM pairs sampler
+    // (inline computeUnifiedMetrics の宣言が必要なため)
+
+// SimpleCameraPreview は CameraPreview.h に移動
+
+static SimpleCameraPreview gCamera;
+static AppContext             gApp;
+static MaskPicker::Renderer   gMaskRenderer;
+RegistrationImGuiManager gUI;          // PoseLibrary.h からも extern 参照されるため非static
+static UmeyamaController gUmeyama;
+// 臓器6個 + board(6) + target(7)  ≥0.75="ON", 0.01~0.74="50%", <0.01="OFF"
+//   起動デフォルト: liver と target だけ ON、それ以外は全 OFF
+//     [0] liver   ON  (0.8)
+//     [1] portal  OFF (0.0)
+//     [2] vein    OFF (0.0)
+//     [3] tumor   OFF (0.0)
+//     [4] segment OFF (0.0)
+//     [5] gb      OFF (0.0)
+//     [6] board   OFF (0.0)
+//     [7] target  ON  (0.8) — 点群表示
+static float g_meshAlpha[8] = {0.8f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f};
+
+// =========================================================
+//  screenMesh の描画モード切替
+// ---------------------------------------------------------
+//  screenMesh (= masked OBJ, full-res target) は頂点が多く、
+//  三角形描画では overdraw で重い。デフォルトで点群描画にし、
+//  必要なら従来の三角形描画にも戻せるようにする。
+//
+//  g_screenMeshAsPoints  : true=点群 (デフォルト)、false=三角形
+//  g_screenMeshPointSize : GL_POINTS のサイズ [px]、ImGui で調整可
+//  g_screenMeshDensity   : 描画する頂点の割合 [%], 100 = 全頂点
+// =========================================================
+static bool  g_screenMeshAsPoints  = true;
+static float g_screenMeshPointSize = 2.0f;
+static float g_screenMeshDensity   = 100.0f;
+static SphereMesh g_sphereMarker;  // クラスタ・対応点描画用スフィア
+static ARSave::State g_arSave;    // AR保存＋プレビュー状態
+static ShaderProgram* g_pShader     = nullptr;  // AR保存用シェーダ参照
+static ShaderProgram* g_pShaderCube = nullptr;
+static int            g_intrinsicsSource = 1;   // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
+static CalibResult    g_calibResult;             // キャリブレーション結果
+
+// カメラ開始前の状態を保存
+static struct {
+    AppMode previousMode = AppMode::kEmpty;
+    bool hadImage = false;
+    std::string previousImagePath;
+    int previousImageWidth = 0;
+    int previousImageHeight = 0;
+} g_cameraBackupState;
+bool g_showCorrespondencePoints = false;
+
+// =========================================================
+//  Debug: AABB 可視化 (チャット 10)
+// ---------------------------------------------------------
+//  Initial Orientation の重心合わせを目視確認するため、
+//  - target_full AABB の 8 コーナー + center を 赤  (固定)
+//  - source subset AABB の 8 コーナー + center を 緑 (Apply 直後に保存)
+//  を球マーカーで描画する。toggle で ON/OFF。
+//  applyInitRotation() で post-transform AABB を g_dbgSourceBB に保存し、
+//  drawScene の最後で sphere を描く。
+// =========================================================
+bool      g_showDebugBB = true;          // 既定で ON。ImGui で toggle 可
+glm::vec3 g_dbgSourceBB_min(0.0f);
+glm::vec3 g_dbgSourceBB_max(0.0f);
+glm::vec3 g_dbgSourceBB_center(0.0f);
+bool      g_dbgSourceBB_valid = false;
+bool g_showCyclicCorrespondence = false;  // Shift+B: Shift+P 対応点の可視化
+
+// =========================================================
+//  LiverRegion (Shift+R / Shift+T): 肝臓を anterior(前面)/
+//  rim(ヘリ)/posterior(後面) の 3 領域に分けて可視化する。
+//  Python 版 liver_raycast_4patients.py と
+//  liver_anterior_rim_4patients.py の手法を C++ で再実装。
+//
+//  - Shift+R: 表示トグル (初回 ON 時に自動計算 ~数百 ms)
+//  - Shift+T: 現在の g_rimTargetMm で再計算
+//
+//  ラベルは頂点 index に紐づくので、registration の transform
+//  で動いても再計算不要 (球マーカーは mVertices[idx*3] で
+//  現在位置を取得 → 自動追従)。
+// =========================================================
+LiverRegionLabel::Result g_liverRegion;
+bool                     g_showLiverRegion = false;
+float                    g_rimTargetMm     = 8.0f;   // Shift+T で再計算時の rim 厚さ (mm)
+std::vector<int>         g_regionVizIdxAnt;          // 球マーカー描画用 subsample (anterior)
+std::vector<int>         g_regionVizIdxRim;          //                            (rim)
+std::vector<int>         g_regionVizIdxPost;         //                            (posterior)
+
+// Shift+R 初回 ON 時、または Shift+T で呼ばれる。
+// liverMesh3D の現在の頂点座標で計算する。
+//
+// rim 厚さは「物理 mm」で指定したいが、現在の liverMesh3D は
+// prealignSourceToTarget で scale ≈ 0.005-0.007 に縮小されている。
+// labelVertices() に「元 CT mesh の bbox diag (mm)」を渡せば、
+// 関数内で mesh_units_per_mm = curDiag / origDiag(mm) を計算して
+// 換算してくれる。startup 時に g_originalLiverDiagMm として保持済み。
+inline void recomputeLiverRegion() {
+    if (!liverMesh3D) {
+        std::cerr << "[Region] liverMesh3D not loaded yet" << std::endl;
+        return;
+    }
+    if (liverMesh3D->mVertices.empty() || liverMesh3D->mIndices.empty()) {
+        std::cerr << "[Region] liverMesh3D has no geometry" << std::endl;
+        return;
+    }
+
+    float orig_diag_mm = (g_hasOriginalDiags ? g_originalLiverDiagMm : 0.0f);
+    std::cout << "[Region] calling labelVertices with target_rim_mm="
+              << g_rimTargetMm << "  origDiag_mm=" << orig_diag_mm
+              << std::endl;
+
+    g_liverRegion = LiverRegionLabel::labelVertices(
+        *liverMesh3D, g_rimTargetMm, /*smooth_iters=*/40, orig_diag_mm);
+    if (!g_liverRegion.valid()) {
+        std::cerr << "[Region] labeling failed" << std::endl;
+        g_regionVizIdxAnt.clear();
+        g_regionVizIdxRim.clear();
+        g_regionVizIdxPost.clear();
+        return;
+    }
+    g_regionVizIdxAnt  = LiverRegionLabel::sampleVertexIndices(
+        g_liverRegion.labels, LiverRegionLabel::ANTERIOR_CORE, 1500);
+    g_regionVizIdxRim  = LiverRegionLabel::sampleVertexIndices(
+        g_liverRegion.labels, LiverRegionLabel::RIM,            800);
+    g_regionVizIdxPost = LiverRegionLabel::sampleVertexIndices(
+        g_liverRegion.labels, LiverRegionLabel::POSTERIOR,     1200);
+    std::cout << "[Region] viz subsample: ant=" << g_regionVizIdxAnt.size()
+              << " rim=" << g_regionVizIdxRim.size()
+              << " post=" << g_regionVizIdxPost.size() << std::endl;
+}
+
+// =========================================================
+//  LiverLeftRight (Y / Shift+Y): 肝臓を pure-right(右葉) /
+//  boundary(鎌状間膜) / pure-left(左葉) の 3 領域に分けて可視化。
+//  Python 版 liver_leftright_4patients.py の手法を C++ で再実装。
+//
+//  Shift+R/Shift+T (anterior/rim/posterior) と完全パラレルの仕組み:
+//  - Y       : 表示トグル (初回 ON 時に自動計算 ~数百 ms)
+//  - Shift+Y : 現在の g_lrPureFrac, g_lrFullFrac で再計算
+//
+//  ラベルは頂点 index に紐づくので、registration の transform で
+//  動いても再計算不要 (球マーカーは mVertices[idx*3] で現在位置を
+//  取得 → 自動追従)。
+//
+//  スケール変換は不要 (閾値が無次元 mass 比なのでスケール不変)。
+// =========================================================
+LiverLeftRightLabel::Result g_liverLR;
+bool                        g_showLiverLR  = false;
+float                       g_lrPureFrac   = 0.60f;   // Python デフォルト
+float                       g_lrFullFrac   = 0.70f;   // Python デフォルト
+bool                        g_lrFlipManual = false;   // Python の FLIP_OVERRIDE 相当
+std::vector<int>            g_lrVizIdxR;              // 球マーカー描画用 subsample (pure right)
+std::vector<int>            g_lrVizIdxBoundary;       //                              (boundary)
+std::vector<int>            g_lrVizIdxL;              //                              (pure left)
+
+// Y キー初回 ON または Shift+Y で呼ばれる。
+inline void recomputeLiverLR() {
+    if (!liverMesh3D) {
+        std::cerr << "[LR] liverMesh3D not loaded yet" << std::endl;
+        return;
+    }
+    if (liverMesh3D->mVertices.empty() || liverMesh3D->mIndices.empty()) {
+        std::cerr << "[LR] liverMesh3D has no geometry" << std::endl;
+        return;
+    }
+
+    std::cout << "[LR] calling labelVertices with right_pure_fraction="
+              << g_lrPureFrac << "  right_full_fraction=" << g_lrFullFrac
+              << "  flip_manual=" << (g_lrFlipManual ? "true" : "false")
+              << std::endl;
+
+    g_liverLR = LiverLeftRightLabel::labelVertices(
+        *liverMesh3D, g_lrPureFrac, g_lrFullFrac, g_lrFlipManual);
+
+    if (!g_liverLR.valid()) {
+        std::cerr << "[LR] labeling failed" << std::endl;
+        g_lrVizIdxR.clear();
+        g_lrVizIdxBoundary.clear();
+        g_lrVizIdxL.clear();
+        return;
+    }
+    g_lrVizIdxR        = LiverLeftRightLabel::sampleVertexIndices(
+        g_liverLR.labels, LiverLeftRightLabel::PURE_RIGHT, 1500);
+    g_lrVizIdxBoundary = LiverLeftRightLabel::sampleVertexIndices(
+        g_liverLR.labels, LiverLeftRightLabel::BOUNDARY,    600);
+    g_lrVizIdxL        = LiverLeftRightLabel::sampleVertexIndices(
+        g_liverLR.labels, LiverLeftRightLabel::PURE_LEFT,  1200);
+    std::cout << "[LR] viz subsample: R=" << g_lrVizIdxR.size()
+              << " boundary=" << g_lrVizIdxBoundary.size()
+              << " L=" << g_lrVizIdxL.size() << std::endl;
+}
+
+// =========================================================
+//  LiverCranioCaudal (Shift+H): 肝臓を cranial (頭側) / caudal (足側)
+//  の 2 領域に分けて可視化。Python v7 アルゴリズム (RIM 上の
+//  area-weighted dihedral roughness) を C++ で再実装したもの。
+//
+//  Shift+R (anterior/rim/posterior) と Y (pure_R/boundary/pure_L) の
+//  ラベルに依存する (RIM mask + lr_axis_idx を借りる)。未計算なら
+//  Shift+H 押下時に自動的に計算する (Quad と同じ流儀)。
+//
+//  キー操作:
+//    Shift+H : 可視化トグル (初回 ON 時に自動計算)
+//              黄=CRANIAL(頭側), 青=CAUDAL(足側)
+//              confidence < 5% で std::cout に [WEAK] 警告を出力。
+//
+//  Phase 1 段階では registration には未統合 (CC ラベル参照箇所なし)。
+//  Phase 2 (Initial Orientation 幾何ベース化) で d_cc を使う予定。
+//
+//  ラベルは頂点 index に紐づくので、registration の transform で
+//  動いても再計算不要 (球マーカーは mVertices[idx*3] で現在位置を
+//  取得 → 自動追従)。
+// =========================================================
+LiverCranioCaudalLabel::Result g_liverCC;
+bool                           g_showLiverCC  = false;
+bool                           g_ccFlipManual = false;   // Python の FLIP_OVERRIDE 相当 (Phase 1 では UI 無し)
+std::vector<int>               g_ccVizIdxCranial;        // 球マーカー描画用 subsample (黄)
+std::vector<int>               g_ccVizIdxCaudal;         //                              (青)
+
+// Shift+H 初回 ON または明示再計算で呼ばれる。
+inline void recomputeLiverCC() {
+    if (!liverMesh3D) {
+        std::cerr << "[CC] liverMesh3D not loaded yet" << std::endl;
+        return;
+    }
+    if (liverMesh3D->mVertices.empty() || liverMesh3D->mIndices.empty()) {
+        std::cerr << "[CC] liverMesh3D has no geometry" << std::endl;
+        return;
+    }
+
+    // 依存: Shift+R / Y のラベルが未計算なら auto-trigger (Quad と同じ流儀)
+    if (!g_liverRegion.valid()) {
+        std::cout << "[CC] LiverRegion (Shift+R) not yet computed, auto-running..." << std::endl;
+        recomputeLiverRegion();
+    }
+    if (!g_liverLR.valid()) {
+        std::cout << "[CC] LiverLR (Y) not yet computed, auto-running..." << std::endl;
+        recomputeLiverLR();
+    }
+    if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+        std::cerr << "[CC] Cannot compute CC labels: "
+                  << "Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
+                  << "  LR.valid=" << (g_liverLR.valid() ? "Y" : "N")
+                  << std::endl;
+        g_ccVizIdxCranial.clear();
+        g_ccVizIdxCaudal.clear();
+        return;
+    }
+
+    std::cout << "[CC] calling labelVertices  flip_manual="
+              << (g_ccFlipManual ? "true" : "false") << std::endl;
+
+    g_liverCC = LiverCranioCaudalLabel::labelVertices(
+        *liverMesh3D, g_liverRegion, g_liverLR, g_ccFlipManual);
+
+    if (!g_liverCC.valid()) {
+        std::cerr << "[CC] labeling failed" << std::endl;
+        g_ccVizIdxCranial.clear();
+        g_ccVizIdxCaudal.clear();
+        return;
+    }
+
+    g_ccVizIdxCranial = LiverCranioCaudalLabel::sampleVertexIndices(
+        g_liverCC.labels, LiverCranioCaudalLabel::CRANIAL, 1500);
+    g_ccVizIdxCaudal  = LiverCranioCaudalLabel::sampleVertexIndices(
+        g_liverCC.labels, LiverCranioCaudalLabel::CAUDAL,  1500);
+    std::cout << "[CC] viz subsample: cranial=" << g_ccVizIdxCranial.size()
+              << " caudal=" << g_ccVizIdxCaudal.size() << std::endl;
+}
+
+// =========================================================
+//  LiverQuad (H): 肝臓を4象限に分けて可視化。
+//  Shift+R (anterior/rim/posterior) と Y (pure_R/boundary/pure_L)
+//  の結果を AND 合成して4象限ラベルを作る。
+//
+//  rim は前後どちらにも、boundary は左右どちらにも所属させる
+//  「重複所属」方式 (案D):
+//    ant_right = (anterior OR rim) ∩ (pure_right OR boundary)   緑
+//    ant_left  = (anterior OR rim) ∩ (pure_left  OR boundary)   紫
+//    pos_right = (posterior OR rim) ∩ (pure_right OR boundary)  青
+//    pos_left  = (posterior OR rim) ∩ (pure_left  OR boundary)  橙
+//
+//  例: rim ∩ pure_right の頂点 → ant_right と pos_right の両方に描画
+//      anterior ∩ boundary の頂点 → ant_right と ant_left の両方に描画
+//      rim ∩ boundary の頂点 → 4象限全部に描画
+//
+//  キー操作:
+//    H : 4象限可視化トグル (初回 ON 時に自動計算)
+//        Shift+R / Y のラベルが未計算なら自動的に計算する。
+//
+//  ラベルは頂点 index に紐づくので、registration の transform で
+//  動いても再計算不要 (球マーカーは mVertices[idx*3] で現在位置を
+//  取得 → 自動追従)。
+// =========================================================
+bool             g_showLiverQuad = false;
+std::vector<int> g_quadVizIdxAR;   // ant_right (緑)
+std::vector<int> g_quadVizIdxAL;   // ant_left  (紫)
+std::vector<int> g_quadVizIdxPR;   // pos_right (青)
+std::vector<int> g_quadVizIdxPL;   // pos_left  (橙)
+
+// ----------------------------------------------------------------------
+//  Ctrl+G (V3-R) 用の 4象限選択ビットマスク
+//  ---------------------------------------------------------------------
+//  ImGui 2×2 grid checkbox (Ctrl+G Quadrant Selector パネル) で操作。
+//  デフォルト QUAD_ALL = 0x0F (全象限選択) は V3 と同じ subset =全頂点 を
+//  意味するので、起動直後に Ctrl+G を押した場合の挙動は (S4 完了時点で)
+//  Shift+G と byte-identical になる検証ハンドルになる。
+//
+//  本変数は H キー可視化 (g_showLiverQuad / g_quadVizIdx*) と完全独立。
+//  Ctrl+G 実行時にのみ参照される。
+// ----------------------------------------------------------------------
+uint8_t g_activeQuadrantMask = LiverLeftRightLabel::QUAD_ALL;  // 0x0F
+
+// H キー初回 ON で呼ばれる。Shift+R / Y のラベルを利用して
+// 4象限の subsample 配列を構築する。
+inline void recomputeLiverQuad() {
+    if (!liverMesh3D) {
+        std::cerr << "[Quad] liverMesh3D not loaded yet" << std::endl;
+        return;
+    }
+    // Shift+R / Y のラベルが未計算なら自動的に計算
+    if (!g_liverRegion.valid()) {
+        std::cout << "[Quad] LiverRegion (Shift+R) not yet computed, auto-running..." << std::endl;
+        recomputeLiverRegion();
+    }
+    if (!g_liverLR.valid()) {
+        std::cout << "[Quad] LiverLR (Y) not yet computed, auto-running..." << std::endl;
+        recomputeLiverLR();
+    }
+    if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+        std::cerr << "[Quad] Cannot build 4-quadrant labels: "
+                  << "Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
+                  << "  LR.valid=" << (g_liverLR.valid() ? "Y" : "N")
+                  << std::endl;
+        g_quadVizIdxAR.clear();
+        g_quadVizIdxAL.clear();
+        g_quadVizIdxPR.clear();
+        g_quadVizIdxPL.clear();
+        return;
+    }
+
+    const int nV = (int)liverMesh3D->mVertices.size() / 3;
+    if ((int)g_liverRegion.labels.size() != nV ||
+        (int)g_liverLR.labels.size()     != nV) {
+        std::cerr << "[Quad] label size mismatch: "
+                  << "region=" << g_liverRegion.labels.size()
+                  << "  LR=" << g_liverLR.labels.size()
+                  << "  nV=" << nV
+                  << " (mesh changed? recomputing both)" << std::endl;
+        recomputeLiverRegion();
+        recomputeLiverLR();
+        if ((int)g_liverRegion.labels.size() != nV ||
+            (int)g_liverLR.labels.size()     != nV) {
+            std::cerr << "[Quad] still mismatched, abort" << std::endl;
+            return;
+        }
+    }
+
+    // 4象限の所属判定 (重複可)
+    //   AP: anterior(0) / posterior(1) / rim(2)
+    //   LR: pure_R(0)   / pure_L(1)    / boundary(2)
+    std::vector<uint8_t> in_AR(nV, 0), in_AL(nV, 0),
+        in_PR(nV, 0), in_PL(nV, 0);
+    for (int i = 0; i < nV; i++) {
+        uint8_t ap = g_liverRegion.labels[i];
+        uint8_t lr = g_liverLR.labels[i];
+        bool is_ant = (ap == LiverRegionLabel::ANTERIOR_CORE) ||
+                      (ap == LiverRegionLabel::RIM);
+        bool is_pos = (ap == LiverRegionLabel::POSTERIOR) ||
+                      (ap == LiverRegionLabel::RIM);
+        bool is_R   = (lr == LiverLeftRightLabel::PURE_RIGHT) ||
+                    (lr == LiverLeftRightLabel::BOUNDARY);
+        bool is_L   = (lr == LiverLeftRightLabel::PURE_LEFT)  ||
+                    (lr == LiverLeftRightLabel::BOUNDARY);
+        if (is_ant && is_R) in_AR[i] = 1;
+        if (is_ant && is_L) in_AL[i] = 1;
+        if (is_pos && is_R) in_PR[i] = 1;
+        if (is_pos && is_L) in_PL[i] = 1;
+    }
+
+    // 集計
+    int n_AR = 0, n_AL = 0, n_PR = 0, n_PL = 0;
+    for (int i = 0; i < nV; i++) {
+        if (in_AR[i]) n_AR++;
+        if (in_AL[i]) n_AL++;
+        if (in_PR[i]) n_PR++;
+        if (in_PL[i]) n_PL++;
+    }
+    std::cout << "[Quad] 4-quadrant membership counts (with overlap):" << std::endl;
+    std::cout << "[Quad]   ant_right  (緑) : " << n_AR << " verts" << std::endl;
+    std::cout << "[Quad]   ant_left   (紫) : " << n_AL << " verts" << std::endl;
+    std::cout << "[Quad]   pos_right  (青) : " << n_PR << " verts" << std::endl;
+    std::cout << "[Quad]   pos_left   (橙) : " << n_PL << " verts" << std::endl;
+    std::cout << "[Quad]   sum=" << (n_AR + n_AL + n_PR + n_PL)
+              << "  (>= " << nV << " due to rim/boundary overlap)" << std::endl;
+
+    // subsample (各象限 1000 点)
+    auto sample = [&](const std::vector<uint8_t>& mask, int max_points) {
+        std::vector<int> all;
+        all.reserve(mask.size() / 3 + 1);
+        for (int i = 0; i < (int)mask.size(); i++) {
+            if (mask[i]) all.push_back(i);
+        }
+        if ((int)all.size() <= max_points) return all;
+        std::vector<int> out;
+        out.reserve(max_points);
+        double step = double(all.size()) / double(max_points);
+        for (int k = 0; k < max_points; k++) {
+            int idx = (int)std::floor((k + 0.5) * step);
+            if (idx >= (int)all.size()) idx = (int)all.size() - 1;
+            out.push_back(all[idx]);
+        }
+        return out;
+    };
+    g_quadVizIdxAR = sample(in_AR, 1000);
+    g_quadVizIdxAL = sample(in_AL, 1000);
+    g_quadVizIdxPR = sample(in_PR, 1000);
+    g_quadVizIdxPL = sample(in_PL, 1000);
+    std::cout << "[Quad] viz subsample: AR=" << g_quadVizIdxAR.size()
+              << "  AL=" << g_quadVizIdxAL.size()
+              << "  PR=" << g_quadVizIdxPR.size()
+              << "  PL=" << g_quadVizIdxPL.size() << std::endl;
+}
+
+// 前方宣言
+static bool setupObjScene();
+static bool runDepthAndUpdateScene(AppContext& ctx);
+// Forward decl: kind selects which mask the preview pops up for.
+//   MaskKind::Liver       -> uses ctx.maskPoints, writes segmentation_mask.png
+//   MaskKind::Instrument  -> uses ctx.instrumentMaskPoints, writes
+//                            instrument_segmentation_mask.png
+// Called by the Segment 1 / Instrument buttons via the onSegment1 /
+// onSegment2 lambdas.
+static bool runSegmentOnly(AppContext& ctx, MaskKind kind);
+static void syncUIState();
+static void setupUICallbacks();
+static void showFPS(GLFWwindow* window);
+static void snapshotInitialPose();
+static void restoreInitialPose();
+static void applyInitRotation(bool startNewSession);   // Phase 2 拡張: preset + position 適用
+static void computeTargetSubsetAabbs();                // Phase 2 拡張: target cloud の AABB を 3 通り (full/+X/-X) 計算
+static void computeSourceLiverSubsetAabbs();           // Phase 2 拡張 v2: source liver の AABB を 3 通り計算
+
+// グローバル変数
+// PoseLibrary.h からも extern 参照されるため static を外す
+std::vector<std::vector<GLfloat>> g_initOrganVertices;
+std::vector<std::vector<GLfloat>> g_initOrganNormals;
+
+// Registration用3Dビューポート（キャリブレーション解像度に合わせる）
+static struct {
+    int x = 0, y = 0, w = 1280, h = 720;
+} g_3dViewport;
+
+// キャリブレーション解像度のアスペクト比を維持したビューポートを計算
+static void compute3DViewport(int windowW, int windowH, int sidebarW) {
+    int availW = windowW - sidebarW;
+    int availH = windowH;
+    if (availW <= 0 || availH <= 0) {
+        g_3dViewport = {0, 0, windowW, windowH};
+        return;
+    }
+
+    int cw = OrbitCam.calibWidth;
+    int ch = OrbitCam.calibHeight;
+    if (cw <= 0 || ch <= 0) {
+        // キャリブレーション未設定時はサイドバー分だけ除外
+        g_3dViewport = {0, 0, availW, availH};
+        return;
+    }
+
+    float calibAspect = (float)cw / (float)ch;
+    float availAspect = (float)availW / (float)availH;
+
+    if (availAspect > calibAspect) {
+        // 横余裕あり → 高さに合わせて中央配置
+        int vpH = availH;
+        int vpW = (int)(vpH * calibAspect);
+        g_3dViewport = {(availW - vpW) / 2, 0, vpW, vpH};
     } else {
-        std::cout << "[Session] CompRMSE degraded: "
-                  << currentRmse << " > best " << g_bestSessionCompRmse
-                  << " -> reverting" << std::endl;
-
-        if (!g_bestSessionVertices.empty() &&
-            g_bestSessionVertices.size() == organs.size()) {
-            for (size_t i = 0; i < organs.size(); i++) {
-                organs[i]->mVertices = g_bestSessionVertices[i];
-                organs[i]->mNormals  = g_bestSessionNormals[i];
-                setUp(*organs[i]);
-            }
-            registrationHandle.state = RegistrationData::REGISTERED;
-            registrationHandle.useRegistration = true;
-            computeUnifiedMetrics();
-            std::cout << "[Session] Reverted. CompRMSE restored: "
-                      << registrationHandle.compRmse << std::endl;
-        }
+        // 縦余裕あり → 幅に合わせて中央配置
+        int vpW = availW;
+        int vpH = (int)(vpW / calibAspect);
+        g_3dViewport = {0, (availH - vpH) / 2, vpW, vpH};
     }
 }
 
-static void poseApplyEntry(int entryId) {
-    auto organs = getOrganList();
-    if (g_poseLibrary.applyEntry(entryId, g_initOrganVertices, g_initOrganNormals, organs)) {
-        registrationHandle.state = RegistrationData::REGISTERED;
-        registrationHandle.useRegistration = true;
-        float savedCompRmse = 0.0f;
-        for (auto& e : g_poseLibrary.entries) {
-            if (e.id == entryId) {
-                savedCompRmse                        = e.compRmse;
-                registrationHandle.fitness           = e.baseFitness;
-                registrationHandle.icpRmse           = e.baseIcpRmse;
-                registrationHandle.averageError      = e.baseAvgError;
-                registrationHandle.rmse              = e.baseRmse;
-                registrationHandle.maxError          = e.baseMaxError;
-                registrationHandle.scaleFactor       = e.baseScale;
-                registrationHandle.refineCount       = e.refineCount;
-                registrationHandle.refineInitialRMSE   = e.refineInitialRMSE;
-                registrationHandle.refineBestRMSE      = e.refineBestRMSE;
-                registrationHandle.refineBestIteration = e.refineBestIteration;
-                registrationHandle.compRmse          = e.compRmse;
-                registrationHandle.compAvgError      = e.compAvgError;
-                registrationHandle.compMaxError      = e.compMaxError;
-                registrationHandle.compCount         = e.compCount;
-                registrationHandle.compSource        = e.corrSource;
-                registrationHandle.compTarget        = e.corrTarget;
-                if (e.baseMethod == PoseEntry::FULL_AUTO)
-                    gUIManager.state.regMethod = 0;
-                else if (e.baseMethod == PoseEntry::HEMI_AUTO)
-                    gUIManager.state.regMethod = 1;
-                else if (e.baseMethod == PoseEntry::UMEYAMA)
-                    gUIManager.state.regMethod = 2;
-                else if (e.baseMethod == PoseEntry::BIPOP_CMAES)
-                    gUIManager.state.regMethod = 3;
-                else
-                    gUIManager.state.regMethod = 1;
+// カメラから深度推定を実行する関数
+static bool runCameraDepthEstimation() {
+    if (!gCamera.active) {
+        std::cerr << "[DepthEstimation] Camera is not active" << std::endl;
+        return false;
+    }
+
+    // カメラフレームをJPEGとして保存
+    std::string jpegFile = gCamera.saveForDepthEstimation();
+    if (jpegFile.empty()) {
+        std::cerr << "[DepthEstimation] Failed to save camera frame" << std::endl;
+        return false;
+    }
+
+    std::cout << "[DepthEstimation] Saved camera frame to: " << jpegFile << std::endl;
+
+    // AppContextを設定（画像サイズも設定）
+    gApp.image.path = jpegFile;
+    gApp.image.loaded = true;
+    gApp.image.width = gCamera.width;
+    gApp.image.height = gCamera.height;
+
+    // 深度推定を実行
+    if (!runDepthAndUpdateScene(gApp)) {
+        std::cerr << "[DepthEstimation] Failed to run depth estimation" << std::endl;
+        return false;
+    }
+
+    std::cout << "[DepthEstimation] Successfully generated depth mesh from camera" << std::endl;
+
+    // 深度生成が成功したら、カメラを停止する
+    // Registrationモードに移行するため、カメラは不要になる
+    gCamera.stop();
+    std::cout << "[DepthEstimation] Camera stopped after successful depth generation" << std::endl;
+
+    return true;
+}
+
+// gGridHeight(), getOrganList() は RegistrationActions.h に移動
+
+static glm::vec3 liverCenter() {
+    glm::vec3 c(0.0f);
+    size_t n = liverMesh3D->mVertices.size() / 3;
+    if (n == 0) return c;
+    for (size_t i = 0; i < liverMesh3D->mVertices.size(); i += 3) {
+        c.x += liverMesh3D->mVertices[i];
+        c.y += liverMesh3D->mVertices[i+1];
+        c.z += liverMesh3D->mVertices[i+2];
+    }
+    return c / (float)n;
+}
+
+static bool rayTri(const glm::vec3& O, const glm::vec3& D,
+                   const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
+                   float& t) {
+    const float EPS = 1e-7f;
+    glm::vec3 e1 = v1 - v0, e2 = v2 - v0;
+    glm::vec3 h = glm::cross(D, e2);
+    float a = glm::dot(e1, h);
+    if (std::abs(a) < EPS) return false;
+    float f = 1.0f / a;
+    glm::vec3 s = O - v0;
+    float u = f * glm::dot(s, h);
+    if (u < 0.0f || u > 1.0f) return false;
+    glm::vec3 q = glm::cross(s, e1);
+    float v = f * glm::dot(D, q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+    t = f * glm::dot(e2, q);
+    return t > EPS;
+}
+
+static bool hitTestMesh(float sx, float sy, mCutMesh* mesh, glm::vec3& outPos) {
+    if (!mesh || mesh->mIndices.empty()) return false;
+    // Registration時は3Dビューポート座標を使用
+    float vpX = (float)g_3dViewport.x;
+    float vpY = (float)g_3dViewport.y;
+    float vpW = (float)g_3dViewport.w;
+    float vpH = (float)g_3dViewport.h;
+    float ndcX = 2.0f * (sx - vpX) / vpW  - 1.0f;
+    float ndcY = 1.0f - 2.0f * (sy - vpY) / vpH;
+    glm::mat4 invVP = glm::inverse(projection * view);
+    glm::vec4 nr = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 fr = invVP * glm::vec4(ndcX, ndcY,  1.0f, 1.0f);
+    nr /= nr.w; fr /= fr.w;
+    glm::vec3 O = glm::vec3(nr);
+    glm::vec3 D = glm::normalize(glm::vec3(fr - nr));
+
+    const auto& V = mesh->mVertices;
+    const auto& I = mesh->mIndices;
+    float bestT = std::numeric_limits<float>::max();
+    bool  hit   = false;
+    for (size_t i = 0; i + 2 < I.size(); i += 3) {
+        GLuint a = I[i], b = I[i+1], c = I[i+2];
+        glm::vec3 v0(V[a*3], V[a*3+1], V[a*3+2]);
+        glm::vec3 v1(V[b*3], V[b*3+1], V[b*3+2]);
+        glm::vec3 v2(V[c*3], V[c*3+1], V[c*3+2]);
+        float t;
+        if (rayTri(O, D, v0, v1, v2, t) && t < bestT) {
+            bestT  = t;
+            outPos = O + D * t;
+            hit    = true;
+        }
+    }
+    return hit;
+}
+
+#include "InteractionHelpers.h"
+
+// computeUnifiedMetrics(), runHemiAuto(), runBipopCmaes(), runShiftE()
+// は RegistrationActions.h に移動
+
+static glm::vec3 g_lastOrganOffset(0.0f);
+
+// =========================================================
+//  ScreenMeshPointCache - 点群描画用のシャッフル済みインデックス
+// ---------------------------------------------------------
+//  事前に頂点インデックス [0..N-1] をランダムシャッフルして EBO に
+//  上げておき、density% に応じて先頭から K 個だけ glDrawElements する。
+//  シャッフルは 1 回限り (mesh が変わるまで) なので、density スライダを
+//  動かしても点はチラつかない (常に同じシャッフル順の prefix を描く)。
+//
+//  VAO は専用に作る理由: mesh->VAO に GL_ELEMENT_ARRAY_BUFFER を bind
+//  してしまうと VAO 状態が破壊され、次フレームの三角形描画が壊れる。
+//  VBO/NBO は mesh のものを共有 (アトリビュート設定だけ別 VAO に貼る)。
+//
+//  cachedVBO で mesh の VBO ID を覚え、setUp() で VBO が再生成された
+//  ときに自動的にリビルドする (ID の変化で検出)。
+// =========================================================
+struct ScreenMeshPointCache {
+    GLuint vao            = 0;
+    GLuint ebo            = 0;
+    size_t totalVerts     = 0;
+    GLuint cachedVBO      = 0;     // mesh->VBO id at last build (invalidation key)
+    bool   needsReshuffle = false; // user pressed Reshuffle button
+
+    bool ensure(mCutMesh* mesh) {
+        if (!mesh || mesh->VBO == 0 || mesh->mVertices.empty()) return false;
+        const size_t n = mesh->mVertices.size() / 3;
+
+        // already up-to-date?
+        if (vao != 0
+            && totalVerts == n
+            && cachedVBO == mesh->VBO
+            && !needsReshuffle) {
+            return true;
+        }
+
+        cleanup();
+
+        // shuffled indices [0..n-1]
+        std::vector<GLuint> idx(n);
+        std::iota(idx.begin(), idx.end(), 0u);
+        // 固定シードで再現性確保 (Reshuffle ボタン押下時のみ別シード)
+        static uint64_t seed = 0xC0FFEEULL;
+        if (needsReshuffle) seed += 1;
+        std::mt19937 rng(static_cast<unsigned>(seed));
+        std::shuffle(idx.begin(), idx.end(), rng);
+
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &ebo);
+        glBindVertexArray(vao);
+
+        // share mesh->VBO for positions (location=0)
+        glBindBuffer(GL_ARRAY_BUFFER, mesh->VBO);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+        glEnableVertexAttribArray(0);
+
+        // share mesh->NBO for normals (location=1) so the basic shader's
+        // lighting calc still gets sensible values
+        if (mesh->NBO != 0) {
+            glBindBuffer(GL_ARRAY_BUFFER, mesh->NBO);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+            glEnableVertexAttribArray(1);
+        }
+
+        // upload shuffled index buffer
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     n * sizeof(GLuint), idx.data(), GL_STATIC_DRAW);
+
+        glBindVertexArray(0);
+
+        totalVerts     = n;
+        cachedVBO      = mesh->VBO;
+        needsReshuffle = false;
+        return true;
+    }
+
+    void requestReshuffle() { needsReshuffle = true; }
+
+    void cleanup() {
+        if (vao) { glDeleteVertexArrays(1, &vao); vao = 0; }
+        if (ebo) { glDeleteBuffers(1, &ebo);      ebo = 0; }
+        totalVerts = 0;
+        cachedVBO  = 0;
+    }
+};
+
+static ScreenMeshPointCache g_screenMeshPC;
+
+// =========================================================
+//  drawScreenMeshAsPoints
+// ---------------------------------------------------------
+//  screenMesh を点群として描画する。
+//  - g_screenMeshDensity [%] で描画頂点数を制御 (ランダムサンプリング)
+//  - 三角形ラスタライズの overdraw が消えるので頂点数が多くても軽量
+//
+//  シェーダは shaderProgram (basic) を流用。useTexture=false にして
+//  単色 (vertColor) で描く。lighting uniforms も一応セットしておく。
+// =========================================================
+static void drawScreenMeshAsPoints(
+    mCutMesh* mesh,
+    ShaderProgram& shader,
+    const glm::mat4& model,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const glm::vec3& camPos,
+    const glm::vec4& color,
+    float pointSize)
+{
+    if (!mesh || mesh->VAO == 0 || mesh->mVertices.empty()) return;
+    if (!g_screenMeshPC.ensure(mesh)) return;
+
+    shader.use();
+    shader.setUniform("model",      model);
+    shader.setUniform("view",       view);
+    shader.setUniform("projection", projection);
+    shader.setUniform("vertColor",  color);
+    shader.setUniform("lightPos",   camPos);
+    shader.setUniform("viewPos",    camPos);
+    shader.setUniform("lightColor", glm::vec3(1.0f, 1.0f, 1.0f));
+    shader.setUniform("useTexture", false);
+
+    // density [%] -> draw count (シャッフル済み配列の先頭から K 個)
+    const float pct = std::clamp(g_screenMeshDensity, 0.1f, 100.0f);
+    const size_t total = g_screenMeshPC.totalVerts;
+    GLsizei drawCount = (GLsizei)std::max<size_t>(
+        1, (size_t)((double)total * (double)pct / 100.0));
+
+    glPointSize(pointSize);
+    glBindVertexArray(g_screenMeshPC.vao);
+    glDrawElements(GL_POINTS, drawCount, GL_UNSIGNED_INT, (void*)0);
+    glBindVertexArray(0);
+}
+
+static void rebuildOBJWithCurrentThreshold() {
+    if (!screenMesh) return;
+    std::cout << "\n=== Rebuilding OBJ with cosThreshold="
+              << g_silhouetteCosThreshold << " ===" << std::endl;
+
+    delete screenMesh;
+    screenMesh = new mCutMesh(mCutMesh().loadMeshFromFile(g_objSourcePath.c_str()));
+    gApp.screen = screenMesh;
+
+    Reg3DCustom::clearCachedTargetCloud();
+
+    auto stats = Reg3DCustom::cleanupOBJMesh(*screenMesh,
+                                             g_silhouetteCosThreshold,
+                                             0.0f);
+    (void)stats;
+
+    auto targetCloud = Reg3DCustom::setupOBJTarget(
+        *screenMesh, g_intrinsics, Reg3DCustom::OBJ_Y_SIGN_OPENGL);
+    if (!targetCloud || targetCloud->empty()) {
+        std::cerr << "[Rebuild] target cloud empty, aborting" << std::endl;
+        return;
+    }
+
+    Reg3DCustom::mirrorMeshAndCloudX(*screenMesh, *targetCloud);
+
+    // Undo previous prealignment (similarity), if any. This restores organs
+    // to their model-space pose so we can prealign again to the new target.
+    std::vector<mCutMesh*> organs = { liverMesh3D, portalMesh3D, veinMesh3D,
+                                      tumorMesh3D, segmentMesh3D, gbMesh3D };
+    if (g_hasLastOrganTransform) {
+        glm::mat4 invT = glm::inverse(g_lastOrganTransform);
+        Reg3DCustom::applyTransformToMeshes(organs, invT);
+    } else if (glm::dot(g_lastOrganOffset, g_lastOrganOffset) > 0.0f) {
+        // Legacy translation-only undo (older state)
+        for (auto* m : organs) {
+            if (m) {
+                for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+                    m->mVertices[i    ] -= g_lastOrganOffset.x;
+                    m->mVertices[i + 1] -= g_lastOrganOffset.y;
+                    m->mVertices[i + 2] -= g_lastOrganOffset.z;
+                }
+            }
+        }
+    }
+
+    glm::vec3 organCenter = Reg3DCustom::computeMeshCenter(*liverMesh3D);
+    glm::vec3 objCenter   = Reg3DCustom::computeMeshCenter(*screenMesh);
+    g_lastOrganOffset     = objCenter - organCenter;  // legacy
+
+    // NEW: similarity prealignment again
+    g_lastOrganTransform     = Reg3DCustom::prealignSourceToTarget(
+        organs, *screenMesh);
+    g_hasLastOrganTransform  = true;
+
+    g_sceneDiag = std::max(Reg3DCustom::computeMeshDiag(*screenMesh), 1e-3f);
+    std::cout << "[SceneDiag/rebuild] " << g_sceneDiag << std::endl;
+
+    // Recompute L for the new target cloud
+    if (targetCloud && !targetCloud->empty()) {
+        float L_new = Reg3DCustom::computeMedianNNDistance(*targetCloud);
+        g_referenceL = std::max(L_new, 1e-6f);
+        std::cout << "[L/rebuild] " << g_referenceL << std::endl;
+    }
+
+    applySceneScaleToCamera();
+
+    setUp(*screenMesh);
+    setUp(*liverMesh3D);
+    setUp(*portalMesh3D);
+    setUp(*veinMesh3D);
+    setUp(*tumorMesh3D);
+    setUp(*segmentMesh3D);
+    setUp(*gbMesh3D);
+
+    Reg3DCustom::printMeshBBox(*screenMesh,  "OBJ rebuilt");
+    Reg3DCustom::printMeshBBox(*liverMesh3D, "liver rebuilt");
+    std::cout << "=== Rebuild done ===" << std::endl;
+}
+
+static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int mods) {
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+
+    const bool isShiftV   = (key == GLFW_KEY_V) && (mods & GLFW_MOD_SHIFT);
+    const bool isShiftE   = (key == GLFW_KEY_E) && (mods & GLFW_MOD_SHIFT);
+    const bool isShiftF   = (key == GLFW_KEY_F) && (mods & GLFW_MOD_SHIFT);  // V2 BIPOP-CMA-ES (Fast)
+    const bool isShiftG     = (key == GLFW_KEY_G) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);  // V3 BIPOP-CMA-ES (Good performance)
+    const bool isCtrlShiftG = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);   // V3-RS BIPOP-CMA-ES (silhouette anchor)
+    const bool isCtrlG      = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V3-R BIPOP-CMA-ES (Region-aware, 4-quadrant subset)
+    const bool needsScene = (key == GLFW_KEY_O      ||
+                             key == GLFW_KEY_P      ||
+                             isShiftV               ||
+                             isShiftE               ||
+                             isShiftF               ||
+                             isShiftG               ||
+                             isCtrlG                ||
+                             isCtrlShiftG           ||
+                             key == GLFW_KEY_D      ||
+                             key == GLFW_KEY_COMMA  ||
+                             key == GLFW_KEY_PERIOD);
+    if (needsScene && gApp.mode != AppMode::kRegistration) {
+        std::cout << "[Key] '" << (char)key
+                  << "' requires a loaded scene -- drop an image and"
+                     " press R to run the depth pipeline." << std::endl;
+        return;
+    }
+
+    switch (key) {
+    case GLFW_KEY_ESCAPE:
+        glfwSetWindowShouldClose(win, GLFW_TRUE);
+        break;
+    case GLFW_KEY_O:
+        if (mods & GLFW_MOD_SHIFT) {
+            // ---- Shift+O : QuadAuto -----------------------------------------
+            //   AR 固定視点 ∩ g_activeQuadrantMask の解剖象限、の交差集合を
+            //   source として FGR+ICP。Key O (HemiAuto) と独立、副作用なし。
+            //   Region/LR labels が未計算なら auto-trigger
+            //   (applyInitRotation と同じ流儀)。
+            if (!g_liverRegion.valid()) {
+                std::cout << "[Shift+O] LiverRegion (Shift+R) not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[Shift+O] LiverLR (Y) not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverLR();
+            }
+            gUI.state.regMethod = 1;        // HemiAuto と同じ表示扱い
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            g_sessionBipopN  = 0;            // 新規試行扱い
+            poseAutoSaveBeforeRegistration();
+            runQuadAuto();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        } else {
+            // ---- O : HemiAuto (既存) ----------------------------------------
+            //         元コード line 3213-3238 (a.onHemiAuto) の順序に合わせる
+            gUI.state.regMethod = 1;
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            g_sessionBipopN  = 0;          // HemiAuto は新規試行扱い: BIPOP カウンタをリセット
+            poseAutoSaveBeforeRegistration();
+            runHemiAuto();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        }
+        break;
+    case GLFW_KEY_V:
+        if (mods & GLFW_MOD_SHIFT) {
+            // 元コード line 6256-6266 (キー Shift+V) の順序
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaes();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        } else {
+            g_showClusterVisualization = !g_showClusterVisualization;
+            std::cout << "Cluster visualization: "
+                      << (g_showClusterVisualization ? "ON" : "OFF") << std::endl;
+        }
+        break;
+    case GLFW_KEY_F:
+        // Shift+F: BIPOP-CMA-ES V2 ("Fast"). V1-equivalent path that
+        // runs CmaesRefine::runV2(). Phase 1 forces eval_mode=FULL_MESH
+        // so CompRMSE is bit-identical to Shift+V from the same
+        // (g_trialSeed, g_callIdx) state -- this is the validation
+        // hook for the V2 refactor. Phase 2 will switch to SUBSET_RMSE
+        // for the speedup; Phase 3 adds OpenMP. Plain F (no shift)
+        // is intentionally left unbound for future use.
+        if (mods & GLFW_MOD_SHIFT) {
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V)
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaesV2();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        }
+        break;
+    case GLFW_KEY_G:
+        // Shift+G: BIPOP-CMA-ES V3 ("Good performance"). Pure-function
+        // refactor of V2 with liver-only snapshot, matrix-based per-Run
+        // result, and zero global writes inside the inner loop --
+        // foundation for V3-4 (population OMP) and V3-5 (run OMP).
+        // V3-1 ships with src_voxel_ratio = tgt_voxel_ratio = 0, which
+        // makes CompRMSE bit-identical to Shift+V (V1) and Shift+F (V2
+        // FULL_MESH) from the same (g_trialSeed, g_callIdx) state --
+        // the validation hook for the V3 architectural refactor.
+        // V3-2 will set both ratios to 0.015f for the speedup.
+        // Plain G (no shift) is intentionally left unbound.
+        //
+        // Ctrl+G : BIPOP-CMA-ES V3-R (Region-aware) — 4 象限選択
+        //          (g_activeQuadrantMask) で対応点候補を絞った CMA-ES。
+        //          S4 完了: CmaesRefineV3R::runBipopCmaesV3R を呼ぶ。
+        //          QUAD_ALL のとき Shift+G (V3) と数値 byte-identical
+        //          (HANDOVER §2.6 受け入れ基準)。
+        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
+            // ----- Ctrl+Shift+G : V3-RS (silhouette-anchored) -----
+            // Independent of Ctrl+G; calls a fresh wrapper that reads
+            // a single sil-specific global g_ctrlgsLambdaSil. Quadrant
+            // mask + Caudal + AR-vis + beta all still apply via the
+            // shared g_ctrlg* globals because ParamsV3RS inherits
+            // ParamsV3R.
+            std::cout << "[Ctrl+Shift+G] V3-RS (silhouette anchor) session start"
+                      << std::endl;
+            const auto maskStr = LiverLeftRightLabel::quadrantMaskString(
+                g_activeQuadrantMask);
+            std::cout << "[Ctrl+Shift+G] quadrant_mask = " << maskStr
+                      << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
+                      << std::dec << ")" << std::endl;
+
+            if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+                std::cerr << "[Ctrl+Shift+G] ERROR: labels not computed"
+                          << " (Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
+                          << ", LR.valid="    << (g_liverLR.valid() ? "Y" : "N")
+                          << "). Run HemiAuto (O) first."
+                          << std::endl;
+                break;
+            }
+            auto subsetCS = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+                g_liverRegion.labels, g_liverLR.labels,
+                g_activeQuadrantMask);
+            std::cout << "[Ctrl+Shift+G] subset_size = " << subsetCS.size()
+                      << " / " << g_liverRegion.labels.size()
+                      << " vertices (original-index space)"
+                      << std::endl;
+            if (subsetCS.empty()) {
+                std::cerr << "[Ctrl+Shift+G] ERROR: subset is empty."
+                          << std::endl;
+                break;
+            }
+
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaesV3RS(g_activeQuadrantMask);
+            poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+        } else if (mods & GLFW_MOD_CONTROL) {
+            // ----- Ctrl+G : V3-R (region-aware, S4 implemented) -----
+            // g_activeQuadrantMask が示す 4 象限部分集合だけを KDTree
+            // 入力とする region-aware BIPOP-CMA-ES。実体は
+            // CmaesRefineV3R::runBipopCmaesV3R にあり、ParamsV3R に
+            // region/lr ラベルと quadrant_mask を渡して呼び出す。
+            std::cout << "[Ctrl+G] V3-R (region-aware) session start" << std::endl;
+            const auto maskStr = LiverLeftRightLabel::quadrantMaskString(
+                g_activeQuadrantMask);
+            std::cout << "[Ctrl+G] quadrant_mask = " << maskStr
+                      << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
+                      << std::dec << ")" << std::endl;
+
+            if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+                std::cerr << "[Ctrl+G] ERROR: labels not computed"
+                          << " (Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
+                          << ", LR.valid="    << (g_liverLR.valid() ? "Y" : "N")
+                          << "). Run HemiAuto (O) first to populate labels."
+                          << std::endl;
+                break;
+            }
+            auto subset = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+                g_liverRegion.labels, g_liverLR.labels,
+                g_activeQuadrantMask);
+            std::cout << "[Ctrl+G] subset_size = " << subset.size()
+                      << " / " << g_liverRegion.labels.size()
+                      << " vertices (original-index space)";
+            if (g_activeQuadrantMask == LiverLeftRightLabel::QUAD_ALL) {
+                std::cout << "  (QUAD_ALL: byte-identical to V3 expected)";
+            }
+            std::cout << std::endl;
+
+            if (subset.empty()) {
+                std::cerr << "[Ctrl+G] ERROR: subset is empty for mask=0x"
+                          << std::hex << (unsigned)g_activeQuadrantMask
+                          << std::dec
+                          << ". Select at least one quadrant in the UI panel."
+                          << std::endl;
+                break;
+            }
+
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V/F/G)
+            poseAutoSaveBeforeRegistration();
+            // S4: V3-R driver dispatch (HANDOVER §4.6 切替).
+            runBipopCmaesV3R(g_activeQuadrantMask);
+            // S5 (V3R): PoseEntry に quadrant_mask を記録するため、
+            // Ctrl+G 経路でのみ第 2 引数 (g_activeQuadrantMask) を渡す。
+            // 他の経路 (Shift+G/V/F/E、HemiAuto 等) はデフォルト 0xFF (legacy)。
+            poseSaveToLibrary(SaveCriterion::RMSE, g_activeQuadrantMask);
+        } else if (mods & GLFW_MOD_SHIFT) {
+            // ----- Shift+G : V3 (既存) ----------------------------------
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V/F)
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaesV3();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        }
+        break;
+    case GLFW_KEY_B:
+        if (mods & GLFW_MOD_SHIFT) {
+            // Shift+B: Cyclic Boundary Registration (Shift+P) の対応点表示トグル
+            //   24 セクターを HSV サイクルで着色、source (大球) / target (中球)
+            //   を同色で描画 → 同じ色の球同士がペア。空セクターは非表示。
+            //   Shift+P を一度実行した後に有効になる。
+            g_showCyclicCorrespondence = !g_showCyclicCorrespondence;
+            std::cout << "[CyclicCorr] "
+                      << (g_showCyclicCorrespondence ? "ON" : "OFF")
+                      << "  available=" << (g_cyclicAvailable ? "YES" : "NO (run Shift+P first)")
+                      << "  sectors=" << g_cyclicSectors
+                      << "  best_shift=" << g_cyclicBestShift
+                      << "  best_dir=" << (g_cyclicBestRev ? "reverse(CCW)" : "forward(CW)")
+                      << std::endl;
+        } else {
+            // B: 境界候補の可視化トグル: 緑=採用境界, 赤=器具マスクで棄却された偽境界
+            g_showBoundaryCandidates = !g_showBoundaryCandidates;
+            std::cout << "[BoundaryCandidates] "
+                      << (g_showBoundaryCandidates ? "ON" : "OFF")
+                      << "  accepted=" << g_targetPoints.size()
+                      << "  rejected=" << g_rejectedBoundaryPoints.size()
+                      << "  threshold=" << g_instrumentPxThresh << "px"
+                      << std::endl;
+        }
+        break;
+    case GLFW_KEY_N:
+        // ソース側可視化トグル: シアン=全可視頂点, マゼンタ=シルエット絞り込み後
+        g_showSourceVisualization = !g_showSourceVisualization;
+        std::cout << "[SourceVis] "
+                  << (g_showSourceVisualization ? "ON" : "OFF")
+                  << "  visible=" << g_visibleSourcePoints.size()
+                  << "  silhouette=" << g_silhouetteSourcePoints.size()
+                  << "  cosThresh=" << g_silhouetteSrcCosThresh
+                  << std::endl;
+        break;
+    case GLFW_KEY_P:
+        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
+            // ---- Shift+Ctrl+P : QuadCyclic-RANSAC --------------------------
+            //   Ctrl+P と同じ AR ∩ silh ∩ quad 前処理を使うが、matching を
+            //   「24 sector 全部対 48 パターン cyclic shift」ではなく
+            //   「K=3 subset RANSAC + 2 段階評価 (内部 RMSE → chamfer)」に
+            //   置き換える。3 sector だけ使うので一部の sector が rim から
+            //   逸れていても inlier 3 つで初期姿勢を確保できる。
+            //   ハイパラは v1 ハードコード (g_qcrSubsetK / g_qcrMinSpreadSec
+            //   / g_qcrTopKCandidates)、将来 UI 露出予定。
+            //   注意: mods の判定順は Shift+Ctrl > Ctrl > Shift > 単独で、
+            //   Shift+Ctrl の組合せが先に拾われるよう必ずこの位置 (Ctrl
+            //   単独より先) に置くこと。
+            if (!g_liverRegion.valid()) {
+                std::cout << "[Shift+Ctrl+P] LiverRegion (Shift+R) not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[Shift+Ctrl+P] LiverLR (Y) not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverLR();
+            }
+            gUI.state.regMethod = 1;
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            g_sessionBipopN  = 0;
+            poseAutoSaveBeforeRegistration();
+            runQuadCyclicRansac();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        } else if (mods & GLFW_MOD_CONTROL) {
+            // ---- Ctrl+P : QuadCyclic ---------------------------------------
+            //   Shift+P と同じ cyclic boundary + Umeyama + ICP のパイプラインを
+            //   使うが、source を AR 固定視点 ∩ silhouette ∩ g_activeQuadrantMask
+            //   の三段交差集合で絞り込む。Initial Orientation で選んだ象限の rim
+            //   だけが target 境界に当てに行く動作。
+            //   Region/LR labels が未計算なら auto-trigger
+            //   (applyInitRotation / Shift+O と同じ流儀)。
+            if (!g_liverRegion.valid()) {
+                std::cout << "[Ctrl+P] LiverRegion (Shift+R) not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[Ctrl+P] LiverLR (Y) not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverLR();
+            }
+            gUI.state.regMethod = 1;   // SilhouetteHemi と同じ表示扱い
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            g_sessionBipopN  = 0;
+            poseAutoSaveBeforeRegistration();
+            runQuadCyclic();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        } else if (mods & GLFW_MOD_SHIFT) {
+            // Shift+P: Cyclic Boundary Registration
+            //  Key P と同じ前処理 (source silhouette + target boundary) を使うが、
+            //  FGR/FPFH の代わりに重心まわり N=24 セクターで巡回シフト × ミラー
+            //  反転 (合計 2N=48 パターン) を試し、全 source × 全 target の
+            //  chamfer RMSE が最小の T を初期姿勢として ICP で精錬する。
+            //  動機: silhouette/boundary の点数が少ない場面では FPFH 識別性が
+            //  不十分で FGR が tuple test 0 → identity に落ちるため、
+            //  特徴量を介さない幾何ベースの初期化を試す。
+            gUI.state.regMethod = 1;   // SilhouetteHemi と同じ表示扱い
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            g_sessionBipopN  = 0;
+            poseAutoSaveBeforeRegistration();
+            runCyclicBoundaryReg();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        } else {
+            // P: SilhouetteHemi (既存) — HemiAuto と並ぶ独立の登録ボタン
+            //                            (Source/Target 双方境界優先)
+            gUI.state.regMethod = 1;   // HemiAuto と同じ表示扱い
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            g_sessionBipopN  = 0;
+            poseAutoSaveBeforeRegistration();
+            runSilhouetteHemi();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+        }
+        break;
+    case GLFW_KEY_E:
+        if (mods & GLFW_MOD_SHIFT) {
+            // 元コード line 2854 (runShiftE 内冒頭) と line 3073-3075 の順序
+            // g_stepStartTime をリセットして各Shift+E呼出しごとの所要時間を記録
+            g_stepStartTime = std::chrono::steady_clock::now();
+            poseAutoSaveBeforeRegistration();
+            runShiftE();
+            g_sessionSilhouetteN++;
+            gUI.state.regMethod = 5;
+            poseSaveToLibrary(SaveCriterion::IOU);
+        }
+        break;
+    case GLFW_KEY_I:
+        // Shift+I : dump IoU debug bitmaps (hitmap, target mask, composite,
+        // boundary map) to DEPTH_OUTPUT_PATH.  Useful when registrationHandle
+        // .compIoU2D looks wrong: open the PNGs to see whether the right
+        // mask is being used and where the liver silhouette actually lands.
+        if ((mods & GLFW_MOD_SHIFT) && gApp.mode == AppMode::kRegistration) {
+            glm::mat4 silView = buildSilhouetteView();
+            glm::mat4 silProj = buildSilhouetteProj();
+            int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+            int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+            IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
+                           liverMesh3D, silView, silProj, silW, silH, /*step=*/8);
+        } else if (mods & GLFW_MOD_SHIFT) {
+            std::cout << "[Shift+I] requires Registration mode (run depth first)"
+                      << std::endl;
+        }
+        break;
+    case GLFW_KEY_Q:
+        // Pose Library ウィンドウ開閉
+        g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
+        std::cout << "[PoseLibrary] Window "
+                  << (g_poseLibrary.showWindow ? "ON" : "OFF") << std::endl;
+        break;
+    case GLFW_KEY_X:
+        // 元コード line 7039-7042 通り: REGISTRATION_MODE && hasLastRegistration
+        if (gApp.mode == AppMode::kRegistration && g_poseLibrary.hasLastRegistration) {
+            poseUndo();
+        }
+        break;
+    case GLFW_KEY_F2:
+        OrbitCam.resetToInitialState();
+        if (gApp.mode == AppMode::kRegistration) {
+            OrbitCam.rotation = glm::angleAxis(glm::radians(180.0f),
+                                               glm::vec3(0.0f, 1.0f, 0.0f));
+            OrbitCam.currentTarget = TARGET_TEXTURE;
+        }
+        std::cout << "Camera reset" << std::endl;
+        break;
+    case GLFW_KEY_A:
+        gApp.arMode = !gApp.arMode;
+        std::cout << "[AR] background overlay: "
+                  << (gApp.arMode ? "ON" : "OFF") << std::endl;
+        break;
+    case GLFW_KEY_D:
+        if (gApp.mode == AppMode::kRegistration && g_pShader) {
+            std::vector<mCutMesh*> organs = {
+                liverMesh3D, portalMesh3D, veinMesh3D,
+                tumorMesh3D, segmentMesh3D, gbMesh3D
+            };
+            int imgW = OrbitCam.calibWidth  > 0 ? OrbitCam.calibWidth  : 1280;
+            int imgH = OrbitCam.calibHeight > 0 ? OrbitCam.calibHeight : 720;
+            ARSave::capture(g_arSave, OrbitCam, *g_pShader, *g_pShaderCube,
+                            gApp.arBg, organs, g_meshAlpha, objPos,
+                            imgW, imgH,
+                            DEPTH_OUTPUT_PATH, gWindowWidth, gWindowHeight);
+        } else {
+            std::cout << "[D] AR save requires Registration mode" << std::endl;
+        }
+        break;
+
+    case GLFW_KEY_F9:
+        // V3RS Phase 2 diagnostic: toggle silhouette IoU overlay window.
+        // Window contents are filled by the per-Run + Final captures
+        // performed inside runBipopCmaesV3RS (RegistrationActions.h).
+        // Pattern mirrors GLFW_KEY_A (AR-mode toggle).
+        SilOverlay::g_silOverlay.showWindow =
+            !SilOverlay::g_silOverlay.showWindow;
+        std::cout << "[F9] V3RS silhouette overlay: "
+                  << (SilOverlay::g_silOverlay.showWindow ? "ON" : "OFF")
+                  << std::endl;
+        break;
+
+    case GLFW_KEY_F10:
+        // V3RS vertex-squash raster diagnostic (HANDOVER §5.2, Phase A).
+        // Measurement-only: rasterizes the quadrant-filtered liver
+        // silhouette at the CURRENT static pose with BOTH the hot-path
+        // triangle-bbox splat AND a plain vertex-squash 3x3, prints the
+        // [V3RS/vsq-diag] hole / write-count / edge-length comparison,
+        // and uploads both composites to the F9 overlay's Diagnostic
+        // slot. Does NOT run CMA-ES and does NOT touch the optimiser or
+        // the liver pose. Guards (mesh / labels / boundary map) live
+        // inside diagnoseVertexSquashV3RS. Quadrant filter uses the
+        // same g_activeQuadrantMask the Ctrl+Shift+G cost function does.
+        diagnoseVertexSquashV3RS(g_activeQuadrantMask);
+        break;
+
+    case GLFW_KEY_COMMA: {
+        const float step = (mods & GLFW_MOD_SHIFT) ? 0.05f : 0.01f;
+        g_silhouetteCosThreshold = std::max(0.0f,
+                                            g_silhouetteCosThreshold - step);
+        rebuildOBJWithCurrentThreshold();
+        break;
+    }
+    case GLFW_KEY_PERIOD: {
+        const float step = (mods & GLFW_MOD_SHIFT) ? 0.05f : 0.01f;
+        g_silhouetteCosThreshold = std::min(0.99f,
+                                            g_silhouetteCosThreshold + step);
+        rebuildOBJWithCurrentThreshold();
+        break;
+    }
+    case GLFW_KEY_R: {
+        if (mods & GLFW_MOD_SHIFT) {
+            // Shift+R: 肝臓領域 (anterior/rim/posterior) の可視化トグル
+            //   赤=前面コア, 橙=ヘリ帯, 青=後面
+            //   初回 ON 時に自動計算 (~数百 ms)。
+            //   登録 (CMA-ES 等) で頂点が動いてもラベルは頂点 index に
+            //   紐づくので球マーカーは追従する。
+            g_showLiverRegion = !g_showLiverRegion;
+            if (g_showLiverRegion && !g_liverRegion.valid()) {
+                recomputeLiverRegion();
+            }
+            std::cout << "[Region] visualization: "
+                      << (g_showLiverRegion ? "ON" : "OFF")
+                      << "  available=" << (g_liverRegion.valid() ? "YES" : "NO")
+                      << std::endl;
+            break;
+        }
+        // Plain R: 既存の Run depth (image-only mode)
+        if (gApp.mode != AppMode::kImageOnly) {
+            std::cout << "[R] only valid in image-only mode" << std::endl;
+            break;
+        }
+        if (!gApp.image.loaded) {
+            std::cout << "[R] no image loaded" << std::endl;
+            break;
+        }
+        runDepthAndUpdateScene(gApp);
+        break;
+    }
+    case GLFW_KEY_T: {
+        if (mods & GLFW_MOD_SHIFT) {
+            // Shift+T: 肝臓領域ラベルの再計算 (現在の g_rimTargetMm で)。
+            //   メッシュを差し替えた後や、rim 厚さを変えたいときに使う。
+            std::cout << "[Region] recomputing with target_rim_mm = "
+                      << g_rimTargetMm << std::endl;
+            recomputeLiverRegion();
+        }
+        break;
+    }
+    case GLFW_KEY_Y: {
+        if (mods & GLFW_MOD_SHIFT) {
+            // Shift+Y: 肝臓左右ラベルの再計算 (現在の g_lrPureFrac, g_lrFullFrac で)。
+            //   メッシュを差し替えた後や、fraction を変えたいときに使う。
+            std::cout << "[LR] recomputing with right_pure_fraction = "
+                      << g_lrPureFrac << "  right_full_fraction = "
+                      << g_lrFullFrac << std::endl;
+            recomputeLiverLR();
+        } else {
+            // Y: 肝臓左右領域 (pure-R / boundary / pure-L) の可視化トグル。
+            //   緑=純右, 黄=境界, 紫=純左
+            //   初回 ON 時に自動計算 (~数百 ms)。
+            //   登録 (CMA-ES 等) で頂点が動いてもラベルは頂点 index に
+            //   紐づくので球マーカーは追従する。
+            g_showLiverLR = !g_showLiverLR;
+            if (g_showLiverLR && !g_liverLR.valid()) {
+                recomputeLiverLR();
+            }
+            std::cout << "[LR] visualization: "
+                      << (g_showLiverLR ? "ON" : "OFF")
+                      << "  available=" << (g_liverLR.valid() ? "YES" : "NO")
+                      << std::endl;
+        }
+        break;
+    }
+    case GLFW_KEY_H: {
+        if (mods & GLFW_MOD_SHIFT) {
+            // Shift+H: 肝臓 cranial/caudal 可視化トグル (Phase 1)。
+            //   黄=CRANIAL(頭側), 青=CAUDAL(足側)
+            //   初回 ON 時に Shift+R / Y のラベルを必要なら自動計算 → v7 実行。
+            //   confidence < 5% で [WEAK] を std::cout に出力 (UI Flip は Phase 2 で検討)。
+            //   Phase 1 段階では registration には未統合 (可視化のみ)。
+            g_showLiverCC = !g_showLiverCC;
+            if (g_showLiverCC && !g_liverCC.valid()) {
+                recomputeLiverCC();
+            }
+            std::cout << "[CC] visualization: "
+                      << (g_showLiverCC ? "ON" : "OFF")
+                      << "  available=" << (g_liverCC.valid() ? "YES" : "NO");
+            if (g_liverCC.valid()) {
+                std::cout << "  confidence="
+                          << (g_liverCC.cc.confidence * 100.0f) << "%"
+                          << (g_liverCC.cc.weak ? " [WEAK]" : "");
+            }
+            std::cout << std::endl;
+            break;
+        }
+        // ---- plain H: 4象限可視化トグル (anterior/rim/posterior と pure_R/boundary/pure_L
+        //    の組合せを「重複所属」方式で 4 象限に分けて表示)。
+        //    緑=ant_right, 紫=ant_left, 青=pos_right, 橙=pos_left
+        //    初回 ON 時に Shift+R / Y のラベルを必要なら自動計算。
+        //    rim と boundary は重複所属するので、該当頂点は複数の球マーカーが重なる。
+        g_showLiverQuad = !g_showLiverQuad;
+        if (g_showLiverQuad && (g_quadVizIdxAR.empty() &&
+                                g_quadVizIdxAL.empty() &&
+                                g_quadVizIdxPR.empty() &&
+                                g_quadVizIdxPL.empty())) {
+            recomputeLiverQuad();
+        }
+        bool valid = !(g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
+                       g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty());
+        std::cout << "[Quad] visualization: "
+                  << (g_showLiverQuad ? "ON" : "OFF")
+                  << "  available=" << (valid ? "YES" : "NO")
+                  << std::endl;
+        break;
+    }
+    case GLFW_KEY_U:
+        if (gApp.mode == AppMode::kImageOnly) MaskPicker::undo(gApp);
+        break;
+    case GLFW_KEY_C:
+        if (gApp.mode == AppMode::kImageOnly) MaskPicker::clear(gApp);
+        break;
+    case GLFW_KEY_UP:
+        if (gApp.mode == AppMode::kRegistration) {
+            g_voxelSize += 0.05f;
+            std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
+        }
+        break;
+    case GLFW_KEY_DOWN:
+        if (gApp.mode == AppMode::kRegistration) {
+            g_voxelSize = std::max(0.0f, g_voxelSize - 0.05f);
+            std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
+        }
+        break;
+    case GLFW_KEY_K: {
+        // カメラから深度推定を実行
+        if (!gCamera.active) {
+            std::cout << "[K] Camera is not active. Starting camera..." << std::endl;
+            if (!gCamera.start()) {
+                std::cerr << "[K] Failed to start camera" << std::endl;
                 break;
             }
         }
-        computeUnifiedMetrics();
-        float reproRmse = registrationHandle.compRmse;
-        float diff = std::abs(reproRmse - savedCompRmse);
-        std::cout << "[PoseLibrary] Reproduction check entry #" << entryId << std::endl;
-        std::cout << "  Saved  CompRMSE: " << savedCompRmse << std::endl;
-        std::cout << "  Repro  CompRMSE: " << reproRmse << std::endl;
-        std::cout << "  Diff:            " << diff
-                  << (diff < 1e-4f ? "  [OK]" : "  [WARN: drift detected]") << std::endl;
-    }
-}
 
-static void poseUndo() {
-    auto organs = getOrganList();
-    g_poseLibrary.undoToLast(g_initOrganVertices, g_initOrganNormals, organs);
-    registrationHandle.state = RegistrationData::REGISTERED;
-    registrationHandle.useRegistration = true;
-    computeUnifiedMetrics();
-}
-
-// -------------------------------------------------------
-// Pose Library ImGui Window
-// -------------------------------------------------------
-static void drawPoseLibraryWindow() {
-    if (!g_poseLibrary.showWindow) return;
-
-    ImGui::SetNextWindowSize(ImVec2(640, 420), ImGuiCond_FirstUseEver);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,      ImVec4(0.06f,0.06f,0.08f,0.95f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg,       ImVec4(0.12f,0.10f,0.18f,1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.20f,0.15f,0.30f,1.0f));
-
-    if (ImGui::Begin("Pose Library", &g_poseLibrary.showWindow)) {
-        ImGui::Text("Entries: %d / %d  |  Session #%d",
-                    (int)g_poseLibrary.entries.size(), g_poseLibrary.maxEntries, g_sessionId);
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 248);
-        {
-            static bool s_importGuard = false;
-            if (ImGui::Button("Import CSV", ImVec2(120,0)) && !s_importGuard) {
-                s_importGuard = true;
-#ifdef HAS_TINYFILEDIALOGS
-                const char* filters[] = {"*.csv"};
-                const char* sel = tinyfd_openFileDialog(
-                    "Import Pose Library CSV","",1,filters,"CSV Files (*.csv)",0);
-                if (sel) g_poseLibrary.importFromCsv(std::string(sel));
-#else
-                std::cerr << "[PoseLibrary] Build with -DHAS_TINYFILEDIALOGS for file picker." << std::endl;
-#endif
-            } else { s_importGuard = false; }
-        }
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
-        if (ImGui::Button("Export CSV", ImVec2(120,0))) {
-            auto now = std::chrono::system_clock::now();
-            auto tt  = std::chrono::system_clock::to_time_t(now);
-            auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          now.time_since_epoch()) % 1000;
-            std::tm tm = *std::localtime(&tt);
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "pose_library_%04d%02d%02d_%02d%02d%02d_%03d.csv",
-                          tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
-                          tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
-            g_poseLibrary.exportToCsv(buf);
-        }
-        ImGui::Separator();
-
-        // # | Session | Method | BIPOP | Refine | CompRMSE | N | Time | [Apply]
-        ImGui::Columns(9, "pose_cols", true);
-        ImGui::SetColumnWidth(0, 26);
-        ImGui::SetColumnWidth(1, 76);
-        ImGui::SetColumnWidth(2, 66);
-        ImGui::SetColumnWidth(3, 42);
-        ImGui::SetColumnWidth(4, 42);
-        ImGui::SetColumnWidth(5, 76);
-        ImGui::SetColumnWidth(6, 44);
-        ImGui::SetColumnWidth(7, 44);
-        ImGui::SetColumnWidth(8, 46);
-
-        auto hc = ImVec4(0.7f,0.7f,0.7f,1);
-        ImGui::TextColored(hc, "#");        ImGui::NextColumn();
-        ImGui::TextColored(hc, "Session");  ImGui::NextColumn();
-        ImGui::TextColored(hc, "Method");   ImGui::NextColumn();
-        ImGui::TextColored(hc, "BIPOP");    ImGui::NextColumn();
-        ImGui::TextColored(hc, "Refine");   ImGui::NextColumn();
-        ImGui::TextColored(hc, "CompRMSE"); ImGui::NextColumn();
-        ImGui::TextColored(hc, "N");        ImGui::NextColumn();
-        ImGui::TextColored(hc, "Time");     ImGui::NextColumn();
-        ImGui::TextColored(hc, "");         ImGui::NextColumn();
-        ImGui::Separator();
-
-        int applyId = -1;
-        int prevSessionId = -1;
-
-        for (size_t i = 0; i < g_poseLibrary.entries.size(); i++) {
-            auto& e = g_poseLibrary.entries[i];
-            bool isActive = (e.id == g_poseLibrary.activeEntryId);
-
-            if (prevSessionId >= 0 && e.sessionId != prevSessionId) {
-                ImGui::Columns(1);
-                ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.3f,0.3f,0.5f,0.8f));
-                ImGui::Separator();
-                ImGui::PopStyleColor();
-                ImGui::Columns(9, "pose_cols", true);
-                ImGui::SetColumnWidth(0, 26);
-                ImGui::SetColumnWidth(1, 76);
-                ImGui::SetColumnWidth(2, 66);
-                ImGui::SetColumnWidth(3, 42);
-                ImGui::SetColumnWidth(4, 42);
-                ImGui::SetColumnWidth(5, 76);
-                ImGui::SetColumnWidth(6, 44);
-                ImGui::SetColumnWidth(7, 44);
-                ImGui::SetColumnWidth(8, 46);
+        std::cout << "[K] Running depth estimation from camera..." << std::endl;
+        if (runCameraDepthEstimation()) {
+            std::cout << "[K] Depth estimation completed successfully" << std::endl;
+            // 自動的にRegistrationモードに切り替え
+            if (gApp.mode != AppMode::kRegistration) {
+                gApp.mode = AppMode::kRegistration;
+                std::cout << "[K] Switched to Registration mode" << std::endl;
             }
-            prevSessionId = e.sessionId;
-
-            if (isActive) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f,1.0f,0.3f,1.0f));
-
-            ImGui::Text("%d", (int)(i+1)); ImGui::NextColumn();
-
-            ImGui::TextColored(ImVec4(0.55f,0.80f,1.0f,1.0f), "%s", e.sessionLabel().c_str());
-            ImGui::NextColumn();
-
-            {
-                ImVec4 mc = ImVec4(0.85f,0.85f,0.85f,1);
-                if (e.baseMethod == PoseEntry::HEMI_AUTO)   mc = ImVec4(0.94f,0.56f,0.19f,1);
-                if (e.baseMethod == PoseEntry::BIPOP_CMAES) mc = ImVec4(0.94f,0.56f,0.19f,1);
-                if (e.baseMethod == PoseEntry::REFINE)      mc = ImVec4(0.13f,0.77f,0.37f,1);
-                if (e.baseMethod == PoseEntry::UMEYAMA)     mc = ImVec4(0.55f,0.80f,1.0f,1);
-                ImGui::TextColored(mc, "%s", e.methodStr());
-                if (ImGui::IsItemHovered()) {
-                    ImGui::BeginTooltip();
-                    ImGui::Text("ID: %d  Session: %s", e.id, e.sessionLabel().c_str());
-                    ImGui::Text("Timestamp: %s", e.timestamp.c_str());
-                    ImGui::Text("Elapsed: %.3f s", e.elapsedSec);
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(1,1,0.5f,1), "=== Unified Metrics ===");
-                    ImGui::Text("Comp RMSE:   %.6f  (%d pairs)", e.compRmse, e.compCount);
-                    ImGui::Text("Comp AvgErr: %.6f", e.compAvgError);
-                    ImGui::Text("Comp MaxErr: %.6f", e.compMaxError);
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "--- Base Registration ---");
-                    ImGui::Text("Fitness (ICP): %.6f", e.baseFitness);
-                    ImGui::Text("ICP RMSE:      %.6f", e.baseIcpRmse);
-                    ImGui::Text("Corr. RMSE:    %.6f", e.baseRmse);
-                    ImGui::Text("Corr. AvgErr:  %.6f", e.baseAvgError);
-                    ImGui::Text("Corr. MaxErr:  %.6f", e.baseMaxError);
-                    ImGui::Text("Scale:         %.4f", e.baseScale);
-                    if (e.refineCount > 0) {
-                        ImGui::Separator();
-                        ImGui::TextColored(ImVec4(0.13f,0.77f,0.37f,1), "--- Refine ---");
-                        ImGui::Text("Count:     %d",   e.refineCount);
-                        ImGui::Text("Init RMSE: %.6f", e.refineInitialRMSE);
-                        ImGui::Text("Best RMSE: %.6f", e.refineBestRMSE);
-                        ImGui::Text("Best Iter: %d",   e.refineBestIteration);
-                    }
-                    ImGui::EndTooltip();
-                }
-            }
-            ImGui::NextColumn();
-
-            if (e.bipopCount > 0)
-                ImGui::TextColored(ImVec4(0.94f,0.56f,0.19f,0.9f), "x%d", e.bipopCount);
-            else
-                ImGui::TextColored(ImVec4(0.3f,0.3f,0.3f,1), "---");
-            ImGui::NextColumn();
-
-            if (e.refineCount > 0)
-                ImGui::TextColored(ImVec4(0.13f,0.77f,0.37f,0.9f), "x%d", e.refineCount);
-            else
-                ImGui::TextColored(ImVec4(0.3f,0.3f,0.3f,1), "---");
-            ImGui::NextColumn();
-
-            ImGui::Text("%.4f", e.compRmse); ImGui::NextColumn();
-            ImGui::Text("%d",   e.compCount); ImGui::NextColumn();
-
-            {
-                char tbuf[16];
-                if (e.elapsedSec < 100.0f)
-                    std::snprintf(tbuf, sizeof(tbuf), "%.1fs", e.elapsedSec);
-                else
-                    std::snprintf(tbuf, sizeof(tbuf), "%ds", (int)e.elapsedSec);
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1), "%s", tbuf);
-            }
-            ImGui::NextColumn();
-
-            ImGui::PushID(e.id);
-            if (ImGui::SmallButton("Apply")) applyId = e.id;
-            ImGui::PopID();
-            ImGui::NextColumn();
-
-            if (isActive) ImGui::PopStyleColor();
-        }
-
-        ImGui::Columns(1);
-
-        if (applyId >= 0) poseApplyEntry(applyId);
-
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        float bw = (ImGui::GetContentRegionAvail().x - 8) / 2.0f;
-        bool canUndo = g_poseLibrary.hasLastRegistration;
-        if (!canUndo) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
-        if (ImGui::Button("Undo", ImVec2(bw, 28))) { if (canUndo) poseUndo(); }
-        if (!canUndo) ImGui::PopStyleVar();
-        ImGui::SameLine();
-        if (ImGui::Button("Clear All", ImVec2(bw, 28))) {
-            g_poseLibrary.entries.clear();
-            g_poseLibrary.activeEntryId = -1;
-        }
-    }
-    ImGui::End();
-    ImGui::PopStyleColor(3);
-}
-
-void setupUICallbacks() {
-    auto& a = gUIManager.actions;
-
-    a.onToggleCamera = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        if (gCameraPreview.active) {
-            clearSegPoints();
-            gCameraPreview.captureAndFreeze(screenMesh);
-            depthSplitScreenMode = true;
-            splitScreenMode = true;
-            OrbitCamLeft_Target = OrbitCam;
-            OrbitCamRight_Screen = OrbitCam;
-            OrbitCamLeft_Target.currentTarget = TARGET_LIVER;
-            OrbitCamLeft_Target.cx = (gWindowWidth / 2) / 2.0f;
-            OrbitCamLeft_Target.cy = gWindowHeight / 2.0f;
-            OrbitCamRight_Screen.currentTarget = TARGET_TEXTURE;
-            OrbitCamRight_Screen.gRadius = OrbitCam.InitialRadius * 2.0f;
-            OrbitCamRight_Screen.cx = (gWindowWidth / 2) / 2.0f;
-            OrbitCamRight_Screen.cy = gWindowHeight / 2.0f;
-        } else if (gCameraPreview.frozen) {
-            depthSplitScreenMode = false;
-            splitScreenMode = false;
-            gCameraPreview.clearFrozen();
-            clearSegPoints();
-            gCameraPreview.start(screenMesh, 0, 1280, 720);
         } else {
-            clearSegPoints();
-            gCameraPreview.start(screenMesh, 0, 1280, 720);
+            std::cerr << "[K] Depth estimation failed" << std::endl;
         }
-    };
+        break;
+    }
+    case GLFW_KEY_J: {
+        // カメラフレームをJPEGファイルとして保存
+        if (!gCamera.active) {
+            std::cerr << "[J] Camera is not active" << std::endl;
+            break;
+        }
 
-    a.onRunDepth = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        showProgressOverlay(0.05f, "Preparing depth...");
-        std::vector<DepthRunnerPoint> segPoints;
-        if (gUserSegPoints.empty()) {
-            segPoints = createDefaultSegPoints(
-                screenMesh->loadedImageWidth, screenMesh->loadedImageHeight);
+        std::string filename = gCamera.saveForDepthEstimation();
+        if (!filename.empty()) {
+            std::cout << "[J] Saved camera frame to: " << filename << std::endl;
         } else {
-            segPoints = gUserSegPoints;
+            std::cerr << "[J] Failed to save camera frame" << std::endl;
         }
-        if (gCameraPreview.frozen) {
-            gCameraPreview.runDepthFromFrozen(gDepthRunner, screenMesh, segPoints, showProgressOverlay);
-        } else if (gCameraPreview.active) {
-            gCameraPreview.captureAndRunDepthWithPoints(gDepthRunner, screenMesh, segPoints, showProgressOverlay);
-        } else if (gDepthRunner.isAvailable()) {
-            DepthRunnerIntegration::updateScreenMeshDepth(
-                gDepthRunner, gDepthInputImage, screenMesh,
-                128, 10.0f, 0.3f, segPoints,
-                [](mCutMesh& mesh) { setUp(mesh); },
-                showProgressOverlay);
+        break;
+    }
+    case GLFW_KEY_S: {
+        // カメラモードで静止画キャプチャ（Sキー = Snapshot）
+        if (gCamera.active && !gCamera.captured) {
+            gCamera.captureCurrentFrame();
+            gApp.image.path = "[Camera Captured]";
+            std::cout << "[S] Camera frame captured for mask selection" << std::endl;
         }
-        showProgressOverlay(1.0f, "Depth complete!");
-        resetBoundaryMap();
-        gDepthScale = 0.3f;
-        clearSegPoints();
-        depthSplitScreenMode = false;
-        splitScreenMode = false;
-        registrationHandle.reset();
-        registrationHandle.state = RegistrationData::IDLE;
-        g_refineVertexIndices.clear();
-        g_cluster1Points.clear();
-        g_cluster2Points.clear();
-        g_targetPoints.clear();
-        g_showClusterVisualization = false;
-        g_showCorrespondencePoints = false;
-    };
-
-    a.onResetDefaultImage = []() {
-        gCameraPreview.stop();
-        gCameraPreview.clearFrozen();
-        clearSegPoints();
-        gDepthScale = 0.3f;
-        gDroppedFilePath = "";
-        depthSplitScreenMode = false;
-        splitScreenMode = false;
-        showProgressOverlay(0.05f, "Resetting to default...");
-        initScreenMeshWithDepthRunner(gDepthRunner, screenMesh, false, showProgressOverlay);
-        showProgressOverlay(1.0f, "Reset complete!");
-    };
-
-    a.onLoadLocalImage = []() {
-        if (currentMainMode == REGISTRATION_MODE) openImageFilePicker();
-    };
-
-    a.onUndoSegPoint = []() {
-        if (!gUserSegPoints.empty()) {
-            gUserSegPoints.pop_back();
-            gUserSegPoints3D.pop_back();
-            gUserSegPointsFG.pop_back();
+        break;
+    }
+    case GLFW_KEY_L: {
+        // カメラモードでライブビューに戻る（Lキー = Live）
+        if (gCamera.active && gCamera.captured) {
+            gCamera.releaseCapture();
+            gApp.image.path = "[Camera Live]";
+            std::cout << "[L] Returned to camera live view" << std::endl;
         }
-    };
-
-    a.onDepthScaleChanged = [](float v) {
-        gDepthScale = v;
-        regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-        if (g_showClusterVisualization && registrationHandle.state == RegistrationData::REGISTERED) {
-            computeUnifiedMetrics();
+        break;
+    }
+    case GLFW_KEY_M: {
+        if (gApp.mode != AppMode::kRegistration) {
+            std::cout << "[M] only valid in Registration mode" << std::endl;
+            break;
         }
-    };
-
-    a.onFullAuto = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        gUIManager.state.regMethod = 0;
-        splitScreenMode = false;
-        poseAutoSaveBeforeRegistration();
-        registrationHandle.reset();
-        registrationHandle.state = RegistrationData::IDLE;
-        OrbitCam.cx = gWindowWidth / 2.0f;
-        OrbitCam.cy = gWindowHeight / 2.0f;
-
-        auto organs = getOrganList();
-        std::vector<std::string> names = {"Liver","Portal","Vein","Tumor","Segment","Gallbladder"};
-        Reg3DCustom::performRegistrationMultiMeshWithScale(
-            organs, names, screenMesh, OrbitCam.cameraPos,
-            gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale);
-        computeUnifiedMetrics();
-        poseSaveToLibrary();
-    };
-
-    a.onHemiAuto = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        gUIManager.state.regMethod = 1;
-        g_stepStartTime  = std::chrono::steady_clock::now();
-        g_sessionBipopN  = 0;
-        g_sessionRefineN = 0;
-        poseAutoSaveBeforeRegistration();
-        resetRegistrationState();
-
-        Reg3D::BVHTree bvh;
-        bvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-        auto vis = Reg3DCustom::extractVisibleVerticesCustom(
-            *liverMesh3D, bvh, OrbitCam.cameraPos, OrbitCam.cameraTarget);
-        if (vis.cloud->size() < 50) return;
-        g_cluster1Points = vis.points;
-        g_cluster2Points.clear();
-        g_refineVertexIndices = vis.vertexIndices;
-        computeIdealVoxelSizes();
-        auto organs = getOrganList();
-        Reg3DCustom::performRegistrationSingleMesh(
-            organs, liverMesh3D, vis.vertexIndices,
-            screenMesh, OrbitCam.cameraPos,
-            gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
-        computeUnifiedMetrics();
-        poseSaveToLibrary();
-    };
-
-    a.onHemiVoxelChanged = [](float v) {
-        g_voxelSize = v;
-    };
-
-    a.onInitRotPresetChanged = [](int preset) {
-        startNewSession();
-        registrationHandle.initRotPreset =
-            (RegistrationData::InitRotPreset)preset;
-        std::cout << "[InitRot] Preset selected: "
-                  << RegistrationData::presetName(registrationHandle.initRotPreset)
-                  << std::endl;
-
-        g_currentOrientLabel = RegistrationData::presetName(registrationHandle.initRotPreset);
-        std::cout << "[Session] New session: " << g_currentOrientLabel << std::endl;
-
-        auto organs = getOrganList();
-        if (g_initOrganVertices.empty() ||
-            g_initOrganVertices.size() != organs.size()) return;
-
-        for (size_t i = 0; i < organs.size(); i++) {
-            organs[i]->mVertices = g_initOrganVertices[i];
-            organs[i]->mNormals  = g_initOrganNormals[i];
-            setUp(*organs[i]);
-        }
-
-        RegistrationData::InitRotPreset p =
-            (RegistrationData::InitRotPreset)preset;
-        if (p != RegistrationData::PRESET_FRONT) {
-            glm::vec3 centroid =
-                computeMeshCentroidFromVertices(liverMesh3D->mVertices);
-            glm::mat4 R = getPresetRotation(p, centroid);
-            for (auto* m : organs) {
-                applyMatrixToMeshVerticesAndNormals(m, R);
-                setUp(*m);
-            }
-        }
-    };
-
-    a.onRefine = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        if (registrationHandle.state == RegistrationData::REGISTERED) {
-            if (g_refineVertexIndices.empty()) {
-                std::cerr << "[Refine] No visible vertex indices." << std::endl;
-                return;
-            }
-            g_stepStartTime = std::chrono::steady_clock::now();
-            poseAutoSaveBeforeRegistration();
-            std::cout << "\n=== Normal-Compatible Refinement START ===" << std::endl;
-            std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                              tumorMesh3D, segmentMesh3D, gbMesh3D};
-            NormalRefine::RefineParams params;
-            params.useZWeight      = true;
-            params.zWeightBoundary = 0.05f;
-            params.zWeightInterior = 0.30f;
-            params.boundaryWidth   = 8.0f;
-            params.boundaryBoost   = 3.0f;
-            if (NormalRefine::initRefine(g_refineState, liverMesh3D,
-                                         g_refineVertexIndices,
-                                         screenMesh, organs,
-                                         gGridWidth, gGridHeight(), gDepthScale, params,
-                                         NormalRefine::NORMAL_COMPAT)) {
-                // Override initial/best RMSE with unified Target→Source metric
-                computeUnifiedMetrics();
-                g_refineState.initialRMSE = registrationHandle.compRmse;
-                g_refineState.bestRMSE    = registrationHandle.compRmse;
-                std::cout << "[Refine] Unified initial RMSE: " << registrationHandle.compRmse << std::endl;
-                registrationHandle.state = RegistrationData::REFINING;
-            } else {
-                std::cerr << "[Refine] Initialization failed" << std::endl;
-            }
-        } else if (registrationHandle.state == RegistrationData::REFINING) {
-            g_refineState.active = false;
-            registrationHandle.state = RegistrationData::REGISTERED;
-            bool improved = g_refineState.bestRMSE < g_refineState.initialRMSE;
-            g_refineState.restoreMeshes();
-            if (improved) {
-                NormalRefine::applyIncrementalTransform(
-                    g_refineState.bestCumulativeTransform,
-                    g_refineState.organMeshes);
-            }
-            // Update refine metrics in registrationHandle
-            registrationHandle.refineCount++;
-            registrationHandle.refineInitialRMSE   = g_refineState.initialRMSE;
-            registrationHandle.refineBestRMSE      = g_refineState.bestRMSE;
-            registrationHandle.refineBestIteration = g_refineState.bestIteration;
-            computeUnifiedMetrics();
-            poseSaveToLibrary();
-            std::cout << "\n=== Refinement STOPPED ===" << std::endl;
-            std::cout << "  Initial RMSE: " << g_refineState.initialRMSE << std::endl;
-            std::cout << "  Best RMSE:    " << g_refineState.bestRMSE
-                      << " (iter " << g_refineState.bestIteration << ")" << std::endl;
-            if (improved)
-                std::cout << "  >> Reverted to best state" << std::endl;
-            else
-                std::cout << "  >> No improvement — reverted to initial" << std::endl;
-        }
-    };
-
-    a.onBipopCmaes = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        if (registrationHandle.compRmse == 0.0f) {
-            std::cerr << "[UI] No registration yet. Run HemiAuto first." << std::endl;
-            return;
-        }
-        g_stepStartTime = std::chrono::steady_clock::now();
-        g_sessionBipopN++;
-        gUIManager.state.regMethod = 3;
-        std::cout << "\n=== BIPOP-CMA-ES Multi-Start (UI Button) ===" << std::endl;
-        poseAutoSaveBeforeRegistration();
-        auto organs = getOrganList();
-        computeUnifiedMetrics();
-        float rmse_before = registrationHandle.compRmse;
-        std::cout << "[Shift+V] Current compRMSE: " << rmse_before << std::endl;
-
-        std::vector<std::vector<GLfloat>> start_v(organs.size());
-        std::vector<std::vector<GLfloat>> start_n(organs.size());
-        for (size_t i = 0; i < organs.size(); i++) {
-            if (organs[i]) { start_v[i] = organs[i]->mVertices; start_n[i] = organs[i]->mNormals; }
-        }
-
-        float best_rmse = rmse_before;
-        std::vector<std::vector<GLfloat>> best_v = start_v;
-        std::vector<std::vector<GLfloat>> best_n = start_n;
-
-        const int N_STARTS = 10;
-        std::mt19937 rng(std::random_device{}());
-        std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
-
-        for (int run = 0; run < N_STARTS; run++) {
-            for (size_t i = 0; i < organs.size(); i++) {
-                if (organs[i]) { organs[i]->mVertices = start_v[i]; organs[i]->mNormals = start_n[i]; setUp(*organs[i]); }
-            }
-
-            CmaesRefine::Params p;
-            p.verbose        = true;
-            p.log_every      = 100;
-            p.save_debug_jpg = false;
-
-            float tx_perturb = 0, ty_perturb = 0, tz_perturb = 0;
-            float rx_perturb = 0, ry_perturb = 0, rz_perturb = 0;
-            float sc_perturb = 1.0f;
-            std::string regime;
-
-            if (run % 2 == 0) {
-                p.sigma0 = 0.3 + dist01(rng) * 0.4;
-                tx_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
-                ty_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
-                tz_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
-                rx_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
-                ry_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
-                rz_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
-                sc_perturb = 0.95f + dist01(rng) * 0.10f;
-                regime = "Regime2(local)";
-            } else {
-                p.sigma0 = 0.5 + dist01(rng) * 0.5;
-                tx_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
-                ty_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
-                tz_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
-                rx_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
-                ry_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
-                rz_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
-                sc_perturb = 0.90f + dist01(rng) * 0.20f;
-                regime = "Regime1(global)";
-            }
-
-            if (run > 0) {
-                CmaesRefine::applyIncrementalSRT(organs, tx_perturb, ty_perturb, tz_perturb,
-                                                 rx_perturb, ry_perturb, rz_perturb, sc_perturb);
-                for (size_t i = 0; i < organs.size(); i++) if (organs[i]) setUp(*organs[i]);
-            }
-
-            std::cout << "[BIPOP] Run " << (run+1) << "/" << N_STARTS << "  " << regime
-                      << "  sigma0=" << std::fixed << std::setprecision(2) << p.sigma0 << std::endl;
-
-            CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
-                                                     gGridWidth, gGridHeight(), gDepthScale, p);
-            computeUnifiedMetrics();
-            float rmse_run = registrationHandle.compRmse;
-            std::cout << "[BIPOP] Run " << (run+1) << " compRMSE=" << std::setprecision(6) << rmse_run
-                      << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
-
-            if (rmse_run < best_rmse) {
-                best_rmse = rmse_run;
-                for (size_t i = 0; i < organs.size(); i++) {
-                    if (organs[i]) { best_v[i] = organs[i]->mVertices; best_n[i] = organs[i]->mNormals; }
-                }
-            }
-        }
-
-        for (size_t i = 0; i < organs.size(); i++) {
-            if (organs[i]) { organs[i]->mVertices = best_v[i]; organs[i]->mNormals = best_n[i]; setUp(*organs[i]); }
-        }
-        computeUnifiedMetrics();
-        std::cout << "[BIPOP] Best: " << rmse_before << " -> " << best_rmse
-                  << (best_rmse < rmse_before ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
-        poseSaveToLibrary();
-    };
-
-    a.onStartUmeyama = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        gUIManager.state.regMethod = 2;
-        isDragging = false; hit_index = -1;
-        if (splitScreenMode) splitScreenMode = false;
-        registrationHandle.reset();
-        registrationHandle.targetPointCount = 5;
-        registrationHandle.state = RegistrationData::SELECTING_BOARD_POINTS;
-        registrationHandle.useRegistration = false;
-        OrbitCam.resetToInitialState();
-        OrbitCam.cx = gWindowWidth / 2.0f;
-        OrbitCam.cy = gWindowHeight / 2.0f;
-        OrbitCamLeft_Target = OrbitCam;
-        OrbitCamRight_Screen = OrbitCam;
-        OrbitCamLeft_Target.gRadius = OrbitCam.InitialRadius * 1.0f;
-        OrbitCamLeft_Target.currentTarget = TARGET_LIVER;
-        OrbitCamLeft_Target.cx = (gWindowWidth / 2) / 2.0f;
-        OrbitCamLeft_Target.cy = gWindowHeight / 2.0f;
-        OrbitCamRight_Screen.gRadius = OrbitCam.InitialRadius * 2.0f;
-        OrbitCamRight_Screen.currentTarget = TARGET_TEXTURE;
-        OrbitCamRight_Screen.cx = (gWindowWidth / 2) / 2.0f;
-        OrbitCamRight_Screen.cy = gWindowHeight / 2.0f;
-        splitScreenMode = true;
-    };
-
-    a.onExecuteUmeyama = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        if (!registrationHandle.canRegister()) return;
-        poseAutoSaveBeforeRegistration();
-        std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                          tumorMesh3D, segmentMesh3D, gbMesh3D};
-        performRegistrationUmeyama(registrationHandle, organs);
-        computeUnifiedMetrics();
-        poseSaveToLibrary();
-        splitScreenMode = false;
-        OrbitCam = OrbitCamRight_Screen;
-        OrbitCam.gRadius = OrbitCam.InitialRadius;
-        OrbitCam.cx = gWindowWidth / 2.0f;
-        OrbitCam.cy = gWindowHeight / 2.0f;
-    };
-
-    a.onResetRegistration = []() {
-        startNewSession();
-        registrationHandle.resetTransformOnly();
-        splitScreenMode = false;
-        gUIManager.state.regMethod = -1;
-        g_refineVertexIndices.clear();
-        g_refineState.reset();
-
-        auto organs = getOrganList();
-        if (!g_initOrganVertices.empty() &&
-            g_initOrganVertices.size() == organs.size()) {
-            for (size_t i = 0; i < organs.size(); i++) {
-                organs[i]->mVertices = g_initOrganVertices[i];
-                organs[i]->mNormals  = g_initOrganNormals[i];
-                setUp(*organs[i]);
-            }
-        }
-
-        registrationHandle.initRotPreset = RegistrationData::PRESET_FRONT;
-        gUIManager.state.initRotPreset   = 0;
-        g_currentOrientLabel             = "Front";
-        std::cout << "[InitRot] Reset to Front" << std::endl;
-    };
-
-    a.onPoseUndo = []() {
-        poseUndo();
-    };
-
-    a.onSwitchDepthModel = [](int idx) {
-        switchDepthModel(gDepthRunner, idx);
-        gUIManager.state.depthModelIdx = idx;
-    };
-
-    a.onPoseLibraryToggle = []() {
-        g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
-    };
-
-    a.onClearPoints = []() {
-        registrationHandle.clearPoints();
-        registrationHandle.state = RegistrationData::IDLE;
-        g_showCorrespondencePoints = false;
-        std::cout << "Correspondence points cleared" << std::endl;
-    };
-
-    a.onToggleCorrespondenceVis = []() {
-        g_showCorrespondencePoints = !g_showCorrespondencePoints;
-        std::cout << "Correspondence points: "
-                  << (g_showCorrespondencePoints ? "ON" : "OFF") << std::endl;
-    };
-
-    a.onUndoUmeyamaPoint = []() {
-        if (currentMainMode != REGISTRATION_MODE) return;
-        if (registrationHandle.state == RegistrationData::READY_TO_REGISTER ||
-            registrationHandle.state == RegistrationData::SELECTING_OBJECT_POINTS) {
-            if (!registrationHandle.objectPoints.empty()) {
-                registrationHandle.objectPoints.pop_back();
-                std::cout << "[Umeyama] Undo object point. Remaining: "
-                          << registrationHandle.objectPoints.size() << std::endl;
-                if (registrationHandle.state == RegistrationData::READY_TO_REGISTER)
-                    registrationHandle.state = RegistrationData::SELECTING_OBJECT_POINTS;
-                return;
-            }
-        }
-        if (registrationHandle.state == RegistrationData::SELECTING_OBJECT_POINTS &&
-            registrationHandle.objectPoints.empty()) {
-            if (!registrationHandle.boardPoints.empty()) {
-                registrationHandle.boardPoints.pop_back();
-                registrationHandle.state = RegistrationData::SELECTING_BOARD_POINTS;
-                std::cout << "[Umeyama] Undo board point (back to board phase). Remaining: "
-                          << registrationHandle.boardPoints.size() << std::endl;
-            }
-            return;
-        }
-        if (registrationHandle.state == RegistrationData::SELECTING_BOARD_POINTS) {
-            if (!registrationHandle.boardPoints.empty()) {
-                registrationHandle.boardPoints.pop_back();
-                std::cout << "[Umeyama] Undo board point. Remaining: "
-                          << registrationHandle.boardPoints.size() << std::endl;
-            }
-        }
-    };
-
-    a.onRigidMode = []() {
-        if (currentMainMode != DEFORM_MODE) return;
-        deformHandlPlace.state = DeformHandlPlaceData::RIGID_MODE;
-        if (multiBody) multiBody->setRigidMode(true);
-    };
-
-    a.onHandlePlaceMode = []() {
-        if (currentMainMode != DEFORM_MODE) return;
-        if (multiBody) {
-            multiBody->setRigidMode(true);
-            multiBody->initPhysics();
-            multiBody->reapplyHandleConstraints();
-        }
-        deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-    };
-
-    a.onDeformMode = []() {
-        if (currentMainMode != DEFORM_MODE) return;
-        if (multiBody) multiBody->setRigidMode(false);
-        deformHandlPlace.state = DeformHandlPlaceData::DEFORM_MODE;
-    };
-
-    a.onFullReset = []() {
-        if (currentMainMode != DEFORM_MODE) return;
-        deformHandlPlace.reset();
-        if (multiBody) { multiBody->fullReset(); multiBody->setRigidMode(true); multiBody->initPhysics(); }
-        deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-    };
-
-    a.onHandleRadiusChanged = [](float r) {
-        gGroupRadius = r;
-    };
-
-    a.onSaveAR = []() { saveARimage = true; };
-
-    a.onToggleClusterVis = []() {
-        g_showClusterVisualization = !g_showClusterVisualization;
-    };
-
-    a.onToggleOrgan = [](int i) {
-        if (i < 0 || i >= (int)meshAlphaValues.size()) return;
-        float a = meshAlphaValues[i];
-        meshAlphaValues[i] = (a < 0.01f) ? 0.5f : (a < 0.75f) ? 1.0f : 0.0f;
-    };
-
-    a.onSwitchToDeformMode = []() {
         std::filesystem::create_directories(REG_MODEL_PATH);
-        liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
-        portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
-        veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
-        tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
-        segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
-        gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
-        currentMainMode = DEFORM_MODE;
-    };
 
-    a.onResetCamera = []() {
-        OrbitCam.resetToInitialState();
-        std::cout << "Camera reset to initial position" << std::endl;
-    };
-
-    a.onStartFromDepth = []() {
-        std::cout << "\n=== RESTART FROM DEPTH ===" << std::endl;
-        showProgressOverlay(0.02f, "Reloading meshes...");
-
-        if (multiBody) { delete multiBody; multiBody = nullptr; }
-        deformInit = false;
-        deformHandlPlace.reset();
-
-        registrationHandle.reset();
-        g_showClusterVisualization = false;
-        g_showCorrespondencePoints = false;
-
-        auto reloadMesh = [](mCutMesh*& mesh, const std::string& path, glm::vec3 color) {
-            if (mesh) { mesh->cleanup(); delete mesh; mesh = nullptr; }
-            mCutMesh loader;
-            mesh = new mCutMesh(loader.loadMeshFromFile(path.c_str()));
-            mesh->mColor = color;
-            setUp(*mesh);
-        };
-        normalizeAndSavePreReg();
-        reloadMesh(liverMesh3D,   PreReg_TARGET_FILE_PATH,  glm::vec3(0.8f, 0.2f, 0.2f));
-        reloadMesh(portalMesh3D,  PreReg_PORTAL_FILE_PATH,  glm::vec3(0.2f, 0.2f, 0.8f));
-        reloadMesh(veinMesh3D,    PreReg_VEIN_FILE_PATH,    glm::vec3(0.2f, 0.5f, 0.5f));
-        reloadMesh(tumorMesh3D,   PreReg_TUMOR_FILE_PATH,   glm::vec3(0.8f, 0.5f, 0.5f));
-        reloadMesh(segmentMesh3D, PreReg_SEGMENT_FILE_PATH, glm::vec3(0.2f, 0.8f, 0.5f));
-        reloadMesh(gbMesh3D,      PreReg_GB_FILE_PATH,      glm::vec3(0.2f, 0.8f, 0.2f));
-
-        allMeshes.clear();
-        allMeshes.push_back(liverMesh3D);
-        allMeshes.push_back(portalMesh3D);
-        allMeshes.push_back(veinMesh3D);
-        allMeshes.push_back(tumorMesh3D);
-        allMeshes.push_back(segmentMesh3D);
-        allMeshes.push_back(gbMesh3D);
-
-        showProgressOverlay(0.05f, "Running depth inference...");
-        gCameraPreview.stop();
-        gCameraPreview.clearFrozen();
-        if (screenMesh) { screenMesh->cleanup(); delete screenMesh; screenMesh = nullptr; }
-        initScreenMeshWithDepthRunner(gDepthRunner, screenMesh, false, showProgressOverlay);
-
-        currentMainMode = REGISTRATION_MODE;
-        splitScreenMode = false;
-        depthSplitScreenMode = false;
-
-        OrbitCam.cx = gWindowWidth / 2.0f;
-        OrbitCam.cy = gWindowHeight / 2.0f;
-        OrbitCam.gRadius = OrbitCam.InitialRadius;
-
-        gUserSegPoints.clear();
-        gUserSegPoints3D.clear();
-        gUserSegPointsFG.clear();
-        gDroppedFilePath = "";
-
-        meshAlphaValues = {0.8f, 0.9f, 0.9f, 0.9f, 0.5f, 0.5f, 0.7f};
-
-        gUIManager.resetToDepthPhase();
-
-        showProgressOverlay(1.0f, "Restart complete!");
-        std::cout << "=== Restart complete - back to Depth phase ===\n" << std::endl;
-    };
-}
-
-static void computeIdealVoxelSizes() {
-    if (!screenMesh || screenMesh->depthImageData.empty()) {
-        g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f;
-        return;
-    }
-    if (g_refineVertexIndices.empty()) {
-        g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f;
-        return;
-    }
-
-    Reg3DCustom::NoOpen3DRegistration reg;
-    float zThresh = std::max(0.01f, gDepthScale * 0.05f);
-    auto targetCloud = reg.extractFrontFacePoints(*screenMesh, gGridWidth, gGridHeight(), zThresh);
-    size_t T = targetCloud->size();
-    if (T == 0) { g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f; return; }
-
-    auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
-    for (size_t idx : g_refineVertexIndices) {
-        if (idx * 3 + 2 < liverMesh3D->mVertices.size())
-            sourceCloud->addPoint(glm::vec3(liverMesh3D->mVertices[idx*3],
-                                            liverMesh3D->mVertices[idx*3+1],
-                                            liverMesh3D->mVertices[idx*3+2]));
-    }
-    if (sourceCloud->empty()) { g_idealVoxel1to1 = g_idealVoxel1to15 = g_idealVoxel1to2 = 0.0f; return; }
-
-    auto findVoxelForRatio = [&](float ratio) -> float {
-        float lo = 0.01f, hi = 2.0f;
-        for (int i = 0; i < 20; i++) {
-            float mid = (lo + hi) * 0.5f;
-            auto down = reg.voxelDownSample(sourceCloud, mid);
-            float r = (T > 0) ? (float)down->size() / (float)T : 0.0f;
-            if (r > ratio) lo = mid; else hi = mid;
-        }
-        return (lo + hi) * 0.5f;
-    };
-
-    g_idealVoxel1to1  = findVoxelForRatio(1.0f);
-    g_idealVoxel1to15 = findVoxelForRatio(1.0f / 1.5f);
-    g_idealVoxel1to2  = findVoxelForRatio(0.5f);
-}
-
-void syncUIState() {
-    auto& s = gUIManager.state;
-    s.mainMode = (currentMainMode == REGISTRATION_MODE) ? 0 : 1;
-
-    if (gCameraPreview.frozen)      s.cameraState = 2;
-    else if (gCameraPreview.active) s.cameraState = 1;
-    else                            s.cameraState = 0;
-
-    s.depthScale = gDepthScale;
-    s.depthDone = screenMesh && !screenMesh->depthImageData.empty();
-
-    int fg = 0, bg = 0;
-    for (const auto& p : gUserSegPoints)
-        if (p.isForeground) fg++; else bg++;
-    s.segFG = fg;
-    s.segBG = bg;
-
-    s.hasLocalImage = !gDroppedFilePath.empty() && gCameraPreview.frozen;
-    s.localImageName = gDroppedFilePath;
-
-    switch (registrationHandle.state) {
-    case RegistrationData::IDLE:                    s.regState = 0; break;
-    case RegistrationData::SELECTING_BOARD_POINTS:  s.regState = 1; break;
-    case RegistrationData::SELECTING_OBJECT_POINTS: s.regState = 2; break;
-    case RegistrationData::READY_TO_REGISTER:       s.regState = 3; break;
-    case RegistrationData::REGISTERED:              s.regState = 4; break;
-    case RegistrationData::REFINING:                s.regState = 5; break;
-    }
-    s.refineEnabled = (registrationHandle.state == RegistrationData::REGISTERED &&
-                       !g_refineVertexIndices.empty());
-    s.poseLibraryOpen = g_poseLibrary.showWindow;
-    s.poseUndoAvailable = g_poseLibrary.hasLastRegistration;
-    s.poseEntryCount = (int)g_poseLibrary.entries.size();
-    s.boardPtCount  = registrationHandle.boardPoints.size();
-    s.objPtCount    = registrationHandle.objectPoints.size();
-    s.targetPtCount = registrationHandle.targetPointCount;
-    s.splitScreen   = splitScreenMode;
-    s.depthSplitScreen = depthSplitScreenMode;
-    s.useRegistration = registrationHandle.useRegistration;
-
-    if (registrationHandle.useRegistration) {
-        const float* m = glm::value_ptr(registrationHandle.registrationMatrix);
-        for (int i = 0; i < 16; i++) s.regMatrix[i] = m[i];
-        s.avgError = registrationHandle.compAvgError;
-        s.rmse = registrationHandle.compRmse;
-        s.maxError = registrationHandle.compMaxError;
-        s.scaleFactor = registrationHandle.scaleFactor;
-    }
-
-    if (liverMesh3D && !liverMesh3D->mVertices.empty()) {
-        glm::vec3 bmin(FLT_MAX), bmax(-FLT_MAX);
-        for (size_t i = 0; i < liverMesh3D->mVertices.size(); i += 3) {
-            glm::vec3 v(liverMesh3D->mVertices[i], liverMesh3D->mVertices[i+1], liverMesh3D->mVertices[i+2]);
-            bmin = glm::min(bmin, v);
-            bmax = glm::max(bmax, v);
-        }
-        s.modelBBoxDiag = glm::length(bmax - bmin);
-    }
-
-    switch (deformHandlPlace.state) {
-    case DeformHandlPlaceData::RIGID_MODE:        s.deformState = 0; break;
-    case DeformHandlPlaceData::HANDLE_PLACE_MODE: s.deformState = 1; break;
-    case DeformHandlPlaceData::DEFORM_MODE:       s.deformState = 2; break;
-    case DeformHandlPlaceData::PLANECUT_MODE:     s.deformState = 3; break;
-    }
-    s.handleGroups = multiBody ? (int)multiBody->handleGroups.size() : 0;
-    s.maxHandleGroups = SoftBody::MAX_HANDLE_GROUPS;
-    s.handleRadius = gGroupRadius;
-
-    for (int i = 0; i < 6; i++)
-        s.organs[i].alpha = meshAlphaValues[i];
-
-    s.boardAlpha = meshAlphaValues[6];
-
-    s.clusterVis = g_showClusterVisualization;
-    s.correspondenceVis = g_showCorrespondencePoints;
-    s.hemiVoxelSize = g_voxelSize;
-    s.idealVoxel1to1  = g_idealVoxel1to1;
-    s.idealVoxel1to15 = g_idealVoxel1to15;
-    s.idealVoxel1to2  = g_idealVoxel1to2;
-
-    s.depthModelIdx = gCurrentDepthModel;
-    for (int i = 0; i < DEPTH_MODEL_COUNT; i++)
-        s.depthModelAvail[i] = isDepthModelAvailable(i);
-}
-
-int main()
-{
-    initPaths();
-    initFilePaths();
-    normalizeAndSavePreReg();
-    initDepthRunnerConfig(gDepthRunner);
-
-    if (!initOpenGL())
-    {
-        std::cerr << "GLFW initialization failed" << std::endl;
-        return -1;
-    }
-
-    g_progressCallback = showProgressOverlay;
-
-    OrbitCam.setWindowSizePointers(&gWindowWidth, &gWindowHeight);
-    OrbitCam.setGlobalMatrixPointers(&view, &projection, &model, &objPos);
-
-    ShaderProgram shaderProgram;
-    ShaderProgram shaderProgramCube;
-
-    shaderProgram.loadShaders((SHADERS_PATH + "basic.vert").c_str(),
-                              (SHADERS_PATH + "basic.frag").c_str());
-    shaderProgramCube.loadShaders((SHADERS_PATH + "texture.vert").c_str(),
-                                  (SHADERS_PATH + "texture.frag").c_str());
-
-    OrbitCam.setIntrinsics(800.0f, 800.0f, gWindowWidth/2.0f, gWindowHeight/2.0f);
-
-    OrbitCam.printCameraInfo();
-
-    deformSphereMarker.generate(1.0f, 16, 16);
-    deformSphereMarker.setup();
-
-    liverMesh3D = new mCutMesh(liverMesh3D->loadMeshFromFile(PreReg_TARGET_FILE_PATH.c_str()));
-    liverMesh3D->mColor = glm::vec3(0.8f, 0.2f, 0.2f);
-    setUp(*liverMesh3D);
-    portalMesh3D = new mCutMesh(portalMesh3D->loadMeshFromFile(PreReg_PORTAL_FILE_PATH.c_str()));
-    portalMesh3D->mColor = glm::vec3(0.2f, 0.2f, 0.8f);
-    setUp(*portalMesh3D);
-    veinMesh3D = new mCutMesh(veinMesh3D->loadMeshFromFile(PreReg_VEIN_FILE_PATH.c_str()));
-    veinMesh3D->mColor = glm::vec3(0.2f, 0.5f, 0.5f);
-    setUp(*veinMesh3D);
-    tumorMesh3D = new mCutMesh(tumorMesh3D->loadMeshFromFile(PreReg_TUMOR_FILE_PATH.c_str()));
-    tumorMesh3D->mColor = glm::vec3(0.8f, 0.5f, 0.5f);
-    setUp(*tumorMesh3D);
-    segmentMesh3D = new mCutMesh(segmentMesh3D->loadMeshFromFile(PreReg_SEGMENT_FILE_PATH.c_str()));
-    segmentMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.5f);
-    setUp(*segmentMesh3D);
-    gbMesh3D = new mCutMesh(gbMesh3D->loadMeshFromFile(PreReg_GB_FILE_PATH.c_str()));
-    gbMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.2f);
-    setUp(*gbMesh3D);
-
-    allMeshes.push_back(liverMesh3D);
-    allMeshes.push_back(portalMesh3D);
-    allMeshes.push_back(veinMesh3D);
-    allMeshes.push_back(tumorMesh3D);
-    allMeshes.push_back(segmentMesh3D);
-    allMeshes.push_back(gbMesh3D);
-
-    snapshotInitialPose();
-
-    initScreenMeshWithDepthRunner(gDepthRunner, screenMesh, cameraUse);
-
-    registrationSphereMarker.generate(1.0f, 16, 16);
-    registrationSphereMarker.setup();
-
-    float dt = 1.0f / 60.0f;
-    glm::vec3 gravity(0.0f, 0.0f, 0.0f);
-
-    Grabber grabber;
-    gGrabber = &grabber;
-
-    setupUICallbacks();
-
-    double lastTime = glfwGetTime();
-
-    while (!glfwWindowShouldClose(gWindow))
-    {
-        double currentTime = glfwGetTime();
-        float deltaTime = static_cast<float>(currentTime - lastTime);
-        lastTime = currentTime;
-
-        showFPS(gWindow);
-
-        glfwPollEvents();
-
-        if (gFileDropped) {
-            gFileDropped = false;
-            clearSegPoints();
-            gCameraPreview.loadLocalImageAsFrozen(screenMesh, gDroppedFilePath);
-            depthSplitScreenMode = true;
-            splitScreenMode = true;
-            OrbitCamLeft_Target = OrbitCam;
-            OrbitCamRight_Screen = OrbitCam;
-            OrbitCamLeft_Target.currentTarget = TARGET_LIVER;
-            OrbitCamLeft_Target.cx = (gWindowWidth / 2) / 2.0f;
-            OrbitCamLeft_Target.cy = gWindowHeight / 2.0f;
-            OrbitCamRight_Screen.currentTarget = TARGET_TEXTURE;
-            OrbitCamRight_Screen.gRadius = OrbitCam.InitialRadius * 2.0f;
-            OrbitCamRight_Screen.cx = (gWindowWidth / 2) / 2.0f;
-            OrbitCamRight_Screen.cy = gWindowHeight / 2.0f;
-            registrationHandle.reset();
-            registrationHandle.state = RegistrationData::IDLE;
-            g_refineVertexIndices.clear();
-            g_cluster1Points.clear();
-            g_cluster2Points.clear();
-            g_targetPoints.clear();
-            g_showClusterVisualization = false;
-            g_showCorrespondencePoints = false;
-        }
-
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        syncUIState();
-
-        if (registrationHandle.state == RegistrationData::REFINING && g_refineState.active) {
-            auto stepResult = NormalRefine::refineStep(g_refineState, OrbitCam.cameraDirection);
-            const char* mtag = NormalRefine::methodTag(g_refineState.method);
-
-            if (stepResult.correspondenceCount >= 6 && !stepResult.converged) {
-                // Apply this step's transform to meshes and accumulate
-                NormalRefine::applyIncrementalTransform(stepResult.incrementalTransform,
-                                                        g_refineState.organMeshes);
-
-                // Track cumulative transform
-                g_refineState.cumulativeTransform =
-                    stepResult.incrementalTransform * g_refineState.cumulativeTransform;
-
-                // Evaluate using unified Target→Source metric (measures actual visual fit)
-                computeUnifiedMetrics();
-                float unifiedRmse = registrationHandle.compRmse;
-
-                if (unifiedRmse < g_refineState.bestRMSE) {
-                    g_refineState.bestRMSE = unifiedRmse;
-                    g_refineState.bestCumulativeTransform = g_refineState.cumulativeTransform;
-                    g_refineState.bestIteration = g_refineState.totalIterations;
-                    g_refineState.worseCount = 0;
-                } else {
-                    g_refineState.worseCount++;
+        if (mods & GLFW_MOD_SHIFT) {
+            // -----------------------------------------------------------------
+            //  Shift+M: cam-mm + OpenGL flip STL export (EchoLiver dataset 評価用)
+            //
+            //  目的: registered organ mesh (cam frame, scene 単位) を
+            //        Adagolodjo の出力フォーマット (cam-mm OpenGL 規約) に
+            //        変換して出力する。
+            //
+            //  スケール復元方針 (CT 真値基準):
+            //    SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag
+            //
+            //  これは prealign + registration + 手合わせのどの段階で scale が
+            //  どう変わっても、最終 mesh の extent が CT 真値と一致するよう
+            //  正規化する。CT mm スケールは absolute 不変量なので、scale chain
+            //  を track する必要がなくなる (堅牢性が大きく上がる)。
+            //
+            //  liver を基準にしているのは tumor よりも 10 倍大きく
+            //  numerically stable なため。同じ scale 係数を全 organ に適用する
+            //  (uniform similarity transform 前提なので、全 organ で本来同じ値)。
+            //
+            //  Z 反転は反射 (det=-1) なので triangle winding 逆転 → index swap。
+            //  Evaluation.m が読込時に y,z 反転 → cam OpenCV (LUS GT 比較フレーム)。
+            //
+            //  no-registration 状態で実行しても extent は CT 真値と一致する
+            //  (round-trip identity 維持)。
+            // -----------------------------------------------------------------
+            auto bboxDiag = [](const mCutMesh* m) -> float {
+                if (!m || m->mVertices.size() < 3) return 0.0f;
+                glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
+                for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+                    glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
+                    mn = glm::min(mn, v);
+                    mx = glm::max(mx, v);
                 }
-
-                // Early stop if RMSE worsening for too long
-                if (g_refineState.worseCount >= 30) {
-                    stepResult.converged = true;
-                    std::cout << mtag << " Early stop: unified RMSE worsening for 30 iterations" << std::endl;
-                }
-
-                if (g_refineState.totalIterations % 10 == 0) {
-                    std::cout << mtag << " iter=" << g_refineState.totalIterations
-                              << " corr=" << stepResult.correspondenceCount
-                              << " internal=" << std::fixed << std::setprecision(4)
-                              << stepResult.rmse
-                              << " unified=" << unifiedRmse
-                              << " best=" << g_refineState.bestRMSE
-                              << "@" << g_refineState.bestIteration << std::endl;
-                }
-            }
-
-            if (stepResult.converged) {
-                g_refineState.active = false;
-                registrationHandle.state = RegistrationData::REGISTERED;
-                const char* mname = NormalRefine::methodName(g_refineState.method);
-
-                // Revert to initial, then apply best transform
-                bool improved = g_refineState.bestRMSE < g_refineState.initialRMSE;
-                g_refineState.restoreMeshes();
-                if (improved) {
-                    NormalRefine::applyIncrementalTransform(
-                        g_refineState.bestCumulativeTransform,
-                        g_refineState.organMeshes);
-                }
-
-                std::cout << "\n=== " << mname << " CONVERGED ===" << std::endl;
-                std::cout << "  Iterations: " << g_refineState.totalIterations << std::endl;
-                std::cout << "  Initial RMSE: " << std::fixed << std::setprecision(4)
-                          << g_refineState.initialRMSE << std::endl;
-                std::cout << "  Best RMSE:    " << g_refineState.bestRMSE
-                          << " (iter " << g_refineState.bestIteration << ")" << std::endl;
-                if (improved) {
-                    std::cout << "  Improvement:  " << std::setprecision(1)
-                    << (1.0f - g_refineState.bestRMSE / g_refineState.initialRMSE) * 100.0f
-                    << "%" << std::endl;
-                    std::cout << "  >> Reverted to best state (iter "
-                              << g_refineState.bestIteration << ")" << std::endl;
-                } else {
-                    std::cout << "  >> No improvement — reverted to initial state" << std::endl;
-                }
-                // Restore cout precision (setprecision(1) above contaminates subsequent output)
-                std::cout << std::defaultfloat << std::setprecision(6);
-
-                // Update refine metrics and unified comparison (same as manual stop)
-                registrationHandle.refineCount++;
-                registrationHandle.refineInitialRMSE   = g_refineState.initialRMSE;
-                registrationHandle.refineBestRMSE      = g_refineState.bestRMSE;
-                registrationHandle.refineBestIteration  = g_refineState.bestIteration;
-                computeUnifiedMetrics();
-                poseSaveToLibrary();
-            }
-        }
-
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        OrbitCam.UpdateCamera(deltaTime);
-
-        if (cameraUse && screenMesh->isUsingCamera()) {
-            screenMesh->updateTextureFromCamera();
-        }
-        gCameraPreview.update(screenMesh);
-
-        if(currentMainMode == REGISTRATION_MODE) {
-
-            if (depthSplitScreenMode) {
-                glm::vec3 liverCenter = OrbitCamLeft_Target.calculateMeshCenter(liverMesh3D->mVertices);
-                glm::vec3 textureCenter = OrbitCamRight_Screen.calculateMeshCenter(screenMesh->mVertices);
-                OrbitCamLeft_Target.updateTargetPositions(liverCenter, glm::vec3(0));
-                OrbitCamRight_Screen.updateTargetPositions(glm::vec3(0), textureCenter);
-                renderDepthSplitScreen(shaderProgram, shaderProgramCube);
-
-            } else if (!splitScreenMode) {
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-                glm::vec3 liverCenter = OrbitCam.calculateMeshCenter(liverMesh3D->mVertices);
-                glm::vec3 textureCenter = OrbitCam.calculateMeshCenter(screenMesh->mVertices);
-                OrbitCam.updateTargetPositions(liverCenter, textureCenter);
-                model = glm::translate(glm::mat4(1.0f), objPos);
-
-                std::vector<glm::vec4> customColors = {
-                    glm::vec4(0.8f, 0.2f, 0.2f, meshAlphaValues[0]),
-                    glm::vec4(0.9f, 0.6f, 0.6f, meshAlphaValues[1]),
-                    glm::vec4(0.2f, 0.8f, 0.8f, meshAlphaValues[2]),
-                    glm::vec4(0.8f, 0.2f, 0.8f, meshAlphaValues[3]),
-                    glm::vec4(0.8f, 0.8f, 0.0f, meshAlphaValues[4]),
-                    glm::vec4(0.2f, 0.5f, 0.2f, meshAlphaValues[5]),
-                    glm::vec4(1.0f, 1.0f, 1.0f, meshAlphaValues[6])
-                };
-
-                std::vector<mCutMesh*> meshesToDraw = {
-                    liverMesh3D, portalMesh3D, veinMesh3D,
-                    tumorMesh3D, segmentMesh3D, gbMesh3D, screenMesh
-                };
-
-                draw_AllmCutMeshes(meshesToDraw, shaderProgram, shaderProgramCube,
-                                   OrbitCam.cameraPos, customColors,
-                                   model, view, projection, 6);
-
-                if (g_showClusterVisualization) {
-                    // std::cout << "Drawing clusters: " << g_cluster1Points.size()
-                    // << " + " << g_cluster2Points.size()
-                    // << " + " << g_targetPoints.size() << std::endl;
-
-                    for (size_t i = 0; i < g_cluster1Points.size(); i++) {
-                        registrationSphereMarker.draw(shaderProgram, g_cluster1Points[i],
-                                                      glm::vec3(0.0f, 1.0f, 0.0f),
-                                                      0.08f, view, projection, OrbitCam.cameraPos);
-                    }
-
-                    for (size_t i = 0; i < g_cluster2Points.size(); i++) {
-                        registrationSphereMarker.draw(shaderProgram, g_cluster2Points[i],
-                                                      glm::vec3(0.0f, 0.5f, 1.0f),
-                                                      0.08f, view, projection, OrbitCam.cameraPos);
-                    }
-
-                    for (size_t i = 0; i < g_targetPoints.size(); i++) {
-                        registrationSphereMarker.draw(shaderProgram, g_targetPoints[i],
-                                                      glm::vec3(1.0f, 1.0f, 0.0f),
-                                                      0.12f, view, projection, OrbitCam.cameraPos);
-                    }
-                }
-
-                {
-                    bool activeSelection = (registrationHandle.state == RegistrationData::SELECTING_BOARD_POINTS ||
-                                            registrationHandle.state == RegistrationData::SELECTING_OBJECT_POINTS ||
-                                            registrationHandle.state == RegistrationData::READY_TO_REGISTER);
-                    if (activeSelection || g_showCorrespondencePoints) {
-                        for (size_t i = 0; i < registrationHandle.boardPoints.size(); i++) {
-                            glm::vec3 color = getPointColor(i, true);
-                            registrationSphereMarker.draw(shaderProgram, registrationHandle.boardPoints[i],
-                                                          color, 0.3f, view, projection, OrbitCam.cameraPos);
-                        }
-                        for (size_t i = 0; i < registrationHandle.objectPoints.size(); i++) {
-                            glm::vec3 color = getPointColor(i, false);
-                            registrationSphereMarker.draw(shaderProgram, registrationHandle.objectPoints[i],
-                                                          color, 0.3f, view, projection, OrbitCam.cameraPos);
-                        }
-                    }
-                }
-
-                if (!gUserSegPoints3D.empty()) {
-                    for (size_t i = 0; i < gUserSegPoints3D.size(); i++) {
-                        glm::vec3 color = gUserSegPointsFG[i]
-                                              ? glm::vec3(0.0f, 1.0f, 0.0f)
-                                              : glm::vec3(1.0f, 0.0f, 0.0f);
-                        registrationSphereMarker.draw(
-                            shaderProgram, gUserSegPoints3D[i],
-                            color, 0.15f, view, projection, OrbitCam.cameraPos);
-                    }
-                }
-
-            } else {
-
-                glm::vec3 liverCenter = OrbitCamLeft_Target.calculateMeshCenter(liverMesh3D->mVertices);
-                glm::vec3 textureCenter = OrbitCamRight_Screen.calculateMeshCenter(screenMesh->mVertices);
-                OrbitCamLeft_Target.updateTargetPositions(liverCenter, glm::vec3(0));
-                OrbitCamRight_Screen.updateTargetPositions(glm::vec3(0), textureCenter);
-                renderSplitScreen(shaderProgram, shaderProgramCube);
-            }
-
-        }
-
-        if(currentMainMode == DEFORM_MODE) {
-            if(!deformInit){
-
-                VoxelTetrahedralizer tetrahedralizer(DEFAULT_GRID_SIZE, Reg_TARGET_FILE_PATH, OUTPUT_TET_FILE);
-
-                tetrahedralizer.setSmoothingEnabled(true, SMOOTH_ITERATION, SMOOTH_FACTOR, true);
-
-                VoxelTetrahedralizer::InflationSettings inflationSettings;
-                if(DEFAULT_GRID_SIZE<30){
-                    inflationSettings.enabled = true;} else {inflationSettings.enabled = false;};
-                inflationSettings.targetCoverage = 99.0f;
-                inflationSettings.successThreshold = 99.0f;
-                tetrahedralizer.setInflationSettings(inflationSettings);
-
-                MeshDataTypes::SimpleMeshData resultData = tetrahedralizer.execute();
-
-                std::cout << "\n=== Tetrahedral mesh generated ===" << std::endl;
-                std::cout << "Output file: " << OUTPUT_TET_FILE << std::endl;
-                std::cout << "Smoothing: Enabled" << std::endl;
-
-                SoftBody::MeshData liver_mesh = TetoMeshData::ReadVetexAndFace(Reg_TARGET_FILE_PATH);
-                SoftBody::MeshData tetmesh = SoftBody::loadTetMesh(OUTPUT_TET_FILE);
-                SoftBody::MeshData portal_mesh = TetoMeshData::ReadVetexAndFace(Reg_PORTAL_FILE_PATH);
-                SoftBody::MeshData vein_mesh = TetoMeshData::ReadVetexAndFace(Reg_VEIN_FILE_PATH);
-                SoftBody::MeshData tumor_mesh = TetoMeshData::ReadVetexAndFace(Reg_TUMOR_FILE_PATH);
-                SoftBody::MeshData res_mesh = TetoMeshData::ReadVetexAndFace(Reg_SEGMENT_FILE_PATH);
-                SoftBody::MeshData gb_mesh = TetoMeshData::ReadVetexAndFace(Reg_GB_FILE_PATH);
-
-                std::vector<SoftBody::MeshData> visMeshes;
-                visMeshes.push_back(liver_mesh);
-                visMeshes.push_back(portal_mesh);
-                visMeshes.push_back(vein_mesh);
-                visMeshes.push_back(tumor_mesh);
-                visMeshes.push_back(res_mesh);
-                visMeshes.push_back(gb_mesh);
-
-                multiBody = new SoftBody(tetmesh, visMeshes,0.001f, 0.0f);
-
-                gGrabber->setPhysicsObject(multiBody);
-                multiBody->setRigidMode(true);
-                deformInit = true;
-            }
-
-            gGrabber->update(dt);
-            model = glm::translate(glm::mat4(1.0f), bunnyPos);
-            multiBody->setModelMatrix(model);
-
-            if (deformHandlPlace.state != DeformHandlPlaceData::PLANECUT_MODE)
-                for (size_t g = 0; g < multiBody->handleGroups.size(); g++) {
-                    glm::vec3 center = multiBody->handleGroups[g].centerPosition;
-                    float radius = multiBody->handleGroups[g].radius;
-                    glm::vec3 worldPos = glm::vec3(model * glm::vec4(center, 1.0f));
-                    glm::vec3 color = getPointColor(g, true);
-                    deformSphereMarker.draw(shaderProgram, worldPos, color, radius,
-                                            view, projection, OrbitCam.cameraPos);
-                }
-
-            shaderProgram.use();
-            shaderProgram.setUniform("model", model);
-            shaderProgram.setUniform("lightPos", OrbitCam.cameraPos);
-            shaderProgram.setUniform("lightColor", glm::vec3(1.0f, 1.0f, 1.0f));
-            shaderProgram.setUniform("view", view);
-            shaderProgram.setUniform("projection", projection);
-            shaderProgram.setUniform("vertColor", glm::vec4(1.0f, 0.0f, 0.0f, 1.0f));
-
-            int numSubsteps = 1;
-            float stepDt = dt / float(numSubsteps);
-            for (int i = 0; i < numSubsteps; i++) {
-                multiBody->preSolve(stepDt, gravity);
-                multiBody->solve(stepDt);
-                multiBody->postSolve(stepDt);
-            }
-
-            multiBody->updateVisMeshes();
-
-            std::vector<glm::vec4> customColors = {
-                glm::vec4(0.8f, 0.2f, 0.2f, meshAlphaValues[0]),
-                glm::vec4(0.9f, 0.6f, 0.6f, meshAlphaValues[1]),
-                glm::vec4(0.2f, 0.8f, 0.8f, meshAlphaValues[2]),
-                glm::vec4(0.8f, 0.2f, 0.8f, meshAlphaValues[3]),
-                glm::vec4(0.8f, 0.8f, 0.0f, meshAlphaValues[4]),
-                glm::vec4(0.2f, 0.5f, 0.2f, meshAlphaValues[5]),
+                return glm::length(mx - mn);
             };
 
-            glm::vec4 screenMeshColor = glm::vec4(1.0f, 1.0f, 1.0f, meshAlphaValues[6]);
-
-            draw_AllVisMeshesWithExtraMesh(
-                multiBody, shaderProgram, shaderProgramCube,
-                screenMesh, OrbitCam.cameraPos,
-                customColors, screenMeshColor,
-                model, view, projection);
-        }
-
-        if (saveARimage) {
-            saveARimage = false;
-
-            const int AR_W = 1280;
-            const int AR_H = 720;
-
-            glm::mat4 savedView = view, savedProj = projection, savedModel = model;
-
-            GLuint fbo, colorTex, depthRbo;
-            glGenFramebuffers(1, &fbo);
-            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-
-            glGenTextures(1, &colorTex);
-            glBindTexture(GL_TEXTURE_2D, colorTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, AR_W, AR_H, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
-
-            glGenRenderbuffers(1, &depthRbo);
-            glBindRenderbuffer(GL_RENDERBUFFER, depthRbo);
-            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, AR_W, AR_H);
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthRbo);
-
-            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
-                FullSphereCamera arCam = OrbitCam;
-                arCam.resetToInitialState();
-                arCam.useIntrinsics = false;
-                arCam.cx = AR_W / 2.0f;
-                arCam.cy = AR_H / 2.0f;
-                float boardScale = 10.0f;
-                float halfFOVy = atan(AR_H / (2.0f * arCam.fy));
-                arCam.gRadius = (boardScale / 2.0f) / tan(halfFOVy);
-                arCam.gFOV = glm::degrees(2.0f * halfFOVy);
-                arCam.currentTarget = TARGET_TEXTURE;
-
-                glm::vec3 textureCenter = arCam.calculateMeshCenter(screenMesh->mVertices);
-                arCam.updateTargetPositions(glm::vec3(0), textureCenter);
-                arCam.UpdateCamera();
-
-                glViewport(0, 0, AR_W, AR_H);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-                model = glm::translate(glm::mat4(1.0f),
-                                       (currentMainMode == DEFORM_MODE) ? bunnyPos : objPos);
-
-                if (currentMainMode == DEFORM_MODE && multiBody != nullptr) {
-                    shaderProgram.use();
-                    shaderProgram.setUniform("model", model);
-                    shaderProgram.setUniform("lightPos", arCam.cameraPos);
-                    shaderProgram.setUniform("lightColor", glm::vec3(1.0f, 1.0f, 1.0f));
-                    shaderProgram.setUniform("view", arCam.view);
-                    shaderProgram.setUniform("projection", arCam.projection);
-
-                    std::vector<glm::vec4> customColors = {
-                        glm::vec4(0.8f, 0.2f, 0.2f, meshAlphaValues[0]),
-                        glm::vec4(0.9f, 0.6f, 0.6f, meshAlphaValues[1]),
-                        glm::vec4(0.2f, 0.8f, 0.8f, meshAlphaValues[2]),
-                        glm::vec4(0.8f, 0.2f, 0.8f, meshAlphaValues[3]),
-                        glm::vec4(0.8f, 0.8f, 0.0f, meshAlphaValues[4]),
-                        glm::vec4(0.2f, 0.5f, 0.2f, meshAlphaValues[5]),
-                    };
-                    glm::vec4 screenMeshColor = glm::vec4(1.0f, 1.0f, 1.0f, meshAlphaValues[6]);
-
-                    draw_AllVisMeshesWithExtraMesh(
-                        multiBody, shaderProgram, shaderProgramCube,
-                        screenMesh, arCam.cameraPos,
-                        customColors, screenMeshColor,
-                        model, arCam.view, arCam.projection);
+            float SCALE_RESTORE = 1.0f;
+            if (g_hasOriginalDiags && liverMesh3D) {
+                float current_liver_diag = bboxDiag(liverMesh3D);
+                if (current_liver_diag < 1e-9f) {
+                    std::cerr << "[Shift+M] current liver diag near zero -- using 1.0 fallback"
+                              << std::endl;
                 } else {
-                    std::vector<glm::vec4> arColors = {
-                        glm::vec4(0.8f, 0.2f, 0.2f, meshAlphaValues[0]),
-                        glm::vec4(0.9f, 0.6f, 0.6f, meshAlphaValues[1]),
-                        glm::vec4(0.2f, 0.8f, 0.8f, meshAlphaValues[2]),
-                        glm::vec4(0.8f, 0.2f, 0.8f, meshAlphaValues[3]),
-                        glm::vec4(0.8f, 0.8f, 0.0f, meshAlphaValues[4]),
-                        glm::vec4(0.2f, 0.5f, 0.2f, meshAlphaValues[5]),
-                        glm::vec4(1.0f, 1.0f, 1.0f, meshAlphaValues[6])
-                    };
-
-                    std::vector<mCutMesh*> arMeshes = {
-                        liverMesh3D, portalMesh3D, veinMesh3D,
-                        tumorMesh3D, segmentMesh3D, gbMesh3D, screenMesh
-                    };
-
-                    draw_AllmCutMeshes(arMeshes, shaderProgram, shaderProgramCube,
-                                       arCam.cameraPos, arColors,
-                                       model, arCam.view, arCam.projection, 6);
+                    SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag;
                 }
-
-                std::vector<unsigned char> pixels(AR_W * AR_H * 3);
-                glReadPixels(0, 0, AR_W, AR_H, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
-
-                int stride = AR_W * 3;
-                std::vector<unsigned char> flipped(pixels.size());
-                for (int y = 0; y < AR_H; y++)
-                    memcpy(&flipped[y * stride], &pixels[(AR_H - 1 - y) * stride], stride);
-
-                auto now = std::chrono::system_clock::now();
-                auto tt = std::chrono::system_clock::to_time_t(now);
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              now.time_since_epoch()) % 1000;
-                struct tm lt;
-#ifdef _WIN32
-                localtime_s(&lt, &tt);
-#else
-                localtime_r(&tt, &lt);
-#endif
-                char stamp[64];
-                snprintf(stamp, sizeof(stamp), "%04d%02d%02d_%02d%02d%02d_%03d",
-                         lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday,
-                         lt.tm_hour, lt.tm_min, lt.tm_sec, (int)ms.count());
-
-                const char* prefixes[] = {"data/","../data/","../../data/","../../../data/","../../../../data/",nullptr};
-                bool saved = false;
-                for (int pi = 0; prefixes[pi]; pi++) {
-                    if (std::filesystem::is_directory(std::string(prefixes[pi]))) {
-                        std::string dir = std::string(prefixes[pi]) + "screenshots/";
-                        std::filesystem::create_directories(dir);
-                        std::string path = dir + "ar_" + stamp + ".png";
-                        stbi_write_png(path.c_str(), AR_W, AR_H, 3, flipped.data(), stride);
-                        printf("[AR] Screenshot saved: %s\n", std::filesystem::absolute(path).string().c_str());
-                        saved = true;
-                        break;
-                    }
-                }
-                if (!saved) {
-                    std::string fallback = std::string("ar_") + stamp + ".png";
-                    stbi_write_png(fallback.c_str(), AR_W, AR_H, 3, flipped.data(), stride);
-                    printf("[AR] Screenshot saved (fallback): %s\n",
-                           std::filesystem::absolute(fallback).string().c_str());
-                }
-
-                if (g_arPreviewTex == 0) glGenTextures(1, &g_arPreviewTex);
-                glBindTexture(GL_TEXTURE_2D, g_arPreviewTex);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, AR_W, AR_H, 0, GL_RGB, GL_UNSIGNED_BYTE, flipped.data());
-                glBindTexture(GL_TEXTURE_2D, 0);
-                g_arPreviewW = AR_W;
-                g_arPreviewH = AR_H;
-                g_showARPreview = true;
             } else {
-                printf("[AR] FBO creation failed!\n");
+                std::cerr << "[Shift+M] WARNING: original CT diagonals not captured at startup; "
+                             "using 1.0 (output will likely be in wrong scale)" << std::endl;
             }
+            std::cout << "[Shift+M] g_originalLiverDiagMm=" << g_originalLiverDiagMm
+                      << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
+                      << "  SCALE_RESTORE=" << SCALE_RESTORE
+                      << "  (CT-truth based)" << std::endl;
 
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glDeleteTextures(1, &colorTex);
-            glDeleteRenderbuffers(1, &depthRbo);
-            glDeleteFramebuffers(1, &fbo);
+            auto exportCamMmStl =
+                [&](const mCutMesh* src, const std::string& outPath, const char* label) {
+                    if (!src || src->mVertices.empty()) {
+                        std::cout << "[Shift+M] Skip " << label << " (mesh empty)" << std::endl;
+                        return;
+                    }
+                    mCutMesh out = *src;
+                    for (size_t i = 0; i + 2 < out.mVertices.size(); i += 3) {
+                        out.mVertices[i  ] =  out.mVertices[i  ] * SCALE_RESTORE;
+                        out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;
+                        out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;
+                    }
+                    // Z 反転は反射 (det=-1) なので triangle winding 逆転。
+                    // STL は法線を頂点順序から計算するので index 入れ替えで戻す。
+                    for (size_t i = 0; i + 2 < out.mIndices.size(); i += 3) {
+                        std::swap(out.mIndices[i+1], out.mIndices[i+2]);
+                    }
+                    out.exportStlFile(outPath);
+                    Reg3DCustom::printMeshBBox(out, label);
+                };
 
-            view = savedView; projection = savedProj; model = savedModel;
-            glViewport(0, 0, gWindowWidth, gWindowHeight);
+            exportCamMmStl(tumorMesh3D, REG_MODEL_PATH + "tumor_cam_mm.stl",
+                           "tumor_cam_mm (Adagolodjo-format)");
+            exportCamMmStl(liverMesh3D, REG_MODEL_PATH + "liver_cam_mm.stl",
+                           "liver_cam_mm (Adagolodjo-format)");
+
+            std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm + OpenGL flip"
+                      << "  (scale = CT_diag / current_diag, Z negate)" << std::endl;
+        } else {
+            if (liverMesh3D)   liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
+            if (portalMesh3D)  portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
+            if (veinMesh3D)    veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
+            if (tumorMesh3D)   tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
+            if (segmentMesh3D) segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
+            if (gbMesh3D)      gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
+            std::cout << "[M] Registered OBJs exported to " << REG_MODEL_PATH << std::endl;
         }
-
-        glViewport(0, 0, gWindowWidth, gWindowHeight);
-        gUIManager.draw(gWindowWidth, gWindowHeight);
-
-        if (g_showARPreview && g_arPreviewTex != 0) {
-            float vpW = gUIManager.getViewportWidth(gWindowWidth);
-            float prevW = vpW * 0.45f;
-            float prevH = prevW * (float)g_arPreviewH / (float)g_arPreviewW;
-            float maxH = gWindowHeight * 0.5f;
-            if (prevH > maxH) { prevH = maxH; prevW = prevH * (float)g_arPreviewW / (float)g_arPreviewH; }
-
-            ImGui::SetNextWindowSize(ImVec2(prevW + 16, prevH + 50), ImGuiCond_Appearing);
-            ImGui::SetNextWindowPos(
-                ImVec2(vpW * 0.5f, gWindowHeight * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.06f, 0.95f));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
-            if (ImGui::Begin("AR Screenshot", &g_showARPreview,
-                             ImGuiWindowFlags_NoCollapse)) {
-                ImVec2 avail = ImGui::GetContentRegionAvail();
-                float imgW = avail.x;
-                float imgH = imgW * (float)g_arPreviewH / (float)g_arPreviewW;
-                if (imgH > avail.y) { imgH = avail.y; imgW = imgH * (float)g_arPreviewW / (float)g_arPreviewH; }
-                float offX = (avail.x - imgW) * 0.5f;
-                if (offX > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offX);
-                ImGui::Image((ImTextureID)(intptr_t)g_arPreviewTex, ImVec2(imgW, imgH));
-            }
-            ImGui::End();
-            ImGui::PopStyleVar(2);
-            ImGui::PopStyleColor();
-        }
-
-        drawPoseLibraryWindow();
-
-        ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-        captureSceneForProgress();
-
-        glfwSwapBuffers(gWindow);
+        break;
     }
-
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-
-    glfwTerminate();
-
-    return 0;
+    }
 }
 
-bool initOpenGL()
+static void glfw_OnFramebufferSize(GLFWwindow*, int w, int h) {
+    gWindowWidth  = w;
+    gWindowHeight = h;
+    gApp.windowW  = w;
+    gApp.windowH  = h;
+    glViewport(0, 0, w, h);
+    OrbitCam.onWindowResize(w, h);
+}
+
+// FileDropHandler.hのglfw_onFileDropを使用するように変更
+static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
+    if (count <= 0 || !paths) return;
+    auto* ctx = (AppContext*)glfwGetWindowUserPointer(win);
+    if (!ctx) {
+        std::cerr << "[FileDrop] ERROR: No AppContext found" << std::endl;
+        return;
+    }
+
+    std::cout << "[FileDrop] Before: mode=" << (int)ctx->mode << std::endl;
+
+    const std::string filePath = paths[0];
+    std::cout << "[FileDrop] Attempting to load: " << filePath << std::endl;
+
+    if (!ImageSession::isSupportedExtension(filePath)) {
+        std::cerr << "[FileDrop] Unsupported format: " << filePath
+                  << "  (expected .png .jpg .jpeg .bmp .ppm)" << std::endl;
+        return;
+    }
+
+    // カメラが動作している場合は停止
+    if (gCamera.active) {
+        gCamera.stop();
+        std::cout << "[FileDrop] Stopping camera to load image" << std::endl;
+    }
+
+    if (!ImageSession::loadWithIntrinsics(*ctx, filePath, g_intrinsics)) {
+        std::cerr << "[FileDrop] Failed to load: " << filePath << std::endl;
+        return;
+    }
+
+    std::cout << "[FileDrop] After: mode=" << (int)ctx->mode << " (0=Empty, 1=ImageOnly, 2=MaskSelection, 3=Registration)" << std::endl;
+}
+
+static void mouse_button_callback(GLFWwindow* win, int button, int action, int mods) {
+    // ImGuiがマウスをキャプチャしている場合は処理しない
+    if (ImGui::GetIO().WantCaptureMouse) return;
+
+    // AR モード中は観測専用 (3D シーン操作を無効化)
+    // — これがないと OrbitCam の cameraPos が更新され続けてライト方向が動く
+    if (gApp.arMode) return;
+
+    // Umeyama 2画面モード
+    if (gUmeyama.active && action == GLFW_PRESS) {
+        double x, y;
+        glfwGetCursorPos(win, &x, &y);
+        if (gUmeyama.handleMouse((float)x, (float)y, button,
+                                 gWindowWidth, gWindowHeight,
+                                 registrationHandle, liverMesh3D, screenMesh))
+            return;
+    }
+
+    if (action == GLFW_RELEASE) {
+        isDragging = false;
+        hit_index  = -1;
+        return;
+    }
+    if (action != GLFW_PRESS) return;
+
+    double x, y;
+    glfwGetCursorPos(win, &x, &y);
+
+    if (gApp.mode == AppMode::kMaskSelection || gApp.mode == AppMode::kImageOnly) {
+        // マスク選択モードでは固定アスペクト比を考慮した座標変換
+        if (gApp.mode == AppMode::kMaskSelection && gApp.image.loaded) {
+            float imgAspect = (float)gApp.image.width / (float)gApp.image.height;
+            float winAspect = (float)gWindowWidth / (float)gWindowHeight;
+
+            int viewW = gWindowWidth;
+            int viewH = gWindowHeight;
+            int viewX = 0;
+            int viewY = 0;
+
+            if (imgAspect > winAspect) {
+                viewH = gWindowWidth / imgAspect;
+                viewY = (gWindowHeight - viewH) / 2;
+            } else {
+                viewW = gWindowHeight * imgAspect;
+                viewX = (gWindowWidth - viewW) / 2;
+            }
+
+            // ビューポート外のクリックは無視
+            if (x < viewX || x > viewX + viewW || y < viewY || y > viewY + viewH) {
+                return;
+            }
+
+            // ビューポート内の座標を画像座標に変換
+            float u = ((float)(x - viewX) / viewW) * gApp.image.width;
+            float v = ((float)(y - viewY) / viewH) * gApp.image.height;
+
+            // Pick the destination list based on which mask the user is
+            // currently editing. Without this branch (the original code
+            // pushed unconditionally to gApp.maskPoints), Instrument-mode
+            // clicks ended up in the Liver list, the Renderer never drew
+            // any cyan/orange points, and the [MaskPicker] log was missing
+            // the "Liver" / "Instrument" prefix.
+            const bool isInstrument = (gApp.activeMaskKind == MaskKind::Instrument);
+            std::vector<MaskPoint>& dst = isInstrument
+                                              ? gApp.instrumentMaskPoints
+                                              : gApp.maskPoints;
+            const char* kindName = isInstrument ? "Instrument" : "Liver";
+            dst.push_back({u, v, button == GLFW_MOUSE_BUTTON_LEFT});
+
+            int nFg = 0, nBg = 0;
+            for (const auto& p : dst) (p.fg ? nFg : nBg)++;
+            std::cout << "[MaskPicker] " << kindName << " "
+                      << (button == GLFW_MOUSE_BUTTON_LEFT ? "FG" : "BG")
+                      << " (" << (int)u << "," << (int)v << ")"
+                      << "  fg=" << nFg << " bg=" << nBg << std::endl;
+        } else {
+            // 通常のImageOnlyモード
+            if (button == GLFW_MOUSE_BUTTON_LEFT)
+                MaskPicker::addFromScreen(gApp, (float)x, (float)y, true);
+            else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+                MaskPicker::addFromScreen(gApp, (float)x, (float)y, false);
+        }
+        return;
+    }
+
+    if (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_RIGHT) {
+        if (hitTestMesh((float)x, (float)y, liverMesh3D, hit_position))
+            isDragging = true;
+    }
+}
+
+static void glfw_onMouseMoveOrbit(GLFWwindow* win, double posX, double posY) {
+    static glm::vec2 last(0.0f);
+
+    // 元コード line 4844-4848 と同じ: ImGui がマウスを使っている間は
+    // カメラ操作をスキップ。ただし last は更新しないと UI を離れた瞬間に
+    // 巨大な delta でカメラが飛んでしまう。
+    if (ImGui::GetIO().WantCaptureMouse) {
+        last = glm::vec2((float)posX, (float)posY);
+        return;
+    }
+
+    // AR モード中は観測専用 (3D カメラ・メッシュ操作を無効化)。
+    // last だけ更新しないと AR モード OFF の瞬間に巨大な delta でカメラが飛ぶ。
+    if (gApp.arMode) {
+        last = glm::vec2((float)posX, (float)posY);
+        return;
+    }
+
+    float dx = (float)posX - last.x;
+    float dy = (float)posY - last.y;
+
+    // Umeyama 2画面モード — 左右独立カメラ操作
+    if (gUmeyama.active) {
+        bool L = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT)  == GLFW_PRESS;
+        bool R = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+        gUmeyama.handleMouseMove((float)posX, dx, dy, L, R, gWindowWidth);
+        last = glm::vec2((float)posX, (float)posY);
+        return;
+    }
+
+    bool L = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT)  == GLFW_PRESS;
+    bool R = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+
+    if (!isDragging) {
+        if (L && !R) OrbitCam.Rotate(dx, dy);
+        else if (R && !L) OrbitCam.Pan(dx, -dy);
+    } else {
+        if (L && R) {
+            glm::vec3 mv = OrbitCam.cameraDirection * (dy * OrbitCam.LIGHT_MOUSE_SENSITIVITY);
+            translateAllMeshes(mv);
+        } else if (R && !L) {
+            float mdx =  dx * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
+            float mdy = -dy * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
+            glm::vec3 mv = OrbitCam.cameraRight * mdx + OrbitCam.cameraUp * mdy;
+            translateAllMeshes(mv);
+        } else if (L && !R) {
+            float rx = dy * 0.01f;
+            float ry = dx * 0.01f;
+            rotateAllMeshes(liverCenter(),
+                            OrbitCam.cameraRight, rx,
+                            OrbitCam.cameraUp,    ry);
+        }
+    }
+
+    last = glm::vec2((float)posX, (float)posY);
+}
+
+static void glfw_onMouseScroll(GLFWwindow* win, double, double deltaY) {
+    // 元コード line 4971 と同じ: ImGui がマウスを使っている間はスクロールを無視
+    if (ImGui::GetIO().WantCaptureMouse) return;
+
+    // AR モード中は観測専用 (ズームも無効化)
+    if (gApp.arMode) return;
+
+    // Umeyama 2画面モード
+    if (gUmeyama.active) {
+        double x, y;
+        glfwGetCursorPos(win, &x, &y);
+        gUmeyama.handleScroll((float)x, (float)deltaY, gWindowWidth);
+        return;
+    }
+
+    bool R = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    if (R) {
+        float s = (deltaY > 0) ? scaleSpeed : (1.0f / scaleSpeed);
+        scaleAllMeshes(liverCenter(), s);
+    } else {
+        OrbitCam.gRadius += (float)deltaY * OrbitCam.ZOOM_SENSITIVITY;
+        OrbitCam.gRadius  = glm::clamp(OrbitCam.gRadius,
+                                      OrbitCam.minRadius,
+                                      OrbitCam.maxRadius);
+    }
+}
+
+static bool setupObjScene() {
+    if (g_objSourcePath.empty() || !std::filesystem::exists(g_objSourcePath)) {
+        std::cerr << "[setupObjScene] OBJ missing: " << g_objSourcePath << std::endl;
+        return false;
+    }
+
+    // 前回のオフセットをリセット（すべての臓器に対して）
+    if (liverMesh3D) {
+        std::vector<mCutMesh*> organs = { liverMesh3D, portalMesh3D, veinMesh3D,
+                                          tumorMesh3D, segmentMesh3D, gbMesh3D };
+        if (g_hasLastOrganTransform) {
+            // similarity transform undo
+            glm::mat4 invT = glm::inverse(g_lastOrganTransform);
+            Reg3DCustom::applyTransformToMeshes(organs, invT);
+            for (auto* m : organs) if (m) setUp(*m);
+            g_lastOrganTransform    = glm::mat4(1.0f);
+            g_hasLastOrganTransform = false;
+        } else if (glm::dot(g_lastOrganOffset, g_lastOrganOffset) > 0.0f) {
+            // legacy translation-only undo
+            for (auto* m : organs) {
+                if (m) {
+                    for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+                        m->mVertices[i]   -= g_lastOrganOffset.x;
+                        m->mVertices[i+1] -= g_lastOrganOffset.y;
+                        m->mVertices[i+2] -= g_lastOrganOffset.z;
+                    }
+                    setUp(*m);
+                }
+            }
+        }
+        g_lastOrganOffset = glm::vec3(0.0f);
+    }
+    Reg3DCustom::clearCachedTargetCloud();
+
+    if (screenMesh) { delete screenMesh; screenMesh = nullptr; }
+    screenMesh = new mCutMesh(mCutMesh().loadMeshFromFile(g_objSourcePath.c_str()));
+    gApp.screen = screenMesh;
+    setUp(*screenMesh);
+    Reg3DCustom::printMeshBBox(*screenMesh, "OBJ raw (meters)");
+
+    Reg3DCustom::CameraIntrinsics K;
+    // intrinsicsSource (UI 状態) に応じて候補リストを切り替える。
+    // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
+    std::vector<std::string> intrinsicsCandidates;
+    if (g_intrinsicsSource == 2) {
+        // Custom: depth pipeline が intrinsics_custom.txt を出すのでそれを読む
+        intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
+        };
+    } else if (g_intrinsicsSource == 3) {
+        // Calib: depth pipeline が intrinsics_calib.txt を出すのでそれを読む
+        intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_calib.txt",
+        };
+    } else if (g_intrinsicsSource == 1) {
+        intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
+        };
+    } else {
+        // DA3 / その他 fallback
+        intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_realsense.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_iphone.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
+        };
+    }
+
+    if (!Reg3DCustom::loadCameraIntrinsicsAny(intrinsicsCandidates, K)) {
+        const char* labels[] = {"DA3", "Kinect", "Custom", "Calib"};
+        std::cerr << "[Intrinsics] "
+                  << labels[std::clamp(g_intrinsicsSource, 0, 3)]
+                  << " selected but no matching file under " << DEPTH_OUTPUT_PATH
+                  << "; falling back to k4a 720p" << std::endl;
+        K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
+    }
+    // 解像度チェックは「画像」と K を比較する (ウィンドウではない)。
+    // 画像が未ロードの場合はスキップ。
+    if (gApp.image.loaded && gApp.image.width > 0 && gApp.image.height > 0) {
+        Reg3DCustom::checkIntrinsicsResolution(K, gApp.image.width, gApp.image.height);
+    }
+    g_intrinsics = K;
+
+    Reg3DCustom::printEdgeLengthStats(*screenMesh, "OBJ raw");
+
+    auto cleanupStats = Reg3DCustom::cleanupOBJMesh(
+        *screenMesh, g_silhouetteCosThreshold, 0.0f);
+    (void)cleanupStats;
+    setUp(*screenMesh);
+    Reg3DCustom::printMeshBBox(*screenMesh, "OBJ after cleanup");
+
+    OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
+    std::cout << "[OrbitCam] intrinsics -> " << K.name
+              << " (fx=" << K.fx << " fy=" << K.fy
+              << " cx=" << K.cx << " cy=" << K.cy
+              << " res=" << K.width << "x" << K.height << ")"
+              << std::endl;
+
+    auto targetCloud = Reg3DCustom::setupOBJTarget(
+        *screenMesh, K, Reg3DCustom::OBJ_Y_SIGN_OPENGL);
+    if (!targetCloud || targetCloud->empty()) {
+        std::cerr << "[OBJ Setup] FAILED to build target cloud" << std::endl;
+        return false;
+    }
+
+    Reg3DCustom::mirrorMeshAndCloudX(*screenMesh, *targetCloud);
+
+    std::vector<mCutMesh*> organs_for_move = { liverMesh3D, portalMesh3D, veinMesh3D,
+                                               tumorMesh3D, segmentMesh3D, gbMesh3D };
+    glm::vec3 organCenterPre = Reg3DCustom::computeMeshCenter(*liverMesh3D);
+    glm::vec3 objCenterPre   = Reg3DCustom::computeMeshCenter(*screenMesh);
+    g_lastOrganOffset        = objCenterPre - organCenterPre;  // legacy (translation only)
+
+    // NEW: similarity prealignment (scale + translation)
+    g_lastOrganTransform     = Reg3DCustom::prealignSourceToTarget(
+        organs_for_move, *screenMesh);
+    g_hasLastOrganTransform  = true;
+
+    // After prealignment, source ≈ target in size. Cache the diagonal as the
+    // single reference length for all downstream registration parameters.
+    g_sceneDiag = std::max(Reg3DCustom::computeMeshDiag(*screenMesh), 1e-3f);
+    std::cout << "[SceneDiag] " << g_sceneDiag
+              << "  (target AABB diagonal, used for parameter normalization)"
+              << std::endl;
+
+    // ===== Diagnostic: median NN distance L (used for paper-time analysis) =====
+    // Compute L of target cloud and store it. Currently NOT used by registration
+    // (we tried voxel = 5L per Open3D / Zhou 2018 but it failed FGR tuple test
+    // on our dense depth-anything reconstructions; reverted to empirical voxel).
+    // L is logged for future sensitivity analysis and paper writing.
+    if (targetCloud && !targetCloud->empty()) {
+        float L_target = Reg3DCustom::computeMedianNNDistance(*targetCloud);
+        g_referenceL = std::max(L_target, 1e-6f);
+
+        // Show the actual parameters in use vs literature-derived values for context
+        float voxel_used     = g_sceneDiag * (0.30f / 7.36f);     // currently active
+        float voxel_5L       = 5.0f  * g_referenceL;              // Open3D / Zhou 2018
+        float voxel_to_L     = voxel_used / g_referenceL;
+
+        std::cout << "[L-info] median NN distance and active params:" << std::endl;
+        std::cout << "    L (median NN)          : " << g_referenceL << std::endl;
+        std::cout << "    sceneDiag / L          : " << (g_sceneDiag / g_referenceL) << std::endl;
+        std::cout << "    voxel (active)         : " << voxel_used
+                  << "    (= " << voxel_to_L << " L)" << std::endl;
+        std::cout << "    voxel (literature 5L)  : " << voxel_5L
+                  << "    [not used: too fine for dense depth-anything clouds]" << std::endl;
+    }
+    // ===== END diagnostic =====
+
+    // Adjust camera/UI parameters to match new scene scale
+    applySceneScaleToCamera();
+
+    setUp(*screenMesh);
+    setUp(*liverMesh3D);
+    setUp(*portalMesh3D);
+    setUp(*veinMesh3D);
+    setUp(*tumorMesh3D);
+    setUp(*segmentMesh3D);
+    setUp(*gbMesh3D);
+
+    Reg3DCustom::printMeshBBox(*screenMesh,  "OBJ final  (camera-space)");
+    Reg3DCustom::printMeshBBox(*liverMesh3D, "liverMesh3D (moved)");
+
+    // --- テクスチャ付きboardメッシュのロード（表示専用） ---
+    {
+        // Board (textured display mesh) — must match the source of screenMesh,
+        // otherwise we render OLD geometry textured with NEW K, producing a
+        // visible misalignment with the segmentation overlay (this used to be
+        // hard-coded to "_k4a_light.obj" which left stale 1280x720 geometry
+        // sitting around when the user ran depth in custom/calib mode).
+        //
+        // Strategy: derive the suffix from g_objSourcePath itself. The screen
+        // mesh path was set just before setupObjScene was called and looks
+        // like "pc_metric_pinhole_masked_<tag>.obj" -- swap "masked" for
+        // "full" and add "_light".
+        std::string fullObjPath;
+        {
+            const std::string& src = g_objSourcePath;
+            auto pos = src.find("pc_metric_pinhole_masked_");
+            if (pos != std::string::npos) {
+                std::string head = src.substr(0, pos);
+                std::string tail = src.substr(pos + std::string("pc_metric_pinhole_masked_").size());
+                // tail is e.g. "custom.obj" or "k4a.obj"
+                auto dotPos = tail.find(".obj");
+                std::string tag = (dotPos != std::string::npos)
+                                      ? tail.substr(0, dotPos) : tail;
+                fullObjPath = head + "pc_metric_pinhole_full_" + tag + "_light.obj";
+            } else {
+                // Fallback to legacy path if g_objSourcePath wasn't set as expected
+                fullObjPath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_k4a_light.obj";
+            }
+        }
+        std::string texPath = DEPTH_OUTPUT_PATH + "texture.png";
+        if (std::filesystem::exists(fullObjPath)) {
+            if (boardMesh3D) { boardMesh3D->cleanup(); delete boardMesh3D; }
+            boardMesh3D = new mCutMesh(mCutMesh().loadMeshFromFile(fullObjPath.c_str()));
+            boardMesh3D->mColor = glm::vec3(1.0f, 1.0f, 1.0f);
+
+            // K intrinsicsからUV座標を生成（変換前の座標系で投影 - 過去の
+            // 意図的な仕様。X反転と組み合わせて鏡像表示する旧来の挙動）。
+            //
+            // 注意: 過去のコードは V を `py / H` で計算していたが、これは僅かに
+            // 間違っており (1280x720 で 1.8% ずれ、長年気づかれず)、1920x1080 で
+            // 8.5% ずれて GL_REPEAT で「画像上部に帯」として顕在化した。
+            //
+            // 真の関係:
+            //   ・obj_exporter は flipY=true で書き出すので、Y_3D = -(y_pixel-cy)*Z/fy
+            //     → y_pixel = cy - fy*Y_3D/Z = 2*cy - py  (py は existing 計算式の値)
+            //   ・mCutMesh::loadTextureFromData はアップロード時に画像を垂直反転
+            //     する (line 114-118) ので GL の t=0 は元画像の下端、t=1 は元画像の上端
+            //   ・正しいテクスチャサンプリング: v = 1 - y_pixel/H
+            //
+            // この補正で V は必ず [0, 1] に収まる (旧式は (2cy-y)/H で
+            // 2cy > H のとき 1.0 を超える)。GL_REPEAT のラップが完全消滅し、
+            // 帯状の異常表示も解消する。U は flipY の影響を受けないので変更なし。
+            {
+                const auto& V = boardMesh3D->mVertices;
+                int nVerts = (int)(V.size() / 3);
+                boardMesh3D->mTexCoords.resize(nVerts * 2);
+                const float invW = 1.0f / (float)K.width;
+                const float invH = 1.0f / (float)K.height;
+                for (int i = 0; i < nVerts; i++) {
+                    float x = V[i*3+0];
+                    float y = V[i*3+1];
+                    float z = V[i*3+2];
+                    if (std::abs(z) < 1e-6f) z = 1e-6f;
+                    float px = K.fx * x / z + K.cx;
+                    float py = K.fy * y / z + K.cy;
+                    // U: 既存通り (flipY の影響を受けない)
+                    boardMesh3D->mTexCoords[i*2+0] = px * invW;
+                    // V: flipY と texture upload-flip の両方を考慮した正しい式
+                    //    y_pixel = 2*cy - py;  v = 1 - y_pixel/H
+                    float y_pixel = 2.0f * K.cy - py;
+                    boardMesh3D->mTexCoords[i*2+1] = 1.0f - y_pixel * invH;
+                }
+                std::cout << "[Board] UV from intrinsics (" << nVerts
+                          << " verts, V corrected for flipY+upload-flip)" << std::endl;
+            }
+
+            // screenMeshと同じ変換を適用（mirrorX）
+            for (size_t i = 0; i < boardMesh3D->mVertices.size(); i += 3)
+                boardMesh3D->mVertices[i] = -boardMesh3D->mVertices[i];
+
+            // X反転でワインディング順が逆転するので修正（法線を正しく向ける）
+            for (size_t i = 0; i + 2 < boardMesh3D->mIndices.size(); i += 3)
+                std::swap(boardMesh3D->mIndices[i+1], boardMesh3D->mIndices[i+2]);
+
+            // テクスチャロード
+            if (std::filesystem::exists(texPath)) {
+                boardMesh3D->loadTextureFromFile(texPath);
+                std::cout << "[Board] Loaded with texture: " << texPath << std::endl;
+            } else {
+                std::cout << "[Board] No texture: " << texPath << std::endl;
+            }
+
+            setUp(*boardMesh3D);
+            Reg3DCustom::printMeshBBox(*boardMesh3D, "boardMesh3D");
+        } else {
+            std::cout << "[Board] Full OBJ not found: " << fullObjPath << std::endl;
+            boardMesh3D = nullptr;
+        }
+    }
+
+    OrbitCam.rotation = glm::angleAxis(glm::radians(180.0f),
+                                       glm::vec3(0.0f, 1.0f, 0.0f));
+    OrbitCam.currentTarget = TARGET_TEXTURE;
+
+    // ウィンドウサイズ: K の解像度 + サイドバーが希望、ただしディスプレイに
+    // 収まる範囲でクランプ (案A auto-fit)。1920x1080 の Custom intrinsics でも
+    // 1080p ディスプレイで動くようにする。3D viewport は compute3DViewport()
+    // が K のアスペクト比でフィットさせるため、ウィンドウが K より小さくても
+    // 描画自体は壊れない (ピクセル 1:1 表示が崩れるだけ)。
+    {
+        const int sidebarW = 400;
+        int recW = K.width + sidebarW;
+        int recH = K.height;
+
+        // ディスプレイ作業領域でクランプ (タスクバー等を除いた領域)
+        GLFWmonitor* mon = glfwGetPrimaryMonitor();
+        if (mon) {
+            int mx, my, mw, mh;
+            glfwGetMonitorWorkarea(mon, &mx, &my, &mw, &mh);
+            int maxW = (int)(mw * 0.95f);
+            int maxH = (int)(mh * 0.90f);
+            if (recW > maxW) recW = maxW;
+            if (recH > maxH) recH = maxH;
+        }
+
+        glfwSetWindowSize(gWindow, recW, recH);
+        gApp.windowW = recW;
+        gApp.windowH = recH;
+
+        std::cout << "[Window] Resized to " << recW << "x" << recH
+                  << " (calib " << K.width << "x" << K.height
+                  << " + sidebar " << sidebarW << ")" << std::endl;
+        if (recW < K.width + sidebarW || recH < K.height) {
+            std::cout << "[Window] Note: clamped to display work area; "
+                         "AR preview is shown at reduced size, "
+                         "but ARSave outputs at native " << K.width << "x"
+                      << K.height << "." << std::endl;
+        }
+    }
+
+    gApp.objSourcePath = g_objSourcePath;
+    gApp.intrinsics    = K;
+    gApp.mode          = AppMode::kRegistration;
+
+    std::cout << "[OBJ Setup] target cloud ready: "
+              << targetCloud->size() << " points; mode=Registration"
+              << std::endl;
+    return true;
+}
+
+
+
+static bool runDepthAndUpdateScene(AppContext& ctx) {
+    if (ctx.image.path.empty() || !ctx.image.loaded) {
+        std::cerr << "[RunDepth] no image loaded" << std::endl;
+        return false;
+    }
+
+    DepthRunner runner;
+    initDepthRunnerConfig(runner);
+
+    // Propagate the UI checkbox to the external pipeline. When OFF, the
+    // runner adds --no-vignette-detect so instrument_segmentation_mask.png
+    // contains only the SAM2 instrument result without the auto-detected
+    // FOV vignette merged in.
+    runner.config.detectVignette = ctx.detectVignette;
+
+    // CUDA / GPU acceleration. When ON, the runner adds --cuda so the
+    // external pipeline registers the CUDAExecutionProvider. Harmless
+    // when medsam2_da3_lite is a CPU-only build (silent CPU fallback).
+    runner.config.useCuda = ctx.useCuda;
+
+    // 出力ファイル名のサフィックスを決定。setupObjScene の intrinsics 候補
+    // 分岐 (パッチ2) と完全に対応させる。
+    //   0 (DA3)    : intrinsics をオーバーライドしない -> default "k4a"
+    //                 (このソースでは hasKinectIntrinsics 経路に乗らない)
+    //   1 (Kinect) : "k4a"   -> intrinsics_k4a.txt, pc_*_k4a*.obj  (従来動作)
+    //   2 (Custom) : "custom" -> intrinsics_custom.txt, pc_*_custom*.obj
+    //   3 (Calib)  : "calib"  -> intrinsics_calib.txt, pc_*_calib*.obj
+    std::string srcTag = "k4a";  // 既定 (Kinect / DA3)
+    if      (g_intrinsicsSource == 2) srcTag = "custom";
+    else if (g_intrinsicsSource == 3) srcTag = "calib";
+    runner.config.intrinsicsSourceName = srcTag;
+
+    // Custom intrinsics 選択時、外部 medsam2_da3_lite に --kinect-intrinsics
+    // で K を渡す。これがないと外部側はデフォルト Azure Kinect 720p を使って
+    // メッシュをアンプロジェクトしてしまい、AR で 3D メッシュと背景画像が
+    // ずれる (C++ 側の射影行列は Custom K、メッシュは Kinect K で生成、で
+    // 食い違うのが原因)。
+    if (g_intrinsicsSource == 2 && g_intrinsics.valid()) {
+        runner.config.useCustomIntrinsics = true;
+        runner.config.fx = g_intrinsics.fx;
+        runner.config.fy = g_intrinsics.fy;
+        runner.config.cx = g_intrinsics.cx;
+        runner.config.cy = g_intrinsics.cy;
+        // Brown-Conrady distortion: round-trip so the pipeline does NOT
+        // truncate user-edited intrinsics_custom.txt on every Run Depth.
+        // Zero coefficients pass through silently; only non-zero values
+        // emit --kinect-distortion on the medsam side.
+        runner.config.k1 = g_intrinsics.k1;
+        runner.config.k2 = g_intrinsics.k2;
+        runner.config.k3 = g_intrinsics.k3;
+        runner.config.k4 = g_intrinsics.k4;
+        runner.config.p1 = g_intrinsics.p1;
+        runner.config.p2 = g_intrinsics.p2;
+        std::cout << "[RunDepth] passing custom intrinsics to depth pipeline: "
+                  << "fx=" << g_intrinsics.fx << " fy=" << g_intrinsics.fy
+                  << " cx=" << g_intrinsics.cx << " cy=" << g_intrinsics.cy
+                  << "  (image " << g_intrinsics.width << "x"
+                  << g_intrinsics.height << ")"
+                  << "  tag=" << srcTag << std::endl;
+        if (g_intrinsics.hasDistortion()) {
+            std::cout << "[RunDepth] passing distortion: "
+                      << "k1=" << g_intrinsics.k1 << " k2=" << g_intrinsics.k2
+                      << " k3=" << g_intrinsics.k3 << " k4=" << g_intrinsics.k4
+                      << " p1=" << g_intrinsics.p1 << " p2=" << g_intrinsics.p2
+                      << std::endl;
+        }
+    } else if (g_intrinsicsSource == 3 && g_calibResult.valid) {
+        // Calibrated source: same idea
+        runner.config.useCustomIntrinsics = true;
+        runner.config.fx = (float)g_calibResult.fx;
+        runner.config.fy = (float)g_calibResult.fy;
+        runner.config.cx = (float)g_calibResult.cx;
+        runner.config.cy = (float)g_calibResult.cy;
+        // CalibResult only carries k1, k2 (the in-house Zhang tool fits only
+        // those). k3/k4/p1/p2 stay 0; the medsam pipeline will then either
+        // emit them (if non-zero) or skip the --kinect-distortion flag
+        // entirely (when all zero).
+        runner.config.k1 = (float)g_calibResult.k1;
+        runner.config.k2 = (float)g_calibResult.k2;
+        std::cout << "[RunDepth] passing calibrated intrinsics to depth pipeline"
+                  << "  tag=" << srcTag << std::endl;
+        if (std::fabs((float)g_calibResult.k1) > 1e-6f ||
+            std::fabs((float)g_calibResult.k2) > 1e-6f) {
+            std::cout << "[RunDepth] passing distortion (calib): "
+                      << "k1=" << g_calibResult.k1 << " k2=" << g_calibResult.k2
+                      << std::endl;
+        }
+    }
+    // Otherwise (DA3 / Kinect default) leave runner.config.useCustomIntrinsics
+    // = false; the external pipeline uses its built-in Azure Kinect 720p.
+
+    if (!runner.isAvailable()) {
+        std::cerr << "[RunDepth] exe not found: " << runner.config.exePath
+                  << std::endl;
+        runner.printDiagnostics();
+        return false;
+    }
+    if (!runner.areModelsAvailable()) {
+        std::cerr << "[RunDepth] ONNX models missing" << std::endl;
+        runner.printDiagnostics();
+        return false;
+    }
+
+    std::vector<DepthRunnerPoint> pts;
+    if (ctx.maskPoints.empty()) {
+        // マスクポイントがない場合はデフォルトを生成
+        std::cout << "[RunDepth] no mask points; using default (center FG + 4 corner BG)"
+                  << std::endl;
+        float cx = ctx.image.width / 2.0f;
+        float cy = ctx.image.height / 2.0f;
+        float marginX = ctx.image.width * 0.1f;
+        float marginY = ctx.image.height * 0.1f;
+
+        pts.emplace_back(cx, cy, true);  // 前景: 中心
+        pts.emplace_back(marginX, marginY, false);  // 背景: 左上
+        pts.emplace_back(ctx.image.width - marginX, marginY, false);  // 背景: 右上
+        pts.emplace_back(marginX, ctx.image.height - marginY, false);  // 背景: 左下
+        pts.emplace_back(ctx.image.width - marginX, ctx.image.height - marginY, false);  // 背景: 右下
+    } else {
+        pts.reserve(ctx.maskPoints.size());
+        for (const auto& p : ctx.maskPoints) {
+            pts.emplace_back(p.u, p.v, p.fg);
+        }
+        int nFg = 0, nBg = 0;
+        for (const auto& p : pts) (p.isForeground ? nFg : nBg)++;
+        std::cout << "[RunDepth] passing " << pts.size()
+                  << " points (fg=" << nFg << " bg=" << nBg << ")" << std::endl;
+    }
+
+    // ---- Instrument prompts (optional) ----
+    // When the user has placed any Instrument-mask points, ship them to
+    // the external pipeline as --instrument-point / --instrument-bg-point
+    // so it runs a second SAM2 pass and writes
+    //   <output>/instrument_segmentation_mask.png
+    // alongside the liver mask. When the list is empty, we pass an empty
+    // vector and the pipeline behaves exactly as before (no second pass,
+    // no instrument outputs).
+    std::vector<DepthRunnerPoint> instPts;
+    instPts.reserve(ctx.instrumentMaskPoints.size());
+    for (const auto& p : ctx.instrumentMaskPoints) {
+        instPts.emplace_back(p.u, p.v, p.fg);
+    }
+    if (!instPts.empty()) {
+        int nFg = 0, nBg = 0;
+        for (const auto& p : instPts) (p.isForeground ? nFg : nBg)++;
+        std::cout << "[RunDepth] passing " << instPts.size()
+                  << " instrument points (fg=" << nFg << " bg=" << nBg << ")"
+                  << std::endl;
+    } else {
+        // Stale instrument-mask cleanup. The external pipeline only writes
+        // instrument_segmentation_mask.png when --instrument-point is
+        // supplied, so an empty instPts means "this run produces no
+        // instrument mask". Delete any leftover from a previous Run Depth
+        // so the downstream ensureInstrumentDistMap() doesn't accidentally
+        // pick up a mask that belongs to a different image / prompts and
+        // silently corrupt boundary rejection during registration.
+        std::error_code ec;
+        std::string stalePng = DEPTH_OUTPUT_PATH
+                               + "instrument_segmentation_mask.png";
+        std::string staleJpg = DEPTH_OUTPUT_PATH
+                               + "instrument_segmentation_overlay.jpg";
+        if (std::filesystem::remove(stalePng, ec)) {
+            std::cout << "[RunDepth] removed stale instrument mask: "
+                      << stalePng << std::endl;
+        }
+        // Overlay removal is silent; it's purely a debugging artifact.
+        std::filesystem::remove(staleJpg, ec);
+    }
+
+    auto rr = runner.run(ctx.image.path, pts, nullptr, instPts);
+    if (!rr.success) {
+        std::cerr << "[RunDepth] runner failed (exit=" << rr.exitCode << ")"
+                  << std::endl;
+        return false;
+    }
+    if (rr.hasInstrumentMask()) {
+        std::cout << "[RunDepth] instrument mask written to "
+                  << rr.instrumentSegmentationMaskPath << std::endl;
+    }
+
+    std::string objPath =
+        DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj";
+    if (!std::filesystem::exists(objPath)) {
+        std::cerr << "[RunDepth] expected OBJ missing: " << objPath << std::endl;
+        // Backwards compat: fall back to legacy _k4a.obj if the source-tagged
+        // file isn't there (e.g. older pipeline build that doesn't know about
+        // --intrinsics-source). Keeps things working until medsam2_da3_lite
+        // is rebuilt with the new flag.
+        std::string fallback =
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
+        if (std::filesystem::exists(fallback)) {
+            std::cerr << "[RunDepth] falling back to legacy: " << fallback
+                      << std::endl;
+            objPath = fallback;
+        } else {
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Invalidate cached masks tied to the previous segmentation_mask.png.
+    //  The depth runner has just overwritten that file on disk, but
+    //  ensureBoundaryMap() short-circuits when g_boundaryDistMap.valid is
+    //  still true, so without this step setupOBJTarget() reuses the
+    //  PREVIOUS image's boundary map -- which silently corrupts both
+    //  extractTargetFromOBJ() (per-vertex boundaryDist) and the IoU
+    //  computed by computeSilhouette2DObjectiveFast() (which reads
+    //  g_boundaryDistMap.data directly). g_projectedLiverMask is the
+    //  rendered SAM2-on-screenMesh cache used by Shift+E and is also
+    //  derived from the same mask, so drop it too.
+    // ---------------------------------------------------------------------
+    g_boundaryDistMap.invalidate();
+    g_instrumentDistMap.invalidate();    // 器具マスクも再読み込みさせる
+    g_projectedLiverMask.invalidate();
+    std::cout << "[RunDepth] invalidated boundary map & projected liver mask"
+              << "  (will be rebuilt from new segmentation_mask.png)"
+              << std::endl;
+
+    g_objSourcePath = objPath;
+    if (!setupObjScene()) {
+        std::cerr << "[RunDepth] setupObjScene failed" << std::endl;
+        return false;
+    }
+
+    // 初期メッシュ状態をバックアップ
+    snapshotInitialPose();
+
+    // Phase 2 拡張: target cloud の subset AABB を 3 通り (全体/+X/-X) 計算
+    // Position selector が「Right なら右だけのバウンディング」を実現するため。
+    computeTargetSubsetAabbs();
+
+    // Phase 2 拡張 v2: source liver の subset AABB も 3 通り計算
+    // 「source の左半分を target の左半分にマッチ」させるため。
+    computeSourceLiverSubsetAabbs();
+
+    // マスク選択モードから抜けてRegistrationモードへ
+    ctx.mode = AppMode::kRegistration;
+
+    std::cout << "[RunDepth] OK in " << rr.elapsedMs
+              << " ms; mode=Registration" << std::endl;
+    return true;
+}
+
+// =============================================================================
+//  runSegmentOnly: Run the SAM2 stage of the depth pipeline only and pop up
+//  a preview of segmentation_overlay.jpg in the UI. Used by the "Segment 1"
+//  button to let the user sanity-check the mask BEFORE paying for depth.
+//
+//  This is a stripped-down sibling of runDepthAndUpdateScene():
+//    - same DepthRunner config / intrinsics handling / mask-point handling
+//    - sets runner.config.stage = DepthStage::Segment so the external
+//      executable returns after writing segmentation_mask.png and
+//      segmentation_overlay.jpg
+//    - does NOT touch the OBJ scene, mode, or registration state
+//    - loads segmentation_overlay.jpg into a GL texture and hands it to
+//      gUI.state for the popup to render
+//
+//  Failure mode: any error along the way leaves gUI.state.segPreviewOpen
+//  unchanged (i.e. the popup doesn't open) and logs to stderr. The user
+//  can retry or just skip Segment 1 entirely and use Run Depth as before.
+// =============================================================================
+
+// Helper: free any prior preview texture so we don't leak GL handles when
+// the user clicks Segment 1 multiple times in a row.
+static void releaseSegPreviewTexture() {
+    if (gUI.state.segPreviewTexId != 0) {
+        GLuint t = (GLuint)gUI.state.segPreviewTexId;
+        glDeleteTextures(1, &t);
+        gUI.state.segPreviewTexId = 0;
+        gUI.state.segPreviewW = 0;
+        gUI.state.segPreviewH = 0;
+    }
+}
+
+// Helper: load a JPG/PNG into a fresh GL texture. Returns 0 on failure.
+// Forces 3-channel RGB (matches stbi_load's RGB request elsewhere in the
+// file). Mirrors the GL setup in mCutMesh::loadTextureFromFile.
+static GLuint loadImageAsGLTexture(const std::string& path,
+                                   int* outW, int* outH)
 {
-    glfwInit();
+    int w = 0, h = 0, ch = 0;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 3);
+    if (!data) {
+        std::cerr << "[SegPreview] stbi_load failed: " << path
+                  << " (" << stbi_failure_reason() << ")" << std::endl;
+        return 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB,
+                 GL_UNSIGNED_BYTE, data);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(data);
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+    return tex;
+}
+
+// Run the SAM2-only stage of the depth pipeline for the requested mask
+// kind. For Liver this writes segmentation_mask.png; for Instrument it
+// writes instrument_segmentation_mask.png (so the liver mask on disk is
+// not overwritten by an Instrument preview). The popup state is shared:
+// segPreviewTexId points at whichever overlay was just produced.
+static bool runSegmentOnly(AppContext& ctx, MaskKind kind) {
+    const bool isInstrument = (kind == MaskKind::Instrument);
+    const char* tag = isInstrument ? "Instrument" : "Segment1";
+
+    if (ctx.image.path.empty() || !ctx.image.loaded) {
+        std::cerr << "[" << tag << "] no image loaded" << std::endl;
+        return false;
+    }
+
+    DepthRunner runner;
+    initDepthRunnerConfig(runner);
+
+    // Propagate the UI checkbox to the external pipeline. Same logic
+    // as runDepthAndUpdateScene -- both code paths produce
+    // instrument_segmentation_mask.png so both must respect the toggle.
+    runner.config.detectVignette = ctx.detectVignette;
+
+    // CUDA / GPU acceleration. Same logic as runDepthAndUpdateScene.
+    runner.config.useCuda = ctx.useCuda;
+
+    // ---- Same intrinsics tag dispatch as runDepthAndUpdateScene ----
+    std::string srcTag = "k4a";
+    if      (g_intrinsicsSource == 2) srcTag = "custom";
+    else if (g_intrinsicsSource == 3) srcTag = "calib";
+    runner.config.intrinsicsSourceName = srcTag;
+
+    if (g_intrinsicsSource == 2 && g_intrinsics.valid()) {
+        runner.config.useCustomIntrinsics = true;
+        runner.config.fx = g_intrinsics.fx;
+        runner.config.fy = g_intrinsics.fy;
+        runner.config.cx = g_intrinsics.cx;
+        runner.config.cy = g_intrinsics.cy;
+        // Distortion round-trip (same rationale as in runDepthAndUpdateScene).
+        // Stage=Segment does NOT regenerate intrinsics_<tag>.txt (only the
+        // mask is written), so emitting --kinect-distortion here is just
+        // for consistency / future-proofing if the pipeline ever starts to
+        // write the intrinsics file in Stage=Segment too.
+        runner.config.k1 = g_intrinsics.k1;
+        runner.config.k2 = g_intrinsics.k2;
+        runner.config.k3 = g_intrinsics.k3;
+        runner.config.k4 = g_intrinsics.k4;
+        runner.config.p1 = g_intrinsics.p1;
+        runner.config.p2 = g_intrinsics.p2;
+    } else if (g_intrinsicsSource == 3 && g_calibResult.valid) {
+        runner.config.useCustomIntrinsics = true;
+        runner.config.fx = (float)g_calibResult.fx;
+        runner.config.fy = (float)g_calibResult.fy;
+        runner.config.cx = (float)g_calibResult.cx;
+        runner.config.cy = (float)g_calibResult.cy;
+        runner.config.k1 = (float)g_calibResult.k1;
+        runner.config.k2 = (float)g_calibResult.k2;
+    }
+
+    // Stage selector: SAM2 only.
+    runner.config.stage = DepthStage::Segment;
+    // Output filename selector. For Instrument we ask the external pipeline
+    // to write to instrument_segmentation_*.png so the liver mask isn't
+    // clobbered. For Liver we leave maskOutputName empty (legacy names).
+    runner.config.maskOutputName = isInstrument ? "instrument" : "";
+
+    if (!runner.isAvailable()) {
+        std::cerr << "[" << tag << "] exe not found: " << runner.config.exePath
+                  << std::endl;
+        return false;
+    }
+    if (!runner.areModelsAvailable()) {
+        std::cerr << "[" << tag << "] ONNX models missing" << std::endl;
+        return false;
+    }
+
+    // Pick the right point list. The Liver path keeps its legacy default-
+    // points fallback (center FG + 4 corner BG). For Instrument we *don't*
+    // fall back because there is no sensible default position for "the
+    // tool" -- instead we just refuse if the user hasn't placed any
+    // prompts yet, and the UI button enabling logic should match.
+    const std::vector<MaskPoint>& srcPts =
+        isInstrument ? ctx.instrumentMaskPoints : ctx.maskPoints;
+
+    std::vector<DepthRunnerPoint> pts;
+    if (srcPts.empty()) {
+        if (isInstrument) {
+            std::cerr << "[Instrument] no instrument mask points; "
+                         "click on the tool first" << std::endl;
+            return false;
+        }
+        std::cout << "[Segment1] no mask points; using default "
+                     "(center FG + 4 corner BG)" << std::endl;
+        float cx = ctx.image.width / 2.0f;
+        float cy = ctx.image.height / 2.0f;
+        float marginX = ctx.image.width  * 0.1f;
+        float marginY = ctx.image.height * 0.1f;
+        pts.emplace_back(cx, cy, true);
+        pts.emplace_back(marginX, marginY, false);
+        pts.emplace_back(ctx.image.width - marginX, marginY, false);
+        pts.emplace_back(marginX, ctx.image.height - marginY, false);
+        pts.emplace_back(ctx.image.width - marginX,
+                         ctx.image.height - marginY, false);
+    } else {
+        pts.reserve(srcPts.size());
+        for (const auto& p : srcPts) pts.emplace_back(p.u, p.v, p.fg);
+        int nFg = 0, nBg = 0;
+        for (const auto& p : pts) (p.isForeground ? nFg : nBg)++;
+        std::cout << "[" << tag << "] passing " << pts.size()
+                  << " points (fg=" << nFg << " bg=" << nBg << ")" << std::endl;
+    }
+
+    auto rr = runner.run(ctx.image.path, pts);
+    if (!rr.success) {
+        std::cerr << "[" << tag << "] runner failed (exit=" << rr.exitCode << ")"
+                  << std::endl;
+        return false;
+    }
+
+    // ---- Pick the right overlay/mask file for the popup ----
+    // The external pipeline's maskOutputName="instrument" puts the outputs
+    // under instrument_segmentation_*.png; otherwise the legacy names.
+    std::string maskPath, overlayPath;
+    if (isInstrument) {
+        maskPath    = rr.instrumentSegmentationMaskPath;
+        overlayPath = rr.instrumentSegmentationOverlayPath;
+    } else {
+        maskPath    = rr.segmentationMaskPath;
+        overlayPath = rr.segmentationOverlayPath;
+    }
+    if (maskPath.empty() || !std::filesystem::exists(maskPath)) {
+        std::cerr << "[" << tag << "] expected mask missing: "
+                  << maskPath << std::endl;
+        return false;
+    }
+    std::string previewPath = overlayPath;
+    if (previewPath.empty() || !std::filesystem::exists(previewPath)) {
+        previewPath = maskPath;
+    }
+
+    releaseSegPreviewTexture();
+    int w = 0, h = 0;
+    GLuint tex = loadImageAsGLTexture(previewPath, &w, &h);
+    if (tex == 0) {
+        std::cerr << "[" << tag << "] failed to upload preview texture from "
+                  << previewPath << std::endl;
+        return false;
+    }
+    gUI.state.segPreviewTexId    = (unsigned int)tex;
+    gUI.state.segPreviewW        = w;
+    gUI.state.segPreviewH        = h;
+    gUI.state.segPreviewOpen     = true;
+    gUI.state.segPreviewScore    = 0.0f;
+    gUI.state.segPreviewFgPixels = 0;
+
+    std::cout << "[" << tag << "] OK in " << rr.elapsedMs
+              << " ms; preview=" << previewPath
+              << " (" << w << "x" << h << ")" << std::endl;
+    return true;
+}
+
+static bool initOpenGL() {
+    if (!glfwInit()) return false;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    gWindow = glfwCreateWindow(gWindowWidth, gWindowHeight, "Window", NULL, NULL);
+    gWindow = glfwCreateWindow(gWindowWidth, gWindowHeight,
+                               "Simple Registration", nullptr, nullptr);
+    if (!gWindow) { glfwTerminate(); return false; }
     glfwMakeContextCurrent(gWindow);
     glewExperimental = GL_TRUE;
-    glewInit();
+    if (glewInit() != GLEW_OK) return false;
 
     glfwSetKeyCallback(gWindow, glfw_onKey);
     glfwSetMouseButtonCallback(gWindow, mouse_button_callback);
     glfwSetFramebufferSizeCallback(gWindow, glfw_OnFramebufferSize);
     glfwSetCursorPosCallback(gWindow, glfw_onMouseMoveOrbit);
     glfwSetScrollCallback(gWindow, glfw_onMouseScroll);
-    glfwSetDropCallback(gWindow, glfw_onFileDrop);
-
+    glfwSetWindowUserPointer(gWindow, &gApp);
+    glfwSetDropCallback(gWindow, handleFileDrop);
     glfwSetInputMode(gWindow, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-    glfwSetCursorPos(gWindow, gWindowWidth / 2.0, gWindowHeight / 2.0);
+    glfwSetCursorPos(gWindow, gWindowWidth/2.0, gWindowHeight/2.0);
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-
     glViewport(0, 0, gWindowWidth, gWindowHeight);
     glEnable(GL_DEPTH_TEST);
-
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -2410,1700 +3191,1684 @@ bool initOpenGL()
     ImGui_ImplGlfw_InitForOpenGL(gWindow, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    {
-        auto loadIcon = [](const char* subdir, const char* name) -> unsigned int {
-            int w, h, ch;
-            const char* prefixes[] = {
-                "data/",
-                "../data/",
-                "../../data/",
-                "../../../data/",
-                "../../../../data/",
-                nullptr
-            };
-            for (int p = 0; prefixes[p]; p++) {
-                char path[512];
-                snprintf(path, sizeof(path), "%s%s%s_icon.png", prefixes[p], subdir, name);
-                unsigned char* data = stbi_load(path, &w, &h, &ch, 4);
-                if (data) {
-                    GLuint tex;
-                    glGenTextures(1, &tex);
-                    glBindTexture(GL_TEXTURE_2D, tex);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-                    stbi_image_free(data);
-                    printf("[Icon] Loaded: %s (%dx%d)\n", path, w, h);
-                    return tex;
-                }
-            }
-            printf("[Icon] Not found: %s%s_icon.png (tried all paths)\n", subdir, name);
-            return 0;
-        };
-        const char* organNames[] = {"liver","portal","vein","tumor","segment","gb"};
-        for (int i = 0; i < 6; i++) {
-            gUIManager.state.organIconTex[i] = loadIcon("icons/", organNames[i]);
-        }
-        gUIManager.state.boardIconTex = loadIcon("icons/", "board");
-        const char* btnNames[] = {"camera","load_images","depth","full_auto","hemi_auto","umeyama","rigid","handle","deform"};
-        for (int i = 0; i < RegUIState::ICON_COUNT; i++) {
-            gUIManager.state.btnIconTex[i] = loadIcon("icons/", btnNames[i]);
-        }
-    }
-
     return true;
 }
 
-void glfw_onMouseMoveOrbit(GLFWwindow* window, double posX, double posY) {
-    static glm::vec2 lastMousePos = glm::vec2(0, 0);
+int main() {
+    initPaths();
+    initFilePaths();
 
-    if (ImGui::GetIO().WantCaptureMouse) {
-        lastMousePos.x = (float)posX;
-        lastMousePos.y = (float)posY;
-        return;
+    if (!initOpenGL()) {
+        std::cerr << "GLFW initialization failed" << std::endl;
+        return -1;
     }
 
-    float deltaX = posX - lastMousePos.x;
-    float deltaY = posY - lastMousePos.y;
+    OrbitCam.setWindowSizePointers(&gWindowWidth, &gWindowHeight);
+    OrbitCam.setGlobalMatrixPointers(&view, &projection, &model, &objPos);
+    // Kinectのようなカメラの実際の内部パラメータを設定（デフォルト: K4A 720p）
+    OrbitCam.setIntrinsics(918.234f, 918.112f, 640.152f, 366.447f, 1280, 720);
+    OrbitCam.printCameraInfo();
 
-    if(currentMainMode == REGISTRATION_MODE){
+    ShaderProgram shaderProgram;
+    shaderProgram.loadShaders("../../../shaders/basic.vert",
+                              "../../../shaders/basic.frag");
+    ShaderProgram shaderProgramCube;
+    shaderProgramCube.loadShaders("../../../shaders/texture.vert",
+                                  "../../../shaders/texture.frag");
+    g_pShader     = &shaderProgram;
+    g_pShaderCube = &shaderProgramCube;
 
-        FullSphereCamera* activeCamera = getActiveCamera(window);
-
-        if (!isDragging) {
-            if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == 1 && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) != 1) {
-                activeCamera->Rotate(deltaX, deltaY);
-            }
-            if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) != GLFW_PRESS) {
-                float dx = posX - lastMousePos.x;
-                float dy = lastMousePos.y - posY;
-                activeCamera->Pan(dx, dy);
-            }
-        }
-        if (isDragging && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) != GLFW_PRESS) {
-            float dx = ((float)posX - lastMousePos.x) * activeCamera->LIGHT_MOUSE_SENSITIVITY;
-            float dy = (lastMousePos.y - (float)posY) * activeCamera->LIGHT_MOUSE_SENSITIVITY;
-            glm::vec3 moveDirection = activeCamera->cameraRight * dx + activeCamera->cameraUp * dy;
-            translateAllMeshes(moveDirection);
-        }
-        if (isDragging && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == 1 && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) != 1) {
-            float rotX = ((float)posY - lastMousePos.y) * 0.01f;
-            float rotY = ((float)posX - lastMousePos.x) * 0.01f;
-            glm::vec3 center = liverMesh3D->calcCenter();
-            rotateAllMeshes(center, activeCamera->cameraRight, rotX, activeCamera->cameraUp, rotY);
-        }
-        if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == 1 && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == 1) {
-            glm::vec3 movement = activeCamera->cameraDirection * ((float)posY - lastMousePos.y) * activeCamera->LIGHT_MOUSE_SENSITIVITY;
-            translateAllMeshes(movement);
-        }
+    gApp.arBg.initGL();
+    if (!gApp.arBg.loadTexture(DEPTH_OUTPUT_PATH + "original.jpg")) {
+        std::cerr << "[AR] background image missing -- overlay disabled"
+                  << std::endl;
     }
+    gMaskRenderer.initGL();
 
-    if(currentMainMode == DEFORM_MODE){
+    // スフィアマーカーの初期化（クラスタ・対応点描画用）
+    g_sphereMarker.generate(1.0f, 16, 16);
+    g_sphereMarker.setup();
+    gUmeyama.init();
 
-        bool leftDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        bool rightDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    liverMesh3D = new mCutMesh(liverMesh3D->loadMeshFromFile((MODEL_PATH + "liver.obj").c_str()));
+    liverMesh3D->mColor = glm::vec3(0.8f, 0.2f, 0.2f);
+    setUp(*liverMesh3D);
 
-        if (isDragging && deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE && multiBody != nullptr) {
-            if (leftDown && rightDown) {
-                glm::vec3 movement = OrbitCam.cameraDirection * (-deltaY) * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
-                multiBody->rigidTranslate(movement);
-            } else if (leftDown && !rightDown) {
-                float rotX = deltaY * 0.01f;
-                float rotY = deltaX * 0.01f;
-                if (std::abs(rotX) > 1e-5f)
-                    multiBody->rigidRotateAroundCenter(OrbitCam.cameraRight, rotX);
-                if (std::abs(rotY) > 1e-5f)
-                    multiBody->rigidRotateAroundCenter(OrbitCam.cameraUp, rotY);
-            } else if (rightDown && !leftDown) {
-                float dx = deltaX * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
-                float dy = -deltaY * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
-                glm::vec3 move = OrbitCam.cameraRight * dx + OrbitCam.cameraUp * dy;
-                multiBody->rigidTranslate(move);
-            }
-        }
-        else if (isDragging && deformHandlPlace.state == DeformHandlPlaceData::DEFORM_MODE) {
-            if (leftDown && !rightDown) {
-                if (gGrabber != nullptr) {
-                    gGrabber->moveGrab(posX, posY, 1.0f / 60.0f);
-                }
-            }
-        }
+    portalMesh3D = new mCutMesh(portalMesh3D->loadMeshFromFile((MODEL_PATH + "portal.obj").c_str()));
+    portalMesh3D->mColor = glm::vec3(0.2f, 0.2f, 0.8f);
+    setUp(*portalMesh3D);
 
-        if (!isDragging) {
-            if (leftDown && !rightDown) {
-                OrbitCam.Rotate(deltaX, deltaY);
-            }
-            if (rightDown && !leftDown) {
-                float dx = posX - lastMousePos.x;
-                float dy = lastMousePos.y - posY;
-                OrbitCam.Pan(dx, dy);
-            }
-        }
-    }
+    veinMesh3D = new mCutMesh(veinMesh3D->loadMeshFromFile((MODEL_PATH + "vein.obj").c_str()));
+    veinMesh3D->mColor = glm::vec3(0.2f, 0.5f, 0.5f);
+    setUp(*veinMesh3D);
 
-    lastMousePos.x = (float)posX;
-    lastMousePos.y = (float)posY;
-}
+    tumorMesh3D = new mCutMesh(tumorMesh3D->loadMeshFromFile((MODEL_PATH + "tumor.obj").c_str()));
+    tumorMesh3D->mColor = glm::vec3(0.8f, 0.5f, 0.5f);
+    setUp(*tumorMesh3D);
 
-void glfw_onMouseScroll(GLFWwindow* window, double deltaX, double deltaY) {
-    if (ImGui::GetIO().WantCaptureMouse) return;
+    segmentMesh3D = new mCutMesh(segmentMesh3D->loadMeshFromFile((MODEL_PATH + "res.obj").c_str()));
+    segmentMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.5f);
+    setUp(*segmentMesh3D);
 
-    FullSphereCamera* activeCamera = getActiveCamera(window);
+    gbMesh3D = new mCutMesh(gbMesh3D->loadMeshFromFile((MODEL_PATH + "gb.obj").c_str()));
+    gbMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.2f);
+    setUp(*gbMesh3D);
 
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) != 1) {
-        activeCamera->gRadius += deltaY * activeCamera->ZOOM_SENSITIVITY;
-        activeCamera->gRadius = glm::clamp(activeCamera->gRadius, 2.0f, 80.0f);
-        std::cout << "Camera radius: " << activeCamera->gRadius << std::endl;
-    }
-
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == 1) {
-        glm::vec3 center = liverMesh3D->calcCenter();
-        float scale = calcScaleFactor(deltaY, scaleSpeed);
-
-        if (currentMainMode == REGISTRATION_MODE) {
-            scaleAllMeshes(center, scale);
-        }
-
-        if (currentMainMode == DEFORM_MODE) {
-            liverMesh3D->scaleAround(center, scale);
-            setUp(*liverMesh3D);
-        }
-
-        if (!registrationHandle.objectPoints.empty()) {
-            scaleRegistrationPoints(center, scale);
-        }
-    }
-}
-
-void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-    if (ImGui::GetIO().WantCaptureMouse) return;
-
-    double xpos, ypos;
-    glfwGetCursorPos(window, &xpos, &ypos);
-    if(currentMainMode == DEFORM_MODE) {
-        if (button == GLFW_MOUSE_BUTTON_LEFT) {
-            if (action == GLFW_PRESS) {
-                if (deformHandlPlace.state == DeformHandlPlaceData::HANDLE_PLACE_MODE) {
-
-                    if (multiBody->handleGroups.size() >= SoftBody::MAX_HANDLE_GROUPS) {
-                        std::cout << "Maximum " << SoftBody::MAX_HANDLE_GROUPS
-                                  << " handle groups reached. Press C to clear." << std::endl;
-                        return;
-                    }
-
-                    int expectedIndex = deformHandlPlace.softbodyPoints.size();
-                    std::cout << ">>> Selecting handle point #" << (expectedIndex + 1)
-                              << "/" << SoftBody::MAX_HANDLE_GROUPS << std::endl;
-
-                    gGrabber->placeSphere(xpos, ypos, gGroupRadius);
-
-                    if (hit_index >= 0) {
-                        deformHandlPlace.softbodyPoints.push_back(hit_position);
-
-                        glm::vec3 color = getPointColor(expectedIndex, false);
-                        std::cout << "Handle group " << deformHandlPlace.softbodyPoints.size()
-                                  << " [Color: R=" << color.r << " G=" << color.g << " B=" << color.b << "]"
-                                  << " created" << std::endl;
-
-                        if (deformHandlPlace.softbodyPoints.size() >= SoftBody::MAX_HANDLE_GROUPS) {
-                            deformHandlPlace.state = DeformHandlPlaceData::DEFORM_MODE;
-                            multiBody->setRigidMode(false);
-                            std::cout << "\n=== Maximum groups reached. Switched to DEFORM MODE ===" << std::endl;
-                        }
-                    }
-
-                    isDragging = false;
-                    hit_index = -1;
-                }
-                else if (deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE) {
-                    if (gGrabber && gGrabber->hitTest(xpos, ypos))
-                        isDragging = true;
-                }
-                else if (deformHandlPlace.state == DeformHandlPlaceData::DEFORM_MODE) {
-                    gGrabber->startGrab(xpos, ypos);
-                } else if(deformHandlPlace.state == DeformHandlPlaceData::PLANECUT_MODE){
-                    std::cout << "Pefortm Cutter FindHit" << std::endl;
-                    if (cutterMesh) {
-                        FindHit(xpos, ypos, cutterMesh->mVertices, cutterMesh->mIndices);
-                    }
-                }
-            }
-            else if (action == GLFW_RELEASE) {
-                if (deformHandlPlace.state == DeformHandlPlaceData::HANDLE_PLACE_MODE) {
-                    isDragging = false;
-                    hit_index = -1;
-                }
-                else if (deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE) {
-                    isDragging = false;
-                }
-                else {
-                    hit_index = -1;
-                    isDragging = false;
-                    gGrabber->endGrab();
-                }
-            }
-        }
-
-        if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-            if (action == GLFW_PRESS) {
-                if(deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE){
-                    if (gGrabber && gGrabber->hitTest(xpos, ypos))
-                        isDragging = true;
-                } else if(deformHandlPlace.state == DeformHandlPlaceData::PLANECUT_MODE){
-                    std::cout << "triMesh Find Hit" << std::endl;
-                    if (cutterMesh) {
-                        FindHit(xpos, ypos, cutterMesh->mVertices, cutterMesh->mIndices);
-                    }
-                }
-            } else if (action == GLFW_RELEASE) {
-                if (deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE) {
-                    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) != GLFW_PRESS)
-                        isDragging = false;
-                } else {
-                    hit_index = -1;
-                    isDragging = false;
-                }
-            }
-        }
-    }
-
-    if(currentMainMode == REGISTRATION_MODE) {
-
-        bool isLeftScreen = false;
-        bool isRightScreen = false;
-        FullSphereCamera* activeCamera = getActiveCameraWithSide(window, isLeftScreen, isRightScreen);
-
-        if (gCameraPreview.frozen && action == GLFW_PRESS
-            && (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_RIGHT)) {
-
-            if (depthSplitScreenMode && !isRightScreen) {
-                std::cout << "[SegPoint] Click on RIGHT screen to add points" << std::endl;
-                return;
-            }
-
-            glm::vec3 hitPos;
-            if (depthSplitScreenMode) {
-                int halfW = gWindowWidth / 2;
-                float localX = (float)xpos - halfW;
-                hitPos = pickPointOnBoardWithCamera(localX, ypos, &OrbitCamRight_Screen, halfW, gWindowHeight);
-            } else {
-                hitPos = pickPointOnBoardWithCamera(xpos, ypos, activeCamera, gWindowWidth, gWindowHeight);
-            }
-
-            if (hitPos != glm::vec3(-999)) {
-                int pixelX, pixelY;
-                if (convert3DToImagePixel(hitPos, screenMesh, pixelX, pixelY)) {
-                    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-                        gUserSegPoints.emplace_back(
-                            static_cast<float>(pixelX),
-                            static_cast<float>(pixelY), true);
-                        gUserSegPoints3D.push_back(hitPos);
-                        gUserSegPointsFG.push_back(true);
-                        std::cout << "[SegPoint] FG(object) #" << gUserSegPoints.size()
-                                  << " at 2D(" << pixelX << ", " << pixelY << ")" << std::endl;
-                    } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-                        gUserSegPoints.emplace_back(
-                            static_cast<float>(pixelX),
-                            static_cast<float>(pixelY), false);
-                        gUserSegPoints3D.push_back(hitPos);
-                        gUserSegPointsFG.push_back(false);
-                        std::cout << "[SegPoint] BG(background) #" << gUserSegPoints.size()
-                                  << " at 2D(" << pixelX << ", " << pixelY << ")" << std::endl;
-                    }
-
-                    std::cout << "[SegPoint] Total: " << gUserSegPoints.size() << " points (";
-                    int fgCount = 0, bgCount = 0;
-                    for (const auto& p : gUserSegPoints) {
-                        if (p.isForeground) fgCount++; else bgCount++;
-                    }
-                    std::cout << fgCount << " FG, " << bgCount << " BG)" << std::endl;
-                }
-            } else {
-                std::cout << "[SegPoint] No hit on screenMesh" << std::endl;
-            }
-            return;
-        }
-
-        if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT) {
-
-            if (registrationHandle.state == RegistrationData::SELECTING_BOARD_POINTS) {
-
-                if (splitScreenMode && !isRightScreen) {
-                    std::cout << "Board point selection is only available on the right screen (texture view)" << std::endl;
-                    return;
-                }
-
-                std::cout << ">>> Selecting board point #" << (registrationHandle.boardPoints.size() + 1)
-                          << " of " << registrationHandle.targetPointCount << "..." << std::endl;
-
-                glm::vec3 boardPoint;
-                if (splitScreenMode) {
-                    double adjustedX = xpos - gWindowWidth / 2.0;
-                    boardPoint = pickPointOnBoardWithCamera(adjustedX, ypos, activeCamera,
-                                                            gWindowWidth/2, gWindowHeight);
-                } else {
-                    boardPoint = pickPointOnBoardWithCamera(xpos, ypos, activeCamera,
-                                                            gWindowWidth, gWindowHeight);
-                }
-
-                if (boardPoint != glm::vec3(-999)) {
-                    registrationHandle.boardPoints.push_back(boardPoint);
-
-                    int pointIndex = registrationHandle.boardPoints.size() - 1;
-                    glm::vec3 color = getPointColor(pointIndex, true);
-                    std::cout << "Board point " << registrationHandle.boardPoints.size()
-                              << " [Color: R=" << color.r << " G=" << color.g << " B=" << color.b << "]"
-                              << ": (" << boardPoint.x << ", " << boardPoint.y
-                              << ", " << boardPoint.z << ")" << std::endl;
-
-                    if (registrationHandle.boardPoints.size() >= registrationHandle.targetPointCount) {
-                        registrationHandle.state = RegistrationData::SELECTING_OBJECT_POINTS;
-                        std::cout << "\n=== SWITCHED TO OBJECT SELECTION MODE ===" << std::endl;
-                        std::cout << "Select " << registrationHandle.targetPointCount
-                                  << " points on the 3D object in THE SAME ORDER!" << std::endl;
-                        if (splitScreenMode) {
-                            std::cout << "NOTE: Switch to the LEFT screen for object selection" << std::endl;
-                        }
-                    } else {
-                        std::cout << "Select " << (registrationHandle.targetPointCount - registrationHandle.boardPoints.size())
-                        << " more board points" << std::endl;
-                    }
-                }
-            }
-
-            else if (registrationHandle.state == RegistrationData::SELECTING_OBJECT_POINTS) {
-
-                if (splitScreenMode && !isLeftScreen) {
-                    std::cout << "Object point selection is only available on the left screen (liver view)" << std::endl;
-                    return;
-                }
-
-                int expectedIndex = registrationHandle.objectPoints.size();
-                std::cout << ">>> Selecting object point #" << (expectedIndex + 1)
-                          << " (corresponds to board point #" << (expectedIndex + 1) << ")..." << std::endl;
-
-                if (splitScreenMode) {
-                    FindHitWithCamera(xpos, ypos, liverMesh3D->mVertices, liverMesh3D->mIndices,
-                                      activeCamera, gWindowWidth/2, gWindowHeight);
-                } else {
-                    FindHitWithCamera(xpos, ypos, liverMesh3D->mVertices, liverMesh3D->mIndices,
-                                      activeCamera, gWindowWidth, gWindowHeight);
-                }
-
-                if (hit_index >= 0) {
-                    registrationHandle.objectPoints.push_back(hit_position);
-
-                    glm::vec3 color = getPointColor(expectedIndex, false);
-                    std::cout << "Object point " << registrationHandle.objectPoints.size()
-                              << " [Color: R=" << color.r << " G=" << color.g << " B=" << color.b << "]"
-                              << ": (" << hit_position.x << ", " << hit_position.y
-                              << ", " << hit_position.z << ")" << std::endl;
-
-                    if (registrationHandle.objectPoints.size() >= registrationHandle.boardPoints.size()) {
-                        registrationHandle.state = RegistrationData::READY_TO_REGISTER;
-                        std::cout << "\n=== READY TO REGISTER ===" << std::endl;
-                        std::cout << "Point correspondences:" << std::endl;
-                        for (size_t i = 0; i < registrationHandle.boardPoints.size(); i++) {
-                            std::cout << "  Pair " << (i+1) << ": Board->Object" << std::endl;
-                        }
-                        std::cout << "Press H to execute registration" << std::endl;
-                    }
-                }
-
-                isDragging = false;
-                hit_index = -1;
-            }
-
-            else if (registrationHandle.state == RegistrationData::IDLE ||
-                     registrationHandle.state == RegistrationData::REGISTERED) {
-
-                std::cout << "Normal mode: Find Hit" << std::endl;
-
-                if (splitScreenMode && isRightScreen) {
-                    std::cout << "Liver mesh manipulation is only available on the left screen" << std::endl;
-                    return;
-                }
-
-                if (splitScreenMode) {
-                    FindHitWithCamera(xpos, ypos, liverMesh3D->mVertices, liverMesh3D->mIndices,
-                                      activeCamera, gWindowWidth/2, gWindowHeight);
-                } else {
-                    FindHitWithCamera(xpos, ypos, liverMesh3D->mVertices, liverMesh3D->mIndices,
-                                      activeCamera, gWindowWidth, gWindowHeight);
-                }
-            }
-        }
-
-        if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_RIGHT) {
-            if (registrationHandle.state != RegistrationData::IDLE &&
-                registrationHandle.state != RegistrationData::REGISTERED) {
-                std::cout << "Right click disabled during registration" << std::endl;
-                return;
-            }
-
-            if (splitScreenMode && isRightScreen) {
-                std::cout << "Right click manipulation is only available on the left screen" << std::endl;
-                return;
-            }
-
-            std::vector<mCutMesh*> meshesToHit = {
-                liverMesh3D,
-                portalMesh3D,
-                veinMesh3D,
-                tumorMesh3D,
-                segmentMesh3D,
-                gbMesh3D
-            };
-
-            if (splitScreenMode) {
-                FindHitWithCameraMultipleMeshes(xpos, ypos, meshesToHit,
-                                                activeCamera, gWindowWidth/2, gWindowHeight);
-            } else {
-                FindHitWithCameraMultipleMeshes(xpos, ypos, meshesToHit,
-                                                activeCamera, gWindowWidth, gWindowHeight);
-            }
-
-        }
-        else if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_RIGHT) {
-            hit_index = -1;
-            isDragging = false;
-        }
-
-        if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_MIDDLE) {
-            if (registrationHandle.state != RegistrationData::IDLE &&
-                registrationHandle.state != RegistrationData::REGISTERED) {
-                registrationHandle.reset();
-                std::cout << "=== Registration cancelled ===" << std::endl;
-            }
-        }
-
-    }
-
-}
-
-void glfw_onKey(GLFWwindow* window, int key, int scancode, int action, int mode)
-{
-    if (ImGui::GetIO().WantCaptureKeyboard) return;
-
-    if (action != GLFW_PRESS && action != GLFW_REPEAT)
-        return;
-
-    switch (key) {
-    case GLFW_KEY_ESCAPE:
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
-        break;
-
-    case GLFW_KEY_1:
-    case GLFW_KEY_2:
-    case GLFW_KEY_3:
-    case GLFW_KEY_4:
-    case GLFW_KEY_5:
-    case GLFW_KEY_6:
-    case GLFW_KEY_7:
+    // -----------------------------------------------------------------
+    //  Capture original CT-mm diagonals of liver and tumor.
+    //  These are the invariants used by Shift+M to undo the full scale
+    //  chain (prealign × registration × manual). They must be recorded
+    //  HERE -- right after the .obj load -- because setupObjScene below
+    //  will run prealignSourceToTarget which mutates the vertices.
+    // -----------------------------------------------------------------
     {
-        int meshIndex = key - GLFW_KEY_1;
-
-        if (meshIndex >= 0 && meshIndex < meshAlphaValues.size()) {
-            float currentAlpha = meshAlphaValues[meshIndex];
-
-            if (currentAlpha < 0.01f) {
-                meshAlphaValues[meshIndex] = 0.5f;
-            } else if (currentAlpha < 0.75f) {
-                meshAlphaValues[meshIndex] = 1.0f;
-            } else {
-                meshAlphaValues[meshIndex] = 0.0f;
+        auto bboxDiag = [](const mCutMesh* m) -> float {
+            if (!m || m->mVertices.size() < 3) return 0.0f;
+            glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
+            for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+                glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
+                mn = glm::min(mn, v);
+                mx = glm::max(mx, v);
             }
-
-            const char* meshNames[] = {"Liver", "Portal", "Vein", "Tumor", "Segment", "GB", "ScreenMesh"};
-            std::cout << meshNames[meshIndex] << " alpha: "
-                      << meshAlphaValues[meshIndex] << std::endl;
-        }
+            return glm::length(mx - mn);
+        };
+        g_originalLiverDiagMm = bboxDiag(liverMesh3D);
+        g_originalTumorDiagMm = bboxDiag(tumorMesh3D);
+        g_hasOriginalDiags    = (g_originalLiverDiagMm > 1e-6f);
+        std::cout << "[OriginalDiag] liver=" << g_originalLiverDiagMm
+                  << " mm, tumor=" << g_originalTumorDiagMm
+                  << " mm  (CT-mm reference for Shift+M scale restoration)"
+                  << std::endl;
     }
-    break;
 
-    case GLFW_KEY_Z:
-        if (currentMainMode == REGISTRATION_MODE && gCameraPreview.frozen) {
-            if (!gUserSegPoints.empty()) {
-                auto& removed = gUserSegPoints.back();
-                std::cout << "[SegPoint] Undo: removed "
-                          << (removed.isForeground ? "FG" : "BG")
-                          << " at 2D(" << removed.x << ", " << removed.y << ")" << std::endl;
-                gUserSegPoints.pop_back();
-                gUserSegPoints3D.pop_back();
-                gUserSegPointsFG.pop_back();
-                std::cout << "[SegPoint] Remaining: " << gUserSegPoints.size() << " points" << std::endl;
-            } else {
-                std::cout << "[SegPoint] Nothing to undo" << std::endl;
+    // Sync with AppContext
+    gApp.liver = liverMesh3D;
+    gApp.portal = portalMesh3D;
+    gApp.vein = veinMesh3D;
+    gApp.tumor = tumorMesh3D;
+    gApp.segment = segmentMesh3D;
+    gApp.gb = gbMesh3D;
+
+    allMeshes.push_back(liverMesh3D);
+    allMeshes.push_back(portalMesh3D);
+    allMeshes.push_back(veinMesh3D);
+    allMeshes.push_back(tumorMesh3D);
+    allMeshes.push_back(segmentMesh3D);
+    allMeshes.push_back(gbMesh3D);
+
+    gApp.all = allMeshes;
+
+    // Initialize other AppContext members
+    gApp.window = gWindow;
+    gApp.windowW = gWindowWidth;
+    gApp.windowH = gWindowHeight;
+    gApp.orbitCam = OrbitCam;
+    gApp.model = model;
+    gApp.view = view;
+    gApp.projection = projection;
+    gApp.objPos = objPos;
+    gApp.reg = registrationHandle;
+    gApp.silhouetteCosThreshold = g_silhouetteCosThreshold;
+    gApp.objSourcePath = g_objSourcePath;
+    gApp.intrinsics = g_intrinsics;
+
+    setupUICallbacks();
+
+    // 起動時に既存 OBJ が残っていれば即ロード。
+    //
+    // 重要: 前回 Run Depth したときの結果は「画像（original.jpg, segmentation_mask.png）
+    // + メッシュ（pc_metric_pinhole_masked_<tag>.obj） + K（intrinsics_<tag>.txt）」
+    // のセットで一貫している必要がある。Custom と Kinect (k4a) を行き来した
+    // 履歴があると、ディスクに両方の OBJ が残り得て、現在の画像と整合しない
+    // 古いメッシュを選んでしまうリスクがある。
+    //
+    // そのため候補を「修正時刻の新しい順」で並べ直し、**最新** の OBJ を選ぶ。
+    // 直近の Run Depth が書き出したものが常に正解。
+    {
+        struct CandObj {
+            std::string path;
+            std::string tag;
+            std::filesystem::file_time_type mtime;
+        };
+        std::vector<CandObj> objCandidates;
+        for (const auto& tag : {"k4a", "custom", "calib"}) {
+            std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + tag + ".obj";
+            std::error_code ec;
+            if (std::filesystem::exists(p, ec)) {
+                auto t = std::filesystem::last_write_time(p, ec);
+                if (!ec) objCandidates.push_back({p, tag, t});
             }
         }
-        break;
-
-    case GLFW_KEY_UP:
-        if (currentMainMode == REGISTRATION_MODE) {
-            g_voxelSize += 0.05f;
-            std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_DOWN:
-        if (currentMainMode == REGISTRATION_MODE) {
-            g_voxelSize = std::max(0.0f, g_voxelSize - 0.05f);
-            std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_COMMA:
-        if (currentMainMode == REGISTRATION_MODE) {
-            int prevGW = gGridWidth;
-            gGridWidth = std::max(64, gGridWidth / 2);
-            if (gGridWidth != prevGW) {
-                regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-                int gh = gGridWidth * screenMesh->loadedImageHeight / screenMesh->loadedImageWidth;
-                std::cout << "[Grid] " << prevGW << " -> " << gGridWidth
-                          << " (" << (gGridWidth+1)*(gh+1) << " vertices)" << std::endl;
-            }
-        }
-        break;
-
-    case GLFW_KEY_PERIOD:
-        if (currentMainMode == REGISTRATION_MODE) {
-            int prevGW = gGridWidth;
-            gGridWidth = std::min(512, gGridWidth * 2);
-            if (gGridWidth != prevGW) {
-                regenerateDepthMesh(screenMesh, gDepthScale, gMeshScale);
-                int gh = gGridWidth * screenMesh->loadedImageHeight / screenMesh->loadedImageWidth;
-                std::cout << "[Grid] " << prevGW << " -> " << gGridWidth
-                          << " (" << (gGridWidth+1)*(gh+1) << " vertices)" << std::endl;
-            }
-        }
-        break;
-
-    case GLFW_KEY_U:
-        if (currentMainMode == REGISTRATION_MODE) {
-            if (gCameraPreview.active) {
-                clearSegPoints();
-                gCameraPreview.captureAndFreeze(screenMesh);
-                depthSplitScreenMode = true;
-                splitScreenMode = true;
-                OrbitCamLeft_Target = OrbitCam;
-                OrbitCamRight_Screen = OrbitCam;
-                OrbitCamLeft_Target.currentTarget = TARGET_LIVER;
-                OrbitCamLeft_Target.cx = (gWindowWidth / 2) / 2.0f;
-                OrbitCamLeft_Target.cy = gWindowHeight / 2.0f;
-                OrbitCamRight_Screen.currentTarget = TARGET_TEXTURE;
-                OrbitCamRight_Screen.gRadius = OrbitCam.InitialRadius * 2.0f;
-                OrbitCamRight_Screen.cx = (gWindowWidth / 2) / 2.0f;
-                OrbitCamRight_Screen.cy = gWindowHeight / 2.0f;
-                std::cout << "[SegPoint] Left-click = FG(object), Right-click = BG(background)" << std::endl;
-                std::cout << "[SegPoint] Z key = Undo last point" << std::endl;
-                std::cout << "[SegPoint] Press I to run depth with segmentation" << std::endl;
-                std::cout << "[SegPoint] Press K to run depth WITHOUT segmentation" << std::endl;
-            } else if (gCameraPreview.frozen) {
-                depthSplitScreenMode = false;
-                splitScreenMode = false;
-                gCameraPreview.clearFrozen();
-                clearSegPoints();
-                std::cout << "[SegPoint] Restarting camera..." << std::endl;
-                gCameraPreview.start(screenMesh, 0, 1280, 720);
-            } else {
-                clearSegPoints();
-                std::cout << "[SegPoint] Starting camera. Press U again to freeze." << std::endl;
-                std::cout << "[SegPoint] After freeze: I=with seg, K=without seg" << std::endl;
-                gCameraPreview.start(screenMesh, 0, 1280, 720);
-            }
-        }
-        break;
-
-    case GLFW_KEY_I:
-        if (currentMainMode == REGISTRATION_MODE) {
-            showProgressOverlay(0.05f, "Preparing depth...");
-            std::vector<DepthRunnerPoint> segPoints;
-            if (gUserSegPoints.empty()) {
-                segPoints = createDefaultSegPoints(
-                    screenMesh->loadedImageWidth,
-                    screenMesh->loadedImageHeight);
-                std::cout << "[Seg] Using DEFAULT points (center=FG + 4corners=BG)" << std::endl;
-            } else {
-                segPoints = gUserSegPoints;
-                std::cout << "[Seg] Using " << segPoints.size() << " USER-SELECTED points" << std::endl;
-            }
-
-            if (gCameraPreview.frozen) {
-                gCameraPreview.runDepthFromFrozen(gDepthRunner, screenMesh, segPoints, showProgressOverlay);
-            } else if (gCameraPreview.active) {
-                gCameraPreview.captureAndRunDepthWithPoints(gDepthRunner, screenMesh, segPoints, showProgressOverlay);
-            } else if (gDepthRunner.isAvailable()) {
-                DepthRunnerIntegration::updateScreenMeshDepth(
-                    gDepthRunner, gDepthInputImage, screenMesh,
-                    128, 10.0f, 0.3f, segPoints,
-                    [](mCutMesh& mesh) { setUp(mesh); },
-                    showProgressOverlay
-                    );
-            }
-
-            showProgressOverlay(1.0f, "Depth complete!");
-            resetBoundaryMap();
-            gDepthScale = 0.3f;
-            clearSegPoints();
-            depthSplitScreenMode = false;
-            splitScreenMode = false;
-            registrationHandle.reset();
-            registrationHandle.state = RegistrationData::IDLE;
-            g_refineVertexIndices.clear();
-            g_cluster1Points.clear();
-            g_cluster2Points.clear();
-            g_targetPoints.clear();
-            g_showClusterVisualization = false;
-            g_showCorrespondencePoints = false;
-        }
-        break;
-
-    case GLFW_KEY_K:
-        if (currentMainMode == REGISTRATION_MODE) {
-            std::cout << "[Seg] Key K: Depth-only mode (NO segmentation)" << std::endl;
-            showProgressOverlay(0.05f, "Depth-only mode...");
-
-            if (gCameraPreview.frozen) {
-                gCameraPreview.runDepthFullFromFrozen(gDepthRunner, screenMesh, showProgressOverlay);
-            } else if (gCameraPreview.active) {
-                gCameraPreview.captureAndFreeze(screenMesh);
-                gCameraPreview.runDepthFullFromFrozen(gDepthRunner, screenMesh, showProgressOverlay);
-            } else if (gDepthRunner.isAvailable()) {
-                auto dummyPts = createDefaultSegPoints(
-                    screenMesh->loadedImageWidth,
-                    screenMesh->loadedImageHeight);
-                DepthRunnerIntegration::updateScreenMeshDepthFullOnly(
-                    gDepthRunner, gDepthInputImage, screenMesh,
-                    128, 10.0f, 0.3f, dummyPts,
-                    [](mCutMesh& mesh) { setUp(mesh); },
-                    showProgressOverlay
-                    );
-            }
-
-            showProgressOverlay(1.0f, "Depth complete!");
-            resetBoundaryMap();
-            gDepthScale = 0.3f;
-            clearSegPoints();
-            depthSplitScreenMode = false;
-            splitScreenMode = false;
-            registrationHandle.reset();
-            registrationHandle.state = RegistrationData::IDLE;
-            g_refineVertexIndices.clear();
-            g_cluster1Points.clear();
-            g_cluster2Points.clear();
-            g_targetPoints.clear();
-            g_showClusterVisualization = false;
-            g_showCorrespondencePoints = false;
-        }
-        break;
-
-    case GLFW_KEY_Y:
-        if(currentMainMode == REGISTRATION_MODE) {
-
-            splitScreenMode = false;
-
-            registrationHandle.reset();
-            registrationHandle.state = RegistrationData::IDLE;
-
-            OrbitCam.cx = gWindowWidth / 2.0f;
-            OrbitCam.cy = gWindowHeight / 2.0f;
-
-            std::cout << "=== Custom Registration Started ===" << std::endl;
-
-            std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D, tumorMesh3D, segmentMesh3D, gbMesh3D};
-            std::vector<std::string> names = {"Liver", "Portal", "Vein", "Tumor", "Segment", "Gallbladder"};
-
-            Reg3DCustom::performRegistrationMultiMeshWithScale(
-                organs, names, screenMesh, OrbitCam.cameraPos,
-                gGridWidth, gGridHeight(),
-                15,
-                0.005f,
-                0.35f,
-                true,
-                0.03f,
-                gDepthScale
-                );
-
-            std::cout << "=== Custom Registration Complete ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_O:
-        if (currentMainMode == REGISTRATION_MODE && (mode & GLFW_MOD_SHIFT)) {
-            /* Shift+O: depth scale grid search + HemiAuto */
-            std::cout << "\n=== Depth Scale Grid Search + HemiAuto (Shift+O) ===" << std::endl;
-            poseAutoSaveBeforeRegistration();
-
-            auto organs = getOrganList();
-            if (g_initOrganVertices.empty() || g_initOrganVertices.size() != organs.size()) {
-                std::cerr << "[Shift+O] No initial pose available." << std::endl;
-                break;
-            }
-
-            const float scales[] = { 0.15f, 0.20f, 0.25f, 0.30f, 0.35f, 0.40f, 0.50f };
-            const int   nScales  = (int)(sizeof(scales) / sizeof(scales[0]));
-
-            float bestScale = gDepthScale;
-            float bestRmse  = FLT_MAX;
-            std::vector<std::vector<GLfloat>> bestVerts(organs.size());
-            std::vector<std::vector<GLfloat>> bestNorms(organs.size());
-
-            for (int si = 0; si < nScales; si++) {
-                float ds = scales[si];
-
-                for (size_t i = 0; i < organs.size(); i++) {
-                    organs[i]->mVertices = g_initOrganVertices[i];
-                    organs[i]->mNormals  = g_initOrganNormals[i];
-                    setUp(*organs[i]);
-                }
-                regenerateDepthMesh(screenMesh, ds, gMeshScale);
-                resetRegistrationState();
-
-                Reg3D::BVHTree bvh;
-                bvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-                auto vis = Reg3DCustom::extractVisibleVerticesCustom(
-                    *liverMesh3D, bvh, OrbitCam.cameraPos, OrbitCam.cameraTarget);
-                if (vis.cloud->size() < 50) {
-                    std::cout << "[Shift+O] scale=" << ds << "  skip (few points)" << std::endl;
-                    continue;
-                }
-                g_cluster1Points      = vis.points;
-                g_cluster2Points.clear();
-                g_refineVertexIndices = vis.vertexIndices;
-                computeIdealVoxelSizes();
-                Reg3DCustom::performRegistrationSingleMesh(
-                    organs, liverMesh3D, vis.vertexIndices,
-                    screenMesh, OrbitCam.cameraPos,
-                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, ds, g_voxelSize);
-                computeUnifiedMetrics();
-                float rmse = registrationHandle.compRmse;
-                std::cout << "[Shift+O] scale=" << ds << "  compRMSE=" << rmse << std::endl;
-
-                if (rmse < bestRmse) {
-                    bestRmse  = rmse;
-                    bestScale = ds;
-                    for (size_t i = 0; i < organs.size(); i++) {
-                        bestVerts[i] = organs[i]->mVertices;
-                        bestNorms[i] = organs[i]->mNormals;
-                    }
-                }
-            }
-
-            gDepthScale = bestScale;
-            regenerateDepthMesh(screenMesh, bestScale, gMeshScale);
-            for (size_t i = 0; i < organs.size(); i++) {
-                organs[i]->mVertices = bestVerts[i];
-                organs[i]->mNormals  = bestNorms[i];
-                setUp(*organs[i]);
-            }
-            computeUnifiedMetrics();
-            std::cout << "[Shift+O] Best: scale=" << bestScale
-                      << "  compRMSE=" << bestRmse << std::endl;
-
-            g_bestSessionCompRmse = FLT_MAX;
-            g_bestSessionVertices.clear();
-            g_bestSessionNormals.clear();
-            registrationHandle.state = RegistrationData::REGISTERED;
-            registrationHandle.useRegistration = true;
-            poseSaveToLibrary();
-
-        } else if (currentMainMode == REGISTRATION_MODE) {
-            /* Key O: camera view registration */
-            std::cout << "\n============================================" << std::endl;
-            std::cout << "  Camera View-Based Registration (Custom)" << std::endl;
-            std::cout << "============================================\n" << std::endl;
-
-            resetRegistrationState();
-
-            Reg3D::BVHTree cameraBvhTree;
-            cameraBvhTree.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-
-            auto visibility = Reg3DCustom::extractVisibleVerticesCustom(
-                *liverMesh3D, cameraBvhTree,
-                OrbitCam.cameraPos, OrbitCam.cameraTarget);
-
-            if (visibility.cloud->size() < 50) {
-                std::cerr << "[X] ERROR: Not enough visible points ("
-                          << visibility.cloud->size() << " < 50)" << std::endl;
-                break;
-            }
-
-            g_cluster1Points = visibility.points;
-            g_cluster2Points.clear();
-            g_refineVertexIndices = visibility.vertexIndices;
-
-            std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D, tumorMesh3D, segmentMesh3D, gbMesh3D};
-
-            Reg3DCustom::performRegistrationSingleMesh(
-                organs, liverMesh3D, visibility.vertexIndices,
-                screenMesh, OrbitCam.cameraPos,
-                gGridWidth, gGridHeight(),
-                15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
-
-            std::cout << "=== Camera View Registration Complete ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_N:
-        if (currentMainMode == REGISTRATION_MODE) {
-            if (registrationHandle.state == RegistrationData::REGISTERED) {
-                if (g_refineVertexIndices.empty()) {
-                    std::cerr << "[Refine] No visible vertex indices. Use Key O first." << std::endl;
-                    break;
-                }
-                std::cout << "\n=== Normal-Compatible Refinement START ===" << std::endl;
-
-                std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                                  tumorMesh3D, segmentMesh3D, gbMesh3D};
-                NormalRefine::RefineParams params;
-
-                if (NormalRefine::initRefine(g_refineState, liverMesh3D,
-                                             g_refineVertexIndices,
-                                             screenMesh, organs,
-                                             gGridWidth, gGridHeight(), gDepthScale, params,
-                                             NormalRefine::NORMAL_COMPAT)) {
-                    computeUnifiedMetrics();
-                    g_refineState.initialRMSE = registrationHandle.compRmse;
-                    g_refineState.bestRMSE    = registrationHandle.compRmse;
-                    std::cout << "[Refine] Unified initial RMSE: " << registrationHandle.compRmse << std::endl;
-                    registrationHandle.state = RegistrationData::REFINING;
-                } else {
-                    std::cerr << "[Refine] Initialization failed" << std::endl;
-                }
-
-            } else if (registrationHandle.state == RegistrationData::REFINING) {
-                g_refineState.active = false;
-                registrationHandle.state = RegistrationData::REGISTERED;
-                bool improved = g_refineState.bestRMSE < g_refineState.initialRMSE;
-                g_refineState.restoreMeshes();
-                if (improved) {
-                    NormalRefine::applyIncrementalTransform(
-                        g_refineState.bestCumulativeTransform,
-                        g_refineState.organMeshes);
-                }
-                std::cout << "\n=== Normal-Compatible Refinement STOPPED ===" << std::endl;
-                std::cout << "  Best RMSE: " << g_refineState.bestRMSE
-                          << " (iter " << g_refineState.bestIteration << ")" << std::endl;
-                std::cout << (improved ? "  >> Reverted to best" : "  >> Reverted to initial") << std::endl;
-                registrationHandle.refineCount++;
-                registrationHandle.refineInitialRMSE   = g_refineState.initialRMSE;
-                registrationHandle.refineBestRMSE      = g_refineState.bestRMSE;
-                registrationHandle.refineBestIteration  = g_refineState.bestIteration;
-                computeUnifiedMetrics();
-                poseSaveToLibrary();
-            }
-        }
-        break;
-
-    case GLFW_KEY_B:
-        if (currentMainMode == REGISTRATION_MODE) {
-            if (registrationHandle.state == RegistrationData::REGISTERED) {
-                if (g_refineVertexIndices.empty()) {
-                    std::cerr << "[SRT-V] No visible vertex indices. Use Key O first." << std::endl;
-                    break;
-                }
-                std::cout << "\n=== SRT Variance-Weighted Refinement START ===" << std::endl;
-
-                std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                                  tumorMesh3D, segmentMesh3D, gbMesh3D};
-                NormalRefine::RefineParams params;
-                params.nSamples    = 11;
-                params.sampleRange = 0.10f;
-                params.srtSlope    = 0.02f;
-
-                if (NormalRefine::initRefine(g_refineState, liverMesh3D,
-                                             g_refineVertexIndices,
-                                             screenMesh, organs,
-                                             gGridWidth, gGridHeight(), gDepthScale, params,
-                                             NormalRefine::SRT_VARIANCE)) {
-                    computeUnifiedMetrics();
-                    g_refineState.initialRMSE = registrationHandle.compRmse;
-                    g_refineState.bestRMSE    = registrationHandle.compRmse;
-                    std::cout << "[SRT-V] Unified initial RMSE: " << registrationHandle.compRmse << std::endl;
-                    registrationHandle.state = RegistrationData::REFINING;
-                } else {
-                    std::cerr << "[SRT-V] Initialization failed" << std::endl;
-                }
-
-            } else if (registrationHandle.state == RegistrationData::REFINING) {
-                g_refineState.active = false;
-                registrationHandle.state = RegistrationData::REGISTERED;
-                bool improved = g_refineState.bestRMSE < g_refineState.initialRMSE;
-                g_refineState.restoreMeshes();
-                if (improved) {
-                    NormalRefine::applyIncrementalTransform(
-                        g_refineState.bestCumulativeTransform,
-                        g_refineState.organMeshes);
-                }
-                std::cout << "\n=== SRT Variance Refinement STOPPED ===" << std::endl;
-                std::cout << "  Best RMSE: " << g_refineState.bestRMSE
-                          << " (iter " << g_refineState.bestIteration << ")" << std::endl;
-                std::cout << (improved ? "  >> Reverted to best" : "  >> Reverted to initial") << std::endl;
-                registrationHandle.refineCount++;
-                registrationHandle.refineInitialRMSE   = g_refineState.initialRMSE;
-                registrationHandle.refineBestRMSE      = g_refineState.bestRMSE;
-                registrationHandle.refineBestIteration  = g_refineState.bestIteration;
-                computeUnifiedMetrics();
-                poseSaveToLibrary();
-            }
-        }
-        break;
-
-    case GLFW_KEY_L:
-        if (currentMainMode == REGISTRATION_MODE) {
-            std::cout << "\n=== Raycast-Based Registration (Auto) ===\n" << std::endl;
-
-            resetRegistrationState();
-
-            Reg3D::BVHTree convergenceBvhTree;
-            convergenceBvhTree.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-
-            Reg3D::RaycastClusterer clusterer(convergenceBvhTree);
-            auto clusteringResult = clusterer.performClustering(
-                liverMesh3D->mVertices, liverMesh3D->mIndices);
-
-            Reg3DCustom::NoOpen3DRegistration tempReg;
-            auto targetCloud = tempReg.extractFrontFacePoints(*screenMesh, gGridWidth, gGridHeight(), gDepthScale);
-            auto selectedClusters = Reg3DCustom::selectTop2ClustersCustom(clusteringResult, targetCloud);
-
-            std::vector<size_t> mergedIndices;
-            g_cluster1Points.clear();
-            g_cluster2Points.clear();
-
-            for (size_t c = 0; c < selectedClusters.size(); c++) {
-                for (int idx : selectedClusters[c].visibleVertexIndices)
-                    mergedIndices.push_back(static_cast<size_t>(idx));
-                for (const auto& v : selectedClusters[c].visibleVertices) {
-                    if (c == 0) g_cluster1Points.push_back(v);
-                    else        g_cluster2Points.push_back(v);
-                }
-            }
-
-            if (mergedIndices.size() < 50) {
-                std::cerr << "[X] Not enough cluster vertices" << std::endl;
-                break;
-            }
-
-            std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D, tumorMesh3D, segmentMesh3D, gbMesh3D};
-
-            Reg3DCustom::performRegistrationSingleMesh(
-                organs, liverMesh3D, mergedIndices,
-                screenMesh, OrbitCam.cameraPos,
-                gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
-
-            std::cout << "=== Registration Complete ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_W:
-        if (currentMainMode == REGISTRATION_MODE) {
-            std::cout << "\n=== Multi-Start FGR with Adaptive Radius ===\n" << std::endl;
-
-            poseAutoSaveBeforeRegistration();
-            resetRegistrationState();
-
-            Reg3D::BVHTree msFgrBvh;
-            msFgrBvh.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-
-            Reg3D::RaycastClusterer clusterer(msFgrBvh);
-            auto clusteringResult = clusterer.performClustering(
-                liverMesh3D->mVertices, liverMesh3D->mIndices);
-
-            Reg3DCustom::NoOpen3DRegistration reg;
-            auto targetCloud = reg.extractFrontFacePoints(
-                *screenMesh, gGridWidth, gGridHeight(), gDepthScale);
-
-            if (targetCloud->size() < 100) {
-                std::cerr << "[W] Not enough target points" << std::endl;
-                break;
-            }
-
-            struct ClusterFGRResult {
-                int clusterId;
-                float fgrFitness;
-                float fgrRmse;
-                std::vector<size_t> vertexIndices;
-                float adaptiveVoxel;
-            };
-
-            std::vector<ClusterFGRResult> fgrResults;
-
-            for (const auto& cluster : clusteringResult.clusters) {
-                if (cluster.visibleVertexIndices.size() < 50) continue;
-
-                glm::vec3 bboxMin(FLT_MAX), bboxMax(-FLT_MAX);
-                for (const auto& v : cluster.visibleVertices) {
-                    bboxMin = glm::min(bboxMin, v);
-                    bboxMax = glm::max(bboxMax, v);
-                }
-                float bboxDiag = glm::length(bboxMax - bboxMin);
-                float adaptiveVoxel = glm::clamp(bboxDiag * 0.05f, 0.3f, 1.5f);
-
-                auto sourceCloud = std::make_shared<Reg3DCustom::PointCloud>();
-                for (int idx : cluster.visibleVertexIndices) {
-                    size_t i = static_cast<size_t>(idx);
-                    if (i * 3 + 2 < liverMesh3D->mVertices.size()) {
-                        glm::vec3 pos(liverMesh3D->mVertices[i*3],
-                                      liverMesh3D->mVertices[i*3+1],
-                                      liverMesh3D->mVertices[i*3+2]);
-                        if (!liverMesh3D->mNormals.empty() && i*3+2 < liverMesh3D->mNormals.size()) {
-                            glm::vec3 nrm(liverMesh3D->mNormals[i*3],
-                                          liverMesh3D->mNormals[i*3+1],
-                                          liverMesh3D->mNormals[i*3+2]);
-                            sourceCloud->addPointWithNormal(pos, nrm);
-                        } else {
-                            sourceCloud->addPoint(pos);
-                        }
-                    }
-                }
-
-                auto sourceDown = reg.preprocess(sourceCloud, adaptiveVoxel, true);
-                auto targetDown = reg.preprocess(targetCloud, adaptiveVoxel, false);
-
-                if (sourceDown->size() < 10 || targetDown->size() < 10) continue;
-
-                auto sourceFpfh = reg.computeFPFH(sourceDown, adaptiveVoxel);
-                auto targetFpfh = reg.computeFPFH(targetDown, adaptiveVoxel);
-
-                auto fgrResult = reg.fastGlobalRegistration(
-                    sourceDown, targetDown, sourceFpfh, targetFpfh, adaptiveVoxel);
-
-                std::cout << "[W] Cluster " << cluster.clusterId
-                          << " bbox=" << bboxDiag
-                          << " voxel=" << adaptiveVoxel
-                          << " fitness=" << fgrResult.fitness
-                          << " rmse=" << fgrResult.inlier_rmse << std::endl;
-
-                fgrResults.push_back({
-                    cluster.clusterId,
-                    fgrResult.fitness,
-                    fgrResult.inlier_rmse,
-                    std::vector<size_t>(cluster.visibleVertexIndices.begin(),
-                                        cluster.visibleVertexIndices.end()),
-                    adaptiveVoxel
-                });
-            }
-
-            if (fgrResults.empty()) {
-                std::cerr << "[W] No valid FGR results" << std::endl;
-                break;
-            }
-
-            std::sort(fgrResults.begin(), fgrResults.end(),
-                      [](const ClusterFGRResult& a, const ClusterFGRResult& b) {
-                          return a.fgrFitness > b.fgrFitness;
-                      });
-
-            int topN = std::min(3, static_cast<int>(fgrResults.size()));
-            std::cout << "\n[W] Running full registration on top " << topN << " clusters..." << std::endl;
-
-            float bestCompRmse = FLT_MAX;
-            int bestClusterId = -1;
-
-            std::vector<std::vector<float>> savedVertices(6), savedNormals(6);
-            std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D,
-                                              tumorMesh3D, segmentMesh3D, gbMesh3D};
-            for (int m = 0; m < 6; m++) {
-                savedVertices[m] = organs[m]->mVertices;
-                savedNormals[m]  = organs[m]->mNormals;
-            }
-
-            std::vector<float> bestVertices0, bestNormals0;
-
-            for (int i = 0; i < topN; i++) {
-                for (int m = 0; m < 6; m++) {
-                    organs[m]->mVertices = savedVertices[m];
-                    organs[m]->mNormals  = savedNormals[m];
-                }
-
-                std::cout << "\n[W] Candidate " << (i+1) << "/" << topN
-                          << " (cluster " << fgrResults[i].clusterId
-                          << ", fitness=" << fgrResults[i].fgrFitness << ")" << std::endl;
-
-                Reg3DCustom::performRegistrationSingleMesh(
-                    organs, liverMesh3D, fgrResults[i].vertexIndices,
-                    screenMesh, OrbitCam.cameraPos,
-                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
-
-                computeUnifiedMetrics();
-                float compRmse = registrationHandle.compRmse;
-
-                std::cout << "[W] Candidate " << (i+1) << " CompRMSE=" << compRmse << std::endl;
-
-                if (compRmse < bestCompRmse) {
-                    bestCompRmse = compRmse;
-                    bestClusterId = fgrResults[i].clusterId;
-                    bestVertices0 = organs[0]->mVertices;
-                    bestNormals0  = organs[0]->mNormals;
-                    for (int m = 0; m < 6; m++) {
-                        savedVertices[m] = organs[m]->mVertices;
-                        savedNormals[m]  = organs[m]->mNormals;
-                    }
-                }
-            }
-
-            for (int m = 0; m < 6; m++) {
-                organs[m]->mVertices = savedVertices[m];
-                organs[m]->mNormals  = savedNormals[m];
-            }
-
-            gUIManager.state.regMethod = 1;
-            registrationHandle.state = RegistrationData::REGISTERED;
-            registrationHandle.useRegistration = true;
-            computeUnifiedMetrics();
-            poseSaveToLibrary();
-
-            std::cout << "\n[W] Best cluster: " << bestClusterId
-                      << " CompRMSE=" << bestCompRmse << std::endl;
-            std::cout << "=== Multi-Start FGR Complete ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_F:
-        if (currentMainMode == REGISTRATION_MODE) {
-            openImageFilePicker();
-        }
-        break;
-
-    case GLFW_KEY_V:
-        if (currentMainMode == REGISTRATION_MODE && (mode & GLFW_MOD_SHIFT)) {
-            std::cout << "\n=== BIPOP-CMA-ES Multi-Start (Shift+V) ===" << std::endl;
-            if (registrationHandle.compRmse == 0.0f) {
-                std::cerr << "[Shift+V] No registration yet. Run HemiAuto first." << std::endl;
-                break;
-            }
-            g_stepStartTime = std::chrono::steady_clock::now();
-            g_sessionBipopN++;
-            gUIManager.state.regMethod = 3;
-            poseAutoSaveBeforeRegistration();
-            auto organs = getOrganList();
-            computeUnifiedMetrics();
-            float rmse_before = registrationHandle.compRmse;
-            std::cout << "[Shift+V] Current compRMSE: " << rmse_before << std::endl;
-
-            /* 現在の頂点をスナップショット */
-            std::vector<std::vector<GLfloat>> start_v(organs.size());
-            std::vector<std::vector<GLfloat>> start_n(organs.size());
-            for (size_t i = 0; i < organs.size(); i++) {
-                if (organs[i]) {
-                    start_v[i] = organs[i]->mVertices;
-                    start_n[i] = organs[i]->mNormals;
-                }
-            }
-
-            float best_rmse = rmse_before;
-            std::vector<std::vector<GLfloat>> best_v = start_v;
-            std::vector<std::vector<GLfloat>> best_n = start_n;
-
-            const int N_STARTS = 10;
-            std::mt19937 rng(std::random_device{}());
-            std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
-
-            for (int run = 0; run < N_STARTS; run++) {
-                /* 毎回start_vに戻す */
-                for (size_t i = 0; i < organs.size(); i++) {
-                    if (organs[i]) {
-                        organs[i]->mVertices = start_v[i];
-                        organs[i]->mNormals  = start_n[i];
-                        setUp(*organs[i]);
-                    }
-                }
-
-                CmaesRefine::Params p;
-                p.verbose        = true;
-                p.log_every      = 100;
-                p.save_debug_jpg = false;
-                p.maxgen         = 300;
-                p.tx_range = 1.0f; p.ty_range = 1.0f; p.tz_range = 1.0f;
-                p.rx_range = 20.0f; p.ry_range = 20.0f; p.rz_range = 20.0f;
-                p.scale_lo = 0.85f; p.scale_hi = 1.15f;
-
-                float tx_perturb = 0.0f, ty_perturb = 0.0f, tz_perturb = 0.0f;
-                float rx_perturb = 0.0f, ry_perturb = 0.0f, rz_perturb = 0.0f;
-                float sc_perturb = 1.0f;
-                std::string regime;
-
-                if (run == 0) {
-                    /* Run 0: 摂動なし・sigma0小（精密ベースライン） */
-                    p.sigma0 = 0.2;
-                    regime = "Baseline";
-                } else if (run <= 4) {
-                    /* Run 1-4: Regime 2（小sigma0・小摂動・局所探索） */
-                    p.sigma0 = 0.05f + dist01(rng) * 0.25f; /* 0.05〜0.30 */
-                    tx_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
-                    ty_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
-                    tz_perturb = (dist01(rng)*2.0f-1.0f) * 0.5f;
-                    rx_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
-                    ry_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
-                    rz_perturb = (dist01(rng)*2.0f-1.0f) * 10.0f;
-                    sc_perturb = 0.95f + dist01(rng) * 0.10f; /* 0.95〜1.05 */
-                    regime = "Regime2(local)";
-                } else {
-                    /* Run 5-9: Regime 1（大sigma0・大摂動・広域探索） */
-                    p.sigma0 = 0.30f + dist01(rng) * 0.50f; /* 0.30〜0.80 */
-                    tx_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
-                    ty_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
-                    tz_perturb = (dist01(rng)*2.0f-1.0f) * 1.5f;
-                    rx_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
-                    ry_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
-                    rz_perturb = (dist01(rng)*2.0f-1.0f) * 30.0f;
-                    sc_perturb = 0.90f + dist01(rng) * 0.20f; /* 0.90〜1.10 */
-                    regime = "Regime1(global)";
-                }
-
-                /* 初期摂動を適用 */
-                if (run > 0) {
-                    CmaesRefine::applyIncrementalSRT(organs,
-                                                     tx_perturb, ty_perturb, tz_perturb,
-                                                     rx_perturb, ry_perturb, rz_perturb,
-                                                     sc_perturb);
-                    for (size_t i = 0; i < organs.size(); i++)
-                        if (organs[i]) setUp(*organs[i]);
-                }
-
-                std::cout << "[Shift+V] Run " << (run+1) << "/" << N_STARTS
-                          << "  " << regime
-                          << "  sigma0=" << std::fixed << std::setprecision(2) << p.sigma0
+        // Most recent first
+        std::sort(objCandidates.begin(), objCandidates.end(),
+                  [](const CandObj& a, const CandObj& b){ return a.mtime > b.mtime; });
+
+        g_objSourcePath.clear();
+        if (!objCandidates.empty()) {
+            const auto& chosen = objCandidates.front();
+            g_objSourcePath = chosen.path;
+            // 古い OBJ もまだディスクにあるならログで警告 (混乱を防ぐため)
+            if (objCandidates.size() > 1) {
+                std::cout << "[main] Multiple existing OBJs found, picking most recent:"
                           << std::endl;
+                for (const auto& c : objCandidates) {
+                    std::cout << "[main]   " << (c.path == chosen.path ? "* " : "  ")
+                    << c.path << std::endl;
+                }
+            }
+            std::cout << "[main] Using existing OBJ: " << chosen.path << std::endl;
 
-                CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
-                                                         gGridWidth, gGridHeight(), gDepthScale, p);
-                computeUnifiedMetrics();
-                float rmse_run = registrationHandle.compRmse;
-                std::cout << "[Shift+V] Run " << (run+1)
-                          << " compRMSE=" << std::setprecision(6) << rmse_run
-                          << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
+            // 起動時の g_intrinsicsSource をその OBJ のソースに合わせる。
+            // これがないと OBJ は custom メッシュなのに intrinsicsSource=Kinect、
+            // という不整合が起きて intrinsics_k4a.txt の方を読みに行ってしまう。
+            if      (chosen.tag == "custom") g_intrinsicsSource = 2;
+            else if (chosen.tag == "calib")  g_intrinsicsSource = 3;
+            else                             g_intrinsicsSource = 1;  // k4a
+            std::cout << "[main] Intrinsics source aligned to OBJ tag: "
+                      << chosen.tag << " (g_intrinsicsSource=" << g_intrinsicsSource << ")"
+                      << std::endl;
+        }
+    }
+    if (!g_objSourcePath.empty()) {
+        if (!setupObjScene()) return -1;
+        snapshotInitialPose();  // 初期ポーズをバックアップ（プリセット回転用）
+        computeTargetSubsetAabbs();   // Phase 2: target cloud の AABB 3 通り (full/+X/-X)
+        computeSourceLiverSubsetAabbs();   // Phase 2 v2: source liver の AABB 3 通り
+    } else {
+        std::cout << "[main] No existing pc_metric_pinhole_masked_*.obj found" << std::endl;
+        std::cout << "[main] Image-only mode."
+                     " Drop image, click FG/BG points, press R to run depth."
+                  << std::endl;
+        gApp.mode = AppMode::kImageOnly;
 
-                if (rmse_run < best_rmse) {
-                    best_rmse = rmse_run;
-                    for (size_t i = 0; i < organs.size(); i++) {
-                        if (organs[i]) {
-                            best_v[i] = organs[i]->mVertices;
-                            best_n[i] = organs[i]->mNormals;
+        const std::vector<std::string> candidates = {
+            DEPTH_OUTPUT_PATH + "original.jpg",
+            gDepthInputImage
+        };
+        bool fallbackLoaded = false;
+        for (const auto& p : candidates) {
+            if (p.empty() || !std::filesystem::exists(p)) continue;
+            if (ImageSession::loadWithIntrinsics(gApp, p, g_intrinsics)) { fallbackLoaded = true; break; }
+        }
+        if (!fallbackLoaded) {
+            std::cout << "[main] No fallback image -- viewport stays black"
+                         " until you drop a file." << std::endl;
+        }
+    }
+
+    double lastTime = glfwGetTime();
+    while (!glfwWindowShouldClose(gWindow)) {
+        double now = glfwGetTime();
+        float  dt  = (float)(now - lastTime);
+        lastTime   = now;
+
+        showFPS(gWindow);
+        glfwPollEvents();
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        syncUIState();
+
+        // マスク選択モードでは通常のUIを表示しない
+        if (gApp.mode != AppMode::kMaskSelection) {
+            gUI.draw(gWindowWidth, gWindowHeight);
+        }
+
+        // screenMesh 描画モード切替（点群 / 三角形）と点サイズ調整
+        //   - レジストレーションモード時のみ表示（screenMesh 自体がそのときだけ意味を持つ）
+        //   - チェックを外すと従来の三角形描画に戻る（緊急時のフォールバック）
+
+        // ----------------------------------------------------------------
+        //  Ctrl+G (V3-R) Quadrant Selector
+        //  -------------------------------------------------------------
+        //  Region (Shift+R) と LR (Y) のラベルを合成した 4 象限から、
+        //  Ctrl+G の最適化対象とする象限をユーザが選択する。
+        //  - 解剖学的配置: 上=anterior, 下=posterior, 左=患者の右, 右=患者の左
+        //  - subset 頂点数 (重複排除後) をリアルタイム表示
+        //  - ラベル未計算の場合は警告表示 (Shift+R / Y を促す)
+        // ----------------------------------------------------------------
+        if (gApp.mode == AppMode::kRegistration) {
+            ImGui::SetNextWindowBgAlpha(0.7f);
+            ImGui::Begin("Ctrl+G Quadrant Selector",
+                         nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize);
+
+            const bool labelsReady = g_liverRegion.valid() && g_liverLR.valid();
+            if (!labelsReady) {
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                                   "Labels not computed yet.");
+                ImGui::TextWrapped("Press Shift+R (anterior/rim/posterior)"
+                                   " and Y (left/right) first,"
+                                   " or H (auto-compute both).");
+            }
+
+            // 象限ごとの頂点数 (ラベル準備済みのときだけ計算)
+            int n_AR = 0, n_AL = 0, n_PR = 0, n_PL = 0;
+            if (labelsReady) {
+                LiverLeftRightLabel::countByQuadrant(
+                    g_liverRegion.labels, g_liverLR.labels,
+                    n_AR, n_AL, n_PR, n_PL);
+            }
+
+            ImGui::Text("Anatomical orientation:");
+            ImGui::Text("  Top=anterior, Left=patient's right");
+            ImGui::Separator();
+
+            // 2×2 grid: BeginTable で枠線付きの 2×2 を作る
+            const ImGuiTableFlags tableFlags =
+                ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchSame;
+            if (ImGui::BeginTable("##quad_grid", 2, tableFlags)) {
+                using LR = LiverLeftRightLabel::QuadrantMask;
+                auto checkbox_cell = [](const char* shortName,
+                                        int   nv,
+                                        uint8_t bit,
+                                        uint8_t& mask)
+                {
+                    bool on = (mask & bit) != 0;
+                    char label[64];
+                    if (nv > 0) {
+                        std::snprintf(label, sizeof(label),
+                                      "%s\n(%d v)", shortName, nv);
+                    } else {
+                        std::snprintf(label, sizeof(label),
+                                      "%s\n(--)", shortName);
+                    }
+                    if (ImGui::Checkbox(label, &on)) {
+                        if (on)  mask |= bit;
+                        else     mask &= static_cast<uint8_t>(~bit);
+                    }
+                };
+
+                // Row 1: anterior
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                checkbox_cell("ant_R", n_AR, LR::QUAD_AR, g_activeQuadrantMask);
+                ImGui::TableNextColumn();
+                checkbox_cell("ant_L", n_AL, LR::QUAD_AL, g_activeQuadrantMask);
+
+                // Row 2: posterior
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                checkbox_cell("pos_R", n_PR, LR::QUAD_PR, g_activeQuadrantMask);
+                ImGui::TableNextColumn();
+                checkbox_cell("pos_L", n_PL, LR::QUAD_PL, g_activeQuadrantMask);
+
+                ImGui::EndTable();
+            }
+
+            ImGui::Separator();
+
+            // subset 頂点数のプレビュー (ラベル準備済みのときだけ)
+            if (labelsReady) {
+                auto subset = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+                    g_liverRegion.labels, g_liverLR.labels,
+                    g_activeQuadrantMask);
+                const int total = static_cast<int>(g_liverRegion.labels.size());
+                ImGui::Text("Subset: %d / %d unique vertices",
+                            (int)subset.size(), total);
+                std::string maskStr = LiverLeftRightLabel::quadrantMaskString(
+                    g_activeQuadrantMask);
+                ImGui::Text("Mask: %s (0x%02X)",
+                            maskStr.c_str(), (unsigned)g_activeQuadrantMask);
+            } else {
+                ImGui::Text("Subset: (n/a)");
+                std::string maskStr = LiverLeftRightLabel::quadrantMaskString(
+                    g_activeQuadrantMask);
+                ImGui::Text("Mask: %s (0x%02X)",
+                            maskStr.c_str(), (unsigned)g_activeQuadrantMask);
+            }
+
+            // 便利ボタン
+            if (ImGui::Button("All")) {
+                g_activeQuadrantMask = LiverLeftRightLabel::QUAD_ALL;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Anterior only")) {
+                g_activeQuadrantMask = static_cast<uint8_t>(
+                    LiverLeftRightLabel::QUAD_AR |
+                    LiverLeftRightLabel::QUAD_AL);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Right only")) {
+                g_activeQuadrantMask = static_cast<uint8_t>(
+                    LiverLeftRightLabel::QUAD_AR |
+                    LiverLeftRightLabel::QUAD_PR);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("None")) {
+                g_activeQuadrantMask = LiverLeftRightLabel::QUAD_NONE;
+            }
+
+            // -----------------------------------------------------------
+            //  [NEW V3R/SearchMode] Reduced-DoF search dimension
+            //  --------------------------------------------------------
+            //  Switches the CMA-ES decision-vector dimension for Ctrl+G:
+            //    7-DoF (default): tx,ty,tz, rx,ry,rz, scale
+            //                     (V3R byte-identical when other Ctrl+G
+            //                      knobs are also at defaults)
+            //    6-DoF rigid    : tx,ty,tz, rx,ry,rz       (scale fixed=1)
+            //    4-DoF XY+RX+RY : tx,ty, rx,ry             (tz/rz/scale=0/0/1)
+            //
+            //  Motivation (HANDOVER_UNIFIED_ALL.md §III/3.1): repeated
+            //  Ctrl+G presses can drift into scale blowup -- each
+            //  session adopts a scale slightly >1.0 which accumulates
+            //  until the mask is inflated. SIX_DOF_RIGID and
+            //  FOUR_DOF_XYRXRY remove the offending DoFs as a hard
+            //  constraint rather than a soft penalty.
+            //
+            //  Recommended workflow:
+            //    1) 7-DoF Ctrl+G    (coarse, 1-2 sessions)
+            //    2) 6-DoF rigid     (after scale converged, 1-2 sessions)
+            //    3) 4-DoF XY+RX+RY  (final polish; no scale/Z/roll drift)
+            //
+            //  The wrapper in RegistrationActions.h additionally
+            //  pre-scales tx_range / ry_range / jitter_local_t etc. by
+            //  0.7x (SIX_DOF_RIGID) or 0.5x (FOUR_DOF_XYRXRY) so the
+            //  reduced-DoF search stays appropriately local without
+            //  needing a separate sigma0 knob.
+            // -----------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.85f, 1.0f, 0.7f, 1.0f),
+                               "Search dimension (Ctrl+G)");
+
+            {
+                int mode = (int)g_ctrlgSearchMode;
+                if (ImGui::RadioButton("7-DoF: T+R+Scale (default)##ctrlg_search_mode",
+                                       &mode, 0)) {
+                    g_ctrlgSearchMode =
+                        CmaesRefineV3R::SearchMode::SEVEN_DOF;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Full 7-DoF search:\n"
+                        "  tx, ty, tz, rx, ry, rz, scale.\n"
+                        "Default. Byte-identical to original V3R when\n"
+                        "other Ctrl+G knobs (AR-vis, caudal, beta) are\n"
+                        "also at defaults.");
+                }
+
+                if (ImGui::RadioButton("6-DoF rigid: T+R, scale=1##ctrlg_search_mode",
+                                       &mode, 1)) {
+                    g_ctrlgSearchMode =
+                        CmaesRefineV3R::SearchMode::SIX_DOF_RIGID;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Rigid 6-DoF: tx, ty, tz, rx, ry, rz; scale\n"
+                        "frozen at 1.0.\n"
+                        "Use after the first Ctrl+G has settled scale\n"
+                        "to prevent mask-expansion drift on repeated runs.\n"
+                        "Range and jitter auto-shrunk to 0.7x.");
+                }
+
+                if (ImGui::RadioButton("4-DoF: TX, TY, RX, RY only##ctrlg_search_mode",
+                                       &mode, 2)) {
+                    g_ctrlgSearchMode =
+                        CmaesRefineV3R::SearchMode::FOUR_DOF_XYRXRY;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Minimal 4-DoF: tx, ty, rx, ry only.\n"
+                        "tz, rz, scale all locked at identity.\n"
+                        "Final polish stage; assumes a fixed-AR-camera\n"
+                        "workflow where scale/roll/depth have already\n"
+                        "converged.\n"
+                        "Range and jitter auto-shrunk to 0.5x.");
+                }
+
+                // Mode-aware diagnostic line
+                const char* sigma_note = "ranges 1.0x, jitter 1.0x (V3R default)";
+                switch (g_ctrlgSearchMode) {
+                case CmaesRefineV3R::SearchMode::SEVEN_DOF:
+                    sigma_note = "ranges 1.0x, jitter 1.0x (V3R default)";
+                    break;
+                case CmaesRefineV3R::SearchMode::SIX_DOF_RIGID:
+                    sigma_note = "ranges 0.7x, jitter 0.7x";
+                    break;
+                case CmaesRefineV3R::SearchMode::FOUR_DOF_XYRXRY:
+                    sigma_note = "ranges 0.5x, jitter 0.5x";
+                    break;
+                }
+                ImGui::TextDisabled("  auto: %s", sigma_note);
+
+                ImGui::SliderFloat("min_match_ratio##ctrlg_search_mode",
+                                   &g_ctrlgMinMatchRatio,
+                                   0.10f, 0.50f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Minimum fraction of source voxel cells that must\n"
+                        "find a target NN within max_dist_sq; otherwise\n"
+                        "penalty_value (9.9) is returned for that sample.\n"
+                        "V3R / ParamsV3 default is 0.30.\n"
+                        "Lower values (0.15 - 0.25) can help 4-DoF /\n"
+                        "6-DoF modes when the constrained search starts\n"
+                        "from a poor pose that would otherwise hit the\n"
+                        "penalty floor at Gen 0.");
+                }
+            }
+
+            // -----------------------------------------------------------
+            //  Rim-weighted V3R extension (opt-in)
+            //  --------------------------------------------------------
+            //  Three controls stacked on top of the 4-quadrant selector.
+            //  When all three are at their defaults
+            //    (AR-vis = OFF, β = 0.0, Show RIM pairs = OFF)
+            //  Ctrl+G behaves identically to the original V3R (and at
+            //  QUAD_ALL, byte-identical to Shift+G). Ticking any of
+            //  them activates the corresponding extension.
+            // -----------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                               "Rim-weighted (opt-in)");
+
+            ImGui::Checkbox("AR-visible only (filter source subset)",
+                            &g_ctrlgUseArVisFilter);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Restrict source vertices to those "
+                                  "visible from the fixed AR camera "
+                                  "(cam_pos=(0,0,0), look-at=+Z).\n"
+                                  "Removes back-side mesh vertices that have no "
+                                  "counterpart in the single-sided depth target.\n"
+                                  "OFF = byte-identical to Shift+G at QUAD_ALL.");
+            }
+
+            // -----------------------------------------------------------
+            //  Only-Caudal (R-feat-2): anatomical CC-axis filter.
+            //  Independent of AR-vis. Uses g_liverCC labels (Shift+H).
+            //  Weak/uncomputed states only show a warning here -- the
+            //  CC sign Flip toggle lives in the Initial Orientation
+            //  panel (drawAnatomicalAxesStatus) to keep one source of
+            //  truth; avoid duplicating it on Ctrl+G.
+            // -----------------------------------------------------------
+            ImGui::Checkbox("Only Caudal rim (mesh-intrinsic)",
+                            &g_ctrlgUseCaudalOnly);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Restrict source vertices to the caudal "
+                                  "(foot-side) half of the mesh, classified by "
+                                  "LiverCranioCaudalLabel (Shift+H).\n"
+                                  "Anatomical axis; transform-invariant (no "
+                                  "camera tuning).\n"
+                                  "Orthogonal to AR-visible: ticking both "
+                                  "applies the Combine mode below.\n"
+                                  "OFF = no caudal filter applied.");
+            }
+            // CC state notice (no Flip button here -- handled in
+            // Initial Orientation panel).
+            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  CC labels not yet computed - press Shift+H "
+                    "or Apply Init Pose.");
+            } else if (g_ctrlgUseCaudalOnly && g_liverCC.valid() &&
+                       g_liverCC.cc.weak) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.32f, 0.32f, 1.0f),
+                    "  [WEAK %.1f%%] verify CC sign in Initial "
+                    "Orientation panel; use Flip CC if reversed.",
+                    g_liverCC.cc.confidence * 100.0f);
+            }
+
+            // Combine mode (effective only when BOTH checkboxes are on).
+            // Always shown; greyed out when not applicable.
+            {
+                const bool both_on = g_ctrlgUseArVisFilter && g_ctrlgUseCaudalOnly;
+                if (!both_on) ImGui::BeginDisabled();
+                ImGui::Text("  Combine when both ON:");
+                ImGui::SameLine();
+                int mode = (int)g_ctrlgArvisCaudalCombine;
+                if (ImGui::RadioButton("AND##arvis_caudal", &mode, 0)) {
+                    g_ctrlgArvisCaudalCombine = 0;
+                }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("OR##arvis_caudal",  &mode, 1)) {
+                    g_ctrlgArvisCaudalCombine = 1;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("AND: vertex must be AR-visible AND caudal "
+                                      "(strict; smallest subset, default).\n"
+                                      "OR : vertex passes if AR-visible OR caudal "
+                                      "(lenient; mutual rescue).\n"
+                                      "Effective only when both filters above are ON.");
+                }
+                if (!both_on) ImGui::EndDisabled();
+            }
+
+            ImGui::SliderFloat("beta (rim-rim weight boost)",
+                               &g_ctrlgBetaRimWeight, 0.0f, 10.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Multiplicative weight for pairs where\n"
+                                  "  source vertex is on the LiverRegion::RIM band\n"
+                                  "  AND target point's boundaryDist < threshold.\n"
+                                  "w_i = 1 + beta * is_rim_src * is_rim_tgt.\n"
+                                  "0.0 = uniform RMSE (byte-identical accumulator).\n"
+                                  "1.0 = rim-rim pairs counted twice.\n"
+                                  "3.0 = rim-rim pairs counted 4x.");
+            }
+
+            ImGui::SliderFloat("rim threshold [px]",
+                               &g_ctrlgRimTgtThreshPx, 4.0f, 30.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Target boundaryDist < threshold -> "
+                                  "treated as RIM (image-side rim membership).\n"
+                                  "Same semantic as Shift+P kBoundaryPxTh (default 12).");
+            }
+
+            ImGui::Checkbox("Show RIM pairs",
+                            &g_ctrlgShowRimPairs);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Visualize the rim sets used by beta "
+                                  "weighting:\n  orange = source RIM (mesh-intrinsic)\n"
+                                  "  magenta = target RIM (image boundary).\n"
+                                  "Buffers are populated at next Ctrl+G press.");
+            }
+
+            // 状態表示: viz バッファの中身が分かるとデバッグしやすい
+            if (g_ctrlgRimVizAvailable) {
+                ImGui::Text("RimViz buffers: src=%d  tgt=%d",
+                            (int)g_ctrlgRimSrcVertIdx.size(),
+                            (int)g_ctrlgRimTgtPos.size());
+            } else if (g_ctrlgShowRimPairs) {
+                ImGui::TextDisabled(
+                    "RimViz: press Ctrl+G to populate");
+            }
+
+            // -----------------------------------------------------------
+            // [Phase D] Colored RIM pairs (K representatives).
+            //   Independent from Show RIM pairs above. Shows K paired
+            //   source+target spheres in matching HSV colors so the
+            //   operator can see WHICH rim vertex maps to WHICH target
+            //   point at the current pose. Pairs are sampled from the
+            //   ~20k captured at Ctrl+G Phase F.5 (or restored from a
+            //   PoseLibrary entry after Apply). 4 sampling modes:
+            //     - ArcUniform: even spacing around tgt centroid (default)
+            //     - WorstK    : K longest src-tgt distances (diagnostic)
+            //     - BestK     : K shortest distances
+            //     - Random    : seeded uniform (reshufflable)
+            // -----------------------------------------------------------
+            ImGui::Checkbox("Show colored pairs (K)",
+                            &g_ctrlgShowColoredRimPairs);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Overlay K representative rim-rim pairs "
+                                  "drawn in matching HSV colors so each "
+                                  "src↔tgt mapping is visually identifiable.\n"
+                                  "Data source: g_lastRimPair* (set by "
+                                  "Ctrl+G / Ctrl+Shift+G Phase F.5; restored "
+                                  "by Pose Library Apply).\n"
+                                  "Pairs follow the mesh through subsequent "
+                                  "ICP/Apply (source is a full-mesh vertex "
+                                  "index; target is fixed world coords).\n"
+                                  "Independent from Show RIM pairs above — "
+                                  "leave both ON for max info.");
+            }
+            if (g_ctrlgShowColoredRimPairs) {
+                ImGui::Indent();
+                ImGui::SliderInt("K pairs", &g_ctrlgColoredRimN, 5, 30);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How many representative pairs to draw "
+                                      "(5–30). 10 is the sweet spot — small "
+                                      "enough to differentiate by HSV hue, "
+                                      "large enough to span the rim.");
+                }
+                const char* modeItems =
+                    "ArcUniform\0WorstK\0BestK\0Random\0";
+                ImGui::Combo("Sample mode",
+                             &g_ctrlgColoredRimMode, modeItems);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "ArcUniform : evenly spaced around tgt centroid "
+                        "(stable across runs — default).\n"
+                        "WorstK     : K longest src↔tgt distances "
+                        "(diagnostic: where is the rim misaligned?).\n"
+                        "BestK      : K shortest distances "
+                        "(sanity check).\n"
+                        "Random     : seeded uniform sample. Use the "
+                        "Reshuffle button to draw a new sample.");
+                }
+                // Reshuffle only affects Random mode (other modes are
+                // deterministic). Disable the button outside Random so
+                // the UI signals this clearly instead of accepting clicks
+                // that produce no visible change.
+                const bool reshuffleActive =
+                    (g_ctrlgColoredRimMode ==
+                     (int)RimPairSampling::Mode::Random);
+                if (!reshuffleActive) ImGui::BeginDisabled();
+                if (ImGui::Button("Reshuffle")) {
+                    g_ctrlgColoredRimSeed++;
+                }
+                if (!reshuffleActive) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered()) {
+                    if (reshuffleActive) {
+                        ImGui::SetTooltip(
+                            "Draw a new K-sample with a fresh seed.\n"
+                            "Active only in Random mode.");
+                    } else {
+                        ImGui::SetTooltip(
+                            "Reshuffle is only available in Random mode.\n"
+                            "ArcUniform / WorstK / BestK are deterministic — "
+                            "pressing this button would have no effect.");
+                    }
+                }
+                ImGui::SameLine();
+                if (!g_lastRimPairSrcVertIdx.empty()) {
+                    ImGui::TextDisabled("(%d pairs avail.)",
+                                        (int)g_lastRimPairSrcVertIdx.size());
+                } else {
+                    ImGui::TextDisabled("(no pairs — press Ctrl+G)");
+                }
+                ImGui::Unindent();
+            }
+
+            // -----------------------------------------------------------
+            //  Ctrl+Shift+G (V3-RS, silhouette anchor) - inline section.
+            //  Placed inside the Ctrl+G panel so it is always visible
+            //  alongside beta / AR-vis / Caudal. These controls are
+            //  read only when Ctrl+Shift+G is pressed; plain Ctrl+G
+            //  ignores them entirely.
+            // -----------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.5f, 1.0f),
+                               "Ctrl+Shift+G silhouette anchor");
+
+            ImGui::SliderFloat("lambda_sil",
+                               &g_ctrlgsLambdaSil, 0.0f, 1.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Silhouette anchor strength for Ctrl+Shift+G.\n"
+                    "  0.00 : V3R-W behaviour (use Ctrl+G instead).\n"
+                    "  0.10 : weak.\n"
+                    "  0.30 : recommended starting point.\n"
+                    "  1.00 : silhouette-dominant.\n"
+                    "Plain Ctrl+G ignores this slider.");
+            }
+
+            // ----- [NEW UI-1a] Asymmetric outside-ratio penalty -------
+            ImGui::Checkbox("Asymmetric outside-ratio penalty (mask-expansion brake)",
+                            &g_ctrlgsUseOutsideRatio);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Add an ASYMMETRIC penalty to the Ctrl+Shift+G cost:\n"
+                    "  cost += lambda_out * (source AND NOT target) / source\n"
+                    "\n"
+                    "Symmetric (1-IoU) penalises source-contains-target only\n"
+                    "weakly: a fully-containing source has IoU < 1 but the\n"
+                    "gradient toward shrinking is small. This term directly\n"
+                    "measures the FRACTION of source raster outside the\n"
+                    "target, putting a one-sided pull toward source-in-target.\n"
+                    "  0   : source is inside target (no penalty).\n"
+                    "  1   : no overlap (max penalty).\n"
+                    "\n"
+                    "Default OFF -- byte-identical to pre-feature behaviour.\n"
+                    "Recommended when Ctrl+G has drifted into mask expansion.");
+            }
+            ImGui::SliderFloat("lambda_out",
+                               &g_ctrlgsLambdaOut, 0.0f, 2.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Weight for the asymmetric outside-ratio penalty.\n"
+                    "  0.0  : no effect (same as checkbox OFF).\n"
+                    "  0.3  : weak brake on mask expansion.\n"
+                    "  0.5  : recommended starting point.\n"
+                    "  1.0+ : aggressive shrink toward source inside target.\n"
+                    "Only active when the checkbox above is ON.");
+            }
+
+            // ----- [NEW UI-1b] RIM silhouette penalty ----------------
+            ImGui::Checkbox("RIM silhouette penalty (boundary-to-boundary)",
+                            &g_ctrlgsUseRimSil);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Add a boundary-alignment penalty to the cost:\n"
+                    "  cost += lambda_rim_sil * mean(dist_to_target_boundary)\n"
+                    "\n"
+                    "Evaluated only at SOURCE-BOUNDARY raster cells (source\n"
+                    "cells with at least one non-source 4-neighbour). For\n"
+                    "each such cell:\n"
+                    "  outside target mask -> contribute 1.0 (max).\n"
+                    "  inside target mask  -> contribute min(d/max_px, 1.0)\n"
+                    "where d is the image-pixel distance to the target\n"
+                    "silhouette boundary, from the SAM2 distance map.\n"
+                    "\n"
+                    "Silhouette-space analogue of Ctrl+G's beta-rim weighting:\n"
+                    "forces source RIM to target RIM coincidence rather than\n"
+                    "mere area overlap. Catches drift patterns where source\n"
+                    "covers target area well but with bulges/dents at the rim.\n"
+                    "\n"
+                    "Default OFF.");
+            }
+            ImGui::SliderFloat("lambda_rim_sil",
+                               &g_ctrlgsLambdaRimSil, 0.0f, 2.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Weight for the RIM silhouette penalty.\n"
+                    "  0.0  : no effect.\n"
+                    "  0.2  : weak.\n"
+                    "  0.3  : recommended starting point.\n"
+                    "  1.0+ : boundary-dominant.\n"
+                    "Only active when 'RIM silhouette penalty' is ON.");
+            }
+            ImGui::SliderFloat("rim_sil_max_px",
+                               &g_ctrlgsRimSilMaxPx, 10.0f, 300.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Image-pixel normalisation cap for the RIM penalty.\n"
+                    "Source-boundary cells AT the target boundary contribute\n"
+                    "0; cells >= max_px away from the boundary saturate to 1.\n"
+                    "  50  : tight (small drift heavily penalised).\n"
+                    "  100 : recommended starting point.\n"
+                    "  200 : loose (only large drift penalised).\n"
+                    "Only active when 'RIM silhouette penalty' is ON.");
+            }
+
+            // [NEW UI-RIM-ANAT] Anatomic-mode toggle
+            ImGui::Checkbox("Use anatomical RIM (vs. raster boundary)",
+                            &g_ctrlgsRimSilAnatomic);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Switch the source-rim definition between two modes:\n"
+                    "\n"
+                    "OFF (legacy raster boundary):\n"
+                    "  Source RIM = every cell on the rasterised silhouette\n"
+                    "  outline (4-neighbour test on the source hitmap).\n"
+                    "  Includes the outlines of detached blobs / artefacts;\n"
+                    "  doesn't know anything about anatomy. Pure geometric.\n"
+                    "\n"
+                    "ON (anatomical RIM):\n"
+                    "  Source RIM = vertices labelled LiverRegionLabel::RIM,\n"
+                    "  filtered by quadrant + AR-vis + Caudal the SAME way\n"
+                    "  the Ctrl+G 'Show RIM pairs' checkbox filters them.\n"
+                    "  These are exactly the orange spheres you see in the\n"
+                    "  AR view when RimViz is enabled. rim_sil is the mean\n"
+                    "  distance from each VISIBLE projected RIM vertex to\n"
+                    "  the target silhouette boundary.\n"
+                    "\n"
+                    "F9 viz: in anatomic mode, panels 4 & 6 highlight cells\n"
+                    "where any anatomical RIM vertex projected, NOT the full\n"
+                    "silhouette outline. Lets you check whether the rim\n"
+                    "Ctrl+G already cares about coincides with the SAM2\n"
+                    "boundary.\n"
+                    "\n"
+                    "Only active when 'RIM silhouette penalty' is ON.\n"
+                    "Default OFF -- legacy behaviour.");
+            }
+            if (g_ctrlgsRimSilAnatomic && !g_ctrlgsUseRimSil) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  NOTE: anatomic toggle ON but rim_sil penalty OFF -- has no effect");
+            }
+
+            // ----- [NEW UI-1c] Dynamic RMSE cap for Phase E ----------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                               "Phase E RMSE acceptance cap");
+            ImGui::Checkbox("Dynamic cap (loosen on IoU gain)",
+                            &g_ctrlgsUseDynamicCap);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Layer 3 (Phase E) rejects candidates whose RMSE exceeds\n"
+                    "rmse_before * cap_factor. The legacy fixed cap (1.05x)\n"
+                    "can block silhouette-improving candidates whose RMSE\n"
+                    "rose 6-10%% while IoU jumped 0.05-0.10 -- exactly the\n"
+                    "recovery move we WANT after Ctrl+G mask expansion.\n"
+                    "\n"
+                    "OFF: cap = RmseCapBase (legacy 1.05x behaviour).\n"
+                    "ON : cap interpolates linearly between RmseCapBase\n"
+                    "     (at diou=0) and RmseCapMax (at diou>=DiouFull).\n"
+                    "     diou is the IoU gain reported in the ACCEPTED /\n"
+                    "     REJECTED log line.\n"
+                    "\n"
+                    "Default OFF -- preserves legacy behaviour.");
+            }
+            ImGui::SliderFloat("RmseCapBase",
+                               &g_ctrlgsRmseCapBase, 1.00f, 1.20f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Cap factor with no IoU improvement (and the only one\n"
+                    "used when Dynamic cap is OFF).\n"
+                    "  1.00 : strict (RMSE cannot increase at all).\n"
+                    "  1.05 : legacy default (5%% tolerance).\n"
+                    "  1.20 : very lenient.\n"
+                    "Always active.");
+            }
+            ImGui::SliderFloat("RmseCapMax",
+                               &g_ctrlgsRmseCapMax, 1.00f, 1.50f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Cap factor when IoU gain saturates (diou>=DiouFull).\n"
+                    "  1.05 : same as base (no loosening).\n"
+                    "  1.15 : recommended starting point.\n"
+                    "  1.30 : aggressive recovery from mask expansion.\n"
+                    "Only effective when 'Dynamic cap' is ON.");
+            }
+            ImGui::SliderFloat("RmseCapDiouFull",
+                               &g_ctrlgsRmseCapDiouFull, 0.00f, 0.20f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "IoU gain at which the dynamic cap reaches RmseCapMax.\n"
+                    "Linear interpolation: (diou=0, cap=Base) to\n"
+                    "(diou>=DiouFull, cap=Max).\n"
+                    "  0.02 : aggressive loosening on tiny IoU gains.\n"
+                    "  0.05 : recommended starting point.\n"
+                    "  0.10 : conservative -- only big IoU gains relax cap.\n"
+                    "Only effective when 'Dynamic cap' is ON.");
+            }
+            ImGui::Separator();
+
+            // Target-mask squash toggle. When ON, the SAM2 target mask
+            // is rasterized through the same triangle-bbox + 1-cell halo
+            // system the source mesh uses, so IoU compares equally-
+            // inflated shapes (fair). When OFF, target uses legacy
+            // per-cell centre sample (asymmetric -- the diagnostic
+            // path for A/B comparison). Default ON.
+            ImGui::Checkbox("Target squash (source-parity raster)",
+                            &CmaesRefineV3RS::g_silTargetSquashEnabled);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Rasterize the SAM2 target mask through the SAME\n"
+                    "raster system the source mesh uses (step x step OR\n"
+                    "coverage + 1-cell halo). Removes the asymmetric bias\n"
+                    "that was capping IoU around 0.63.\n"
+                    "\n"
+                    "  ON  (default): fair, cached app-wide.\n"
+                    "  OFF          : legacy centre-sample (A/B reference).\n"
+                    "\n"
+                    "Cache survives across Ctrl+Shift+G presses and is\n"
+                    "rebuilt only when the SAM2 mask changes.");
+            }
+
+            // Instrument occlusion filter (NEW). When ON, grid cells
+            // covered by instruments (per g_instrumentDistMap) are
+            // excluded from BOTH union and intersection of the IoU
+            // computation. Fixes the asymmetric error where the source
+            // mesh extends behind an instrument occluder but the SAM2
+            // target mask correctly has no liver there. Default OFF so
+            // pre-feature behaviour is preserved byte-for-byte.
+            ImGui::Checkbox("Ignore instrument-occluded pixels",
+                            &g_ctrlgsIgnoreInstrument);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Exclude IoU grid cells that lie under an instrument\n"
+                    "(rasterized through g_instrumentDistMap).\n"
+                    "\n"
+                    "Why: when the source mesh projects onto an area\n"
+                    "covered by a tool, SAM2 correctly has NO liver mask\n"
+                    "there. Without this filter, the source overshoot in\n"
+                    "that occluded area is counted as IoU loss, biasing\n"
+                    "the optimiser toward poses that shrink the mesh\n"
+                    "behind tools (containment failure variant).\n"
+                    "\n"
+                    "Requires instrument_segmentation_mask.png to exist\n"
+                    "and match the liver-mask dimensions. If unavailable,\n"
+                    "the filter is silently disabled for that session.\n"
+                    "\n"
+                    "Default OFF -- pre-feature behaviour preserved.");
+            }
+
+            ImGui::SliderFloat("instrument ignore thresh [px]",
+                               &g_ctrlgsInstrumentThreshPx,
+                               3.0f, 20.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Pixel-distance threshold for the instrument filter.\n"
+                    "Cells whose centre pixel has inst_dist < thresh are\n"
+                    "excluded.\n"
+                    "\n"
+                    "  0.0  : exclude only INSIDE the instrument region.\n"
+                    "  5.0  : also exclude within 5 px of the boundary\n"
+                    "         (compensates for SAM2 mask edge slop).\n"
+                    "         Recommended starting point.\n"
+                    " 10.0+ : aggressive; risk of dropping legitimate\n"
+                    "         silhouette near tools.\n"
+                    "\n"
+                    "Only active when the checkbox above is ON.");
+            }
+            if (g_ctrlgsIgnoreInstrument && !g_instrumentDistMap.valid) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  WARNING: instrument mask not loaded -- filter inactive");
+            }
+
+            ImGui::Checkbox("Show sil projection (after Ctrl+Shift+G)",
+                            &g_silProjShow);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Draw the rim ∩ quadrant subset (the points the\n"
+                    "silhouette loss actually evaluates) as coloured\n"
+                    "spheres in the AR view. No subsampling -- you see\n"
+                    "every point the optimiser was scored against.\n"
+                    "Colour scale by 2D boundary distance:\n"
+                    "  RED  : projection OUTSIDE the SAM mask\n"
+                    "         -> contributes image-diagonal penalty.\n"
+                    "  GREEN  (< 5 px)   : on the silhouette boundary\n"
+                    "  YELLOW (5-30 px)  : near the boundary\n"
+                    "  BLUE   (>= 30 px) : inside the mask\n"
+                    "                       (rim voxel that drifted in)\n"
+                    "Captured once per Ctrl+Shift+G press.");
+            }
+
+            if (g_silProjDebug.valid) {
+                const int n_in  = g_silProjDebug.n_with_signal;
+                const int n_tot = g_silProjDebug.n_visible;
+                const int n_out = std::max(0, n_tot - n_in);
+                const float pct_out = (n_tot > 0)
+                    ? 100.0f * (float)n_out / (float)n_tot : 0.0f;
+                ImGui::Text("  sil viz: %d pts  mean_dist=%.1f px (%.3f norm)",
+                            (int)g_silProjDebug.pts.size(),
+                            g_silProjDebug.mean_dist_px,
+                            g_silProjDebug.mean_dist_norm);
+                ImGui::Text("  out-of-mask: %d / %d (%.1f%%)  in-mask: %d",
+                            n_out, n_tot, pct_out, n_in);
+            } else {
+                ImGui::TextDisabled(
+                    "  sil viz: (press Ctrl+Shift+G to populate)");
+            }
+
+            if (g_silProjShow && !g_boundaryDistMap.valid) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  WARNING: g_boundaryDistMap invalid - sil will be skipped");
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Press Ctrl+G to run V3-R with this selection");
+            ImGui::TextDisabled("Press Ctrl+Shift+G to run V3-RS (silhouette anchor)");
+
+            ImGui::End();
+        }
+
+        if (gApp.mode == AppMode::kRegistration) {
+            ImGui::SetNextWindowBgAlpha(0.7f);
+            ImGui::Begin("ScreenMesh Display",
+                         nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::Checkbox("Draw as points (lightweight)", &g_screenMeshAsPoints);
+            if (g_screenMeshAsPoints) {
+                ImGui::SliderFloat("Point size [px]",
+                                   &g_screenMeshPointSize,
+                                   1.0f, 8.0f, "%.1f");
+                ImGui::SliderFloat("Density [%]",
+                                   &g_screenMeshDensity,
+                                   1.0f, 100.0f, "%.0f");
+                if (ImGui::Button("Reshuffle")) {
+                    g_screenMeshPC.requestReshuffle();
+                }
+                // 表示中の頂点数の情報
+                const size_t total = g_screenMeshPC.totalVerts;
+                if (total > 0) {
+                    const size_t drawn = std::max<size_t>(
+                        1, (size_t)((double)total
+                                  * (double)g_screenMeshDensity / 100.0));
+                    ImGui::SameLine();
+                    ImGui::Text("(%zu / %zu pts)", drawn, total);
+                }
+            }
+            ImGui::Separator();
+            ImGui::Checkbox("Show debug AABB (red=target, green=source)",
+                            &g_showDebugBB);
+            if (g_showDebugBB) {
+                ImGui::TextDisabled("Source AABB is post-Apply state");
+                if (g_dbgSourceBB_valid && g_targetAabbFull.valid) {
+                    glm::vec3 err = g_dbgSourceBB_center - g_targetAabbFull.center;
+                    float d = glm::length(err);
+                    ImGui::Text("|err| = %.4f m  (%.1f mm)", d, d * 1000.0f);
+                }
+            }
+            ImGui::End();
+        }
+
+        // Pose Library ウィンドウ (元コード line 4699 通り、mode guard 無しで毎フレーム呼ぶ。
+        // showWindow == false なら drawPoseLibraryWindow 側で early-return)
+        drawPoseLibraryWindow();
+
+        // ARスクリーンショットのプレビューウィンドウ
+        float vpW = gUI.getViewportWidth(gWindowWidth);
+        ARSave::drawPreviewWindow(g_arSave, vpW, (float)gWindowHeight);
+
+        // V3RS Phase 2 diagnostic: silhouette IoU overlay window.
+        // Toggled via F9. Reuses the same viewport width / window
+        // height computed for ARSave above.
+        SilOverlay::drawPreviewWindow(
+            SilOverlay::g_silOverlay, vpW, (float)gWindowHeight);
+
+        OrbitCam.UpdateCamera(dt);
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        if (gApp.mode == AppMode::kMaskSelection) {
+            // カメラモードの場合はフレームをキャプチャ
+            if (gCamera.active) {
+                gCamera.capture(gApp.arBg);
+            }
+
+            // マスク選択モード：固定アスペクト比で画像を表示
+            if (gApp.image.loaded || gCamera.active) {
+                // 画像のアスペクト比を保持して中央に表示
+                int imgWidth = gCamera.active ? gCamera.width : gApp.image.width;
+                int imgHeight = gCamera.active ? gCamera.height : gApp.image.height;
+                float imgAspect = (float)imgWidth / (float)imgHeight;
+                float winAspect = (float)gWindowWidth / (float)gWindowHeight;
+
+                int viewW = gWindowWidth;
+                int viewH = gWindowHeight;
+                int viewX = 0;
+                int viewY = 0;
+
+                if (imgAspect > winAspect) {
+                    // 画像の方が横長
+                    viewH = gWindowWidth / imgAspect;
+                    viewY = (gWindowHeight - viewH) / 2;
+                } else {
+                    // 画像の方が縦長
+                    viewW = gWindowHeight * imgAspect;
+                    viewX = (gWindowWidth - viewW) / 2;
+                }
+
+                glViewport(viewX, viewY, viewW, viewH);
+                // JPEG経由でテクスチャは更新済みなので、単に描画するだけ
+                gApp.arBg.draw();
+                glViewport(0, 0, gWindowWidth, gWindowHeight);
+
+                // マスクポイントの描画（調整が必要）
+                gMaskRenderer.draw(gApp);
+            }
+
+            // マスク選択モード用のUIオーバーレイを常に表示
+            gUI.drawDepthOverlay(gWindowWidth, gWindowHeight);
+        }
+        else if (gApp.mode == AppMode::kImageOnly) {
+            // カメラモードの場合はフレームを更新
+            if (gCamera.active && !gCamera.captured) {
+                gCamera.capture(gApp.arBg);
+            }
+            if (gApp.image.loaded) gApp.arBg.draw();
+            gMaskRenderer.draw(gApp);
+        }
+        else if (gApp.mode == AppMode::kRegistration) {
+            if (gUmeyama.active) {
+                // ---- Umeyama 2画面モード ----
+                gUmeyama.render(shaderProgram, shaderProgramCube,
+                                registrationHandle,
+                                {liverMesh3D, portalMesh3D, veinMesh3D,
+                                 tumorMesh3D, segmentMesh3D, gbMesh3D},
+                                screenMesh, gWindowWidth, gWindowHeight);
+            } else {
+                // ---- 通常1画面描画 ----
+                const int sidebarW = 400;
+                compute3DViewport(gWindowWidth, gWindowHeight, sidebarW);
+                glViewport(g_3dViewport.x, g_3dViewport.y,
+                           g_3dViewport.w, g_3dViewport.h);
+
+                glm::vec3 liverCenter   = Reg3DCustom::computeMeshCenter(*liverMesh3D);
+                glm::vec3 textureCenter = Reg3DCustom::computeMeshCenter(*screenMesh);
+                OrbitCam.updateTargetPositions(liverCenter, textureCenter);
+                model = glm::translate(glm::mat4(1.0f), objPos);
+
+                if (gApp.arMode) {
+                    view = glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f),
+                                       glm::vec3(0.0f, 0.0f, 1.0f),
+                                       glm::vec3(0.0f, 1.0f, 0.0f));
+                }
+
+                if (gApp.arMode) gApp.arBg.draw();
+
+                std::vector<mCutMesh*> meshesToDraw;
+                std::vector<glm::vec4> dynamicColors;
+
+                mCutMesh* organs[6] = { liverMesh3D, portalMesh3D, veinMesh3D,
+                                       tumorMesh3D, segmentMesh3D, gbMesh3D };
+                glm::vec4 organColors[6] = {
+                    glm::vec4(0.8f, 0.2f, 0.2f, 1.0f),  // liver - red
+                    glm::vec4(0.2f, 0.2f, 0.8f, 1.0f),  // portal - blue
+                    glm::vec4(0.2f, 0.5f, 0.5f, 1.0f),  // vein - teal
+                    glm::vec4(0.8f, 0.5f, 0.5f, 1.0f),  // tumor - pink
+                    glm::vec4(0.2f, 0.8f, 0.5f, 1.0f),  // segment - green
+                    glm::vec4(0.2f, 0.8f, 0.2f, 1.0f)    // gb - yellow-green
+                };
+
+                int textureMeshIdx = -1;
+                for (int i = 0; i < 6; i++) {
+                    if (organs[i] && g_meshAlpha[i] > 0.01f) {
+                        meshesToDraw.push_back(organs[i]);
+                        glm::vec4 c = organColors[i];
+                        c.a = g_meshAlpha[i];
+                        dynamicColors.push_back(c);
+                    }
+                }
+                // screenMesh（レジストレーション用、非テクスチャ、alpha=g_meshAlpha[7]）
+                //   - g_screenMeshAsPoints=false : 既存の三角形描画パス（meshesToDraw に追加）
+                //   - g_screenMeshAsPoints=true  : ここでは push せず、後段で点群として別描画
+                if (g_meshAlpha[7] > 0.01f && !g_screenMeshAsPoints) {
+                    meshesToDraw.push_back(screenMesh);
+                    dynamicColors.push_back(glm::vec4(0.3f, 0.6f, 0.9f, g_meshAlpha[7]));
+                }
+
+                // boardMesh（テクスチャ付き表示用、alpha=g_meshAlpha[6]）
+                if (boardMesh3D && g_meshAlpha[6] > 0.01f) {
+                    meshesToDraw.push_back(boardMesh3D);
+                    dynamicColors.push_back(glm::vec4(1.0f, 1.0f, 1.0f, g_meshAlpha[6]));
+                    textureMeshIdx = (int)meshesToDraw.size() - 1;
+                }
+
+                draw_AllmCutMeshes(meshesToDraw, shaderProgram, shaderProgramCube,
+                                   OrbitCam.cameraPos, dynamicColors,
+                                   model, view, projection, textureMeshIdx);
+
+                // screenMesh を点群として描画（フラグが立っている場合）
+                //   - 三角形描画より軽量（overdraw なし）
+                //   - 既存 VBO を共有するので追加メモリなし
+                if (g_screenMeshAsPoints && g_meshAlpha[7] > 0.01f && screenMesh) {
+                    drawScreenMeshAsPoints(
+                        screenMesh, shaderProgram,
+                        model, view, projection, OrbitCam.cameraPos,
+                        glm::vec4(0.3f, 0.6f, 0.9f, g_meshAlpha[7]),
+                        g_screenMeshPointSize);
+                }
+
+                // クラスタ可視化の描画
+                // ソース (cluster1) は明るく大きく目立たせ、ターゲット (targetPoints) は
+                // 多数あるので暗めで小さくして視覚的に「源点 vs 先点」を区別する。
+                if (g_showClusterVisualization) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rSrc  = rBase * 1.4f;   // Source: 大きい
+                    const float rTgt  = rBase * 0.55f;  // Target accepted: 小さい
+                    const float rInt  = rBase * 0.40f;  // Target interior: もっと小さい
+
+                    // SOURCE (cluster1) — bright green, large
+                    for (size_t i = 0; i < g_cluster1Points.size(); i++) {
+                        g_sphereMarker.draw(shaderProgram, g_cluster1Points[i],
+                                            glm::vec3(0.30f, 1.00f, 0.20f),  // bright green
+                                            rSrc, view, projection, OrbitCam.cameraPos);
+                    }
+                    // TARGET interior (cluster2) — dim blue, small (rare; only when used as interior cloud)
+                    for (size_t i = 0; i < g_cluster2Points.size(); i++) {
+                        g_sphereMarker.draw(shaderProgram, g_cluster2Points[i],
+                                            glm::vec3(0.05f, 0.20f, 0.45f),  // very dim blue
+                                            rInt, view, projection, OrbitCam.cameraPos);
+                    }
+                    // TARGET accepted boundary — dim yellow, small (massive count)
+                    for (size_t i = 0; i < g_targetPoints.size(); i++) {
+                        g_sphereMarker.draw(shaderProgram, g_targetPoints[i],
+                                            glm::vec3(0.55f, 0.50f, 0.05f),  // dim yellow / mustard
+                                            rTgt, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // 境界候補の可視化（B キー）: 採用=緑, 棄却(器具)=赤
+                if (g_showBoundaryCandidates) {
+                    const float rTarget = RegRatios::markerTarget();
+                    for (const auto& p : g_targetPoints) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(0.0f, 1.0f, 0.2f),
+                                            rTarget, view, projection, OrbitCam.cameraPos);
+                    }
+                    for (const auto& p : g_rejectedBoundaryPoints) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(1.0f, 0.1f, 0.1f),
+                                            rTarget, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // ソース側の可視化（N キー）: シアン=全可視, マゼンタ=シルエット絞り込み後
+                // 全可視は半径やや小さめで奥に、シルエット集合は大きめで手前に描画。
+                if (g_showSourceVisualization) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rVis  = rBase * 0.8f;
+                    const float rSil  = rBase * 1.1f;
+                    for (const auto& p : g_visibleSourcePoints) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(0.0f, 0.8f, 1.0f),  // cyan
+                                            rVis, view, projection, OrbitCam.cameraPos);
+                    }
+                    for (const auto& p : g_silhouetteSourcePoints) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(1.0f, 0.2f, 0.9f),  // magenta
+                                            rSil, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // Cyclic correspondence visualization (Shift+B):
+                //   24 セクターを HSV で円環着色し、source (大球) と target
+                //   (中球) を同色で描画 → 同じ色のペアが対応関係を示す。
+                //   src は liverMesh3D の頂点 index 経由で現在位置を取得するので、
+                //   後段の ICP で organ が動いてもマーカーが追従する。
+                if (g_showCyclicCorrespondence && g_cyclicAvailable && liverMesh3D) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rSrc  = rBase * 1.6f;   // source: 大きい
+                    const float rTgt  = rBase * 1.0f;   // target: 中サイズ
+                    const auto& V = liverMesh3D->mVertices;
+                    const int N = g_cyclicSectors;
+
+                    for (int i = 0; i < N; i++) {
+                        if ((int)g_cyclicPairValid.size() <= i) continue;
+                        if (!g_cyclicPairValid[i]) continue;
+
+                        float h = float(i) / float(std::max(1, N));
+                        glm::vec3 col = cyclicHsv2rgb(h, 0.85f, 1.0f);
+
+                        // Source: 現在の頂点位置 (ICP 後の姿勢を反映)
+                        int vIdx = g_cyclicPairSrcVertIdx[i];
+                        if (vIdx >= 0 && (size_t)vIdx * 3 + 2 < V.size()) {
+                            glm::vec3 srcPos(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
+                            g_sphereMarker.draw(shaderProgram, srcPos, col, rSrc,
+                                                view, projection, OrbitCam.cameraPos);
+                        }
+
+                        // Target: 不変なので保存済み 3D 位置を使用
+                        g_sphereMarker.draw(shaderProgram, g_cyclicPairTgtPos[i],
+                                            col, rTgt,
+                                            view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // -----------------------------------------------------------
+                // Ctrl+G RIM pair visualization (g_ctrlgShowRimPairs)
+                //   orange  = source RIM (LiverRegion::RIM band) — uses
+                //             liverMesh3D vertex index, so the marker
+                //             follows the mesh through ICP/CMA-ES updates.
+                //   magenta = target RIM (image boundary; immutable).
+                //   Populated by RegistrationActions::runBipopCmaesV3R
+                //   wrapper at every Ctrl+G entry; persists until next
+                //   session. AND-filtered with AR-vis when enabled.
+                // -----------------------------------------------------------
+                if (g_ctrlgShowRimPairs && g_ctrlgRimVizAvailable && liverMesh3D) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rSrc  = rBase * 1.2f;   // source: 中〜大
+                    const float rTgt  = rBase * 0.9f;   // target: 中
+                    const glm::vec3 colSrc(1.0f, 0.55f, 0.10f);  // orange
+                    const glm::vec3 colTgt(1.0f, 0.20f, 0.85f);  // magenta
+                    const auto&  V  = liverMesh3D->mVertices;
+                    const size_t nV = V.size() / 3;
+
+                    for (int vIdx : g_ctrlgRimSrcVertIdx) {
+                        if (vIdx < 0 || (size_t)vIdx >= nV) continue;
+                        glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
+                        g_sphereMarker.draw(shaderProgram, p, colSrc, rSrc,
+                                            view, projection,
+                                            OrbitCam.cameraPos);
+                    }
+                    for (const auto& p : g_ctrlgRimTgtPos) {
+                        g_sphereMarker.draw(shaderProgram, p, colTgt, rTgt,
+                                            view, projection,
+                                            OrbitCam.cameraPos);
+                    }
+                }
+
+                // -----------------------------------------------------------
+                // [Phase D] Colored RIM pairs (K representatives).
+                //   Same data-follows-mesh contract as Shift+B Cyclic viz:
+                //   src is a liverMesh3D vertex index so spheres track
+                //   subsequent ICP/Apply moves; tgt is fixed world coords.
+                //   Sampling is done every frame (fast enough at N≈20k,
+                //   K≤30) so the K pairs stay sensibly distributed even
+                //   if WorstK/BestK rankings shift as the mesh moves.
+                //
+                //   Source data: g_lastRimPair* (publish/consume globals).
+                //   - Set by Ctrl+G / Ctrl+Shift+G Phase F.5 [Phase A].
+                //   - Restored from PoseEntry by poseApplyEntry [Phase B].
+                //   When both vectors are empty (e.g. session bailed out
+                //   before F.5, or an applied entry was non-Ctrl+G), the
+                //   block silently draws nothing.
+                //
+                //   Colour: cyclicHsv2rgb(k/K, 0.85, 1.0) — same palette
+                //   as Shift+B Cyclic correspondence so the two viewers
+                //   are visually consistent (Shift+B's 24-sector wheel
+                //   and our K=10 wheel both use HSV ramps).
+                // -----------------------------------------------------------
+                if (g_ctrlgShowColoredRimPairs &&
+                    !g_lastRimPairSrcVertIdx.empty() &&
+                    g_lastRimPairSrcVertIdx.size() == g_lastRimPairTgtPos.size() &&
+                    liverMesh3D)
+                {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rSrc  = rBase * 1.6f;   // source: 大 (matches Shift+B)
+                    const float rTgt  = rBase * 1.0f;   // target: 中
+                    const auto& V  = liverMesh3D->mVertices;
+                    const size_t nV = V.size() / 3;
+
+                    const auto mode =
+                        static_cast<RimPairSampling::Mode>(
+                            g_ctrlgColoredRimMode);
+                    std::vector<int> sel = RimPairSampling::sampleRimPairIndices(
+                        g_lastRimPairSrcVertIdx,
+                        g_lastRimPairTgtPos,
+                        V,
+                        mode,
+                        g_ctrlgColoredRimN,
+                        g_ctrlgColoredRimSeed);
+
+                    const int K = (int)sel.size();
+                    for (int k = 0; k < K; k++) {
+                        const int i = sel[k];
+                        if (i < 0 ||
+                            (size_t)i >= g_lastRimPairSrcVertIdx.size()) continue;
+
+                        // Colour by position in the selection (0..K-1),
+                        // NOT by original pair index, so the K colours
+                        // span the wheel cleanly regardless of how the
+                        // sampler chose them.
+                        const float h = float(k) / float(std::max(1, K));
+                        const glm::vec3 col = cyclicHsv2rgb(h, 0.85f, 1.0f);
+
+                        // Source: current vertex position (follows mesh).
+                        const int vIdx = g_lastRimPairSrcVertIdx[i];
+                        if (vIdx >= 0 && (size_t)vIdx * 3 + 2 < V.size()) {
+                            glm::vec3 srcPos(V[vIdx*3],
+                                             V[vIdx*3+1],
+                                             V[vIdx*3+2]);
+                            g_sphereMarker.draw(shaderProgram, srcPos, col, rSrc,
+                                                view, projection,
+                                                OrbitCam.cameraPos);
+                        }
+
+                        // Target: immutable world coord from the capture.
+                        const glm::vec3& tgtPos = g_lastRimPairTgtPos[i];
+                        g_sphereMarker.draw(shaderProgram, tgtPos, col, rTgt,
+                                            view, projection,
+                                            OrbitCam.cameraPos);
+                    }
+                    (void)nV;   // silence unused-warn if compiler complains
+                }
+
+                // -----------------------------------------------------------
+                // Ctrl+Shift+G silhouette projection visualization.
+                //   Captured ONCE per Ctrl+Shift+G press (see Phase E.5 in
+                //   runBipopCmaesV3RS). Each stored point keeps its world
+                //   position from the captured pose, so the markers stay
+                //   put even if the liver is moved by a subsequent
+                //   registration -- they show "where the previous sil
+                //   result placed the points".
+                //
+                //   Colour semantics (revised):
+                //     RED (sentinel >= 9000)  : projection landed OUTSIDE
+                //                               the SAM mask entirely.
+                //                               These points contribute
+                //                               nothing to the silhouette
+                //                               loss -- a HIGH count here
+                //                               is the real failure mode
+                //                               (scale too large / pose
+                //                               translated off the organ).
+                //     GREEN  (< 5  px)        : on the silhouette boundary
+                //                               -> silhouette match.
+                //     YELLOW (5-30 px)        : near boundary.
+                //     BLUE   (>= 30 px)       : inside the mask, deep
+                //                               interior. EXPECTED for
+                //                               non-rim voxels; not a
+                //                               problem.
+                //   Sentinels are drawn slightly larger to surface them
+                //   over the inside-mask voxels.
+                // -----------------------------------------------------------
+                if (g_silProjShow && g_silProjDebug.valid) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rSil  = rBase * 0.55f;
+                    const float rOut  = rBase * 0.70f;  // out-of-mask: bigger
+                    for (const auto& pt : g_silProjDebug.pts) {
+                        glm::vec3 col;
+                        float radius = rSil;
+                        if (pt.dist_px >= 9000.0f) {
+                            // OUTSIDE mask -- the real diagnostic signal
+                            col = glm::vec3(0.95f, 0.18f, 0.18f);             // red
+                            radius = rOut;
+                        } else if (pt.dist_px < 5.0f) {
+                            col = glm::vec3(0.20f, 0.95f, 0.20f);             // green
+                        } else if (pt.dist_px < 30.0f) {
+                            const float t = (pt.dist_px - 5.0f) / 25.0f;
+                            col = glm::vec3(0.20f + 0.75f * t,
+                                            0.95f,
+                                            0.20f * (1.0f - t));              // green->yellow
+                        } else {
+                            // inside the mask, deep interior -- expected
+                            col = glm::vec3(0.25f, 0.55f, 0.95f);             // blue / cyan
+                        }
+                        g_sphereMarker.draw(shaderProgram, pt.world_pos,
+                                            col, radius,
+                                            view, projection,
+                                            OrbitCam.cameraPos);
+                    }
+                }
+
+                // -----------------------------------------------------------
+                // Liver region visualization (Shift+R):
+                //   赤=anterior_core, 橙=rim, 青=posterior の subsample を
+                //   球マーカーで描画。liverMesh3D の頂点 index 経由で現在
+                //   位置を取るので registration 後も追従する。
+                // -----------------------------------------------------------
+                if (g_showLiverRegion && g_liverRegion.valid() && liverMesh3D) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rAnt  = rBase * 1.0f;
+                    const float rRim  = rBase * 1.4f;   // rim を強調
+                    const float rPost = rBase * 0.7f;
+                    const auto& V = liverMesh3D->mVertices;
+                    const size_t nV = V.size() / 3;
+
+                    auto drawIdx = [&](const std::vector<int>& idxs,
+                                       const glm::vec3& col, float r) {
+                        for (int vIdx : idxs) {
+                            if (vIdx < 0 || (size_t)vIdx >= nV) continue;
+                            glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
+                            g_sphereMarker.draw(shaderProgram, p, col, r,
+                                                view, projection,
+                                                OrbitCam.cameraPos);
+                        }
+                    };
+
+                    // 赤: anterior_core
+                    drawIdx(g_regionVizIdxAnt,  glm::vec3(0.86f, 0.22f, 0.22f), rAnt);
+                    // 橙: rim
+                    drawIdx(g_regionVizIdxRim,  glm::vec3(0.97f, 0.65f, 0.10f), rRim);
+                    // 青: posterior
+                    drawIdx(g_regionVizIdxPost, glm::vec3(0.20f, 0.45f, 0.86f), rPost);
+                }
+
+                // -----------------------------------------------------------
+                //  LiverLeftRight (Y / Shift+Y) 球マーカー描画
+                //   緑=pure_right, 黄=boundary, 紫=pure_left の subsample を
+                //   球マーカーで描画。liverMesh3D の頂点 index 経由で現在
+                //   位置を取るので registration 後も追従する。
+                //
+                //   Shift+R (anterior/rim/posterior) と同時 ON も可能。
+                //   その場合、同じ頂点に複数の球マーカーが重なって描画される。
+                // -----------------------------------------------------------
+                if (g_showLiverLR && g_liverLR.valid() && liverMesh3D) {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rR    = rBase * 1.0f;
+                    const float rBnd  = rBase * 1.4f;   // 境界帯を強調
+                    const float rL    = rBase * 1.0f;
+                    const auto& V = liverMesh3D->mVertices;
+                    const size_t nV = V.size() / 3;
+
+                    auto drawIdxLR = [&](const std::vector<int>& idxs,
+                                         const glm::vec3& col, float r) {
+                        for (int vIdx : idxs) {
+                            if (vIdx < 0 || (size_t)vIdx >= nV) continue;
+                            glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
+                            g_sphereMarker.draw(shaderProgram, p, col, r,
+                                                view, projection,
+                                                OrbitCam.cameraPos);
+                        }
+                    };
+
+                    // 緑: pure right (右葉)
+                    drawIdxLR(g_lrVizIdxR,        glm::vec3(0.20f, 0.70f, 0.30f), rR);
+                    // 黄: boundary (鎌状間膜)
+                    drawIdxLR(g_lrVizIdxBoundary, glm::vec3(0.95f, 0.85f, 0.10f), rBnd);
+                    // 紫: pure left (左葉)
+                    drawIdxLR(g_lrVizIdxL,        glm::vec3(0.65f, 0.25f, 0.75f), rL);
+                }
+
+                // -----------------------------------------------------------
+                //  LiverQuad (H) 4象限球マーカー描画
+                //   緑=ant_right, 紫=ant_left, 青=pos_right, 橙=pos_left
+                //   重複所属方式 (案D): rim と boundary はそれぞれ前後・左右
+                //   両方に所属するため、該当頂点は複数のマーカーが重なって描画される。
+                //   球サイズを4種で変えて識別しやすくする (AR大、AL中、PR中、PL小)。
+                //
+                //   Shift+R / Y / H すべて同時 ON できるが、視認性が悪くなるため
+                //   通常は H のみ ON で運用するのが推奨。
+                // -----------------------------------------------------------
+                if (g_showLiverQuad && liverMesh3D &&
+                    !(g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
+                      g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty())) {
+                    const float rBase = RegRatios::markerCluster();
+                    // 重複描画されるので、球のサイズを変えて識別性を上げる
+                    const float rAR = rBase * 1.4f;   // 緑: 大
+                    const float rAL = rBase * 1.1f;   // 紫: 中大
+                    const float rPR = rBase * 0.9f;   // 青: 中小
+                    const float rPL = rBase * 0.7f;   // 橙: 小
+                    const auto& V = liverMesh3D->mVertices;
+                    const size_t nV = V.size() / 3;
+
+                    auto drawIdxQuad = [&](const std::vector<int>& idxs,
+                                           const glm::vec3& col, float r) {
+                        for (int vIdx : idxs) {
+                            if (vIdx < 0 || (size_t)vIdx >= nV) continue;
+                            glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
+                            g_sphereMarker.draw(shaderProgram, p, col, r,
+                                                view, projection,
+                                                OrbitCam.cameraPos);
+                        }
+                    };
+
+                    // 緑: ant_right
+                    drawIdxQuad(g_quadVizIdxAR, glm::vec3(0.20f, 0.70f, 0.30f), rAR);
+                    // 紫: ant_left
+                    drawIdxQuad(g_quadVizIdxAL, glm::vec3(0.65f, 0.25f, 0.75f), rAL);
+                    // 青: pos_right
+                    drawIdxQuad(g_quadVizIdxPR, glm::vec3(0.20f, 0.45f, 0.86f), rPR);
+                    // 橙: pos_left
+                    drawIdxQuad(g_quadVizIdxPL, glm::vec3(0.97f, 0.55f, 0.10f), rPL);
+                }
+
+                // -----------------------------------------------------------
+                //  LiverCranioCaudal (Shift+H) 球マーカー描画
+                //   黄=CRANIAL(頭側), 青=CAUDAL(足側) を subsample 球で表示。
+                //   liverMesh3D の頂点 index 経由で現在位置を取るので
+                //   registration 後も追従する。
+                //
+                //   Shift+R / Y / H / Shift+H すべて同時 ON できるが、
+                //   視認性が悪くなるため通常は Shift+H のみ ON で運用するのが推奨。
+                //
+                //   Phase 1 では registration には影響しない (可視化のみ)。
+                // -----------------------------------------------------------
+                if (g_showLiverCC && liverMesh3D &&
+                    !(g_ccVizIdxCranial.empty() && g_ccVizIdxCaudal.empty()))
+                {
+                    const float rBase = RegRatios::markerCluster();
+                    const float rCr   = rBase * 1.1f;   // 識別性を上げるため LR より少し大きく
+                    const float rCa   = rBase * 1.1f;
+                    const auto& V = liverMesh3D->mVertices;
+                    const size_t nV = V.size() / 3;
+
+                    auto drawIdxCC = [&](const std::vector<int>& idxs,
+                                         const glm::vec3& col, float r) {
+                        for (int vIdx : idxs) {
+                            if (vIdx < 0 || (size_t)vIdx >= nV) continue;
+                            glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
+                            g_sphereMarker.draw(shaderProgram, p, col, r,
+                                                view, projection,
+                                                OrbitCam.cameraPos);
+                        }
+                    };
+
+                    // 黄: CRANIAL (頭側)
+                    drawIdxCC(g_ccVizIdxCranial, glm::vec3(0.95f, 0.85f, 0.10f), rCr);
+                    // 青: CAUDAL (足側)
+                    drawIdxCC(g_ccVizIdxCaudal,  glm::vec3(0.15f, 0.45f, 0.90f), rCa);
+                }
+
+                // 対応点の描画
+                {
+                    bool activeSelection =
+                        (registrationHandle.state == RegistrationData::SELECTING_BOARD_POINTS ||
+                         registrationHandle.state == RegistrationData::SELECTING_OBJECT_POINTS ||
+                         registrationHandle.state == RegistrationData::READY_TO_REGISTER);
+                    if (activeSelection || g_showCorrespondencePoints) {
+                        const float rCorr = RegRatios::markerCorrespondence();
+                        for (size_t i = 0; i < registrationHandle.boardPoints.size(); i++) {
+                            glm::vec3 color = getPointColor(i, true);
+                            g_sphereMarker.draw(shaderProgram, registrationHandle.boardPoints[i],
+                                                color, rCorr, view, projection, OrbitCam.cameraPos);
+                        }
+                        for (size_t i = 0; i < registrationHandle.objectPoints.size(); i++) {
+                            glm::vec3 color = getPointColor(i, false);
+                            g_sphereMarker.draw(shaderProgram, registrationHandle.objectPoints[i],
+                                                color, rCorr, view, projection, OrbitCam.cameraPos);
                         }
                     }
                 }
-            }
 
-            /* ベスト姿勢を適用 */
-            for (size_t i = 0; i < organs.size(); i++) {
-                if (organs[i]) {
-                    organs[i]->mVertices = best_v[i];
-                    organs[i]->mNormals  = best_n[i];
-                    setUp(*organs[i]);
-                }
-            }
-            computeUnifiedMetrics();
-            std::cout << "[Shift+V] Best: " << rmse_before
-                      << " -> " << best_rmse
-                      << (best_rmse < rmse_before ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
-            poseSaveToLibrary();
-        } else {
-            g_showClusterVisualization = !g_showClusterVisualization;
-            std::cout << "Cluster visualization: "
-                      << (g_showClusterVisualization ? "ON" : "OFF") << std::endl;
-        }
-        break;
+                // ============================================================
+                //  デバッグ AABB 描画 (チャット 10):
+                //   赤 = target_full の AABB (8 コーナー + center 計 9 点)
+                //   緑 = source の post-transform AABB (Apply Init Pose 後の状態)
+                //   両者の center が重なっていれば OK。
+                //  toggle: g_showDebugBB (ImGui のチェックボックスで切替)
+                // ============================================================
+                if (g_showDebugBB) {
+                    const float r_marker = 0.012f;   // 小さめ
+                    auto drawBoxMarkers = [&](const glm::vec3& mn,
+                                              const glm::vec3& mx,
+                                              const glm::vec3& ctr,
+                                              const glm::vec3& corner_color,
+                                              const glm::vec3& center_color,
+                                              float r_center_scale)
+                    {
+                        const glm::vec3 corners[8] = {
+                                                      {mn.x, mn.y, mn.z}, {mx.x, mn.y, mn.z},
+                                                      {mn.x, mx.y, mn.z}, {mx.x, mx.y, mn.z},
+                                                      {mn.x, mn.y, mx.z}, {mx.x, mn.y, mx.z},
+                                                      {mn.x, mx.y, mx.z}, {mx.x, mx.y, mx.z},
+                                                      };
+                        for (int i = 0; i < 8; i++) {
+                            g_sphereMarker.draw(shaderProgram, corners[i],
+                                                corner_color, r_marker,
+                                                view, projection, OrbitCam.cameraPos);
+                        }
+                        // center は少し大きく目立たせる
+                        g_sphereMarker.draw(shaderProgram, ctr,
+                                            center_color, r_marker * r_center_scale,
+                                            view, projection, OrbitCam.cameraPos);
+                    };
 
-    case GLFW_KEY_G:
-        if(currentMainMode == REGISTRATION_MODE){
-            std::cout << "\n============================================" << std::endl;
-            std::cout << "  Starting Umeyama Registration Mode" << std::endl;
-            std::cout << "============================================\n" << std::endl;
-
-            isDragging = false;
-            hit_index = -1;
-
-            if (splitScreenMode) {
-                splitScreenMode = false;
-                std::cout << "Turning off previous split screen mode..." << std::endl;
-            }
-
-            registrationHandle.reset();
-            registrationHandle.targetPointCount = 5;
-            registrationHandle.state = RegistrationData::SELECTING_BOARD_POINTS;
-            registrationHandle.useRegistration = false;
-
-            std::cout << "Registration handle reset complete" << std::endl;
-
-            OrbitCam.resetToInitialState();
-            OrbitCam.cx = gWindowWidth / 2.0f;
-            OrbitCam.cy = gWindowHeight / 2.0f;
-
-            std::cout << "Main camera reset complete" << std::endl;
-
-            OrbitCamLeft_Target = OrbitCam;
-            OrbitCamRight_Screen = OrbitCam;
-
-            OrbitCamLeft_Target.gRadius = OrbitCam.InitialRadius * 1.0f;
-            OrbitCamLeft_Target.currentTarget = TARGET_LIVER;
-            OrbitCamLeft_Target.cx = (gWindowWidth / 2) / 2.0f;
-            OrbitCamLeft_Target.cy = gWindowHeight / 2.0f;
-
-            OrbitCamRight_Screen.gRadius = OrbitCam.InitialRadius * 2.0f;
-            OrbitCamRight_Screen.currentTarget = TARGET_TEXTURE;
-            OrbitCamRight_Screen.cx = (gWindowWidth / 2) / 2.0f;
-            OrbitCamRight_Screen.cy = gWindowHeight / 2.0f;
-
-            std::cout << "Split screen cameras configured" << std::endl;
-            std::cout << "  Left camera radius: " << OrbitCamLeft_Target.gRadius << std::endl;
-            std::cout << "  Right camera radius: " << OrbitCamRight_Screen.gRadius << std::endl;
-
-            splitScreenMode = true;
-
-            std::cout << "\n=== Umeyama Registration Mode Started (5 points) ===" << std::endl;
-            std::cout << "1. Select 5 points on texture board (RIGHT screen)" << std::endl;
-            std::cout << "2. Then select 5 corresponding points on liver (LEFT screen)" << std::endl;
-            std::cout << "3. Press T to execute registration\n" << std::endl;
-            std::cout << "=== Split Screen Mode: ON ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_T:
-        if(currentMainMode == REGISTRATION_MODE){
-            if (registrationHandle.canRegister()) {
-                poseAutoSaveBeforeRegistration();
-                std::vector<mCutMesh*> organs = {liverMesh3D, portalMesh3D, veinMesh3D, tumorMesh3D, segmentMesh3D, gbMesh3D};
-                performRegistrationUmeyama(registrationHandle, organs);
-                computeUnifiedMetrics();
-                poseSaveToLibrary();
-                std::cout << "Registration complete: " << std::endl;
-            }
-
-            splitScreenMode = false;
-            OrbitCam = OrbitCamRight_Screen;
-            OrbitCam.gRadius = OrbitCam.InitialRadius;
-            OrbitCam.cx = gWindowWidth / 2.0f;
-            OrbitCam.cy = gWindowHeight / 2.0f;
-
-            std::cout << "=== Split Screen Mode OFF ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_J:
-        if(currentMainMode == REGISTRATION_MODE){
-            if(registrationHandle.state == RegistrationData::SELECTING_BOARD_POINTS ||
-                registrationHandle.state == RegistrationData::SELECTING_OBJECT_POINTS){
-                registrationHandle.reset();
-                std::cout << "Registration reset" << std::endl;
-                registrationHandle.targetPointCount = 5;
-                registrationHandle.state = RegistrationData::SELECTING_BOARD_POINTS;
-                std::cout << "=== Registration Mode Started (5 points) ===" << std::endl;
-                std::cout << "Select 5 points on texture board" << std::endl;
-            } else {
-                registrationHandle.reset();
-                std::cout << "Registration reset" << std::endl;
-            }
-        }
-        break;
-
-    case GLFW_KEY_H:
-        if(currentMainMode == DEFORM_MODE) {
-            if(deformHandlPlace.state  != DeformHandlPlaceData::DEFORM_MODE){
-                multiBody->setRigidMode(true);
-                multiBody->initPhysics();
-                deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-                std::cout << "=== HandlePlace Mode Started (max "
-                          << SoftBody::MAX_HANDLE_GROUPS << " groups) ===" << std::endl;
-                std::cout << "Current groups: " << multiBody->handleGroups.size()
-                          << "/" << SoftBody::MAX_HANDLE_GROUPS << std::endl;
-            }
-
-            if(deformHandlPlace.state  == DeformHandlPlaceData::DEFORM_MODE){
-                if (multiBody->handleGroups.size() < SoftBody::MAX_HANDLE_GROUPS){
-                    multiBody->setRigidMode(true);
-                    deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-                } else {
-                    deformHandlPlace.reset();
-                    if (multiBody) {
-                        multiBody->fullReset();
+                    if (g_targetAabbFull.valid) {
+                        drawBoxMarkers(g_targetAabbFull.min,
+                                       g_targetAabbFull.max,
+                                       g_targetAabbFull.center,
+                                       glm::vec3(0.95f, 0.20f, 0.20f),   // 赤コーナー
+                                       glm::vec3(1.00f, 0.05f, 0.05f),   // 濃赤センター
+                                       1.6f);
                     }
-                    std::cout << "Complete reset performed" << std::endl;
-
-                    multiBody->setRigidMode(true);
-                    multiBody->initPhysics();
-                    deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-                    std::cout << "=== HandlePlace Mode Started (max "
-                              << SoftBody::MAX_HANDLE_GROUPS << " groups) ===" << std::endl;
-                    std::cout << "Current groups: " << multiBody->handleGroups.size()
-                              << "/" << SoftBody::MAX_HANDLE_GROUPS << std::endl;
+                    if (g_dbgSourceBB_valid) {
+                        drawBoxMarkers(g_dbgSourceBB_min,
+                                       g_dbgSourceBB_max,
+                                       g_dbgSourceBB_center,
+                                       glm::vec3(0.30f, 0.95f, 0.30f),   // 緑コーナー
+                                       glm::vec3(0.05f, 1.00f, 0.05f),   // 濃緑センター
+                                       1.6f);
+                    }
                 }
-            }
-        }
 
-        break;
+                // ビューポートをフルウィンドウに復元（ImGui描画用）
+                glViewport(0, 0, gWindowWidth, gWindowHeight);
+            } // else（通常1画面描画）
+        } // kRegistration
 
-    case GLFW_KEY_M:
-        liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
-        portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
-        veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
-        tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
-        segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
-        gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        currentMainMode = DEFORM_MODE;
-        break;
-
-        if(currentMainMode == REGISTRATION_MODE) {
-            currentMainMode = DEFORM_MODE;
-            std::cout << "=== Switched to DEFORM_MODE ===" << std::endl;
-        } else {
-            currentMainMode = REGISTRATION_MODE;
-            std::cout << "=== Switched to REGISTRATION_MODE ===" << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_D:
-        if(currentMainMode == DEFORM_MODE) {
-            multiBody->setRigidMode(false);
-            deformHandlPlace.state = DeformHandlPlaceData::DEFORM_MODE;
-            std::cout << "Mode: DEFORM MODE" << std::endl;
-        }
-
-        break;
-
-    case GLFW_KEY_R:
-        if(currentMainMode == DEFORM_MODE) {
-            deformHandlPlace.state = DeformHandlPlaceData::RIGID_MODE;
-            multiBody->setRigidMode(true);
-            std::cout << "Mode: RIGID MODE" << std::endl;
-        }
-        if (!cutterMesh) std::cerr << "[Warning] cutterMesh is not initialized, plane cut will not work" << std::endl;
-
-        break;
-
-    case GLFW_KEY_P:
-        if(currentMainMode == DEFORM_MODE){
-            multiBody->setRigidMode(true);
-            deformHandlPlace.state = DeformHandlPlaceData::PLANECUT_MODE;
-            std::cout << "Mode: PLANECUT_MODE" << std::endl;
-        }
-
-        break;
-
-    case GLFW_KEY_C:
-        if(currentMainMode == REGISTRATION_MODE){
-            if (mode & GLFW_MOD_SHIFT) {
-                /* Shift+C = CMA-ES only（現在の姿勢からそのまま精密化） */
-                std::cout << "\n=== CMA-ES Only (Shift+C) ===" << std::endl;
-                if (registrationHandle.compRmse == 0.0f) {
-                    std::cerr << "[Shift+C] No registration yet. Run HemiAuto first." << std::endl;
-                    break;
-                }
-                poseAutoSaveBeforeRegistration();
-                auto organs = getOrganList();
-                computeUnifiedMetrics();
-                float rmse_before = registrationHandle.compRmse;
-                std::cout << "[Shift+C] Current compRMSE: " << rmse_before << std::endl;
-
-                CmaesRefine::Params p;
-                p.verbose   = true;
-                p.log_every = 30;
-                p.save_debug_jpg = false;
-                p.tx_range = 1.0f;
-                p.ty_range = 1.0f;
-                p.tz_range = 1.0f;
-                p.rx_range = 20.0f;
-                p.ry_range = 20.0f;
-                p.rz_range = 20.0f;
-                p.scale_lo = 0.85f;
-                p.scale_hi = 1.15f;
-                CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
-                                                         gGridWidth, gGridHeight(), gDepthScale, p);
-                computeUnifiedMetrics();
-                std::cout << "[Shift+C] Result: " << rmse_before
-                          << " -> " << registrationHandle.compRmse
-                          << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
-                poseSaveToLibrary();
-            } else {
-                /* Key C = HemiAuto + CMA-ES */
-                std::cout << "\n=== HemiAuto + CMA-ES Mode (Key C) ===" << std::endl;
-                gUIManager.state.regMethod = 1;
-                poseAutoSaveBeforeRegistration();
-                resetRegistrationState();
-
-                Reg3D::BVHTree bvhC;
-                bvhC.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-                auto visC = Reg3DCustom::extractVisibleVerticesCustom(
-                    *liverMesh3D, bvhC, OrbitCam.cameraPos, OrbitCam.cameraTarget);
-                if (visC.cloud->size() < 50) {
-                    std::cerr << "[Key C] Not enough visible points" << std::endl;
-                    break;
-                }
-                g_cluster1Points = visC.points;
-                g_cluster2Points.clear();
-                g_refineVertexIndices = visC.vertexIndices;
-                computeIdealVoxelSizes();
-                {
-                    auto organs = getOrganList();
-                    Reg3DCustom::performRegistrationSingleMesh(
-                        organs, liverMesh3D, visC.vertexIndices,
-                        screenMesh, OrbitCam.cameraPos,
-                        gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
-                    computeUnifiedMetrics();
-                    float rmse_before = registrationHandle.compRmse;
-                    std::cout << "[Key C] HemiAuto compRMSE: " << rmse_before << std::endl;
-
-                    CmaesRefine::Params p;
-                    p.verbose   = true;
-                    p.log_every = 30;
-                    p.tx_range = 1.0f;
-                    p.ty_range = 1.0f;
-                    p.tz_range = 1.0f;
-                    p.rx_range = 20.0f;
-                    p.ry_range = 20.0f;
-                    p.rz_range = 20.0f;
-                    p.scale_lo = 0.85f;
-                    p.scale_hi = 1.15f;
-                    CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
-                                                             gGridWidth, gGridHeight(), gDepthScale, p);
-                    computeUnifiedMetrics();
-                    std::cout << "[Key C] Result: " << rmse_before
-                              << " -> " << registrationHandle.compRmse
-                              << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
-                    poseSaveToLibrary();
-                }
-            }
-        }
-        if(currentMainMode == DEFORM_MODE){
-            deformHandlPlace.reset();
-            if (multiBody) {
-                multiBody->fullReset();
-            }
-            std::cout << "Complete reset performed" << std::endl;
-
-            multiBody->setRigidMode(true);
-            multiBody->initPhysics();
-            deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-            std::cout << "=== HandlePlace Mode Started (max "
-                      << SoftBody::MAX_HANDLE_GROUPS << " groups) ===" << std::endl;
-            std::cout << "Current groups: " << multiBody->handleGroups.size()
-                      << "/" << SoftBody::MAX_HANDLE_GROUPS << std::endl;
-        }
-        break;
-
-    case GLFW_KEY_A:
-        if(currentMainMode == REGISTRATION_MODE){
-            saveARimage = true;
-        }
-        break;
-
-    case GLFW_KEY_F2:
-        OrbitCam.resetToInitialState();
-        std::cout << "Camera reset to initial position" << std::endl;
-        break;
-
-    case GLFW_KEY_S:
-        if (currentMainMode == REGISTRATION_MODE) {
-            poseSaveToLibrary();
-        }
-        break;
-
-    case GLFW_KEY_Q:
-        g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
-        std::cout << "[PoseLibrary] Window " << (g_poseLibrary.showWindow ? "ON" : "OFF") << std::endl;
-        break;
-
-    case GLFW_KEY_X:
-        if (currentMainMode == REGISTRATION_MODE && g_poseLibrary.hasLastRegistration) {
-            poseUndo();
-        }
-        break;
-
-    case GLFW_KEY_TAB:
-        if(currentMainMode == REGISTRATION_MODE){
-            OrbitCam.switchTarget();
-        }
-        break;
-
-    case GLFW_KEY_E:
-        if(currentMainMode == REGISTRATION_MODE){
-            bool shiftHeld = (mode & GLFW_MOD_SHIFT) != 0;
-            if (shiftHeld) {
-                std::cout << "\n=== HemiAuto + 2D Silhouette CMA-ES (Shift+E) ===" << std::endl;
-            } else {
-                std::cout << "\n=== HemiAuto + Boundary-Weighted CMA-ES (Key E) ===" << std::endl;
-            }
-            gUIManager.state.regMethod = 1;
-            poseAutoSaveBeforeRegistration();
-            resetRegistrationState();
-
-            Reg3D::BVHTree bvhE;
-            bvhE.build(liverMesh3D->mVertices, liverMesh3D->mIndices);
-            auto visE = Reg3DCustom::extractVisibleVerticesCustom(
-                *liverMesh3D, bvhE, OrbitCam.cameraPos, OrbitCam.cameraTarget);
-            if (visE.cloud->size() < 50) {
-                std::cerr << "[Key E] Not enough visible points" << std::endl;
-                break;
-            }
-            g_cluster1Points = visE.points;
-            g_cluster2Points.clear();
-            g_refineVertexIndices = visE.vertexIndices;
-            computeIdealVoxelSizes();
-            {
-                auto organs = getOrganList();
-                Reg3DCustom::performRegistrationSingleMesh(
-                    organs, liverMesh3D, visE.vertexIndices,
-                    screenMesh, OrbitCam.cameraPos,
-                    gGridWidth, gGridHeight(), 15, 0.005f, 0.35f, true, 0.03f, gDepthScale, g_voxelSize);
-                computeUnifiedMetrics();
-                float rmse_before = registrationHandle.compRmse;
-
-                CmaesRefine::Params p;
-                p.verbose     = true;
-                p.log_every   = 30;
-                /* 広範囲探索パラメータ */
-                p.tx_range = 1.0f;
-                p.ty_range = 1.0f;
-                p.tz_range = 1.0f;
-                p.rx_range = 20.0f;
-                p.ry_range = 20.0f;
-                p.rz_range = 20.0f;
-                p.scale_lo = 0.85f;
-                p.scale_hi = 1.15f;
-                if (shiftHeld) {
-                    p.use_silhouette_2d = true;
-                    p.alpha_silhouette  = 1.0f;
-                    p.alpha_3d          = 0.3f;
-                    p.silhouette_step   = 4;
-                    std::cout << "[Shift+E] HemiAuto compRMSE: " << rmse_before << std::endl;
-                } else {
-                    p.use_boundary_weight = true;
-                    p.boundary_width      = 12.0f;
-                    p.boundary_boost      = 3.0f;
-                    std::cout << "[Key E] HemiAuto compRMSE: " << rmse_before << std::endl;
-                }
-                CmaesRefine::Result r = CmaesRefine::run(organs, screenMesh,
-                                                         gGridWidth, gGridHeight(), gDepthScale, p);
-                computeUnifiedMetrics();
-                std::string label = shiftHeld ? "[Shift+E]" : "[Key E]";
-                std::cout << label << " Result: " << rmse_before
-                          << " -> " << registrationHandle.compRmse
-                          << (r.improved ? " [IMPROVED]" : " [NO CHANGE]") << std::endl;
-                poseSaveToLibrary();
-            }
-        }
-        break;
-
+        glfwSwapBuffers(gWindow);
     }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
+    glfwDestroyWindow(gWindow);
+    glfwTerminate();
+    return 0;
 }
 
-
-void glfw_OnFramebufferSize(GLFWwindow* window, int width, int height)
-{
-    gWindowWidth = width;
-    gWindowHeight = height;
-    glViewport(0, 0, gWindowWidth, gWindowHeight);
-
-    g_sceneTexAllocated = false;
-
-    OrbitCam.onWindowResize(width, height);
-}
-
-void showFPS(GLFWwindow* window)
-{
+void showFPS(GLFWwindow* window) {
     static double previousSeconds = 0.0;
     static int frameCount = 0;
     double elapsedSeconds;
@@ -4111,16 +4876,14 @@ void showFPS(GLFWwindow* window)
 
     elapsedSeconds = currentSeconds - previousSeconds;
 
-    if (elapsedSeconds > 0.25)
-    {
+    if (elapsedSeconds > 0.25) {
         previousSeconds = currentSeconds;
         double fps = (double)frameCount / elapsedSeconds;
         double msPerFrame = 1000.0 / fps;
 
-        int gcd = std::gcd(gWindowWidth, gWindowHeight);
+        int gcd = 1;  // Simplified without std::gcd
         int aspectWidth = gWindowWidth / gcd;
         int aspectHeight = gWindowHeight / gcd;
-
         double aspectRatio = (double)gWindowWidth / (double)gWindowHeight;
 
         std::ostringstream outs;
@@ -4132,9 +4895,1396 @@ void showFPS(GLFWwindow* window)
              << "Aspect: " << aspectWidth << ":" << aspectHeight
              << " (" << aspectRatio << ")";
         glfwSetWindowTitle(window, outs.str().c_str());
-
         frameCount = 0;
     }
-
     frameCount++;
+}
+
+static void syncUIState() {
+    auto& s = gUI.state;
+    s.mainMode          = 0;
+    s.depthRunning      = false;
+    // MaskSelectionとImageOnlyモードの時はdepthDone=falseにしてDepthセクションを表示
+    s.depthDone         = (gApp.mode == AppMode::kRegistration);
+    s.hasLocalImage     = gApp.image.loaded;
+
+    if (gApp.image.loaded) {
+        auto pos = gApp.image.path.find_last_of("/\\");
+        s.localImageName = (pos == std::string::npos)
+                               ? gApp.image.path : gApp.image.path.substr(pos + 1);
+    } else {
+        s.localImageName.clear();
+    }
+
+    int nFg = 0, nBg = 0;
+    for (const auto& p : gApp.maskPoints) (p.fg ? nFg : nBg)++;
+    s.segFG = nFg;
+    s.segBG = nBg;
+    // Instrument-mask counters and active-kind indicator. Mirroring these
+    // every frame keeps the UI live without needing an event when points
+    // are added / removed via MaskPicker.
+    int iFg = 0, iBg = 0;
+    for (const auto& p : gApp.instrumentMaskPoints) (p.fg ? iFg : iBg)++;
+    s.instSegFG = iFg;
+    s.instSegBG = iBg;
+    s.activeMaskKind = (gApp.activeMaskKind == MaskKind::Instrument) ? 1 : 0;
+
+    s.depthScale       = gDepthScale;
+    // RegistrationData の状態を UI にマッピング
+    if (gApp.mode == AppMode::kImageOnly) {
+        s.regState = 0;
+    } else {
+        switch (registrationHandle.state) {
+        case RegistrationData::IDLE:                    s.regState = 0; break;
+        case RegistrationData::SELECTING_BOARD_POINTS:  s.regState = 1; break;
+        case RegistrationData::SELECTING_OBJECT_POINTS: s.regState = 2; break;
+        case RegistrationData::READY_TO_REGISTER:       s.regState = 3; break;
+        case RegistrationData::REGISTERED:              s.regState = 4; break;
+        case RegistrationData::REFINING:                s.regState = 5; break;
+        }
+    }
+    s.boardPtCount     = (int)registrationHandle.boardPoints.size();
+    s.objPtCount       = (int)registrationHandle.objectPoints.size();
+    s.targetPtCount    = registrationHandle.targetPointCount;
+    s.useRegistration  = registrationHandle.useRegistration;
+    s.rmse             = registrationHandle.compRmse;
+    s.avgError         = registrationHandle.compAvgError;
+    s.maxError         = registrationHandle.compMaxError;
+
+    // Pose Library の状態をUIに反映
+    s.poseLibraryOpen    = g_poseLibrary.showWindow;
+    s.poseUndoAvailable  = g_poseLibrary.hasLastRegistration;
+    s.poseEntryCount     = (int)g_poseLibrary.entries.size();
+
+    s.splitScreen      = gUmeyama.active;
+    s.depthSplitScreen = false;
+    // カメラの状態を反映 0:未起動, 1:ライブビュー, 2:キャプチャ済み
+    if (!gCamera.active) {
+        s.cameraState = 0;
+    } else if (!gCamera.captured) {
+        s.cameraState = 1;  // ライブビュー中（Captureボタンを表示）
+    } else {
+        s.cameraState = 2;  // キャプチャ済み（Restart Cameraボタンを表示）
+    }
+
+    s.depthModelIdx    = gCurrentDepthModel;
+    for (int i = 0; i < 3; i++) s.depthModelAvail[i] = isDepthModelAvailable(i);
+
+    s.clusterVis        = g_showClusterVisualization;
+    s.correspondenceVis = g_showCorrespondencePoints;
+
+    s.hemiVoxelSize     = g_voxelSize;
+
+    // 器具マスク連動: スライダー値と「マスクが有効か」フラグを UI 側へ
+    s.instrumentPxThresh   = g_instrumentPxThresh;
+    s.instrumentMaskActive = g_instrumentDistMap.valid;
+
+    // Vignette toggle: mirror AppContext state into the UI so the
+    // checkbox reflects the value used by the next Run Depth.
+    s.detectVignette = gApp.detectVignette;
+
+    // GPU toggle: same mirroring pattern as the vignette flag.
+    s.useCuda = gApp.useCuda;
+
+    // 臓器+board+targetのアルファ値をUIに反映
+    for (int i = 0; i < 6; i++)
+        s.organs[i].alpha = g_meshAlpha[i];
+    s.boardAlpha  = g_meshAlpha[6];
+    s.targetAlpha = g_meshAlpha[7];
+
+    // Calibration state
+    s.intrinsicsSource = g_intrinsicsSource;
+    s.calibDone     = g_calibResult.valid;
+    s.calibMessage  = g_calibResult.message;
+    s.calibFx       = (float)g_calibResult.fx;
+    s.calibFy       = (float)g_calibResult.fy;
+    s.calibCx       = (float)g_calibResult.cx;
+    s.calibCy       = (float)g_calibResult.cy;
+    s.calibRms      = (float)g_calibResult.rmsError;
+    s.calibImgCount = g_calibResult.numImages;
+
+    // チャット 9: 4-quadrant mask 連動 (Ctrl+G ↔ Initial Orientation で完全共有)
+    //   g_activeQuadrantMask を毎フレーム UI 側にコピー → 別 panel で変えても
+    //   両方の checkbox が同期して見える。
+    //   ラベルが未計算なら頂点数 = 0 を渡し、UI 側で "labels not computed" 表示。
+    s.activeQuadrantMask = g_activeQuadrantMask;
+    const bool quadReady = g_liverRegion.valid() && g_liverLR.valid();
+    s.quadLabelsReady = quadReady;
+    if (quadReady) {
+        LiverLeftRightLabel::countByQuadrant(
+            g_liverRegion.labels, g_liverLR.labels,
+            s.quadNAR, s.quadNAL, s.quadNPR, s.quadNPL);
+        auto subset = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+            g_liverRegion.labels, g_liverLR.labels,
+            g_activeQuadrantMask);
+        s.quadSubsetCount = (int)subset.size();
+        s.quadTotalCount  = (int)g_liverRegion.labels.size();
+    } else {
+        s.quadNAR = s.quadNAL = s.quadNPR = s.quadNPL = 0;
+        s.quadSubsetCount = 0;
+        s.quadTotalCount  = 0;
+    }
+
+    // ---- Anatomical Axes Status (Preview OBJ Anatomical Pose) ----
+    //   3 軸ラベルの状態を毎フレーム UI 側にコピー。confidence と weak flag、
+    //   flip 状態の現在値も同期する。Apply Init Pose で auto-trigger される
+    //   経路と、Shift+R / Y / Shift+H で個別に計算する経路、どちらでも
+    //   毎フレーム反映される (UI 側は読み取り専用)。
+    s.apAxisValid  = g_liverRegion.valid();
+    s.lrAxisValid  = g_liverLR.valid();
+    s.ccAxisValid  = g_liverCC.valid();
+    if (s.lrAxisValid) {
+        // LR confidence: |a_vis_pos - a_vis_neg| / a_avg。decisive = >= 2%。
+        const auto& e = g_liverLR.eclipse;
+        float a_avg = 0.5f * (e.a_vis_pos + e.a_vis_neg);
+        s.lrConfidence = (a_avg > 1e-9f)
+            ? (std::fabs(e.a_vis_pos - e.a_vis_neg) / a_avg)
+            : 0.0f;
+        if (s.lrConfidence > 1.0f) s.lrConfidence = 1.0f;
+        s.lrDecisive = e.decisive;
+    } else {
+        s.lrConfidence = 0.0f;
+        s.lrDecisive   = false;
+    }
+    if (s.ccAxisValid) {
+        s.ccConfidence = g_liverCC.cc.confidence;
+        s.ccWeak       = g_liverCC.cc.weak;
+    } else {
+        s.ccConfidence = 0.0f;
+        s.ccWeak       = false;
+    }
+    s.lrFlipped = g_lrFlipManual;
+    s.ccFlipped = g_ccFlipManual;
+
+    if (s.arSavedTimer > 0) s.arSavedTimer -= ImGui::GetIO().DeltaTime;
+}
+
+static void setupUICallbacks() {
+    auto& a = gUI.actions;
+
+    a.onLoadLocalImage = []() {
+#ifdef HAS_TINYFILEDIALOGS
+        const char* filters[] = {"*.png", "*.jpg", "*.jpeg", "*.ppm", "*.bmp"};
+        const char* selected = tinyfd_openFileDialog(
+            "Load Image for Depth",
+            "",
+            5, filters,
+            "Image Files (png/jpg/ppm/bmp)",
+            0
+            );
+        if (selected) {
+            std::cout << "[FilePicker] Selected: " << selected << std::endl;
+            ImageSession::loadWithIntrinsics(gApp, selected, g_intrinsics);
+            if (gApp.mode == AppMode::kRegistration) {
+                gApp.mode = AppMode::kImageOnly;
+            }
+        } else {
+            std::cout << "[FilePicker] Cancelled" << std::endl;
+        }
+#else
+        std::cerr << "[FilePicker] tinyfiledialogs not available." << std::endl;
+#endif
+    };
+
+    a.onUndoSegPoint = []() {
+        MaskPicker::undo(gApp);
+    };
+
+    a.onClearPoints = []() {
+        MaskPicker::clear(gApp);
+    };
+
+    a.onRunDepth = []() {
+        AppMode previousMode = gApp.mode;
+        std::cout << "[UI] Run Depth" << std::endl;
+
+        // カメラモードかどうかチェック
+        if (gCamera.active && (gApp.image.path == "[Camera Live]" || gApp.image.path == "[Camera Captured]")) {
+            // カメラの場合、マスクポイントの座標変換が必要
+            // 画面上のクリック位置（左右反転済み）を元の画像座標に変換
+            std::vector<MaskPoint> originalMaskPoints       = gApp.maskPoints;
+            std::vector<MaskPoint> originalInstrumentPoints = gApp.instrumentMaskPoints;
+            for (auto& p : gApp.maskPoints) {
+                p.u = gApp.image.width - p.u;  // X座標を反転
+            }
+            for (auto& p : gApp.instrumentMaskPoints) {
+                p.u = gApp.image.width - p.u;  // X座標を反転
+            }
+
+            // カメラから深度推定を実行
+            bool result = runCameraDepthEstimation();
+
+            // マスクポイントを元に戻す
+            gApp.maskPoints           = originalMaskPoints;
+            gApp.instrumentMaskPoints = originalInstrumentPoints;
+
+        } else {
+            // 通常の画像から深度推定を実行
+            runDepthAndUpdateScene(gApp);
+        }
+    };
+
+    // ---- Segment 1 / Instrument button handlers -----------------------------
+    // Each handler does two things:
+    //   (1) make its mask kind the active one (so future clicks land in the
+    //       right list and the renderer picks the right colors);
+    //   (2) if that list already has a foreground point, run a SAM2-only
+    //       preview popup so the user can sanity-check the mask before
+    //       committing to Run Depth.
+    //
+    // Camera-live mode mirrors the click coordinates left/right because the
+    // preview is also flipped; we restore the original click coords after
+    // the runner returns so the user's edits aren't disturbed.
+    auto runSegmentForCamera = [](AppContext& ctx, MaskKind kind) {
+        // Pick which list to flip based on the kind being previewed.
+        std::vector<MaskPoint>& target =
+            (kind == MaskKind::Instrument) ? ctx.instrumentMaskPoints
+                                           : ctx.maskPoints;
+        std::vector<MaskPoint> backup = target;
+        for (auto& p : target) p.u = ctx.image.width - p.u;
+        runSegmentOnly(ctx, kind);
+        target = backup;
+    };
+
+    a.onSegment1 = [runSegmentForCamera]() {
+        std::cout << "[UI] Segment 1 (Liver)" << std::endl;
+        // (1) Activate Liver mask (next click lands in maskPoints).
+        gApp.activeMaskKind = MaskKind::Liver;
+        // (2) Preview only if there's at least one foreground point.
+        bool hasFg = false;
+        for (const auto& p : gApp.maskPoints) if (p.fg) { hasFg = true; break; }
+        if (!hasFg) {
+            std::cout << "[Segment1] activated; click a foreground point "
+                         "and press Segment 1 again to preview" << std::endl;
+            return;
+        }
+        if (gCamera.active &&
+            (gApp.image.path == "[Camera Live]" ||
+             gApp.image.path == "[Camera Captured]"))
+        {
+            runSegmentForCamera(gApp, MaskKind::Liver);
+        } else {
+            runSegmentOnly(gApp, MaskKind::Liver);
+        }
+    };
+
+    a.onSegment2 = [runSegmentForCamera]() {
+        std::cout << "[UI] Instrument (Segment 2)" << std::endl;
+        // (1) Activate Instrument mask (next click lands in instrumentMaskPoints).
+        gApp.activeMaskKind = MaskKind::Instrument;
+        // (2) Preview only if there's at least one foreground point.
+        bool hasFg = false;
+        for (const auto& p : gApp.instrumentMaskPoints)
+            if (p.fg) { hasFg = true; break; }
+        if (!hasFg) {
+            std::cout << "[Instrument] activated; click a foreground point "
+                         "(cyan) and press Instrument again to preview"
+                      << std::endl;
+            return;
+        }
+        if (gCamera.active &&
+            (gApp.image.path == "[Camera Live]" ||
+             gApp.image.path == "[Camera Captured]"))
+        {
+            runSegmentForCamera(gApp, MaskKind::Instrument);
+        } else {
+            runSegmentOnly(gApp, MaskKind::Instrument);
+        }
+    };
+
+    a.onResetDefaultImage = []() {
+        ImageSession::loadWithIntrinsics(gApp, DEPTH_OUTPUT_PATH + "original.jpg", g_intrinsics);
+        gApp.maskPoints.clear();
+    };
+
+    a.onHemiAuto = []() {
+        // 元コード line 3213-3238 通り
+        gUI.state.regMethod = 1;
+        g_stepStartTime  = std::chrono::steady_clock::now();
+        g_sessionBipopN  = 0;
+        poseAutoSaveBeforeRegistration();
+        runHemiAuto();
+        poseSaveToLibrary(SaveCriterion::RMSE);
+    };
+
+    a.onQuadAuto = []() {
+        // Shift+O / QuadAuto: labels auto-trigger してから runQuadAuto。
+        //   a.onHemiAuto と並列のラッパー。UI ボタン経由でも同等の動作を保証
+        //   (現時点で UI ボタンは未配線 — 将来 HemiAuto ボタン横に追加可能)。
+        if (!g_liverRegion.valid()) {
+            std::cout << "[QuadAuto] LiverRegion not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverRegion();
+        }
+        if (!g_liverLR.valid()) {
+            std::cout << "[QuadAuto] LiverLR not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverLR();
+        }
+        gUI.state.regMethod = 1;
+        g_stepStartTime  = std::chrono::steady_clock::now();
+        g_sessionBipopN  = 0;
+        poseAutoSaveBeforeRegistration();
+        runQuadAuto();
+        poseSaveToLibrary(SaveCriterion::RMSE);
+    };
+
+    a.onQuadCyclic = []() {
+        // Ctrl+P / QuadCyclic: labels auto-trigger してから runQuadCyclic。
+        //   a.onQuadAuto と並列のラッパー。UI ボタン経由でも同等の動作を保証
+        //   (現時点で UI ボタンは未配線 — 将来追加可能)。
+        if (!g_liverRegion.valid()) {
+            std::cout << "[QuadCyclic] LiverRegion not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverRegion();
+        }
+        if (!g_liverLR.valid()) {
+            std::cout << "[QuadCyclic] LiverLR not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverLR();
+        }
+        gUI.state.regMethod = 1;
+        g_stepStartTime  = std::chrono::steady_clock::now();
+        g_sessionBipopN  = 0;
+        poseAutoSaveBeforeRegistration();
+        runQuadCyclic();
+        poseSaveToLibrary(SaveCriterion::RMSE);
+    };
+
+    a.onQuadCyclicRansac = []() {
+        // Shift+Ctrl+P / QuadCyclic-RANSAC: labels auto-trigger → runQuadCyclicRansac。
+        //   a.onQuadCyclic と同形のラッパー。UI ボタン経由でも同等の動作を保証
+        //   (現時点で UI ボタンは未配線 — 将来 Cyclic Tuning panel で追加予定)。
+        if (!g_liverRegion.valid()) {
+            std::cout << "[QuadCyclic-RANSAC] LiverRegion not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverRegion();
+        }
+        if (!g_liverLR.valid()) {
+            std::cout << "[QuadCyclic-RANSAC] LiverLR not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverLR();
+        }
+        gUI.state.regMethod = 1;
+        g_stepStartTime  = std::chrono::steady_clock::now();
+        g_sessionBipopN  = 0;
+        poseAutoSaveBeforeRegistration();
+        runQuadCyclicRansac();
+        poseSaveToLibrary(SaveCriterion::RMSE);
+    };
+
+    a.onBipopCmaes = []() {
+        // 元コード line 3338-3445 通り
+        g_stepStartTime = std::chrono::steady_clock::now();
+        g_sessionBipopN++;
+        gUI.state.regMethod = 3;
+        poseAutoSaveBeforeRegistration();
+        runBipopCmaes();
+        poseSaveToLibrary(SaveCriterion::RMSE);
+    };
+
+    a.onSaveAR = []() {
+        if (gApp.mode != AppMode::kRegistration || !screenMesh || !g_pShader) {
+            std::cout << "[AR] Not in Registration mode or missing data" << std::endl;
+            return;
+        }
+        std::vector<mCutMesh*> organs = {
+            liverMesh3D, portalMesh3D, veinMesh3D,
+            tumorMesh3D, segmentMesh3D, gbMesh3D
+        };
+        // 入力画像サイズ（キャリブレーション解像度）で保存
+        int imgW = OrbitCam.calibWidth  > 0 ? OrbitCam.calibWidth  : 1280;
+        int imgH = OrbitCam.calibHeight > 0 ? OrbitCam.calibHeight : 720;
+        ARSave::capture(g_arSave, OrbitCam, *g_pShader, *g_pShaderCube,
+                        gApp.arBg, organs, g_meshAlpha, objPos,
+                        imgW, imgH,
+                        DEPTH_OUTPUT_PATH, gWindowWidth, gWindowHeight);
+        gUI.state.arSavedTimer = 2.0f;
+    };
+
+    a.onResetCamera = []() {
+        OrbitCam.resetToInitialState();
+        // OBJワークフローではカメラを180° Y回転が正しい初期位置
+        if (gApp.mode == AppMode::kRegistration) {
+            OrbitCam.rotation = glm::angleAxis(glm::radians(180.0f),
+                                               glm::vec3(0.0f, 1.0f, 0.0f));
+            OrbitCam.currentTarget = TARGET_TEXTURE;
+        }
+    };
+
+    a.onToggleClusterVis = []() {
+        g_showClusterVisualization = !g_showClusterVisualization;
+    };
+
+    a.onSwitchDepthModel = [](int i) {
+        DepthRunner dummy;
+        switchDepthModel(dummy, i);
+    };
+
+    a.onDepthScaleChanged = [](float v) {
+        gDepthScale = v;
+    };
+
+    a.onIntrinsicsSourceChanged = [](int i) {
+        g_intrinsicsSource = i;
+        const char* names[] = {"DA3", "Kinect", "Custom", "Calibrated"};
+        std::cout << "[Intrinsics] Source: " << names[std::clamp(i,0,3)] << std::endl;
+
+        // ボタン押下と同時に g_intrinsics を更新する。これがないと Custom を
+        // 選んだ直後にドロップした画像が rectify 経路を通らない
+        // (loadWithIntrinsics は g_intrinsics を見るが、setupObjScene が
+        // 呼ばれるまで g_intrinsics は古い K のまま) というバグになる。
+        Reg3DCustom::CameraIntrinsics K;
+        bool loaded = false;
+        if (i == 2) {
+            loaded = Reg3DCustom::loadCameraIntrinsics(
+                DEPTH_OUTPUT_PATH + "intrinsics_custom.txt", K);
+        } else if (i == 1) {
+            loaded = Reg3DCustom::loadCameraIntrinsics(
+                DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt", K);
+            if (!loaded) {
+                K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
+                loaded = true;
+            }
+        } else if (i == 0) {
+            loaded = Reg3DCustom::loadCameraIntrinsics(
+                DEPTH_OUTPUT_PATH + "intrinsics.txt", K);
+        } else if (i == 3) {
+            if (g_calibResult.valid) {
+                K.fx = (float)g_calibResult.fx;
+                K.fy = (float)g_calibResult.fy;
+                K.cx = (float)g_calibResult.cx;
+                K.cy = (float)g_calibResult.cy;
+                K.width  = g_calibResult.width;
+                K.height = g_calibResult.height;
+                K.name   = "calibrated";
+                loaded = true;
+            }
+        }
+
+        if (loaded && K.valid()) {
+            g_intrinsics    = K;
+            gApp.intrinsics = K;
+            OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
+            std::cout << "[Intrinsics] Live K updated: "
+                      << (K.name.empty() ? "(unnamed)" : K.name)
+                      << "  " << K.width << "x" << K.height
+                      << (K.hasDistortion() ? "  [has distortion]" : "")
+                      << std::endl;
+        } else {
+            std::cerr << "[Intrinsics] Failed to load K for source "
+                      << names[std::clamp(i,0,3)]
+                      << " -- keeping previous K" << std::endl;
+        }
+    };
+
+    a.onRunCalibration = []() {
+        std::cout << "[Calib] Running calibration_tool..." << std::endl;
+
+        // Find calibration_tool executable (same dir as medsam2_da3_lite)
+        std::string exeDir = std::filesystem::path(DEPTH_EXE_PATH).parent_path().string();
+        std::string exe;
+        const std::vector<std::string> candidates = {
+            "./calibration_tool",
+            exeDir + "/calibration_tool",
+        };
+        for (auto& c : candidates) {
+            if (std::filesystem::exists(c)) { exe = c; break; }
+        }
+        if (exe.empty()) {
+            std::cerr << "[Calib] calibration_tool not found!\n"
+                      << "  CWD: " << std::filesystem::current_path() << "\n"
+                      << "  Searched:" << std::endl;
+            for (auto& c : candidates) {
+                std::string abs;
+                try { abs = std::filesystem::absolute(c).string(); } catch (...) { abs = c; }
+                std::cerr << "    " << abs << "  "
+                          << (std::filesystem::exists(c) ? "[OK]" : "[NOT FOUND]") << std::endl;
+            }
+            g_calibResult.message = "calibration_tool not found (check build)";
+            return;
+        }
+
+        try { exe = std::filesystem::absolute(exe).string(); } catch (...) {}
+        std::cout << "[Calib] exe: " << exe << std::endl;
+
+        std::string folder  = "../../../chessboard/";
+        std::string outFile = DEPTH_OUTPUT_PATH + "intrinsics_calib.txt";
+
+        std::string cmd = "\"" + exe + "\" \"" + folder + "\""
+                          + " --board 9,6 --square 22"
+                          + " --output \"" + outFile + "\""
+                          + " 2>&1";
+
+        std::cout << "[Calib] " << cmd << std::endl;
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            g_calibResult.message = "popen failed";
+            std::cerr << "[Calib] " << g_calibResult.message << std::endl;
+            return;
+        }
+        char buf[512];
+        while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
+        int exitCode = pclose(pipe);
+
+        if (exitCode != 0) {
+            g_calibResult.message = "calibration_tool exit code " + std::to_string(exitCode);
+            std::cerr << "[Calib] " << g_calibResult.message << std::endl;
+            return;
+        }
+
+        // Read result file
+        std::ifstream ifs(outFile);
+        if (!ifs.is_open()) {
+            g_calibResult.message = "Cannot open " + outFile;
+            return;
+        }
+        std::string key; double val;
+        while (ifs >> key >> val) {
+            if      (key == "fx")     g_calibResult.fx = val;
+            else if (key == "fy")     g_calibResult.fy = val;
+            else if (key == "cx")     g_calibResult.cx = val;
+            else if (key == "cy")     g_calibResult.cy = val;
+            else if (key == "k1")     g_calibResult.k1 = val;
+            else if (key == "k2")     g_calibResult.k2 = val;
+            else if (key == "width")  g_calibResult.width  = (int)val;
+            else if (key == "height") g_calibResult.height = (int)val;
+            else if (key == "rms")    g_calibResult.rmsError = val;
+        }
+        g_calibResult.valid = (g_calibResult.fx > 0 && g_calibResult.fy > 0);
+        g_calibResult.message = g_calibResult.valid ? "OK" : "Invalid result";
+        if (g_calibResult.valid) g_intrinsicsSource = 3;
+
+        std::cout << "[Calib] Result: fx=" << g_calibResult.fx
+                  << " fy=" << g_calibResult.fy
+                  << " cx=" << g_calibResult.cx
+                  << " cy=" << g_calibResult.cy
+                  << " rms=" << g_calibResult.rmsError << std::endl;
+    };
+
+    a.onToggleOrgan = [](int i) {
+        if (i < 0 || i >= 8) return;
+        float a = g_meshAlpha[i];
+        // ON(≥0.75) → OFF(0) → 50%(0.5) → ON(0.8)
+        if (a >= 0.75f)      g_meshAlpha[i] = 0.0f;
+        else if (a < 0.01f)  g_meshAlpha[i] = 0.5f;
+        else                 g_meshAlpha[i] = 0.8f;
+    };
+
+    a.onToggleCorrespondenceVis = []() {
+        g_showCorrespondencePoints = !g_showCorrespondencePoints;
+    };
+
+    a.onToggleCamera = []() {
+        if (!gCamera.active) {
+            // カメラ開始前に現在の状態を保存
+            g_cameraBackupState.previousMode = gApp.mode;
+            g_cameraBackupState.hadImage = gApp.image.loaded;
+            g_cameraBackupState.previousImagePath = gApp.image.path;
+            g_cameraBackupState.previousImageWidth = gApp.image.width;
+            g_cameraBackupState.previousImageHeight = gApp.image.height;
+
+            // カメラを開始（ライブビューモード、通常UIのまま）
+            if (gCamera.start()) {
+                // ImageOnlyモードでライブビュー表示（通常のUIが表示される）
+                gApp.mode = AppMode::kImageOnly;
+                gApp.maskPoints.clear();
+                gApp.image.loaded = true;
+                gApp.image.width = gCamera.width;
+                gApp.image.height = gCamera.height;
+                gApp.image.path = "[Camera Live]";
+                std::cout << "[Camera] Started in live view mode (ImageOnly mode)" << std::endl;
+            }
+        } else if (!gCamera.captured) {
+            // ライブビュー中 → キャプチャして静止画にする、マスク選択モードへ
+            // 少し待ってから最初のフレームをキャプチャ
+            for (int i = 0; i < 5; i++) {
+                gCamera.capture(gApp.arBg);
+            }
+            gCamera.captureCurrentFrame();  // 静止画キャプチャ
+            gApp.image.path = "[Camera Captured]";
+            gApp.mode = AppMode::kMaskSelection;  // キャプチャ後にマスク選択モードへ
+            std::cout << "[Camera] Frame captured, switched to mask selection mode" << std::endl;
+        } else {
+            // キャプチャ済み → カメラを停止
+            gCamera.stop();
+            gApp.mode = AppMode::kEmpty;
+            gApp.image.loaded = false;
+            std::cout << "[Camera] Stopped and returned to empty mode" << std::endl;
+        }
+    };
+
+    a.onCameraBack = []() {
+        // カメラを停止
+        gCamera.stop();
+
+        // 前の状態を復元
+        gApp.mode = g_cameraBackupState.previousMode;
+        gApp.image.loaded = g_cameraBackupState.hadImage;
+        gApp.image.path = g_cameraBackupState.previousImagePath;
+        gApp.image.width = g_cameraBackupState.previousImageWidth;
+        gApp.image.height = g_cameraBackupState.previousImageHeight;
+
+        // マスクポイントはクリア（新しい操作として開始）
+        gApp.maskPoints.clear();
+
+        std::cout << "[Camera] Returned to previous mode: "
+                  << static_cast<int>(g_cameraBackupState.previousMode)
+                  << (g_cameraBackupState.hadImage ? " (with previous image)" : " (no image)")
+                  << std::endl;
+    };
+
+    a.onFullAuto = []() {
+        std::cout << "[stub] onFullAuto" << std::endl;
+    };
+
+    a.onHemiVoxelChanged = [](float v) {
+        g_voxelSize = v;
+        std::cout << "[HemiVoxel] Changed to " << g_voxelSize << std::endl;
+    };
+
+    a.onInstrumentPxThreshChanged = [](float v) {
+        g_instrumentPxThresh = std::max(0.0f, v);
+        std::cout << "[InstrumentMask] threshold -> "
+                  << g_instrumentPxThresh << " px"
+                  << "  (next HemiAuto / O will reclassify)" << std::endl;
+    };
+
+    a.onDetectVignetteChanged = [](bool include) {
+        // Update the AppContext flag. The next Instrument-preview or
+        // Run-Depth invocation will pass this through to
+        // DepthRunnerConfig::detectVignette which controls whether the
+        // external pipeline merges the auto-detected FOV vignette into
+        // instrument_segmentation_mask.png.
+        gApp.detectVignette = include;
+        std::cout << "[Occluder] include_vignette_in_occluder="
+                  << (include ? "ON" : "OFF")
+                  << "  (applies to NEXT Run Depth / Instrument preview)"
+                  << std::endl;
+    };
+
+    a.onUseCudaChanged = [](bool useGpu) {
+        // Update the AppContext flag. The next Instrument-preview or
+        // Run-Depth invocation passes this through to
+        // DepthRunnerConfig::useCuda which adds --cuda to the CLI so the
+        // external pipeline registers the CUDAExecutionProvider.
+        // The flag is harmless when medsam2_da3_lite was built with
+        // USE_CUDA=OFF -- the pipeline prints a "CUDA not available"
+        // warning and falls back to CPU.
+        gApp.useCuda = useGpu;
+        std::cout << "[Depth] use_cuda="
+                  << (useGpu ? "ON" : "OFF")
+                  << "  (applies to NEXT Run Depth / Instrument preview)"
+                  << std::endl;
+    };
+
+    a.onStartUmeyama = []() {
+        gUmeyama.start(registrationHandle, OrbitCam, gWindowWidth, gWindowHeight);
+        gUI.state.regMethod = 2;
+    };
+
+    a.onExecuteUmeyama = []() {
+        // 元コード line 3475-3489 通り
+        // (g_stepStartTime は触らない; regMethod=2 は onStartUmeyama で設定済み)
+        poseAutoSaveBeforeRegistration();
+        auto organs = getOrganList();
+        gUmeyama.execute(registrationHandle, organs, OrbitCam, gWindowWidth, gWindowHeight);
+        computeUnifiedMetrics();
+        poseSaveToLibrary(SaveCriterion::RMSE);
+    };
+
+    a.onUndoUmeyamaPoint = []() {
+        gUmeyama.undoPoint(registrationHandle);
+    };
+
+    a.onResetRegistration = []() {
+        AppMode previousMode = gApp.mode;
+        std::cout << "[UI] Reset Registration" << std::endl;
+
+        // 元コード line 3491-3513 通り: startNewSession を最初に
+        poseStartNewSession();
+
+        // Phase 1: trial シード/callIdx もリセット (再現性の "fresh trial")
+        resetTrialSeed();
+
+        // Umeyamaがアクティブなら閉じる
+        if (gUmeyama.active) {
+            gUmeyama.cancel(registrationHandle, OrbitCam);
+        }
+
+        // レジストレーションの変換のみリセット（ポイントは保持）
+        registrationHandle.resetTransformOnly();
+        gUI.state.regMethod = -1;
+
+        // 初期ポーズを復元（元のコードと同じ）
+        restoreInitialPose();
+
+        // 初期回転プリセットをリセット (Phase 2: 幾何ベース BASE + Position CENTER)
+        registrationHandle.initRotPreset = RegistrationData::PRESET_BASE;
+        registrationHandle.initRotPosition = RegistrationData::POS_CENTER;
+        gUI.state.initRotPreset = 0;
+        gUI.state.initRotPosition = 0;
+        // チャット 9: 4-quadrant mask も QUAD_ALL にリセット
+        //   (= 旧 POS_CENTER と byte-identical な初期状態)
+        g_activeQuadrantMask = LiverLeftRightLabel::QUAD_ALL;
+        gUI.state.activeQuadrantMask = LiverLeftRightLabel::QUAD_ALL;
+        g_currentOrientLabel    = "Base";   // Phase 2: 旧 "Front" → "Base"
+
+        // クラスタ可視化をクリア
+        g_cluster1Points.clear();
+        g_cluster2Points.clear();
+        g_targetPoints.clear();
+        g_rejectedBoundaryPoints.clear();
+        g_visibleSourcePoints.clear();
+        g_silhouetteSourcePoints.clear();
+        g_showClusterVisualization = false;
+        g_showBoundaryCandidates   = false;
+        g_showSourceVisualization  = false;
+        g_showCorrespondencePoints = false;
+        g_showCyclicCorrespondence = false;
+        g_cyclicAvailable          = false;
+
+        // Ctrl+G rim-pair viz buffers (V3R-W). Toggle stays as user
+        // last set it; only the populated buffers are cleared.
+        g_ctrlgRimSrcVertIdx.clear();
+        g_ctrlgRimTgtPos.clear();
+        g_ctrlgRimVizAvailable     = false;
+
+        // Cranio-caudal viz buffers (Shift+H, Phase 1). Toggle stays as
+        // user last set it; only the populated buffers are cleared
+        // (LR/Region と同じ流儀。labels 自体はメッシュ再ロード時に
+        //  recomputeLiverCC の size mismatch チェックで再計算される)。
+        g_ccVizIdxCranial.clear();
+        g_ccVizIdxCaudal.clear();
+
+        // AppModeは変更しない！3Dシーンはそのまま表示される
+        // UIのregPhaseActive_は呼び出し元（Back Depthボタン）で制御される
+
+        std::cout << "[InitRot] Reset to Base" << std::endl;
+        std::cout << "[ResetReg] Registration state and clusters cleared (mode unchanged: "
+                  << static_cast<int>(previousMode) << ")" << std::endl;
+    };
+
+    a.onRigidMode = []() {
+        std::cout << "[stub] onRigidMode" << std::endl;
+    };
+
+    a.onHandlePlaceMode = []() {
+        std::cout << "[stub] onHandlePlaceMode" << std::endl;
+    };
+
+    a.onDeformMode = []() {
+        std::cout << "[stub] onDeformMode" << std::endl;
+    };
+
+    a.onFullReset = []() {
+        std::cout << "[stub] onFullReset" << std::endl;
+    };
+
+    a.onHandleRadiusChanged = [](float) {
+        std::cout << "[stub] onHandleRadiusChanged" << std::endl;
+    };
+
+    a.onStartFromDepth = []() {
+        // Registration状態をリセットしてDepthフェーズに戻る
+        registrationHandle.reset();
+        gUI.resetToDepthPhase();
+        gApp.mode = AppMode::kEmpty;
+        gApp.image.loaded = false;
+
+        // 臓器の可視性をリセット（デフォルトalpha値に戻す）
+        // liver と target だけ ON、それ以外は全 OFF
+        const float defaultAlpha[8] = {0.8f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f};
+        for (int i = 0; i < 8; i++) {
+            g_meshAlpha[i] = defaultAlpha[i];
+        }
+
+        std::cout << "[StartFromDepth] Back to Depth phase" << std::endl;
+    };
+
+    a.onSwitchToDeformMode = []() {
+        std::cout << "[stub] onSwitchToDeformMode" << std::endl;
+    };
+
+    a.onRefine = []() {
+        std::cout << "[stub] onRefine" << std::endl;
+    };
+
+    a.onSilhouetteAlign = []() {
+        // 元コード line 2854 (runShiftE 内冒頭) と line 3073-3075
+        // g_stepStartTime をリセットして各Shift+E呼出しごとの所要時間を記録
+        g_stepStartTime = std::chrono::steady_clock::now();
+        poseAutoSaveBeforeRegistration();
+        runShiftE();
+        g_sessionSilhouetteN++;
+        gUI.state.regMethod = 5;
+        poseSaveToLibrary(SaveCriterion::IOU);
+    };
+
+    a.onPoseLibraryToggle = []() {
+        g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
+        std::cout << "[PoseLibrary] Window "
+                  << (g_poseLibrary.showWindow ? "ON" : "OFF") << std::endl;
+    };
+
+    a.onPoseUndo = []() {
+        g_metricsValid = false;  // pose about to be restored; Phase A must remeasure
+        poseUndo();
+    };
+
+    a.onAutoProbe = []() {
+        g_callIdx = 0;  // 単体 AutoProbe: シード範囲 0..N-1
+        runAutoProbe();
+    };
+
+    a.onIterativeAutoProbe = [](int K) {
+        runIterativeAutoProbe(K);
+    };
+
+    a.onInitRotPresetChanged = [](int preset) {
+        // Phase 2: 幾何ベース Initial Orientation (preset = 9 通りの回転)。
+        //   - 患者ごとに肝臓自身の解剖軸を基準にするので、同じプリセットが
+        //     患者間で同じ解剖学的意味を持つ。
+        //   - 重心位置 (initRotPosition) は別の selector で独立に管理。
+        //     9 × 3 = 27 通りの初期姿勢が生成可能。
+        //   - 実際の回転・平行移動の適用は applyInitRotation() に集約。
+        registrationHandle.initRotPreset = (RegistrationData::InitRotPreset)preset;
+        std::cout << "[InitRot] Preset selected: "
+                  << RegistrationData::presetName(registrationHandle.initRotPreset)
+                  << std::endl;
+        applyInitRotation(/*startNewSession=*/true);
+    };
+
+    a.onInitRotPositionChanged = [](int position) {
+        // Phase 2 拡張 (legacy): 重心の画面配置 selector (Right / Center / Left)。
+        //   UI ボタンは削除済みだが、API 互換のため残置。チャット 9 以降は
+        //   onQuadrantMaskChanged + onApplyInitPose 経由が標準。
+        registrationHandle.initRotPosition = (RegistrationData::InitRotPosition)position;
+        std::cout << "[InitRot] (legacy) Position selected: "
+                  << RegistrationData::positionName(registrationHandle.initRotPosition)
+                  << std::endl;
+        applyInitRotation(/*startNewSession=*/false);
+    };
+
+    // -------------------------------------------------------------------
+    //  チャット 9: 4-quadrant 連動 callback
+    //  ------------------------------------------------------------------
+    //  onQuadrantMaskChanged:
+    //    Initial Orientation panel の 2x2 grid checkbox or Quick Preset 押下時、
+    //    または Ctrl+G panel の checkbox 押下時に呼ばれる。
+    //    main.cpp 側で g_activeQuadrantMask を更新するのみ — 副作用なし。
+    //    実際の姿勢適用は onApplyInitPose 経由で明示的に行う (判断 A-2)。
+    //
+    //  ※ Ctrl+G panel 側 checkbox はこの callback を経由せず g_activeQuadrantMask
+    //    を直接書き換える既存実装のまま。これは Ctrl+G 操作中に initial pose を
+    //    勝手に動かさないため (subset 調整時の意図しない姿勢変化を防止)。
+    //    どちらの panel から変えても g_activeQuadrantMask は同期する。
+    a.onQuadrantMaskChanged = [](uint8_t mask) {
+        g_activeQuadrantMask = mask;
+        std::cout << "[InitRot] Quadrant mask changed: "
+                  << LiverLeftRightLabel::quadrantMaskString(mask)
+                  << " (0x" << std::hex << (unsigned)mask << std::dec << ")"
+                  << "  -- press 'Apply Init Pose' to apply, or 'Ctrl+G' to run V3-R"
+                  << std::endl;
+    };
+
+    //  onApplyInitPose:
+    //    Initial Orientation panel の Apply Init Pose ボタン押下時に呼ばれる。
+    //    現在の preset + g_activeQuadrantMask で applyInitRotation を実行し、
+    //    新規 PoseLibrary session を開始する (preset 変更時と同じ扱い)。
+    a.onApplyInitPose = []() {
+        std::cout << "[InitRot] Apply Init Pose button pressed: preset="
+                  << RegistrationData::presetName(registrationHandle.initRotPreset)
+                  << "  mask=" << LiverLeftRightLabel::quadrantMaskString(g_activeQuadrantMask)
+                  << " (0x" << std::hex << (unsigned)g_activeQuadrantMask << std::dec << ")"
+                  << std::endl;
+        g_metricsValid = false;  // pose about to change; Phase A must remeasure
+        applyInitRotation(/*startNewSession=*/true);
+    };
+
+    //  onFlipLR (Preview OBJ Anatomical Pose):
+    //    LR axis の sign を反転する。**in-place** で d_lr を negate + ラベル配列を
+    //    swap するだけで、PCA / eclipse の再計算は行わない。
+    //
+    //    なぜ recompute しないか:
+    //      Apply Init Pose は mesh を回転させる。次に Flip を押したとき、
+    //      labelVertices() を呼ぶと「変形後の mesh」で PCA を実行する → 固有
+    //      ベクトルが変わる → 2 回 Flip しても元の d_lr に戻らない。
+    //      この症状は実機で確認済 (Flip true → Apply → Flip false で sign が
+    //      非対称になる)。
+    //    In-place 実装の対称性:
+    //      g_lrFlipManual を toggle するのみ + g_liverLR の中身を sign-反転する。
+    //      PCA 結果 (eclipse.a_vis_pos 等) は保持されるので、2 回押せば必ず
+    //      元の状態に戻る。Apply Init Pose が間に何回入っても無関係。
+    //    CC への影響:
+    //      CC は LR が選んだ PCA 軸 (idx) ではなく「残りの軸」を使う。LR の
+    //      sign 反転は CC の d_cc には何ら影響しない (LiverCranioCaudalLabel
+    //      の実装を参照)。したがって CC は触らない。
+    //    Bootstrap:
+    //      g_liverLR がまだ未計算なら通常の recompute 経路に fallback する。
+    //      最初の 1 回だけは PCA を回す必要があるため。
+    a.onFlipLR = []() {
+        g_lrFlipManual = !g_lrFlipManual;
+        if (!g_liverLR.valid()) {
+            std::cout << "[Axes] Flip LR -> "
+                      << (g_lrFlipManual ? "true" : "false")
+                      << "  (bootstrap: full recompute)" << std::endl;
+            recomputeLiverLR();
+            if (g_liverCC.valid()) recomputeLiverCC();
+            return;
+        }
+        std::cout << "[Axes] Flip LR -> "
+                  << (g_lrFlipManual ? "true" : "false")
+                  << "  (in-place: PCA preserved -> 2x flip = identity)"
+                  << std::endl;
+        // d_lr 反転
+        g_liverLR.d_lr = -g_liverLR.d_lr;
+        g_liverLR.eclipse.flipped_manual = g_lrFlipManual;
+        // ラベル swap (PURE_R ↔ PURE_L、BOUNDARY はそのまま)
+        for (auto& lbl : g_liverLR.labels) {
+            if (lbl == LiverLeftRightLabel::PURE_RIGHT)
+                lbl = LiverLeftRightLabel::PURE_LEFT;
+            else if (lbl == LiverLeftRightLabel::PURE_LEFT)
+                lbl = LiverLeftRightLabel::PURE_RIGHT;
+        }
+        std::swap(g_liverLR.n_pure_right, g_liverLR.n_pure_left);
+        // 診断情報も swap (UI confidence は |Δ|/avg で対称式なので不変)
+        std::swap(g_liverLR.eclipse.n_vis_pos, g_liverLR.eclipse.n_vis_neg);
+        std::swap(g_liverLR.eclipse.a_vis_pos, g_liverLR.eclipse.a_vis_neg);
+        g_liverLR.eclipse.lean_area = -g_liverLR.eclipse.lean_area;
+        // Y キーの球マーカー (viz subsample) を新しいラベル割り当てに合わせて再構築
+        g_lrVizIdxR = LiverLeftRightLabel::sampleVertexIndices(
+            g_liverLR.labels, LiverLeftRightLabel::PURE_RIGHT, 1500);
+        g_lrVizIdxL = LiverLeftRightLabel::sampleVertexIndices(
+            g_liverLR.labels, LiverLeftRightLabel::PURE_LEFT, 1200);
+    };
+
+    //  onFlipCC (Preview OBJ Anatomical Pose):
+    //    CC axis の sign を反転する。onFlipLR と同じ in-place 戦略。
+    //    LR axis には影響しない (CC は LR の axis idx を借りるが、d_cc は
+    //    独立に sign 決定されているため)。
+    a.onFlipCC = []() {
+        g_ccFlipManual = !g_ccFlipManual;
+        if (!g_liverCC.valid()) {
+            std::cout << "[Axes] Flip CC -> "
+                      << (g_ccFlipManual ? "true" : "false")
+                      << "  (bootstrap: full recompute)" << std::endl;
+            recomputeLiverCC();
+            return;
+        }
+        std::cout << "[Axes] Flip CC -> "
+                  << (g_ccFlipManual ? "true" : "false")
+                  << "  (in-place: PCA preserved -> 2x flip = identity)"
+                  << std::endl;
+        // d_cc 反転
+        g_liverCC.d_cc = -g_liverCC.d_cc;
+        g_liverCC.cc.flipped_manual = g_ccFlipManual;
+        // ラベル swap (CRANIAL ↔ CAUDAL)
+        for (auto& lbl : g_liverCC.labels) {
+            lbl = (lbl == LiverCranioCaudalLabel::CRANIAL)
+                ? (uint8_t)LiverCranioCaudalLabel::CAUDAL
+                : (uint8_t)LiverCranioCaudalLabel::CRANIAL;
+        }
+        std::swap(g_liverCC.n_cranial, g_liverCC.n_caudal);
+        // 診断情報も swap (confidence は |Δ|/sum で対称式なので不変)
+        std::swap(g_liverCC.cc.mean_plus, g_liverCC.cc.mean_minus);
+        std::swap(g_liverCC.cc.area_plus, g_liverCC.cc.area_minus);
+        std::swap(g_liverCC.cc.n_rim_plus, g_liverCC.cc.n_rim_minus);
+        // Shift+H の球マーカー (viz subsample) も更新
+        g_ccVizIdxCranial = LiverCranioCaudalLabel::sampleVertexIndices(
+            g_liverCC.labels, LiverCranioCaudalLabel::CRANIAL, 1500);
+        g_ccVizIdxCaudal = LiverCranioCaudalLabel::sampleVertexIndices(
+            g_liverCC.labels, LiverCranioCaudalLabel::CAUDAL, 1500);
+    };
+}
+
+// === 関数定義 ===
+
+// =========================================================
+//  applyInitRotation (Phase 2 拡張):
+//    現在の registrationHandle.initRotPreset と .initRotPosition に基づき、
+//    初期ポーズから幾何ベース回転 + 重心オフセットを適用する。
+//    onInitRotPresetChanged と onInitRotPositionChanged の両方から呼ばれる。
+//
+//    startNewSession=true : poseStartNewSession() を実行 (preset 変更時)
+//    startNewSession=false: 既存セッション内での再適用 (position 変更時)
+//
+//    依存ラベル (LiverRegion / LiverLR / LiverCC) が未計算なら auto-trigger
+//    する (Quad と同じ流儀)。失敗時は identity (回転スキップ) で安全側。
+// =========================================================
+static void applyInitRotation(bool startNewSession) {
+    if (startNewSession) {
+        poseStartNewSession();
+    }
+
+    // Pose Library label を更新: preset 名 + quadrant mask 名 (QUAD_ALL 以外のみ)
+    //   - 旧: "Base @ Right" / "Base @ Left" / "Base"
+    //   - 新: "Base @ Q:AR+PR" / "Base @ Q:AL+PL" / "Base"
+    //   QUAD_ALL は省略 (旧 POS_CENTER 相当、byte-identical の意味で "Base" のまま)。
+    //   旧 PoseLibrary エントリの "Base @ Right" 等は読み込み時にそのまま文字列保持。
+    g_currentOrientLabel = RegistrationData::presetName(registrationHandle.initRotPreset);
+    if (g_activeQuadrantMask != LiverLeftRightLabel::QUAD_ALL) {
+        g_currentOrientLabel += " @ ";
+        g_currentOrientLabel +=
+            LiverLeftRightLabel::quadrantMaskString(g_activeQuadrantMask);
+    }
+    if (startNewSession) {
+        std::cout << "[Session] New session: " << g_currentOrientLabel
+                  << "  (mask=0x" << std::hex << (unsigned)g_activeQuadrantMask
+                  << std::dec << ")" << std::endl;
+    } else {
+        std::cout << "[InitRot] re-applying within session: " << g_currentOrientLabel
+                  << "  (mask=0x" << std::hex << (unsigned)g_activeQuadrantMask
+                  << std::dec << ")" << std::endl;
+    }
+
+    // 初期ポーズ復元
+    auto organs = getOrganList();
+    if (g_initOrganVertices.empty() ||
+        g_initOrganVertices.size() != organs.size()) {
+        std::cerr << "[InitRot] g_initOrganVertices not snapshotted yet" << std::endl;
+        return;
+    }
+    for (size_t i = 0; i < organs.size(); i++) {
+        organs[i]->mVertices = g_initOrganVertices[i];
+        organs[i]->mNormals  = g_initOrganNormals[i];
+        setUp(*organs[i]);
+    }
+
+    if (!liverMesh3D || liverMesh3D->mVertices.empty()) {
+        std::cerr << "[InitRot] liverMesh3D unavailable; skipping rotation."
+                  << std::endl;
+        return;
+    }
+
+    // d_LR / d_CC が未計算なら auto-trigger (Quad と同じ流儀)。
+    if (!g_liverCC.valid()) {
+        std::cout << "[InitRot] LiverCC (Shift+H) not yet computed, auto-running..."
+                  << std::endl;
+        recomputeLiverCC();
+    }
+    if (!g_liverLR.valid() || !g_liverCC.valid()) {
+        std::cerr << "[InitRot] Cannot apply: "
+                  << "LR.valid=" << (g_liverLR.valid() ? "Y" : "N")
+                  << "  CC.valid=" << (g_liverCC.valid() ? "Y" : "N")
+                  << "  -> identity (no rotation applied)." << std::endl;
+        return;
+    }
+
+    // Step 1+: mask != QUAD_ALL のときは Region/LR ラベルが必須
+    //   (動的 subset AABB を計算するため)。未計算なら auto-trigger。
+    //   mask == QUAD_ALL は g_sourceLiverAabbFull 直行なのでラベル不要。
+    if (g_activeQuadrantMask != LiverLeftRightLabel::QUAD_ALL) {
+        if (!g_liverRegion.valid()) {
+            std::cout << "[InitRot] LiverRegion (Shift+R) not yet computed, auto-running..."
+                      << std::endl;
+            recomputeLiverRegion();
+        }
+        // g_liverLR は既に valid (上で確認済み) なので再確認不要
+        if (!g_liverRegion.valid()) {
+            std::cerr << "[InitRot] LiverRegion still not valid; falling back to "
+                      << "QUAD_ALL behavior (full-mesh AABB)." << std::endl;
+            // Continue with QUAD_ALL-equivalent: srcSubset = g_sourceLiverAabbFull,
+            // scale=1, t_pos=0 (handled below by the "QUAD_ALL or invalid" branch)
+        }
+    }
+
+    // 回転 + mask に応じた scale + 平行移動の適用 (Step 2: mask-based selection)。
+    //   target cloud は target_full に固定。source 側のみ mask が示す 4-quadrant
+    //   subset の AABB を使う:
+    //     mask = QUAD_ALL    → 全体 ↔ 全体 (scale=1, t_pos=0、prealign 済)
+    //                          = 旧 POS_CENTER と byte-identical
+    //     mask = AR+PR (0x05) → 右葉 (= 旧 POS_RIGHT 相当だが解剖学的に厳密)
+    //     mask = AL+PL (0x0A) → 左葉 (= 旧 POS_LEFT 相当)
+    //     mask = AR+AL (0x03) → 前面 (新規)
+    //     mask = PR+PL (0x0C) → 後面 (新規)
+    //     mask = AR (0x01) のみ → 右前 4 象限 (新規)
+    //     ... etc
+    //
+    //   利点 (前バージョンとの差):
+    //   - 解剖学的 4 象限ラベル (Ctrl+G と同じ) を流用するので「右葉」が
+    //     world X 軸ではなく d_LR PCA 軸ベースで定義される
+    //   - Ctrl+G の g_activeQuadrantMask と完全共有 → checkbox を変えるだけで
+    //     初期姿勢と CMA-ES subset の両方が同時に変わる
+    //
+    //   下流影響: Shift+M は g_originalLiverDiagMm / current_liver_diag で
+    //   復元するので scale が変わっても自動対応。他の登録系も影響なし。
+    glm::vec3 centroid = computeMeshCentroidFromVertices(liverMesh3D->mVertices);
+
+    // mask から動的に source subset AABB を計算 (QUAD_ALL は高速パスで full を返す)
+    const bool   use_full = (g_activeQuadrantMask == LiverLeftRightLabel::QUAD_ALL)
+                          || !g_liverRegion.valid();   // fallback safety
+    SourceSubsetAabb subset_storage;
+    const SourceSubsetAabb* srcSubset = nullptr;
+    if (use_full) {
+        srcSubset = &g_sourceLiverAabbFull;
+    } else {
+        subset_storage = computeSourceLiverSubsetAabbFromMask(
+            g_activeQuadrantMask,
+            g_liverRegion.labels,
+            g_liverLR.labels);
+        srcSubset = &subset_storage;
+
+        // Safety fallback: subset が極端に小さい場合は QUAD_ALL 動作にフォールバック。
+        //   閾値:
+        //     - subset.diag < 1e-6f (実質ゼロサイズ)
+        //     - subset.valid == false (頂点 0 個)
+        //   将来的に「subset 頂点数 < 50 で fallback」を追加する場所もここ。
+        if (!srcSubset->valid || srcSubset->diag < 1e-6f) {
+            std::cerr << "[InitRot] subset AABB invalid for mask=0x"
+                      << std::hex << (unsigned)g_activeQuadrantMask << std::dec
+                      << " (valid=" << srcSubset->valid
+                      << " diag=" << srcSubset->diag
+                      << "); falling back to full-mesh AABB." << std::endl;
+            srcSubset = &g_sourceLiverAabbFull;
+        }
+    }
+
+    // Scale factor + translation 計算 (チャット 10 v2: 実頂点回転 → AABB):
+    //   - 8 コーナー回転方式は誤り (元 AABB の外接 box = looser bound、実頂点 AABB と
+    //     center が異なるため、PostApply で error が残る)。
+    //   - 正しくは: subset 頂点 (初期姿勢) を pivot 回転 → 新 AABB → その center を
+    //     target_full.center に合わせる平行移動を計算する。
+    //   - 頂点数は subset で 2k-10k 程度、毎 Apply で数 ms。
+    //   - QUAD_ALL: scale=1 (prealign 済み)、subset: scale = target.diag / subset.diag。
+    //
+    //   定式:
+    //     final point: p' = s * R*(p - centroid) + centroid + t_pos
+    //     rotated_aabb_center は回転後の頂点群から AABB を取り直して 0.5*(min+max)
+    //     scale を centroid 中心で適用: q = s*(rotated_aabb_center - centroid) + centroid
+    //     t_pos = target_full.center - q
+    //
+    //   なぜ mean ではなく AABB center を使うか:
+    //     target は depth cloud で前面のみ頂点があり mean が偏る。AABB center は
+    //     形状サイズベースで両者一貫している (ユーザー指示: チャット 10)。
+    //
+    //   下流影響: Shift+M は g_originalLiverDiagMm / current_liver_diag で
+    //   復元するので scale が変わっても自動対応 (相似変換)。
+    float     scale_factor = 1.0f;
+    glm::vec3 t_pos(0.0f);
+
+    const bool is_quad_all_or_fallback =
+        (srcSubset == &g_sourceLiverAabbFull);   // = QUAD_ALL or fallback
+
+    // 回転後 AABB (デバッグ表示 + g_debugBB 描画用に関数スコープに昇格)
+    glm::vec3 rotated_aabb_center(0.0f);
+    glm::vec3 rotated_aabb_min   (0.0f);
+    glm::vec3 rotated_aabb_max   (0.0f);
+    int       rotated_n_used = 0;
+
+    // subset 頂点インデックス (subset の場合のみ使用)
+    std::vector<int> subset_idx_for_rot;
+    if (!is_quad_all_or_fallback && g_liverRegion.valid()) {
+        subset_idx_for_rot = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+            g_liverRegion.labels, g_liverLR.labels,
+            g_activeQuadrantMask);
+    }
+
+    if (srcSubset->valid
+        && g_targetAabbFull.valid
+        && srcSubset->diag > 1e-9f
+        && !g_initOrganVertices.empty()
+        && !g_initOrganVertices[0].empty())
+    {
+        // scale 決定
+        if (is_quad_all_or_fallback) {
+            scale_factor = 1.0f;
+        } else {
+            scale_factor = g_targetAabbFull.diag / srcSubset->diag;
+        }
+
+        // 回転 R を identity scale + zero translation で取得
+        glm::mat4 M_rot = getPresetRotation(
+            registrationHandle.initRotPreset,
+            centroid,
+            g_liverLR.d_lr, g_liverCC.d_cc,
+            1.0f, glm::vec3(0.0f));
+
+        // ★ 実頂点を pivot 回転 → 新 AABB を計算
+        //   初期姿勢の頂点 (g_initOrganVertices[0]) を使う (snapshotInitialPose で
+        //   prealign 直後の状態が保存されている。これが srcSubset の参照系と一致する)
+        const auto& V0 = g_initOrganVertices[0];
+        const int   nV = (int)(V0.size() / 3);
+        glm::vec3 new_mn( FLT_MAX,  FLT_MAX,  FLT_MAX);
+        glm::vec3 new_mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        int n_used = 0;
+
+        if (is_quad_all_or_fallback) {
+            // QUAD_ALL: 全頂点を回す
+            for (int i = 0; i < nV; i++) {
+                glm::vec3 p0(V0[i*3], V0[i*3+1], V0[i*3+2]);
+                glm::vec3 q  = glm::vec3(M_rot * glm::vec4(p0, 1.0f));
+                new_mn = glm::min(new_mn, q);
+                new_mx = glm::max(new_mx, q);
+                n_used++;
+            }
+        } else {
+            // subset: 該当 idx のみ
+            for (int idx : subset_idx_for_rot) {
+                if (idx < 0 || idx >= nV) continue;
+                glm::vec3 p0(V0[idx*3], V0[idx*3+1], V0[idx*3+2]);
+                glm::vec3 q  = glm::vec3(M_rot * glm::vec4(p0, 1.0f));
+                new_mn = glm::min(new_mn, q);
+                new_mx = glm::max(new_mx, q);
+                n_used++;
+            }
+        }
+
+        if (n_used > 0) {
+            rotated_aabb_min    = new_mn;
+            rotated_aabb_max    = new_mx;
+            rotated_aabb_center = 0.5f * (new_mn + new_mx);
+            rotated_n_used      = n_used;
+
+            // scale を centroid 中心で適用: s*(p - c) + c
+            glm::vec3 src_rotated_scaled =
+                (rotated_aabb_center - centroid) * scale_factor + centroid;
+            // target_full center に合わせる translation
+            t_pos = g_targetAabbFull.center - src_rotated_scaled;
+        } else {
+            std::cerr << "[InitRot] rotated AABB: no vertices used (mask=0x"
+                      << std::hex << (unsigned)g_activeQuadrantMask << std::dec
+                      << "); falling back to t_pos=0" << std::endl;
+        }
+    } else {
+        std::cerr << "[InitRot] AABB invalid (src.valid="
+                  << srcSubset->valid
+                  << " tgt_full.valid=" << g_targetAabbFull.valid
+                  << "); falling back to scale=1, no translation." << std::endl;
+    }
+
+    // Pre-apply ログ
+    std::cout << "[InitRot/PreApply] BEFORE transform:" << std::endl;
+    std::cout << "    centroid (rotation pivot) = ("
+              << centroid.x << "," << centroid.y << "," << centroid.z << ")"
+              << std::endl;
+    if (srcSubset) {
+        std::cout << "    src_subset.center (orig AABB midpoint) = ("
+                  << srcSubset->center.x << "," << srcSubset->center.y << ","
+                  << srcSubset->center.z << ")  diag=" << srcSubset->diag
+                  << std::endl;
+        std::cout << "    rotated AABB (real vertices, n=" << rotated_n_used << "): min=("
+                  << rotated_aabb_min.x << "," << rotated_aabb_min.y << ","
+                  << rotated_aabb_min.z << ")  max=("
+                  << rotated_aabb_max.x << "," << rotated_aabb_max.y << ","
+                  << rotated_aabb_max.z << ")  center=("
+                  << rotated_aabb_center.x << "," << rotated_aabb_center.y << ","
+                  << rotated_aabb_center.z << ")"
+                  << std::endl;
+    }
+    std::cout << "    target_full.center (固定参照点 = AABB midpoint) = ("
+              << g_targetAabbFull.center.x << "," << g_targetAabbFull.center.y << ","
+              << g_targetAabbFull.center.z << ")  diag=" << g_targetAabbFull.diag
+              << std::endl;
+    std::cout << "    computed: scale=" << scale_factor
+              << "  t_pos=(" << t_pos.x << "," << t_pos.y << "," << t_pos.z << ")"
+              << std::endl;
+
+    glm::mat4 R = getPresetRotation(
+        registrationHandle.initRotPreset,
+        centroid,
+        g_liverLR.d_lr, g_liverCC.d_cc,
+        scale_factor, t_pos);
+
+    for (auto* m : organs) {
+        applyMatrixToMeshVerticesAndNormals(m, R);
+        setUp(*m);
+    }
+
+    std::cout << "[InitRot] applied: preset="
+              << RegistrationData::presetName(registrationHandle.initRotPreset)
+              << "  mask=" << LiverLeftRightLabel::quadrantMaskString(g_activeQuadrantMask)
+              << " (0x" << std::hex << (unsigned)g_activeQuadrantMask << std::dec << ")"
+              << "  scale=" << scale_factor
+              << "  t_pos=(" << t_pos.x << "," << t_pos.y << "," << t_pos.z << ")"
+              << "  d_lr=[" << g_liverLR.d_lr.x << "," << g_liverLR.d_lr.y << "," << g_liverLR.d_lr.z << "]"
+              << "  d_cc=[" << g_liverCC.d_cc.x << "," << g_liverCC.d_cc.y << "," << g_liverCC.d_cc.z << "]"
+              << std::endl;
+
+    // ====================================================================
+    //  PostApply 検証ログ (チャット 10 改訂):
+    //  transform 適用後の liverMesh3D で実際の subset 頂点から AABB を再計算し、
+    //  その center が target_full.center と一致するか確認する。
+    //  一致していれば「画面上で source 重心が target 重心に重なっている」
+    //  ことを意味する (AR カメラは world Z 方向 → world AABB = view AABB)。
+    // ====================================================================
+    if (liverMesh3D && !liverMesh3D->mVertices.empty()
+        && srcSubset && srcSubset->valid) {
+        const auto& Vnow = liverMesh3D->mVertices;
+        const int nV = (int)(Vnow.size() / 3);
+
+        // subset 頂点だけから AABB を再計算
+        // - QUAD_ALL: 全頂点
+        // - subset: makeQuadrantSubsetIdx で選ばれた頂点
+        glm::vec3 post_mn( FLT_MAX,  FLT_MAX,  FLT_MAX);
+        glm::vec3 post_mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        int n_used = 0;
+
+        if (is_quad_all_or_fallback || !g_liverRegion.valid()) {
+            for (int i = 0; i < nV; i++) {
+                glm::vec3 p(Vnow[i*3], Vnow[i*3+1], Vnow[i*3+2]);
+                post_mn = glm::min(post_mn, p);
+                post_mx = glm::max(post_mx, p);
+                n_used++;
+            }
+        } else {
+            auto subset_idx = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+                g_liverRegion.labels, g_liverLR.labels,
+                g_activeQuadrantMask);
+            for (int idx : subset_idx) {
+                if (idx < 0 || idx >= nV) continue;
+                glm::vec3 p(Vnow[idx*3], Vnow[idx*3+1], Vnow[idx*3+2]);
+                post_mn = glm::min(post_mn, p);
+                post_mx = glm::max(post_mx, p);
+                n_used++;
+            }
+        }
+
+        if (n_used > 0) {
+            glm::vec3 post_center = 0.5f * (post_mn + post_mx);
+            glm::vec3 err = post_center - g_targetAabbFull.center;
+            float err_dist = glm::length(err);
+            std::cout << "[InitRot/PostApply] VERIFICATION (AABB center):" << std::endl;
+            std::cout << "    post-transform subset AABB center = ("
+                      << post_center.x << "," << post_center.y << ","
+                      << post_center.z << ")  (n_used=" << n_used << ")" << std::endl;
+            std::cout << "    target_full.center                ("
+                      << g_targetAabbFull.center.x << "," << g_targetAabbFull.center.y << ","
+                      << g_targetAabbFull.center.z << ")" << std::endl;
+            std::cout << "    error vector = (" << err.x << "," << err.y << "," << err.z << ")"
+                      << "  |err|=" << err_dist
+                      << (err_dist < 1e-4f ? "  [OK: subset AABB center == target center]"
+                                           : "  [WARN: mismatch]")
+                      << std::endl;
+
+            // ★ デバッグ BB 可視化用に保存 (drawScene で球マーカー描画)
+            g_dbgSourceBB_min    = post_mn;
+            g_dbgSourceBB_max    = post_mx;
+            g_dbgSourceBB_center = post_center;
+            g_dbgSourceBB_valid  = true;
+        }
+    }
+}
+
+static void snapshotInitialPose() {
+    auto organs = getOrganList();
+    g_initOrganVertices.resize(organs.size());
+    g_initOrganNormals.resize(organs.size());
+    for (size_t i = 0; i < organs.size(); i++) {
+        g_initOrganVertices[i] = organs[i]->mVertices;
+        g_initOrganNormals[i] = organs[i]->mNormals;
+    }
+    std::cout << "[MeshBackup] Initial pose snapshot saved (" << organs.size() << " organs)" << std::endl;
+}
+
+static void restoreInitialPose() {
+    auto organs = getOrganList();
+    if (!g_initOrganVertices.empty() && g_initOrganVertices.size() == organs.size()) {
+        for (size_t i = 0; i < organs.size(); i++) {
+            organs[i]->mVertices = g_initOrganVertices[i];
+            organs[i]->mNormals = g_initOrganNormals[i];
+            setUp(*organs[i]);
+        }
+        std::cout << "[MeshBackup] Initial pose restored (" << organs.size() << " organs)" << std::endl;
+    }
 }

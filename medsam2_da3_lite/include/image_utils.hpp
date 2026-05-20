@@ -19,16 +19,16 @@ struct Image {
     int height = 0;
     int channels = 0;
     std::vector<uint8_t> data;
-    
+
     Image() = default;
     Image(int w, int h, int c) : width(w), height(h), channels(c), data(w * h * c, 0) {}
-    
+
     bool empty() const { return data.empty(); }
-    
+
     uint8_t at(int x, int y, int c) const {
         return data[(y * width + x) * channels + c];
     }
-    
+
     uint8_t& at(int x, int y, int c) {
         return data[(y * width + x) * channels + c];
     }
@@ -39,16 +39,16 @@ struct ImageF {
     int height = 0;
     int channels = 0;
     std::vector<float> data;
-    
+
     ImageF() = default;
     ImageF(int w, int h, int c) : width(w), height(h), channels(c), data(w * h * c, 0.0f) {}
-    
+
     bool empty() const { return data.empty(); }
-    
+
     float at(int x, int y, int c) const {
         return data[(y * width + x) * channels + c];
     }
-    
+
     float& at(int x, int y, int c) {
         return data[(y * width + x) * channels + c];
     }
@@ -73,20 +73,20 @@ struct DepthStats {
 class Timer {
 public:
     Timer() : start_(std::chrono::high_resolution_clock::now()) {}
-    
+
     void reset() {
         start_ = std::chrono::high_resolution_clock::now();
     }
-    
+
     double elapsedMs() const {
         auto now = std::chrono::high_resolution_clock::now();
         return std::chrono::duration<double, std::milli>(now - start_).count();
     }
-    
+
     void printElapsed(const std::string& label) const {
         std::cout << label << ": " << elapsedMs() << " ms" << std::endl;
     }
-    
+
 private:
     std::chrono::high_resolution_clock::time_point start_;
 };
@@ -124,14 +124,21 @@ std::vector<uint8_t> postprocessMask(
     int targetWidth,
     int targetHeight,
     float threshold = 0.0f
-);
+    );
+
+std::vector<uint8_t> dilateMask(
+    const std::vector<uint8_t>& mask,
+    int width,
+    int height,
+    int radius
+    );
 
 Image overlayMask(
     const Image& image,
     const std::vector<uint8_t>& mask,
     uint8_t r = 0, uint8_t g = 255, uint8_t b = 0,
     float alpha = 0.5f
-);
+    );
 
 // =============================================================================
 // 深度マップ処理
@@ -142,7 +149,7 @@ std::vector<uint8_t> normalizeDepth(
     int width,
     int height,
     bool invert = false
-);
+    );
 
 std::vector<uint8_t> normalizeDepthMasked(
     const std::vector<float>& depth,
@@ -150,7 +157,7 @@ std::vector<uint8_t> normalizeDepthMasked(
     int width,
     int height,
     bool invert = false
-);
+    );
 
 Image applyViridisColormap(const std::vector<uint8_t>& grayscale, int width, int height);
 
@@ -163,7 +170,7 @@ DepthStats computeDepthStats(
     const std::vector<uint8_t>& mask,
     int width,
     int height
-);
+    );
 
 // =============================================================================
 // ユーティリティ

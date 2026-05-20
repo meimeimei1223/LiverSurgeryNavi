@@ -118,6 +118,7 @@ void SoftBody::solve(float dt) {
         for (int j = 0; j < 2; j++) {
             solveVolumes(volCompliance, dt);
         }
+        solveAttachments(dt);
     }
 }
 
@@ -140,6 +141,7 @@ void SoftBody::initPhysics() {
     std::fill(restVols.begin(), restVols.end(), 0.0f);
     std::fill(edgeLambdas.begin(), edgeLambdas.end(), 0.0f);
     std::fill(volLambdas.begin(), volLambdas.end(), 0.0f);
+    for (auto& a : attachmentConstraints) a.lambda = 0.0f;
 
     float cusum_vol = 1.0;
     for (size_t i = 0; i < numTets; i++) {
@@ -1268,6 +1270,7 @@ void SoftBody::fullReset() {
 
     std::fill(edgeLambdas.begin(), edgeLambdas.end(), 0.0f);
     std::fill(volLambdas.begin(), volLambdas.end(), 0.0f);
+    attachmentConstraints.clear();
 
     initPhysics();
 
@@ -1275,4 +1278,60 @@ void SoftBody::fullReset() {
     updateVisMeshes();
 
     std::cout << "Full reset completed - all data restored from original" << std::endl;
+}
+
+int SoftBody::addAttachmentConstraint(int vertexIdx, const glm::vec3& targetPos, float compliance) {
+    if (vertexIdx < 0 || vertexIdx >= static_cast<int>(numParticles)) return -1;
+    AttachmentConstraint a;
+    a.vertexIdx  = vertexIdx;
+    a.targetPos  = targetPos;
+    a.compliance = std::max(0.0f, compliance);
+    a.lambda     = 0.0f;
+    attachmentConstraints.push_back(a);
+    return static_cast<int>(attachmentConstraints.size()) - 1;
+}
+
+void SoftBody::clearAttachmentConstraints() {
+    attachmentConstraints.clear();
+}
+
+void SoftBody::updateAttachmentTarget(int attachIdx, const glm::vec3& newTarget) {
+    if (attachIdx < 0 || attachIdx >= static_cast<int>(attachmentConstraints.size())) return;
+    attachmentConstraints[attachIdx].targetPos = newTarget;
+    attachmentConstraints[attachIdx].lambda    = 0.0f;
+}
+
+void SoftBody::updateAttachmentCompliance(int attachIdx, float newCompliance) {
+    if (attachIdx < 0 || attachIdx >= static_cast<int>(attachmentConstraints.size())) return;
+    attachmentConstraints[attachIdx].compliance = std::max(0.0f, newCompliance);
+    attachmentConstraints[attachIdx].lambda     = 0.0f;
+}
+
+void SoftBody::solveAttachments(float dt) {
+    if (attachmentConstraints.empty()) return;
+    float dt2 = dt * dt;
+    for (auto& a : attachmentConstraints) {
+        int idx = a.vertexIdx;
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) continue;
+        float w = invMasses[idx];
+        if (w <= 0.0f) continue;
+
+        glm::vec3 p(positions[idx*3], positions[idx*3+1], positions[idx*3+2]);
+        glm::vec3 diff = p - a.targetPos;
+        float C = glm::length(diff);
+        if (C < 1e-8f) continue;
+
+        glm::vec3 grad = diff / C;
+        float alphaTilde = a.compliance / dt2;
+        float denom = w + alphaTilde;
+        if (denom < 1e-12f) continue;
+
+        float dLambda = -(C + alphaTilde * a.lambda) / denom;
+        a.lambda += dLambda;
+
+        glm::vec3 dp = grad * (w * dLambda);
+        positions[idx*3]     += dp.x;
+        positions[idx*3 + 1] += dp.y;
+        positions[idx*3 + 2] += dp.z;
+    }
 }

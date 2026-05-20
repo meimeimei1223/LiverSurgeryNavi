@@ -82,8 +82,8 @@ private:
     // MJPEG → RGB変換（stb_imageを使用）
     // 注意: この機能を使う場合は stb_image.h のインクルードが必要
     bool convertMJPEGtoRGB(const unsigned char* mjpeg, size_t len, unsigned char* rgb) {
-// stb_imageがある場合
-#ifdef STB_IMAGE_IMPLEMENTATION
+// stb_imageがある場合（STBI_VERSIONマクロで検出）
+#ifdef STBI_VERSION
         int w, h, ch;
         unsigned char* data = stbi_load_from_memory(mjpeg, (int)len, &w, &h, &ch, 3);
         if (data) {

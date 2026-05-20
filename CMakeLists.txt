@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(LiverSurgeryNavi)
+project(LiverSurgeryNaviForOBJ)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +52,21 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/medsam2_da3_lite/CMakeLists.txt)
     message(STATUS "")
 else()
     message(WARNING "medsam2_da3_lite/ not found - depth estimation will use fallback")
+endif()
+
+# calibration_tool (chessboard camera calibration, Zhang's method)
+if(EXISTS ${CMAKE_SOURCE_DIR}/calibration_tool/CMakeLists.txt)
+    message(STATUS "")
+    message(STATUS "=== Building calibration_tool ===")
+    add_subdirectory(${CMAKE_SOURCE_DIR}/calibration_tool ${PROJECT_BINARY_DIR}/calibration_tool)
+    set_target_properties(calibration_tool PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin
+    )
+    message(STATUS "calibration_tool -> ${PROJECT_BINARY_DIR}/bin/")
+    message(STATUS "=================================")
+    message(STATUS "")
+else()
+    message(STATUS "calibration_tool/ not found - camera calibration disabled")
 endif()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.h")
@@ -107,10 +122,17 @@ else()
 endif()
 
 # c-cmaes (Apache 2.0, Nikolaus Hansen 2014)
+# cmaes.c is included UNCHANGED via cmaes_tls_wrapper.c, which adds
+# thread-local RNG under _OPENMP for V3-5 Run-level parallelism.
+# Both files must be present in CMAES_DIR.
 set(CMAES_DIR "${CMAKE_SOURCE_DIR}/third_party/c-cmaes")
-if(EXISTS "${CMAES_DIR}/cmaes.c")
+if(EXISTS "${CMAES_DIR}/cmaes_tls_wrapper.c" AND EXISTS "${CMAES_DIR}/cmaes.c")
+    list(APPEND SOURCES "${CMAES_DIR}/cmaes_tls_wrapper.c")
+    message(STATUS "c-cmaes: ${CMAES_DIR} (via tls_wrapper)")
+elseif(EXISTS "${CMAES_DIR}/cmaes.c")
+    # Fallback: wrapper not yet placed, use original directly (single-threaded only)
     list(APPEND SOURCES "${CMAES_DIR}/cmaes.c")
-    message(STATUS "c-cmaes: ${CMAES_DIR}")
+    message(WARNING "c-cmaes: cmaes_tls_wrapper.c not found, using cmaes.c directly (Run parallelism disabled)")
 else()
     message(FATAL_ERROR "c-cmaes not found at ${CMAES_DIR}")
 endif()
@@ -196,6 +218,11 @@ if(OpenMP_CXX_FOUND)
     message(STATUS "OpenMP: ON (${OpenMP_CXX_VERSION})")
 else()
     message(STATUS "OpenMP: OFF")
+endif()
+# cmaes_tls_wrapper.c is a C file; link OpenMP_C so it gets -fopenmp
+# and _OPENMP is defined, activating the thread-local rand_r() path.
+if(OpenMP_C_FOUND)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenMP::OpenMP_C)
 endif()
 
 if(MSVC)

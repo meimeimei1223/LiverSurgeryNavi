@@ -21,31 +21,31 @@ namespace img {
 
 Image loadImage(const std::string& path) {
     Image img;
-    
+
     int w, h, c;
     uint8_t* data = stbi_load(path.c_str(), &w, &h, &c, 3);  // å¼·åˆ¶RGB
-    
+
     if (!data) {
         std::cerr << "Failed to load image: " << path << " - " << stbi_failure_reason() << std::endl;
         return img;
     }
-    
+
     img.width = w;
     img.height = h;
     img.channels = 3;
     img.data.assign(data, data + w * h * 3);
-    
+
     stbi_image_free(data);
     return img;
 }
 
 bool saveImage(const std::string& path, const Image& image) {
     if (image.empty()) return false;
-    
+
     // æ‹¡å¼µå­ã§å½¢å¼åˆ¤å®š
     std::string ext = path.substr(path.find_last_of('.'));
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    
+
     if (ext == ".png") {
         return stbi_write_png(path.c_str(), image.width, image.height,
                               image.channels, image.data.data(),
@@ -57,7 +57,7 @@ bool saveImage(const std::string& path, const Image& image) {
         return stbi_write_bmp(path.c_str(), image.width, image.height,
                               image.channels, image.data.data()) != 0;
     }
-    
+
     // ãƒ‡ãƒ•ã‚©ãƒ«ãƒˆã¯PNG
     return stbi_write_png(path.c_str(), image.width, image.height,
                           image.channels, image.data.data(),
@@ -75,56 +75,56 @@ bool saveGrayscale(const std::string& path, const std::vector<uint8_t>& data, in
 
 Image resize(const Image& src, int newWidth, int newHeight) {
     Image dst(newWidth, newHeight, src.channels);
-    
+
     if (src.empty()) return dst;
-    
+
     stbir_resize_uint8_linear(
         src.data.data(), src.width, src.height, src.width * src.channels,
         dst.data.data(), newWidth, newHeight, newWidth * src.channels,
         (stbir_pixel_layout)src.channels
     );
-    
+
     return dst;
 }
 
 ImageF resizeF(const ImageF& src, int newWidth, int newHeight) {
     ImageF dst(newWidth, newHeight, src.channels);
-    
+
     if (src.empty()) return dst;
-    
+
     // ãƒã‚¤ãƒªãƒ‹ã‚¢è£œé–“
     float scaleX = static_cast<float>(src.width) / newWidth;
     float scaleY = static_cast<float>(src.height) / newHeight;
-    
+
     for (int y = 0; y < newHeight; ++y) {
         for (int x = 0; x < newWidth; ++x) {
             float srcX = x * scaleX;
             float srcY = y * scaleY;
-            
+
             int x0 = static_cast<int>(srcX);
             int y0 = static_cast<int>(srcY);
             int x1 = std::min(x0 + 1, src.width - 1);
             int y1 = std::min(y0 + 1, src.height - 1);
-            
+
             float fx = srcX - x0;
             float fy = srcY - y0;
-            
+
             for (int c = 0; c < src.channels; ++c) {
                 float v00 = src.at(x0, y0, c);
                 float v10 = src.at(x1, y0, c);
                 float v01 = src.at(x0, y1, c);
                 float v11 = src.at(x1, y1, c);
-                
+
                 float value = (1 - fx) * (1 - fy) * v00 +
                               fx * (1 - fy) * v10 +
                               (1 - fx) * fy * v01 +
                               fx * fy * v11;
-                
+
                 dst.at(x, y, c) = value;
             }
         }
     }
-    
+
     return dst;
 }
 
@@ -141,14 +141,14 @@ void bgrToRgb(Image& image) {
 std::vector<float> preprocessImageNet(const Image& image, int targetWidth, int targetHeight) {
     // ãƒªã‚µã‚¤ã‚º
     Image resized = resize(image, targetWidth, targetHeight);
-    
+
     // ImageNetæ­£è¦åŒ–ãƒ‘ãƒ©ãƒ¡ãƒ¼ã‚¿
     const float mean[] = {0.485f, 0.456f, 0.406f};
     const float std[] = {0.229f, 0.224f, 0.225f};
-    
+
     // CHWå½¢å¼ã«å¤‰æ›ã—ãªãŒã‚‰æ­£è¦åŒ–
     std::vector<float> output(3 * targetHeight * targetWidth);
-    
+
     for (int c = 0; c < 3; ++c) {
         for (int y = 0; y < targetHeight; ++y) {
             for (int x = 0; x < targetWidth; ++x) {
@@ -158,7 +158,7 @@ std::vector<float> preprocessImageNet(const Image& image, int targetWidth, int t
             }
         }
     }
-    
+
     return output;
 }
 
@@ -187,12 +187,12 @@ std::vector<uint8_t> postprocessMask(
     for (int i = 0; i < maskWidth * maskHeight; ++i) {
         binaryMask[i] = (maskData[i] > threshold) ? 255 : 0;
     }
-    
+
     // ãƒªã‚µã‚¤ã‚ºï¼ˆãƒ‹ã‚¢ãƒ¬ã‚¹ãƒˆãƒã‚¤ãƒãƒ¼ï¼‰
     std::vector<uint8_t> result(targetWidth * targetHeight);
     float scaleX = static_cast<float>(maskWidth) / targetWidth;
     float scaleY = static_cast<float>(maskHeight) / targetHeight;
-    
+
     for (int y = 0; y < targetHeight; ++y) {
         for (int x = 0; x < targetWidth; ++x) {
             int srcX = static_cast<int>(x * scaleX);
@@ -202,8 +202,43 @@ std::vector<uint8_t> postprocessMask(
             result[y * targetWidth + x] = binaryMask[srcY * maskWidth + srcX];
         }
     }
-    
+
     return result;
+}
+
+std::vector<uint8_t> dilateMask(
+    const std::vector<uint8_t>& mask,
+    int width,
+    int height,
+    int radius
+) {
+    if (radius <= 0) return mask;
+    std::vector<uint8_t> tmp(mask.size(), 0);
+    std::vector<uint8_t> out(mask.size(), 0);
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            uint8_t v = 0;
+            int x0 = std::max(0, x - radius);
+            int x1 = std::min(width - 1, x + radius);
+            for (int xx = x0; xx <= x1; ++xx) {
+                if (mask[y * width + xx]) { v = 255; break; }
+            }
+            tmp[y * width + x] = v;
+        }
+    }
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            uint8_t v = 0;
+            int y0 = std::max(0, y - radius);
+            int y1 = std::min(height - 1, y + radius);
+            for (int yy = y0; yy <= y1; ++yy) {
+                if (tmp[yy * width + x]) { v = 255; break; }
+            }
+            out[y * width + x] = v;
+        }
+    }
+    return out;
 }
 
 Image overlayMask(
@@ -213,7 +248,7 @@ Image overlayMask(
     float alpha
 ) {
     Image result = image;  // ã‚³ãƒ”ãƒ¼
-    
+
     for (int i = 0; i < image.width * image.height; ++i) {
         if (mask[i] > 0) {
             result.data[i * 3 + 0] = static_cast<uint8_t>(result.data[i * 3 + 0] * (1 - alpha) + r * alpha);
@@ -221,7 +256,7 @@ Image overlayMask(
             result.data[i * 3 + 2] = static_cast<uint8_t>(result.data[i * 3 + 2] * (1 - alpha) + b * alpha);
         }
     }
-    
+
     return result;
 }
 
@@ -236,13 +271,13 @@ std::vector<uint8_t> normalizeDepth(
     bool invert
 ) {
     std::vector<uint8_t> result(width * height);
-    
+
     // æœ€å°ãƒ»æœ€å¤§å€¤
     float minVal = *std::min_element(depth.begin(), depth.end());
     float maxVal = *std::max_element(depth.begin(), depth.end());
     float range = maxVal - minVal;
     if (range < 1e-6f) range = 1.0f;
-    
+
     for (int i = 0; i < width * height; ++i) {
         float normalized = (depth[i] - minVal) / range;
         if (invert) {
@@ -250,7 +285,7 @@ std::vector<uint8_t> normalizeDepth(
         }
         result[i] = static_cast<uint8_t>(normalized * 255.0f);
     }
-    
+
     return result;
 }
 
@@ -269,22 +304,22 @@ std::vector<uint8_t> normalizeDepthMasked(
             values.push_back(depth[i]);
         }
     }
-    
+
     if (values.empty()) {
         return std::vector<uint8_t>(width * height, 0);
     }
-    
+
     // ソートしてパーセンタイルで外れ値を除外（2%-98%）
     std::sort(values.begin(), values.end());
     size_t n = values.size();
     float minVal = values[static_cast<size_t>(n * 0.02)];
     float maxVal = values[static_cast<size_t>(n * 0.98)];
-    
+
     float range = maxVal - minVal;
     if (range < 1e-6f) range = 1.0f;
-    
+
     std::vector<uint8_t> result(width * height, 0);  // 背景は0（黒）
-    
+
     // マスク内をクリップ＆正規化
     for (int i = 0; i < width * height; ++i) {
         if (mask[i] > 0) {
@@ -292,7 +327,7 @@ std::vector<uint8_t> normalizeDepthMasked(
             // クリップ
             val = std::max(val, minVal);
             val = std::min(val, maxVal);
-            
+
             float normalized = (val - minVal) / range;
             if (invert) {
                 normalized = 1.0f - normalized;
@@ -301,7 +336,7 @@ std::vector<uint8_t> normalizeDepthMasked(
             result[i] = std::max(out, static_cast<uint8_t>(1));
         }
     }
-    
+
     return result;
 }
 
@@ -312,14 +347,14 @@ static const uint8_t VIRIDIS_B[] = {84,85,87,88,90,91,93,94,96,97,99,100,101,103
 
 Image applyViridisColormap(const std::vector<uint8_t>& grayscale, int width, int height) {
     Image result(width, height, 3);
-    
+
     for (int i = 0; i < width * height; ++i) {
         uint8_t val = grayscale[i];
         result.data[i * 3 + 0] = VIRIDIS_R[val];
         result.data[i * 3 + 1] = VIRIDIS_G[val];
         result.data[i * 3 + 2] = VIRIDIS_B[val];
     }
-    
+
     return result;
 }
 
@@ -335,35 +370,35 @@ DepthStats computeDepthStats(
 ) {
     DepthStats stats;
     std::vector<float> values;
-    
+
     for (int i = 0; i < width * height; ++i) {
         if (mask[i] > 0) {
             values.push_back(static_cast<float>(depth[i]));
         }
     }
-    
+
     if (values.empty()) {
         return stats;
     }
-    
+
     stats.min = *std::min_element(values.begin(), values.end());
     stats.max = *std::max_element(values.begin(), values.end());
-    
+
     float sum = std::accumulate(values.begin(), values.end(), 0.0f);
     stats.mean = sum / values.size();
-    
+
     // ä¸­å¤®å€¤
     std::sort(values.begin(), values.end());
     size_t n = values.size();
     stats.median = (n % 2 == 0) ? (values[n/2 - 1] + values[n/2]) / 2.0f : values[n/2];
-    
+
     // æ¨™æº–åå·®
     float sqSum = 0;
     for (float v : values) {
         sqSum += (v - stats.mean) * (v - stats.mean);
     }
     stats.stddev = std::sqrt(sqSum / values.size());
-    
+
     return stats;
 }
 

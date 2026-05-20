@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include "ShaderProgram.h"
 #include "SimpleCamera.hpp"
 #include "PlatformCompat.h"
@@ -33,7 +34,7 @@ struct mCutMesh {
     int loadedImageWidth = 0;
     int loadedImageHeight = 0;
     int loadedImageChannels = 0;
-    std::vector<unsigned char> depthImageData;
+    std::vector<float> depthImageData;
     int depthWidth = 0;
     int depthHeight = 0;
     SimpleCamera* camera = nullptr;
@@ -93,6 +94,58 @@ struct mCutMesh {
         std::cout << "Successfully exported OBJ file: " << filepath << std::endl;
         std::cout << "  Vertices: " << (mVertices.size() / 3) << std::endl;
         std::cout << "  Faces: " << (mIndices.size() / 3) << std::endl;
+        return true;
+    }
+    // -----------------------------------------------------------------
+    // Binary STL writer (EchoLiver dataset evaluation 用に追加)
+    //   Format: 80-byte header + uint32 tri-count + N * (3 floats normal +
+    //           9 floats verts + uint16 attr) = 84 + 50N bytes
+    //   Normal は face 法線をその場で計算 (mNormals は使わない、頂点法線のため)。
+    //   座標系変換 (cam-meter → cam-mm + OpenGL flip) は呼び出し側で済ませた
+    //   メッシュを渡す前提。本関数は中身そのままバイナリ書き出しのみ。
+    // -----------------------------------------------------------------
+    bool exportStlFile(const std::string& filepath) const {
+        std::ofstream file(filepath, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not create STL file " << filepath << std::endl;
+            return false;
+        }
+        const size_t numTris = mIndices.size() / 3;
+        char header[80] = {0};
+        std::snprintf(header, sizeof(header), "Binary STL exported from mCutMesh");
+        file.write(header, 80);
+
+        uint32_t triCount = static_cast<uint32_t>(numTris);
+        file.write(reinterpret_cast<const char*>(&triCount), 4);
+
+        const uint16_t attrZero = 0;
+        for (size_t i = 0; i + 2 < mIndices.size(); i += 3) {
+            GLuint i0 = mIndices[i], i1 = mIndices[i+1], i2 = mIndices[i+2];
+            if ((size_t)i0 * 3 + 2 >= mVertices.size() ||
+                (size_t)i1 * 3 + 2 >= mVertices.size() ||
+                (size_t)i2 * 3 + 2 >= mVertices.size()) continue;
+            float v0[3] = { mVertices[3*i0], mVertices[3*i0+1], mVertices[3*i0+2] };
+            float v1[3] = { mVertices[3*i1], mVertices[3*i1+1], mVertices[3*i1+2] };
+            float v2[3] = { mVertices[3*i2], mVertices[3*i2+1], mVertices[3*i2+2] };
+            // face normal = normalize((v1-v0) x (v2-v0))
+            float ax = v1[0]-v0[0], ay = v1[1]-v0[1], az = v1[2]-v0[2];
+            float bx = v2[0]-v0[0], by = v2[1]-v0[1], bz = v2[2]-v0[2];
+            float nx = ay*bz - az*by;
+            float ny = az*bx - ax*bz;
+            float nz = ax*by - ay*bx;
+            float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (len > 1e-12f) { nx/=len; ny/=len; nz/=len; }
+            else              { nx = 0.0f; ny = 0.0f; nz = 0.0f; }
+            float n[3] = { nx, ny, nz };
+            file.write(reinterpret_cast<const char*>(n),  12);
+            file.write(reinterpret_cast<const char*>(v0), 12);
+            file.write(reinterpret_cast<const char*>(v1), 12);
+            file.write(reinterpret_cast<const char*>(v2), 12);
+            file.write(reinterpret_cast<const char*>(&attrZero), 2);
+        }
+        file.close();
+        std::cout << "Successfully exported STL file: " << filepath
+                  << "  (triangles=" << numTris << ")" << std::endl;
         return true;
     }
     void loadTextureFromData(const unsigned char* data, int width, int height, int channels) {
@@ -585,11 +638,79 @@ struct mCutMesh {
                             + rawData[y0 * rawW + x1] * fx * (1 - fy)
                             + rawData[y1 * rawW + x0] * (1 - fx) * fy
                             + rawData[y1 * rawW + x1] * fx * fy;
-                depthImageData[ty * targetWidth + tx] = static_cast<unsigned char>(val + 0.5f);
+                depthImageData[ty * targetWidth + tx] = val;
             }
         }
         stbi_image_free(rawData);
         std::cout << "Resized to: " << depthWidth << "x" << depthHeight << std::endl;
+        return true;
+    }
+    bool loadMetricDepth(const std::string& filepath, int targetWidth, int targetHeight) {
+        std::ifstream ifs(filepath, std::ios::binary);
+        if (!ifs.is_open()) {
+            std::cerr << "[MetricDepth] Cannot open " << filepath << std::endl;
+            return false;
+        }
+        uint32_t magic = 0, W = 0, H = 0, reserved = 0;
+        ifs.read(reinterpret_cast<char*>(&magic), 4);
+        ifs.read(reinterpret_cast<char*>(&W), 4);
+        ifs.read(reinterpret_cast<char*>(&H), 4);
+        ifs.read(reinterpret_cast<char*>(&reserved), 4);
+        if (magic != 0x44455054u) {
+            std::cerr << "[MetricDepth] Invalid magic: 0x" << std::hex << magic
+                      << std::dec << " in " << filepath << std::endl;
+            return false;
+        }
+        size_t nPix = static_cast<size_t>(W) * H;
+        std::vector<float> raw(nPix);
+        ifs.read(reinterpret_cast<char*>(raw.data()), sizeof(float) * nPix);
+        if (!ifs) {
+            std::cerr << "[MetricDepth] Read error (expected " << nPix << " floats)" << std::endl;
+            return false;
+        }
+        ifs.close();
+
+        // targetWidth/Height が binary のサイズと異なる場合は nearest-neighbor リサイズ
+        // （通常は一致するのでそのままコピー）
+        if ((int)W == targetWidth && (int)H == targetHeight) {
+            depthImageData = std::move(raw);
+        } else {
+            depthImageData.assign(static_cast<size_t>(targetWidth) * targetHeight, 0.0f);
+            for (int ty = 0; ty < targetHeight; ++ty) {
+                for (int tx = 0; tx < targetWidth; ++tx) {
+                    int sx = std::min((int)W - 1, (int)((float)tx * W / targetWidth));
+                    int sy = std::min((int)H - 1, (int)((float)ty * H / targetHeight));
+                    depthImageData[ty * targetWidth + tx] = raw[sy * W + sx];
+                }
+            }
+        }
+        depthWidth = targetWidth;
+        depthHeight = targetHeight;
+
+        // 詳細統計を出力
+        float dmin_all = 1e30f, dmax_all = -1e30f;
+        float dmin_pos = 1e30f;
+        size_t zeroCount = 0;
+        for (float v : depthImageData) {
+            if (v < dmin_all) dmin_all = v;
+            if (v > dmax_all) dmax_all = v;
+            if (v > 0.0f && v < dmin_pos) dmin_pos = v;
+            if (v == 0.0f) zeroCount++;
+        }
+        std::cout << "[MetricDepth DETAIL] all range=[" << dmin_all << ", " << dmax_all << "]" << std::endl;
+        std::cout << "[MetricDepth DETAIL] positive min=" << dmin_pos << std::endl;
+        std::cout << "[MetricDepth DETAIL] zero count=" << zeroCount << "/" << depthImageData.size() << std::endl;
+
+        // 画像中央の画素を 9 点サンプル
+        std::cout << "[MetricDepth DETAIL] Image center samples:" << std::endl;
+        int cx = depthWidth / 2, cy = depthHeight / 2;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int x = cx + dx * (depthWidth / 8);
+                int y = cy + dy * (depthHeight / 8);
+                std::cout << "  (" << x << "," << y << ")=" << depthImageData[y * depthWidth + x] << std::endl;
+            }
+        }
         return true;
     }
     std::vector<float> applyGaussianSmoothingKernel(const std::vector<float>& depths,
@@ -767,6 +888,153 @@ struct mCutMesh {
         std::cout << "Smoothing complete" << std::endl;
         return normalizedDepths;
     }
+    std::vector<float> calculateBlockDepthRaw(int gridWidth, int gridHeight, float maskRatio = 0.9f) {
+        if (depthImageData.empty()) {
+            std::cerr << "Error: No depth image loaded" << std::endl;
+            return std::vector<float>();
+        }
+        int imgWidth = depthWidth;
+        int imgHeight = depthHeight;
+        float blockWidthF  = (float)imgWidth  / gridWidth;
+        float blockHeightF = (float)imgHeight / gridHeight;
+        int halfBlockW = std::max(1, (int)(blockWidthF  / 2.0f));
+        int halfBlockH = std::max(1, (int)(blockHeightF / 2.0f));
+        std::cout << "[RawDepth] Block size: " << blockWidthF << "x" << blockHeightF
+                  << " pixels (float)" << std::endl;
+        std::vector<float> rawDepths;
+        rawDepths.reserve((gridWidth + 1) * (gridHeight + 1));
+        for (int gy = 0; gy <= gridHeight; gy++) {
+            for (int gx = 0; gx <= gridWidth; gx++) {
+                int centerX = (int)((float)gx / gridWidth  * (imgWidth  - 1));
+                int centerY = (int)((float)gy / gridHeight * (imgHeight - 1));
+                int startX = std::max(0, centerX - halfBlockW);
+                int endX   = std::min(imgWidth,  centerX + halfBlockW + 1);
+                int startY = std::max(0, centerY - halfBlockH);
+                int endY   = std::min(imgHeight, centerY + halfBlockH + 1);
+                float sum = 0.0f;
+                int count = 0;
+                for (int y = startY; y < endY; y++) {
+                    for (int x = startX; x < endX; x++) {
+                        float val = depthImageData[y * depthWidth + x];
+                        if (val > 0.0f) {
+                            sum += val;
+                            count++;
+                        }
+                    }
+                }
+                float avgDepth = (count > 0) ? (sum / count) : 0.0f;
+                rawDepths.push_back(avgDepth);
+            }
+        }
+        float minVal = 1e30f, maxVal = -1e30f;
+        for (size_t k = 0; k < rawDepths.size(); ++k) {
+            if (rawDepths[k] > 0.0f) {
+                rawDepths[k] /= 255.0f;  // 8bit PNG 値を [0, 1] スケールへ
+                if (rawDepths[k] < minVal) minVal = rawDepths[k];
+                if (rawDepths[k] > maxVal) maxVal = rawDepths[k];
+            }
+        }
+        int nNonZero = 0;
+        for (float d : rawDepths) if (d > 0.0f) nNonZero++;
+        std::cout << "[RawDepth] Range: [" << minVal << ", " << maxVal
+                  << "] nonZero=" << nNonZero << "/" << rawDepths.size()
+                  << " (scaled to /255, no min-max renorm)" << std::endl;
+        size_t ctrIdx = rawDepths.size() / 2;
+        std::cout << "[RawDepth] samples: first=" << rawDepths[0]
+                  << " center=" << rawDepths[ctrIdx]
+                  << " last=" << rawDepths.back() << std::endl;
+        if (maskRatio < 1.0f) {
+            rawDepths = applyEdgeMask(rawDepths, gridWidth, gridHeight, maskRatio);
+        }
+        std::cout << "[RawDepth] Applying Gaussian smoothing (5x5)..." << std::endl;
+        rawDepths = applyGaussianSmoothing(rawDepths, gridWidth, gridHeight, 2);
+        return rawDepths;
+    }
+    std::vector<float> calculateBlockDepthMetric(int gridWidth, int gridHeight,
+                                                 const std::vector<unsigned char>& maskData,
+                                                 int maskWidth, int maskHeight,
+                                                 float maskRatio = 0.9f) {
+        if (depthImageData.empty()) {
+            std::cerr << "[MetricBlock] No depth data loaded" << std::endl;
+            return std::vector<float>();
+        }
+        if ((int)maskData.size() != maskWidth * maskHeight) {
+            std::cerr << "[MetricBlock] Mask size mismatch" << std::endl;
+            return std::vector<float>();
+        }
+        int imgW = depthWidth, imgH = depthHeight;
+        float blockWF = (float)imgW / gridWidth;
+        float blockHF = (float)imgH / gridHeight;
+        int halfW = std::max(1, (int)(blockWF / 2.0f));
+        int halfH = std::max(1, (int)(blockHF / 2.0f));
+
+        std::cout << "[MetricBlock] grid=" << (gridWidth+1) << "x" << (gridHeight+1)
+                  << " block=" << blockWF << "x" << blockHF << std::endl;
+
+        std::vector<float> rawDepths;
+        rawDepths.reserve((gridWidth + 1) * (gridHeight + 1));
+        for (int gy = 0; gy <= gridHeight; ++gy) {
+            for (int gx = 0; gx <= gridWidth; ++gx) {
+                int cx = (int)((float)gx / gridWidth  * (imgW - 1));
+                int cy = (int)((float)gy / gridHeight * (imgH - 1));
+                int x0 = std::max(0, cx - halfW), x1 = std::min(imgW, cx + halfW + 1);
+                int y0 = std::max(0, cy - halfH), y1 = std::min(imgH, cy + halfH + 1);
+
+                float sum = 0.0f;
+                int count = 0;
+                for (int y = y0; y < y1; ++y) {
+                    for (int x = x0; x < x1; ++x) {
+                        // mask と depth が同じ解像度と仮定（通常そう）
+                        int mx = std::min(maskWidth  - 1, (int)((float)x * maskWidth  / imgW));
+                        int my = std::min(maskHeight - 1, (int)((float)y * maskHeight / imgH));
+                        if (maskData[my * maskWidth + mx] > 127) {
+                            float v = depthImageData[y * imgW + x];
+                            if (v > 0.0f) { sum += v; count++; }
+                        }
+                    }
+                }
+                rawDepths.push_back(count > 0 ? sum / count : 0.0f);
+            }
+        }
+
+        float dmin = 1e30f, dmax = -1e30f;
+        int nz = 0;
+        for (float d : rawDepths) {
+            if (d > 0.0f) {
+                if (d < dmin) dmin = d; if (d > dmax) dmax = d; nz++;
+            }
+        }
+        std::cout << "[MetricBlock] Range=[" << dmin << ", " << dmax
+                  << "] m, nonZero=" << nz << "/" << rawDepths.size() << std::endl;
+
+        // DA3 の metric depth は「カメラから物体までの距離」で表現（近い=小、遠い=大）
+        // ワールド座標系では「カメラから見てZ小=カメラから遠い」ので、このままでは
+        // 物理的に近いものが画面上で奥に見える逆転現象が発生する
+        // マスク内の depth を反転して「カメラに対する高さ」として扱う
+        if (dmax > 0.0f) {
+            for (auto& d : rawDepths) {
+                if (d > 0.0f) {
+                    d = dmax - d;  // 反転：近かったものが大きく、遠かったものが小さく
+                }
+                // マスク外（d==0）はそのまま 0 に保持（平面配置のため）
+            }
+            float invMin = 1e30f, invMax = -1e30f;
+            for (float d : rawDepths) {
+                if (d > 0.0f) {
+                    if (d < invMin) invMin = d;
+                    if (d > invMax) invMax = d;
+                }
+            }
+            std::cout << "[MetricBlock] After inversion range=[" << invMin << ", " << invMax
+                      << "] (larger = closer to camera)" << std::endl;
+        }
+
+        if (maskRatio < 1.0f) {
+            rawDepths = applyEdgeMask(rawDepths, gridWidth, gridHeight, maskRatio);
+        }
+        rawDepths = applyGaussianSmoothing(rawDepths, gridWidth, gridHeight, 2);
+        return rawDepths;
+    }
     std::vector<float> calculateNormalizedDepth(int gridWidth, int gridHeight, float percentile = 0.95f) {
         if (depthImageData.empty()) {
             std::cerr << "Error: No depth image loaded" << std::endl;
@@ -896,7 +1164,12 @@ struct mCutMesh {
     void generateGridPlaneWithDepth(int gridWidth, int gridHeight,
                                     const std::vector<float>& normalizedDepths,
                                     float thickness = 0.05f,
-                                    float depthScale = 1.0f) {
+                                    float depthScale = 1.0f,
+                                    int   pinMode = 0,
+                                    float fx = 0.0f, float fy = 0.0f,
+                                    float cx = 0.0f, float cy = 0.0f,
+                                    int   imgW = 0, int imgH = 0,
+                                    float baseScale = 0.0f) {
         mVertices.clear();
         mNormals.clear();
         mTexCoords.clear();
@@ -912,17 +1185,58 @@ struct mCutMesh {
                       << ", got " << normalizedDepths.size() << std::endl;
             return;
         }
+        bool validK = (fx > 0.0f && fy > 0.0f && imgW > 0 && imgH > 0);
+        bool useDiff = (pinMode == 1) && validK;
+        bool usePure = (pinMode == 2) && validK;
+        float pureScale = usePure ? (planeWidth * fx / (float)imgW) : 1.0f;
+        float deltaScale = depthScale - baseScale;
         std::cout << "Generating depth grid: " << (gridWidth+1) << "x" << (gridHeight+1)
-                  << " vertices, depth scale=" << depthScale << std::endl;
+                  << " vertices, depth scale=" << depthScale;
+        if (useDiff) std::cout << " [DIFF PINHOLE base=" << baseScale << " delta=" << deltaScale << "]";
+        else if (usePure) std::cout << " [PURE PINHOLE sK=" << pureScale << "]";
+        std::cout << std::endl;
+        if (usePure) {
+            std::cout << "[GenDBG] usePure=true, halfThk IGNORED (scale invariance)" << std::endl;
+            std::cout << "[GenDBG] planeWidth=" << planeWidth << " fx=" << fx
+                      << " cx=" << cx << " pureScale=" << pureScale << std::endl;
+            if (!normalizedDepths.empty()) {
+                float dmin = 1e30f, dmax = -1e30f;
+                for (float d : normalizedDepths) {
+                    if (d > 0.0f) { if (d < dmin) dmin = d; if (d > dmax) dmax = d; }
+                }
+                std::cout << "[GenDBG] input depth range: [" << dmin << ", " << dmax << "]" << std::endl;
+                std::cout << "[GenDBG] expected Z range: [" << dmin*depthScale << ", " << dmax*depthScale << "]" << std::endl;
+                std::cout << "[GenDBG] expected X range at image edge (u=1, d=" << dmin << "): "
+                          << (float)imgW * 0.5f * dmin * depthScale / fx * pureScale << std::endl;
+            }
+        }
+
         int depthIndex = 0;
         for (int y = 0; y <= gridHeight; y++) {
             for (int x = 0; x <= gridWidth; x++) {
                 float u = (float)x / gridWidth;
                 float v = (float)y / gridHeight;
-                float posX = (u - 0.5f) * planeWidth;
-                float posY = (0.5f - v) * planeHeight;
                 float depth = normalizedDepths[depthIndex++];
                 float posZ = halfThickness + depth * depthScale;
+                float posX, posY;
+                if (useDiff) {
+                    float px = u * (float)imgW;
+                    float py = v * (float)imgH;
+                    float ZDelta = depth * deltaScale;
+                    posX = (u - 0.5f) * planeWidth  + (px - cx) * ZDelta / fx;
+                    posY = (0.5f - v) * planeHeight - (py - cy) * ZDelta / fy;
+                } else if (usePure) {
+                    float px = u * (float)imgW;
+                    float py = v * (float)imgH;
+                    float Zpure = depth * depthScale;
+                    if (Zpure < 1e-6f) Zpure = 1e-6f;
+                    posX =  (px - cx) * Zpure / fx * pureScale;
+                    posY = -(py - cy) * Zpure / fy * pureScale;
+                    posZ = Zpure;
+                } else {
+                    posX = (u - 0.5f) * planeWidth;
+                    posY = (0.5f - v) * planeHeight;
+                }
                 mVertices.push_back(posX);
                 mVertices.push_back(posY);
                 mVertices.push_back(posZ);

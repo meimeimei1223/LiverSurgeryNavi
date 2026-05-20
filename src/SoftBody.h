@@ -52,6 +52,24 @@ public:
     void endGrab(const glm::vec3& pos, const glm::vec3& vel);
 
     const std::vector<float>& getPositions() const { return positions; }
+    void setPositions(const std::vector<float>& src) {
+        if (src.size() == positions.size()) {
+            positions = src;
+            prevPositions = src;
+            std::fill(velocities.begin(), velocities.end(), 0.0f);
+            std::fill(edgeLambdas.begin(), edgeLambdas.end(), 0.0f);
+            std::fill(volLambdas.begin(), volLambdas.end(), 0.0f);
+        }
+    }
+    const std::vector<std::vector<float>>& getAllVisPositions() const { return vis_positions_array; }
+    void setAllVisPositions(const std::vector<std::vector<float>>& src) {
+        if (src.size() == vis_positions_array.size()) {
+            for (size_t i = 0; i < src.size(); i++) {
+                if (src[i].size() == vis_positions_array[i].size())
+                    vis_positions_array[i] = src[i];
+            }
+        }
+    }
     const std::vector<int>& getTetIds() const { return tetIds; }
     const std::vector<int>& gettetSurfaceTriIds() const { return tetSurfaceTriIds; }
 
@@ -62,6 +80,40 @@ public:
     size_t getNumVisParticles() const { return numVisParticles; }
     void setEdgeCompliance(float compliance) { edgeCompliance = compliance; }
     void setVolCompliance(float compliance) { volCompliance = compliance; }
+    void  setDamping(float d) { damping = d; }
+    float getDamping() const  { return damping; }
+
+    /* Handle controller access (direct particle manipulation for auto/semi-auto deform) */
+    void setParticlePosition(int idx, const glm::vec3& p) {
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) return;
+        positions[idx*3]     = p.x;
+        positions[idx*3 + 1] = p.y;
+        positions[idx*3 + 2] = p.z;
+    }
+    glm::vec3 getParticlePosition(int idx) const {
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) return glm::vec3(0);
+        return glm::vec3(positions[idx*3], positions[idx*3 + 1], positions[idx*3 + 2]);
+    }
+    void setParticleVelocity(int idx, const glm::vec3& v) {
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) return;
+        velocities[idx*3]     = v.x;
+        velocities[idx*3 + 1] = v.y;
+        velocities[idx*3 + 2] = v.z;
+    }
+    void setParticlePrevPosition(int idx, const glm::vec3& p) {
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) return;
+        prevPositions[idx*3]     = p.x;
+        prevPositions[idx*3 + 1] = p.y;
+        prevPositions[idx*3 + 2] = p.z;
+    }
+    void setInvMass(int idx, float v) {
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) return;
+        invMasses[idx] = v;
+    }
+    float getInvMass(int idx) const {
+        if (idx < 0 || idx >= static_cast<int>(numParticles)) return 0.0f;
+        return invMasses[idx];
+    }
     const MeshData& getMeshData() const { return meshData; }
     const MeshData& getVisMeshData(int ids) const { return vismeshDataArray[ids]; }
     void applyShapeRestoration(float strength);
@@ -77,6 +129,8 @@ public:
     bool isTetMeshVisible() const {
         return showTetMesh;
     }
+    void setTetMeshVisible(bool v) { showTetMesh = v; }
+    void toggleTetMeshVisible() { showTetMesh = !showTetMesh; }
 
     const size_t& getNumVis() const { return numVisVerts; }
 
@@ -197,6 +251,22 @@ public:
     void smartEndGrab(const glm::vec3& position, const glm::vec3& velocity);
 
     void fullReset();
+
+    struct AttachmentConstraint {
+        int       vertexIdx;
+        glm::vec3 targetPos;
+        float     compliance;
+        float     lambda;
+    };
+
+    std::vector<AttachmentConstraint> attachmentConstraints;
+
+    int  addAttachmentConstraint(int vertexIdx, const glm::vec3& targetPos, float compliance);
+    void clearAttachmentConstraints();
+    void updateAttachmentTarget(int attachIdx, const glm::vec3& newTarget);
+    void updateAttachmentCompliance(int attachIdx, float newCompliance);
+    void solveAttachments(float dt);
+    size_t getNumAttachments() const { return attachmentConstraints.size(); }
 
 private:
     std::vector<int> handleVertices;
