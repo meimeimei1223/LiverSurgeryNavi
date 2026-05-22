@@ -1424,12 +1424,35 @@ struct mCutMesh {
         T = glm::rotate(T, angle1, axis1);
         T = glm::rotate(T, angle2, axis2);
         T = glm::translate(T, -center);
+
+        // Normal matrix: 純粋な rotation の inverse-transpose は rotation 自身
+        // だが、安全のため一般式 transpose(inverse(mat3(T))) で求める
+        // (将来 scale が混じっても正しく動く)。translation 成分は mat3() で
+        // 自動的に切り捨てられる。
+        glm::mat3 N = glm::transpose(glm::inverse(glm::mat3(T)));
+
         for (size_t i = 0; i < mVertices.size(); i += 3) {
             glm::vec4 v(mVertices[i], mVertices[i + 1], mVertices[i + 2], 1.0f);
             v = T * v;
             mVertices[i]     = v.x;
             mVertices[i + 1] = v.y;
             mVertices[i + 2] = v.z;
+        }
+
+        // ★FIX (ライティングバグ): 頂点と同じ rotation で normals も同時に回す。
+        //   これが無いと頂点だけ回って normals が古い world 方向のまま残り、
+        //   shader 内のライティング計算 (dot(N, lightDir)) が古い向きで評価
+        //   される。結果として明暗パターンがメッシュ-ローカルに張り付いて
+        //   見える ("ライトがオブジェクトと一緒に回転する" ように錯覚する)。
+        //   InteractionHelpers::rotateAllMeshes (左クリック+ドラッグで肝臓を
+        //   回す経路) の症状の根本原因。
+        //   applyMatrixToMeshVerticesAndNormals (RegistrationCore.h) と同等。
+        for (size_t i = 0; i + 2 < mNormals.size(); i += 3) {
+            glm::vec3 n(mNormals[i], mNormals[i + 1], mNormals[i + 2]);
+            n = glm::normalize(N * n);
+            mNormals[i]     = n.x;
+            mNormals[i + 1] = n.y;
+            mNormals[i + 2] = n.z;
         }
     }
 

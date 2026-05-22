@@ -23,6 +23,31 @@ extern glm::mat4 view, projection;
 extern glm::vec3 objPos;
 extern float g_sceneDiag;   // for scene-scale-relative marker radius (sync with RegRatios)
 
+// boardMesh3D: 右画面でテクスチャ付き板メッシュを screenMesh (target cloud)
+// と一緒に表示するために参照する。
+//   - マーキング時に board の絵柄と target の対応関係が一目で分かるので
+//     クリック対応点を取りやすくなる、というユーザー要望に対応。
+extern mCutMesh* boardMesh3D;
+extern float     g_meshAlpha[8];  // [6]=boardMesh, [7]=screenMesh の alpha
+
+// screenMesh 点群描画フラグと描画関数 (main.cpp で定義)。
+//   Umeyama 2画面モード中、右ビューポートで targetCloud (= screenMesh) を
+//   ユーザーの "Draw as points" / Density 設定に従って軽量描画するために
+//   ここから呼ぶ。これをやらずに draw_AllmCutMeshes で full-triangle 描画
+//   すると数十万頂点メッシュでフレームレートが大幅低下する。
+extern bool  g_screenMeshAsPoints;
+extern float g_screenMeshPointSize;
+extern float g_screenMeshDensity;
+void drawScreenMeshAsPoints(
+    mCutMesh* mesh,
+    ShaderProgram& shader,
+    const glm::mat4& model,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const glm::vec3& camPos,
+    const glm::vec4& color,
+    float pointSize);
+
 struct UmeyamaController {
 
     // ===================== 内部状態 =====================
@@ -36,6 +61,18 @@ struct UmeyamaController {
     float savedFx = 0, savedFy = 0, savedCx = 0, savedCy = 0;
     int   savedCalibW = 0, savedCalibH = 0;
     bool  savedUseIntrinsics = false;
+
+    // ----- mesh center cache (chat: Umeyama frame-rate fix) ---------------
+    // Umeyama 2画面モードはユーザーが対応点をクリックするだけで、organs と
+    // screen mesh は active=true の間まったく動かない (registration apply は
+    // execute() で active=false になった後にしか実行されない)。
+    // それなのに従来は毎フレーム O(N) の calculateMeshCenter を 2 回走らせて
+    // いた (liver 9,992 verts + screen 数十万 verts)。これがフレームレート
+    // ドロップの主犯候補なので start() で一度だけ計算してキャッシュする。
+    // ---------------------------------------------------------------------
+    glm::vec3 cachedLiverCenter  = glm::vec3(0.0f);
+    glm::vec3 cachedScreenCenter = glm::vec3(0.0f);
+    bool centersCached           = false;
 
     // ===================== 公開メソッド =====================
 
@@ -83,6 +120,8 @@ struct UmeyamaController {
         camRight.cy            = winH / 2.0f;
 
         active = true;
+        // 次の render() 呼び出し時に 1 回だけ center を計算するためフラグを下ろす
+        centersCached = false;
         std::cout << "[Umeyama] Split screen started. "
                   << "RIGHT: select " << reg.targetPointCount
                   << " board points" << std::endl;
@@ -240,6 +279,26 @@ struct UmeyamaController {
                 mCutMesh* screen, int winW, int winH) {
         if (!active) return;
 
+        // ----- mesh centers: compute once per session, then reuse -------
+        // organs[0] (liver) と screen はこの session の間動かないので毎フレーム
+        // O(N) を走らせる必要はない。start() で centersCached=false を立てたあと
+        // 最初の render で 1 回だけ計算してキャッシュする。
+        // (ガード: organs/screen が空のときはゼロベクトルのまま、次フレームで再試行)
+        if (!centersCached) {
+            bool gotLiver = false, gotScreen = false;
+            if (!organs.empty() && organs[0] && !organs[0]->mVertices.empty()) {
+                cachedLiverCenter =
+                    FullSphereCamera::calculateMeshCenter(organs[0]->mVertices);
+                gotLiver = true;
+            }
+            if (screen && !screen->mVertices.empty()) {
+                cachedScreenCenter =
+                    FullSphereCamera::calculateMeshCenter(screen->mVertices);
+                gotScreen = true;
+            }
+            if (gotLiver && gotScreen) centersCached = true;
+        }
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         int halfW = winW / 2;
         glm::mat4 mdl = glm::translate(glm::mat4(1.0f), objPos);
@@ -248,12 +307,8 @@ struct UmeyamaController {
         {
             glViewport(0, 0, halfW, winH);
 
-            // liver中心にカメラを向ける
-            glm::vec3 liverC(0.0f);
-            if (!organs.empty() && organs[0]) {
-                liverC = FullSphereCamera::calculateMeshCenter(organs[0]->mVertices);
-            }
-            camLeft.updateTargetPositions(liverC, glm::vec3(0));
+            // liver中心にカメラを向ける (キャッシュ済み)
+            camLeft.updateTargetPositions(cachedLiverCenter, glm::vec3(0));
             camLeft.UpdateCamera();
 
             glm::mat4 leftView = camLeft.view;
@@ -263,10 +318,10 @@ struct UmeyamaController {
             std::vector<mCutMesh*> visMeshes;
             std::vector<glm::vec4> visColors;
             const glm::vec4 defCol[] = {
-                {0.8f,0.2f,0.2f,0.8f}, {0.2f,0.2f,0.8f,0.8f},
-                {0.2f,0.5f,0.5f,0.8f}, {0.8f,0.5f,0.5f,0.8f},
-                {0.2f,0.8f,0.5f,0.6f}, {0.2f,0.8f,0.2f,0.8f},
-            };
+                                        {0.8f,0.2f,0.2f,0.8f}, {0.2f,0.2f,0.8f,0.8f},
+                                        {0.2f,0.5f,0.5f,0.8f}, {0.8f,0.5f,0.5f,0.8f},
+                                        {0.2f,0.8f,0.5f,0.6f}, {0.2f,0.8f,0.2f,0.8f},
+                                        };
             for (size_t i = 0; i < organs.size() && i < 6; i++) {
                 if (organs[i] && !organs[i]->mVertices.empty()) {
                     visMeshes.push_back(organs[i]);
@@ -281,26 +336,62 @@ struct UmeyamaController {
             drawMarkers(shader, reg, leftView, leftProj, camLeft.cameraPos, false);
         }
 
-        // ======== 右画面: board（ターゲットOBJ）========
+        // ======== 右画面: board (テクスチャ付き板) + target (screenMesh) ========
+        //
+        // マーキングしやすさのため、通常モードと同じレイアウト:
+        //   board (テクスチャ付き、白) を下地に描画
+        //   target (screenMesh) を点群 or 半透明三角形で上塗り
+        //   board の表示判定は g_meshAlpha[6]、target は g_meshAlpha[7]
+        //
+        // Umeyama 入口時点で board の alpha がゼロでも右画面では強制的に
+        // 表示する (絵柄が見えないとマーキングできないため)。target も同様に
+        // 最低限の不透明度を保証する。
         {
             glViewport(halfW, 0, halfW, winH);
 
-            // OBJ中心にカメラを向ける
-            glm::vec3 screenC(0.0f);
-            if (screen)
-                screenC = FullSphereCamera::calculateMeshCenter(screen->mVertices);
-            camRight.updateTargetPositions(glm::vec3(0), screenC);
+            // OBJ中心にカメラを向ける (キャッシュ済み)
+            camRight.updateTargetPositions(glm::vec3(0), cachedScreenCenter);
             camRight.UpdateCamera();
 
             glm::mat4 rightView = camRight.view;
             glm::mat4 rightProj = createProjectionForViewport(halfW, winH, camRight);
 
-            // screenMeshを通常メッシュとして描画（テクスチャ非依存）
-            std::vector<mCutMesh*> rightMeshes = { screen };
-            std::vector<glm::vec4> rightColors = { {0.3f, 0.6f, 0.9f, 0.5f} };
-            draw_AllmCutMeshes(rightMeshes, shader, texShader,
-                               camRight.cameraPos, rightColors,
-                               mdl, rightView, rightProj, -1);
+            // (a) board (テクスチャ付き) を draw_AllmCutMeshes で描画。
+            //     通常モードと同じく textureMeshIdx 指定でテクスチャシェーダに
+            //     切り替えてもらう。alpha は Umeyama 中だけ 1.0 に強制 (元値に
+            //     関わらずマーキングしやすいように)。
+            std::vector<mCutMesh*> rightMeshes;
+            std::vector<glm::vec4> rightColors;
+            int textureMeshIdx = -1;
+
+            // target を triangle 描画にする場合のみ draw_AllmCutMeshes 側に積む。
+            // 点群モードのときは後段で別途 drawScreenMeshAsPoints する。
+            if (screen && !screen->mVertices.empty() && !g_screenMeshAsPoints) {
+                rightMeshes.push_back(screen);
+                rightColors.push_back(glm::vec4(0.3f, 0.6f, 0.9f, 0.5f));
+            }
+
+            if (boardMesh3D && !boardMesh3D->mVertices.empty()) {
+                rightMeshes.push_back(boardMesh3D);
+                rightColors.push_back(glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                textureMeshIdx = (int)rightMeshes.size() - 1;
+            }
+
+            if (!rightMeshes.empty()) {
+                draw_AllmCutMeshes(rightMeshes, shader, texShader,
+                                   camRight.cameraPos, rightColors,
+                                   mdl, rightView, rightProj, textureMeshIdx);
+            }
+
+            // (b) target を点群で描画 (デフォルト)。board の上に乗るので
+            //     density スライダの値次第ではテクスチャがほぼ見えるようになる。
+            if (g_screenMeshAsPoints && screen && !screen->mVertices.empty()) {
+                drawScreenMeshAsPoints(
+                    screen, shader,
+                    mdl, rightView, rightProj, camRight.cameraPos,
+                    glm::vec4(0.3f, 0.6f, 0.9f, 0.7f),
+                    g_screenMeshPointSize);
+            }
 
             // board point マーカー
             drawMarkers(shader, reg, rightView, rightProj, camRight.cameraPos, true);

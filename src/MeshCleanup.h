@@ -541,7 +541,7 @@ inline CleanupStats cleanupOBJMesh(mCutMesh& mesh,
     int ncomp = 0, nkept = 0;
     //s.componentTrianglesRemoved = keepLargestComponent(mesh, ncomp);
     s.componentTrianglesRemoved = keepLargeComponents(mesh, ncomp, nkept,
-                                                      /*minRatio=*/0.1f);
+                                                      /*minRatio=*/0.3f);
     s.componentsFound           = ncomp;
 
     compactVertices(mesh);

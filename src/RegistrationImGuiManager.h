@@ -12,8 +12,10 @@
 // Forward declarations for Shift+Ctrl+P tuning globals defined in RegistrationActions.h.
 // (RegistrationActions.h is included after this header in main.cpp, so we need these
 //  extern decls to compile the QCR Tuning slider panel below.)
-extern int g_qcrSubsetK;
-extern int g_qcrMaxTrials;
+extern int   g_qcrSubsetK;
+extern int   g_qcrMaxTrials;
+extern float g_qcrMaxAxisRotDeg;     // hard limit per X/Y/Z axis rotation (deg)
+extern float g_qcrMaxTotalRotDeg;    // hard limit on total axis-angle rotation (deg)
 
 struct RegUIActions {
     std::function<void()> onToggleCamera;
@@ -56,6 +58,23 @@ struct RegUIActions {
     std::function<void()> onResetCamera;
     std::function<void()> onRefine;
     std::function<void()> onSilhouetteAlign;
+    // ---- Ctrl+G : V3-R BIPOP-CMA-ES (Region-aware, main refinement) ----
+    //   Initial Orientation panel + AutoQCR で姿勢を寄せた後の主動線。
+    //   main.cpp 側で以下と等価のシーケンスを実装する:
+    //     1) g_liverRegion / g_liverLR 未計算なら ERROR 出力して abort
+    //     2) makeQuadrantSubsetIdx で subset を計算、空なら abort
+    //     3) g_stepStartTime 更新、g_sessionBipopN++、regMethod=3
+    //     4) poseAutoSaveBeforeRegistration()
+    //     5) runBipopCmaesV3R(g_activeQuadrantMask)
+    //     6) poseSaveToLibrary(SaveCriterion::RMSE, g_activeQuadrantMask)
+    //   キーボードの Ctrl+G dispatch (main.cpp GLFW_KEY_G case) と
+    //   結果 byte-identical になることが期待される。
+    std::function<void()> onCtrlG;
+    // onCtrlgLockScaleChanged: Ctrl+G の 6-DoF/7-DoF チェックボックス変更時。
+    //   true  → main.cpp が g_ctrlgSearchMode = SIX_DOF_RIGID に
+    //   false → main.cpp が g_ctrlgSearchMode = SEVEN_DOF に
+    //   (4-DoF への切替は左 floating パネル経由のみ。サイドバーからは触れない)
+    std::function<void(bool)> onCtrlgLockScaleChanged;
     std::function<void()> onPoseLibraryToggle;
     std::function<void()> onPoseUndo;
     std::function<void()> onAutoProbe;
@@ -66,6 +85,11 @@ struct RegUIActions {
     std::function<void(bool)> onAutoQCR;
     std::function<void(int)> onSwitchDepthModel;
     std::function<void(int)> onInitRotPresetChanged;
+    // onInitRotPresetSilent: registrationHandle.initRotPreset を更新するが
+    //   applyInitRotation は呼ばない。POSITION 変更時の自動 Orient 設定で使う:
+    //   ユーザがクアドラントを選んだ時点で対応する Orient (Right/Base/Left)
+    //   に切り替わるが、Apply Init Pose を押すまで実適用しない。
+    std::function<void(int)> onInitRotPresetSilent;
     std::function<void(int)> onInitRotPositionChanged;   // Phase 2: 重心位置 selector (legacy, deprecated)
     std::function<void(int)> onIntrinsicsSourceChanged;
     std::function<void()>    onRunCalibration;
@@ -98,6 +122,18 @@ struct RegUIActions {
     std::function<void()> onFlipCC;
     // (Reserved) 全ラベルを強制再計算するボタン。Phase 1 では未配線。
     std::function<void()> onRecomputeAxes;
+
+    // ---- Advanced section integration ----
+    //   onDrawAdvancedCtrlG:
+    //     REGISTRATION セクションの "Advanced" CollapsingHeader 内で呼ばれる。
+    //     main.cpp 側で Ctrl+G / Ctrl+Shift+G の RIM-weighted / raycast 関連
+    //     コントロール (g_ctrlgUseArVisFilter, g_ctrlgBetaRimWeight,
+    //     g_ctrlgsLambdaRimSil 等) を ImGui 描画する。callback 方式により
+    //     この header に extern decl を 10 個以上撒くのを回避。
+    //
+    //     既存の floating "Ctrl+G Quadrant Selector" 窓と同じ globals を
+    //     操作するので、片方を変えればもう片方の表示も即時同期する。
+    std::function<void()> onDrawAdvancedCtrlG;
 };
 
 struct RegUIState {
@@ -188,6 +224,13 @@ struct RegUIState {
     //   true  (default) = 6-DoF rigid (論文推奨、CMA-ES 発散回避)
     //   false           = 7-DoF T+R+Scale (Shift+Ctrl+P 互換挙動)
     bool  autoQcrLockScale = true;
+    // Ctrl+G (V3-R) 6-DoF/7-DoF 切替。サイドバーのチェックボックスから操作。
+    //   true  = 6-DoF rigid (scale=1 固定、SIX_DOF_RIGID)
+    //   false (default) = 7-DoF T+R+Scale (SEVEN_DOF、g_ctrlgSearchMode の元 default)
+    //   ※ 4-DoF (FOUR_DOF_XYRXRY) は左 floating パネルの radio button 経由のみ。
+    //     その状態のときはこの bool は false 扱いで表示する (4-DoF != 6-DoF)。
+    //   main.cpp 側 syncUIState で g_ctrlgSearchMode から毎フレーム同期する。
+    bool  ctrlgLockScale = false;
     float boardAlpha = 0.7f;
     float targetAlpha = 0.5f;
     unsigned int boardIconTex = 0;
@@ -261,6 +304,24 @@ private:
     bool regPhaseActive_ = false;
     float sidebarWidth_ = 400.0f;
 
+    // ---- INITIAL ORIENTATION panel: CollapsingHeader open states ----
+    //   ImGui の CollapsingHeader は自身で開閉状態を保持するが、
+    //   childH の動的計算 (BeginChild 開始前) には事前にサイズを
+    //   知っておく必要があるため、前フレームの値をここにキャッシュ。
+    //   1 フレームの遅延が発生するが視認では検出不可。
+    //
+    //   anatAxesExpanded_:
+    //     - 通常は false (折りたたみ)
+    //     - WEAK (state.ccWeak == true) 時は SetNextItemOpen で
+    //       強制展開され、ユーザが閉じても次フレームで再展開される
+    //   orientExpanded_:
+    //     - 既定 false (折りたたみ)。AutoQCR が ORIENT を 9 通り自動
+    //       sweep するため、通常は触らない。ヘッダに現在の preset 名
+    //       (state.initRotPreset → presetLabel) を表示するので、AutoQCR
+    //       後の選択結果は折りたたんだままでも確認できる。
+    bool anatAxesExpanded_ = false;
+    bool orientExpanded_   = false;
+
     static ImVec4 colDepth()  { return {0.055f,0.83f,0.66f,1}; }
     static ImVec4 colReg()    { return {0.94f,0.56f,0.19f,1}; }
     static ImVec4 colDeform() { return {0.66f,0.33f,0.97f,1}; }
@@ -274,6 +335,61 @@ private:
 
     static ImU32 toU32(const ImVec4& c, float a=1.0f) {
         return IM_COL32((int)(c.x*255),(int)(c.y*255),(int)(c.z*255),(int)(a*255));
+    }
+
+    // -----------------------------------------------------------------
+    //  presetLabel:
+    //    initRotPreset (int, 0..14) → 表示用ラベル文字列。
+    //    drawInitOrientationPanel の 3x5 grid に書かれているラベルと
+    //    完全一致させること。ORIENTATION CollapsingHeader のヘッダ
+    //    タイトルに "[Base]" / "[Up-R+]" のように現在値を出して、
+    //    折りたたんだまま AutoQCR の結果が確認できるようにする。
+    // -----------------------------------------------------------------
+    static const char* presetLabel(int pid) {
+        switch (pid) {
+        case  0: return "Base";
+        case  1: return "Up";
+        case  2: return "Up-R";
+        case  3: return "Right";
+        case  4: return "Dn-R";
+        case  5: return "Down";
+        case  6: return "Dn-L";
+        case  7: return "Left";
+        case  8: return "Up-L";
+        case  9: return "Up-R+";
+        case 10: return "Right+";
+        case 11: return "Dn-R+";
+        case 12: return "Up-L+";
+        case 13: return "Left+";
+        case 14: return "Dn-L+";
+        default: return "?";
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  mapQuadrantToOrientPreset:
+    //    POSITION 2x2 grid / Quick Presets でクアドラントが変更されたとき、
+    //    対応する Orient preset id を返す。AutoQCR の preset グループ分け
+    //    (main.cpp::runAutoQuadCyclicRansac のコメント) と同じ方針:
+    //
+    //      右側のみ (AR / PR / AR+PR = 0x1 / 0x4 / 0x5)   → Right (preset 3)
+    //      左側のみ (AL / PL / AL+PL = 0x2 / 0x8 / 0xA)   → Left  (preset 7)
+    //      両側 (QUAD_ALL=0xF や混合) / 空                → Base  (preset 0)
+    //
+    //    これにより、ユーザは POSITION を選ぶだけで妥当な Orient が自動セットされ、
+    //    そのまま Apply Init Pose を押せる。手動で別の preset を試したい場合は
+    //    ORIENTATION CollapsingHeader を開いて選び直す。
+    // -----------------------------------------------------------------
+    static int mapQuadrantToOrientPreset(uint8_t mask) {
+        constexpr uint8_t kMaskAR = 0x01;
+        constexpr uint8_t kMaskAL = 0x02;
+        constexpr uint8_t kMaskPR = 0x04;
+        constexpr uint8_t kMaskPL = 0x08;
+        const bool hasR = (mask & (kMaskAR | kMaskPR)) != 0;
+        const bool hasL = (mask & (kMaskAL | kMaskPL)) != 0;
+        if (hasR && !hasL) return 3;   // Right
+        if (hasL && !hasR) return 7;   // Left
+        return 0;                       // Base (両側 / 空)
     }
 
     int currentPhase() const {
@@ -764,36 +880,23 @@ private:
     }
 
     // =====================================================================
-    //  drawAnatomicalAxesStatus (Preview OBJ Anatomical Pose):
-    //    Initial Orientation panel の先頭に表示する 3 軸 (AP / LR / CC) の
+    //  drawAnatomicalAxesContent (Preview OBJ Anatomical Pose):
+    //    Initial Orientation panel の ANATOMICAL AXES CollapsingHeader
+    //    が「展開」状態の時にヘッダ直下に描く 3 軸 (AP / LR / CC) の
     //    確認 UI。レジ前に解剖軸の sign が正しいかを目視 + 数値で確認し、
-    //    weak case (CC confidence < 5%) を赤バッジで強調する。
-    //    Flip ボタンで g_lrFlipManual / g_ccFlipManual を即時トグルし、
-    //    main.cpp 側で対応するラベルを再計算する。
+    //    Flip ボタンで g_lrFlipManual / g_ccFlipManual を即時トグルする。
+    //
+    //    WEAK 状態 (CC confidence < 5%) や未計算状態のステータスバッジは
+    //    drawInitOrientationPanel 側で CollapsingHeader のタイトルに
+    //    埋め込まれる (例: "ANATOMICAL AXES  [WEAK 3.2%]")。ここでは
+    //    純粋に内容 (3 行) のみを担当する。
     //
     //    レイアウト (1 行 = 20px):
     //      [name(40px)] [● status] [conf %] [note]            [Flip btn(70px)]
     // =====================================================================
-    void drawAnatomicalAxesStatus() {
+    void drawAnatomicalAxesContent() {
         const float rowH = 20.0f;
         const float rowSpacing = 3.0f;
-
-        // ---- サブヘッダ + 赤/黄バッジ ----
-        ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 0.85f), "  ANATOMICAL AXES");
-        ImGui::SameLine();
-        if (state.ccAxisValid && state.ccWeak) {
-            // 赤バッジ: CC confidence < 5% (Python の WEAK 閾値と同じ)
-            ImGui::TextColored(ImVec4(0.96f, 0.32f, 0.32f, 1.0f),
-                               "  [WEAK %.1f%% - inspect with Shift+H, Flip CC if reversed]",
-                               state.ccConfidence * 100.0f);
-        } else if (!state.apAxisValid || !state.lrAxisValid || !state.ccAxisValid) {
-            // 黄バッジ: いずれかが未計算
-            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.28f, 1.0f),
-                               "  [not all computed - press Apply Init Pose]");
-        } else {
-            // 緑チェック: 全 OK
-            ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.45f, 1.0f),  "  [OK]");
-        }
 
         // ---- axis 1 行を描く lambda ----
         auto drawRow = [&](const char* name,
@@ -927,40 +1030,131 @@ private:
                 [this]() { if (actions.onFlipCC) actions.onFlipCC(); });
     }
 
+    // =====================================================================
+    //  drawVoxelInfo:
+    //    Voxel size 表示パネル (Voxel 数値 + クリック式バー + ideal markers)。
+    //    g_voxelSize (extern, main.cpp:119) と直接結びついており、Hemi Auto
+    //    だけでなく全 FGR+ICP 系登録 (Shift+O, Ctrl+P, Shift+Ctrl+P, AutoQCR
+    //    含む) の voxel downsample 解像度を決める。default 0.30 で運用しても
+    //    支障はないが、論文の感度解析等で変更したい場合のためここに残す。
+    //
+    //    [UI整理] 以前は state.regMethod == 1 (Hemi Auto 選択時) のみ表示して
+    //    いたが、影響範囲が全方式なのと、日常運用では触らないことから、
+    //    REGISTRATION 末尾の Advanced CollapsingHeader に移動した。
+    //
+    //    キーボードの UP / DOWN でも +/- 0.05 単位で変更可能 (main.cpp 側)。
+    // =====================================================================
+    void drawVoxelInfo() {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.02f,0.08f,0.04f,0.4f));
+        ImGui::BeginChild("##voxelinfo", ImVec2(-1, 62), false);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+        ImGui::TextColored(ImVec4(0.4f,0.8f,0.5f,0.8f), "  Voxel");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.6f,1.0f,0.7f,1.0f), "%.2f", state.hemiVoxelSize);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.3f,0.4f,0.32f,0.7f), "  [UP] +0.05  [DOWN] -0.05");
+        ImGui::Spacing();
+        {
+            const float vMax = 0.6f;
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float avail = ImGui::GetContentRegionAvail().x - 8;
+            const float barH = 14.0f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImGui::InvisibleButton("##voxelbar", ImVec2(avail, barH));
+            bool hovered = ImGui::IsItemHovered();
+            bool held    = ImGui::IsItemActive();
+            if ((held && ImGui::IsMouseDown(0)) || ImGui::IsItemClicked(0)) {
+                float mx = ImGui::GetIO().MousePos.x;
+                float ratio = (mx - p.x) / avail;
+                ratio = std::max(0.0f, std::min(1.0f, ratio));
+                float newVal = ratio * vMax;
+                newVal = std::round(newVal / 0.05f) * 0.05f;
+                newVal = std::max(0.05f, newVal);
+                if (actions.onHemiVoxelChanged) actions.onHemiVoxelChanged(newVal);
+            }
+            ImU32 bgCol  = hovered ? IM_COL32(40, 80, 45, 220) : IM_COL32(30, 60, 35, 200);
+            dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + avail, p.y + barH), bgCol, 3.0f);
+            float fillRatio = std::min(state.hemiVoxelSize, vMax) / vMax;
+            float curX = p.x + avail * fillRatio;
+            ImU32 fillCol = held ? IM_COL32(100, 210, 120, 200) : IM_COL32(80, 180, 100, 160);
+            dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(curX, p.y + barH), fillCol, 3.0f);
+            if (hovered || held) {
+                float mx = ImGui::GetIO().MousePos.x;
+                float ratio = std::max(0.0f, std::min(1.0f, (mx - p.x) / avail));
+                float preview = std::round(ratio * vMax / 0.05f) * 0.05f;
+                float px2 = p.x + avail * (std::min(preview, vMax) / vMax);
+                dl->AddLine(ImVec2(px2, p.y), ImVec2(px2, p.y + barH), IM_COL32(255,255,255,160), 1.0f);
+            }
+            struct IdealLine { float val; ImU32 col; };
+            IdealLine ideals[3] = {
+                                   { state.idealVoxel1to2,  IM_COL32(255,220, 60,220) },
+                                   { state.idealVoxel1to15, IM_COL32(255,160, 40,220) },
+                                   { state.idealVoxel1to1,  IM_COL32(255, 80, 60,220) },
+                                   };
+            for (auto& il : ideals) {
+                if (il.val <= 0.0f || il.val > vMax) continue;
+                float lx = p.x + avail * (il.val / vMax);
+                dl->AddLine(ImVec2(lx, p.y - 2), ImVec2(lx, p.y + barH + 2), il.col, 2.0f);
+                char buf[8]; snprintf(buf, sizeof(buf), "%.2f", il.val);
+                ImVec2 ts = ImGui::CalcTextSize(buf);
+                float tx = lx - ts.x * 0.5f;
+                if (tx < p.x) tx = p.x;
+                if (tx + ts.x > p.x + avail) tx = p.x + avail - ts.x;
+                dl->AddText(ImVec2(tx, p.y + barH + 3),
+                            (il.col & 0x00FFFFFF) | 0xCC000000, buf);
+            }
+            ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + barH + 14));
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
+
     void drawInitOrientationPanel() {
-        // チャット 9: ORIENTATION 9 ボタン + POSITION (4-quadrant checkbox + Quick Presets
-        // + Apply) の 2 セクション構成。POSITION 部は Ctrl+G と完全に連動。
-        // [追加] 先頭に ANATOMICAL AXES (Preview OBJ Anatomical Pose) を配置:
-        //        AP / LR / CC の状態 + confidence + Flip ボタンを表示し、weak
-        //        case (CC conf < 5%) を赤バッジで前面警告。
-        //   高さ内訳:
-        //     header (4 + fontH + 4)
-        //     ANATOMICAL AXES sub-header + badge (fontH + 2)
-        //     3 行 (3 × (20 + 3))
-        //     section separator spacing (6)
-        //     POSITION sub-header (fontH + 2)
-        //     anatomical orientation text (fontH)
-        //     2x2 grid (~ 2 行 × 28px + table padding ≈ 64)
-        //     mask string text (fontH)
-        //     Quick Presets row (22 + 4)
-        //     Apply button row (24 + 6)
-        //     ORIENTATION sub-header (fontH + 2)
-        //     Orientation 3 行 (3 × (22 + 4))
-        //     末尾 padding 8
-        const float fontH = ImGui::GetFontSize();
-        float childH = 4.0f + fontH + 4.0f                        // header
-                       + fontH + 2.0f                              // ANATOMICAL AXES sub
-                       + 3.0f * (20.0f + 3.0f)                     // axes 3 行
-                       + 6.0f                                      // section separator
-                       + fontH + 2.0f                              // POSITION sub
-                       + fontH                                     // anatomy hint
-                       + 64.0f                                     // 2x2 grid
-                       + fontH + 4.0f                              // mask text
-                       + (22.0f + 4.0f)                            // quick presets
-                       + (24.0f + 6.0f)                            // apply button
-                       + fontH + 2.0f                              // ORIENTATION sub
-                       + 3.0f * (22.0f + 4.0f)                     // orientation 3 行
-                       + 8.0f;                                     // tail
+        // [UI整理 - 新レイアウト]
+        //   ANATOMICAL AXES と ORIENTATION を CollapsingHeader 化して
+        //   POSITION + Apply Init Pose を主動線として前面に出す。
+        //
+        //   配置順:
+        //     INITIAL ORIENTATION (固定ヘッダ)
+        //       ANATOMICAL AXES [OK/WEAK/...] (折りたたみ, WEAK 時自動展開)
+        //         └ AP / LR / CC の 3 行 (展開時のみ)
+        //       POSITION (常時表示)
+        //         └ 2x2 grid + Quick Presets
+        //       ORIENTATION [Base/Up/...] (折りたたみ, 既定 OFF)
+        //         └ 3x5 grid (展開時のみ)
+        //       Apply Init Pose (常時表示)
+        //
+        //   AutoQCR が ORIENT を 9 通り自動 sweep するため、ORIENTATION は
+        //   ヘッダのラベルで現在の preset 名 ([Base] / [Up-R+] 等) を確認
+        //   できれば十分。手動指定が必要な時だけ展開する。
+        //
+        //   ANATOMICAL AXES は WEAK (CC confidence < 5%) のとき
+        //   SetNextItemOpen で強制展開し、赤テキストで警告する。
+        //
+        //   childH は前フレームの anatAxesExpanded_ / orientExpanded_ から
+        //   動的に計算 (1 フレーム遅延あるが視認不可)。
+        const float fontH    = ImGui::GetFontSize();
+        const float headerH  = ImGui::GetFrameHeight();  // CollapsingHeader 一行分
+
+        float childH = 4.0f + fontH + 4.0f            // INITIAL ORIENTATION title
+                       + headerH + 2.0f;                 // ANATOMICAL AXES collapsing header
+        if (anatAxesExpanded_) {
+            childH += 3.0f * (20.0f + 3.0f);           // axes 3 行
+        }
+        childH += 6.0f                                 // section separator
+                  + fontH + 2.0f                         // POSITION sub-header
+                  + fontH                                // anatomy hint
+                  + 64.0f                                // 2x2 grid
+                  + fontH + 4.0f                         // mask text
+                  + (22.0f + 4.0f)                       // quick presets
+                  + 6.0f                                 // spacing before ORIENTATION
+                  + headerH + 2.0f;                      // ORIENTATION collapsing header
+        if (orientExpanded_) {
+            childH += 3.0f * (22.0f + 4.0f);           // orientation 3 行
+        }
+        childH += 6.0f                                 // spacing before Apply
+                  + (24.0f + 6.0f)                       // apply button
+                  + 8.0f;                                // tail padding
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.06f, 0.10f, 0.5f));
         ImGui::BeginChild("##initOrient", ImVec2(-1, childH), false);
@@ -969,8 +1163,48 @@ private:
         ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 1.0f), "  INITIAL ORIENTATION");
         ImGui::Spacing();
 
-        // ---- ANATOMICAL AXES (Preview OBJ Anatomical Pose) ----
-        drawAnatomicalAxesStatus();
+        // ============================================================
+        //  [§A] ANATOMICAL AXES (CollapsingHeader, WEAK 時自動展開)
+        // ============================================================
+        {
+            // ヘッダタイトル + 表示色を状態で決める。
+            //   WEAK    -> 赤 + SetNextItemOpen(true) で強制展開
+            //   未計算  -> 黄
+            //   全 OK   -> 緑
+            // "###anat_axes" 部分で固有 ID を固定 (label が変わっても開閉状態が
+            // 維持されるように)。
+            ImVec4 hdrCol;
+            char hdrLabel[160];
+            if (state.ccAxisValid && state.ccWeak) {
+                hdrCol = ImVec4(0.96f, 0.32f, 0.32f, 1.0f);  // red
+                std::snprintf(hdrLabel, sizeof(hdrLabel),
+                              "ANATOMICAL AXES  [WEAK %.1f%% - check Flip CC]###anat_axes",
+                              state.ccConfidence * 100.0f);
+                ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+            } else if (!state.apAxisValid || !state.lrAxisValid || !state.ccAxisValid) {
+                hdrCol = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);  // yellow
+                std::snprintf(hdrLabel, sizeof(hdrLabel),
+                              "ANATOMICAL AXES  [not all computed - press Apply Init Pose]"
+                              "###anat_axes");
+            } else {
+                hdrCol = ImVec4(0.30f, 0.85f, 0.45f, 1.0f);  // green
+                std::snprintf(hdrLabel, sizeof(hdrLabel),
+                              "ANATOMICAL AXES  [OK]###anat_axes");
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Text, hdrCol);
+            // Header 自体の背景は薄めに (主動線ではないので主張させない)。
+            ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.10f, 0.12f, 0.16f, 0.6f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.15f, 0.18f, 0.24f, 0.7f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.20f, 0.24f, 0.32f, 0.8f));
+            bool anatOpen = ImGui::CollapsingHeader(hdrLabel);
+            ImGui::PopStyleColor(4);
+            anatAxesExpanded_ = anatOpen;
+
+            if (anatOpen) {
+                drawAnatomicalAxesContent();
+            }
+        }
         ImGui::Spacing();
 
         float totalW = ImGui::GetContentRegionAvail().x;
@@ -981,9 +1215,9 @@ private:
         ImVec4 colInactive = ImVec4(0.20f, 0.22f, 0.28f, 1.0f);
         ImVec4 colHover    = ImVec4(0.18f, 0.28f, 0.48f, 1.0f);
 
-        // -----------------------------------------------------------------
-        //  POSITION (チャット 9: 4-quadrant チェックボックス + Quick Presets + Apply)
-        //  ----------------------------------------------------------------
+        // ============================================================
+        //  [§B] POSITION (主動線、常時表示)
+        // ============================================================
         //  Ctrl+G Quadrant Selector パネルと g_activeQuadrantMask を完全共有。
         //  この panel で checkbox を変更すると、Ctrl+G panel の同じ checkbox も
         //  自動で連動する (ImGui immediate mode + 同じ state を毎フレーム参照)。
@@ -1002,6 +1236,30 @@ private:
         constexpr uint8_t kMaskPL  = 0x08;
         constexpr uint8_t kMaskAll = 0x0F;
         constexpr uint8_t kMaskNone= 0x00;
+
+        // ---- applyMaskChange (POSITION 変更時の共通ハンドラ) ----
+        //   2x2 grid checkbox / Quick Presets ボタンのどちらから呼んでも
+        //   同じ副作用を持つようまとめた lambda:
+        //     1) state.activeQuadrantMask を更新 (UI 即時反映)
+        //     2) onQuadrantMaskChanged 経由で main.cpp 側 g_activeQuadrantMask 同期
+        //     3) mapQuadrantToOrientPreset で対応 Orient を引いて、現在値と
+        //        違うときだけ state.initRotPreset と registrationHandle.initRotPreset
+        //        を更新 (onInitRotPresetSilent 経由)。applyInitRotation は呼ばない。
+        //
+        //   結果: クアドラントを選んだ瞬間に ORIENTATION ヘッダの [Base/Right/Left]
+        //   表示が切り替わり、Apply Init Pose をすぐ押せる状態になる。
+        auto applyMaskChange = [&](uint8_t newMask) {
+            state.activeQuadrantMask = newMask;
+            if (actions.onQuadrantMaskChanged)
+                actions.onQuadrantMaskChanged(newMask);
+
+            const int autoPreset = mapQuadrantToOrientPreset(newMask);
+            if (state.initRotPreset != autoPreset) {
+                state.initRotPreset = autoPreset;
+                if (actions.onInitRotPresetSilent)
+                    actions.onInitRotPresetSilent(autoPreset);
+            }
+        };
 
         ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 0.85f), "  POSITION");
         ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 0.85f),
@@ -1030,9 +1288,7 @@ private:
                         uint8_t newMask = state.activeQuadrantMask;
                         if (on)  newMask |= bit;
                         else     newMask = static_cast<uint8_t>(newMask & ~bit);
-                        state.activeQuadrantMask = newMask;
-                        if (actions.onQuadrantMaskChanged)
-                            actions.onQuadrantMaskChanged(newMask);
+                        applyMaskChange(newMask);
                     }
                     ImGui::PopID();
                 };
@@ -1127,9 +1383,7 @@ private:
                                           ImVec4(0.55f, 0.60f, 0.70f, 1.0f));
                 }
                 if (ImGui::Button(presets[i].label, ImVec2(qpW, btnH))) {
-                    state.activeQuadrantMask = presets[i].mask;
-                    if (actions.onQuadrantMaskChanged)
-                        actions.onQuadrantMaskChanged(presets[i].mask);
+                    applyMaskChange(presets[i].mask);
                 }
                 ImGui::PopStyleColor(4);
                 ImGui::PopStyleVar();
@@ -1137,7 +1391,93 @@ private:
             }
         }
 
-        // ---- Apply Init Pose ボタン (mask 確定後に明示的に姿勢を適用) ----
+        // ============================================================
+        //  [§C] ORIENTATION (CollapsingHeader, 既定 OFF)
+        // ============================================================
+        //  AutoQCR が 9 通り自動 sweep するため通常は閉じたまま。
+        //  ヘッダタイトルに現在の preset 名 ([Base] / [Up-R+] 等) を出すので、
+        //  AutoQCR 実行後の選択結果は折りたたんだまま確認できる。
+        //  手動で別 preset を試したい時だけ展開する。
+        ImGui::Spacing();
+        {
+            char orientHdr[64];
+            std::snprintf(orientHdr, sizeof(orientHdr),
+                          "ORIENTATION  [%s]###orient_hdr",
+                          presetLabel(state.initRotPreset));
+
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.45f, 0.55f, 0.70f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.10f, 0.12f, 0.16f, 0.6f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.15f, 0.18f, 0.24f, 0.7f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.20f, 0.24f, 0.32f, 0.8f));
+            bool orientOpen = ImGui::CollapsingHeader(orientHdr);
+            ImGui::PopStyleColor(4);
+            orientExpanded_ = orientOpen;
+
+            if (orientOpen) {
+                struct PresetBtn { int id; const char* label; };
+                // Radiology 慣例: 患者の右 (Right) を画面左、患者の左 (Left)
+                // を画面右に配置する。enum 番号は維持して動作は変えない
+                // (動作は getPresetRotation 側で d_lr に基づいて決まる)。
+                // ボタンの位置とラベルの対応だけ反転。
+                //
+                // チャット 11 拡張: 外側 2 列 (Right+/Left+ ファミリ) を追加し、
+                //   3x5 グリッドに。外側 = ±40° (dx=±2)、内側 = ±20° (dx=±1)、
+                //   中央列 = 既存 (dx=0)。ラベルは末尾 "+" で強めを明示。
+                PresetBtn grid[3][5] = {
+                                        { { 9,"Up-R+"}, {2,"Up-R"},  {1,"Up"},   {8,"Up-L"}, {12,"Up-L+"} },
+                                        { {10,"Right+"},{3,"Right"}, {0,"Base"}, {7,"Left"}, {13,"Left+"} },
+                                        { {11,"Dn-R+"}, {4,"Dn-R"},  {5,"Down"}, {6,"Dn-L"}, {14,"Dn-L+"} },
+                                        };
+
+                // 5 列用ローカル width。4 個の spacing (4px each) 分を totalW
+                // から控除して 5 等分。
+                float btnW_orient = (totalW - 4.0f * 4.0f) / 5.0f;
+
+                for (int row = 0; row < 3; row++) {
+                    for (int col = 0; col < 5; col++) {
+                        if (col > 0) ImGui::SameLine(0, 4);
+                        int pid    = grid[row][col].id;
+                        bool isSel = (state.initRotPreset == pid);
+                        ImGui::PushID(pid + 200);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+                        if (isSel) {
+                            ImGui::PushStyleColor(ImGuiCol_Button,
+                                                  ImVec4(colActive.x*0.25f, colActive.y*0.25f, colActive.z*0.25f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                                  ImVec4(colActive.x*0.35f, colActive.y*0.35f, colActive.z*0.35f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                                  ImVec4(colActive.x*0.45f, colActive.y*0.45f, colActive.z*0.45f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_Text, colActive);
+                        } else {
+                            ImGui::PushStyleColor(ImGuiCol_Button,
+                                                  ImVec4(colInactive.x, colInactive.y, colInactive.z, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                                  ImVec4(colHover.x, colHover.y, colHover.z, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                                  ImVec4(colHover.x*1.2f, colHover.y*1.2f, colHover.z*1.2f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                                  ImVec4(0.55f, 0.60f, 0.70f, 1.0f));
+                        }
+                        if (ImGui::Button(grid[row][col].label, ImVec2(btnW_orient, btnH))) {
+                            state.initRotPreset = pid;
+                            if (actions.onInitRotPresetChanged)
+                                actions.onInitRotPresetChanged(pid);
+                        }
+                        ImGui::PopStyleColor(4);
+                        ImGui::PopStyleVar();
+                        ImGui::PopID();
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        //  [§D] Apply Init Pose (主動線、常時表示、最下部)
+        // ============================================================
+        //  POSITION / ORIENTATION を確定したあとにこのボタンで applyInitRotation
+        //  を実行する。ORIENTATION が折りたたみのとき、現在値は ORIENTATION ヘッダ
+        //  の "[Base]" 等で確認できる。
         ImGui::Spacing();
         {
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
@@ -1157,63 +1497,6 @@ private:
             if (empty) ImGui::EndDisabled();
             ImGui::PopStyleColor(4);
             ImGui::PopStyleVar();
-        }
-
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 0.85f), "  ORIENTATION");
-
-        struct PresetBtn { int id; const char* label; };
-        // Radiology 慣例: 患者の右 (Right) を画面左、患者の左 (Left) を画面右に
-        // 配置する。enum 番号は維持して動作は変えない (動作は getPresetRotation
-        // 側で d_lr に基づいて決まる)。ボタンの位置とラベルの対応だけ反転。
-        //
-        // チャット 11 拡張: 外側 2 列 (Right+/Left+ ファミリ) を追加し、3x5 グリッドに。
-        //   外側 = ±40° (dx=±2)、内側 = ±20° (dx=±1)、中央列 = 既存 (dx=0)。
-        //   ラベルは末尾 "+" で強めを明示。
-        PresetBtn grid[3][5] = {
-                                { { 9,"Up-R+"}, {2,"Up-R"},  {1,"Up"},   {8,"Up-L"}, {12,"Up-L+"} },
-                                { {10,"Right+"},{3,"Right"}, {0,"Base"}, {7,"Left"}, {13,"Left+"} },
-                                { {11,"Dn-R+"}, {4,"Dn-R"},  {5,"Down"}, {6,"Dn-L"}, {14,"Dn-L+"} },
-                                };
-
-        // 5 列用ローカル width (POSITION 2x2 と Apply は既存の btnW/qpW を継続)。
-        // 4 個の spacing (4px each) 分を totalW から控除して 5 等分。
-        float btnW_orient = (totalW - 4.0f * 4.0f) / 5.0f;
-
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 5; col++) {
-                if (col > 0) ImGui::SameLine(0, 4);
-                int pid    = grid[row][col].id;
-                bool isSel = (state.initRotPreset == pid);
-                ImGui::PushID(pid + 200);
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-                if (isSel) {
-                    ImGui::PushStyleColor(ImGuiCol_Button,
-                                          ImVec4(colActive.x*0.25f, colActive.y*0.25f, colActive.z*0.25f, 1));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                          ImVec4(colActive.x*0.35f, colActive.y*0.35f, colActive.z*0.35f, 1));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                          ImVec4(colActive.x*0.45f, colActive.y*0.45f, colActive.z*0.45f, 1));
-                    ImGui::PushStyleColor(ImGuiCol_Text, colActive);
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Button,
-                                          ImVec4(colInactive.x, colInactive.y, colInactive.z, 1));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                          ImVec4(colHover.x, colHover.y, colHover.z, 1));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                          ImVec4(colHover.x*1.2f, colHover.y*1.2f, colHover.z*1.2f, 1));
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                                          ImVec4(0.55f, 0.60f, 0.70f, 1.0f));
-                }
-                if (ImGui::Button(grid[row][col].label, ImVec2(btnW_orient, btnH))) {
-                    state.initRotPreset = pid;
-                    if (actions.onInitRotPresetChanged)
-                        actions.onInitRotPresetChanged(pid);
-                }
-                ImGui::PopStyleColor(4);
-                ImGui::PopStyleVar();
-                ImGui::PopID();
-            }
         }
 
         ImGui::Spacing();
@@ -1312,24 +1595,17 @@ private:
             const char* label = state.autoQcrLockScale
                                     ? "AutoQCR  6-DoF"
                                     : "AutoQCR  7-DoF";
-            bool anyP2 = (state.cameraState == 2 || state.hasLocalImage);
-            if(glowButton(label, colReg(), anyP2, wAutoQcr, 52, 0)) {
+            // [BUGFIX] 旧コード:
+            //   bool anyP2 = (state.cameraState == 2 || state.hasLocalImage);
+            //   if(glowButton(label, colReg(), anyP2, ...)) {
+            // anyP2 は「画像ソースが用意済み」を表す true 値だったが、
+            // それを `disabled` に渡していたため、画像をロードした直後に
+            // ボタンが灰色になる polarity bug が発生していた (= 主要動線で
+            // ボタンが押せなくなる)。AutoProbe と同じ `anyP` (= 他登録が
+            // 実行中) に統一。前提 (Apply Init Pose 済み等) は
+            // runAutoQuadCyclicRansac 内のガードで早期 return される。
+            if(glowButton(label, colReg(), anyP, wAutoQcr, 52, 0)) {
                 if(actions.onAutoQCR) actions.onAutoQCR(state.autoQcrLockScale);
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "AutoQCR (Alt+Ctrl+P): 9-preset QuadCyclic-RANSAC sweep\n"
-                    "QUADRANT は Apply Init Pose で決定済みの値で固定し、\n"
-                    "ORIENT preset 9 個を自動試行して compRMSE 最小の解を採用。\n"
-                    "\n"
-                    "右隣のチェック ON (default) = 6-DoF rigid:\n"
-                    "  scale=1 強制。CMA-ES の size_ratio 発散を回避。\n"
-                    "  論文 defensible (CT mm + metric depth → SE(3))。\n"
-                    "\n"
-                    "チェック OFF = 7-DoF T+R+Scale:\n"
-                    "  Shift+Ctrl+P 単発と同じ挙動。scale を観察するモード。\n"
-                    "\n"
-                    "実行時間: 約 3-4 秒 (1 trial 0.38s × 9)。");
             }
 
             ImGui::SameLine(0.0f, gap2);
@@ -1341,82 +1617,106 @@ private:
                 // 反映される設計でも OK だが、即時反映が欲しいので直接書く)。
                 const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "ON  : AutoQCR を 6-DoF rigid で実行 (scale=1 固定)\n"
-                    "OFF : AutoQCR を 7-DoF T+R+Scale で実行 (scale 推定)\n"
-                    "\n"
-                    "Default ON 推奨。Ctrl+G を後段で繰り返すとき、\n"
-                    "scale=1 起点なら size_ratio 1.0-1.05 で安定。\n"
-                    "7-DoF だと RANSAC が scale=1.5x 級の解を選ぶ\n"
-                    "ことがあり、CMA-ES はそれを縮められない。");
-            }
         }
         ImGui::Spacing();
-        if (state.regMethod == 1) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.02f,0.08f,0.04f,0.4f));
-            ImGui::BeginChild("##voxelinfo", ImVec2(-1, 62), false);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
-            ImGui::TextColored(ImVec4(0.4f,0.8f,0.5f,0.8f), "  Voxel");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.6f,1.0f,0.7f,1.0f), "%.2f", state.hemiVoxelSize);
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.3f,0.4f,0.32f,0.7f), "  [UP] +0.05  [DOWN] -0.05");
-            ImGui::Spacing();
-            {
-                const float vMax = 0.6f;
-                ImVec2 p = ImGui::GetCursorScreenPos();
-                float avail = ImGui::GetContentRegionAvail().x - 8;
-                const float barH = 14.0f;
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                ImGui::InvisibleButton("##voxelbar", ImVec2(avail, barH));
-                bool hovered = ImGui::IsItemHovered();
-                bool held    = ImGui::IsItemActive();
-                if ((held && ImGui::IsMouseDown(0)) || ImGui::IsItemClicked(0)) {
-                    float mx = ImGui::GetIO().MousePos.x;
-                    float ratio = (mx - p.x) / avail;
-                    ratio = std::max(0.0f, std::min(1.0f, ratio));
-                    float newVal = ratio * vMax;
-                    newVal = std::round(newVal / 0.05f) * 0.05f;
-                    newVal = std::max(0.05f, newVal);
-                    if (actions.onHemiVoxelChanged) actions.onHemiVoxelChanged(newVal);
-                }
-                ImU32 bgCol  = hovered ? IM_COL32(40, 80, 45, 220) : IM_COL32(30, 60, 35, 200);
-                dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + avail, p.y + barH), bgCol, 3.0f);
-                float fillRatio = std::min(state.hemiVoxelSize, vMax) / vMax;
-                float curX = p.x + avail * fillRatio;
-                ImU32 fillCol = held ? IM_COL32(100, 210, 120, 200) : IM_COL32(80, 180, 100, 160);
-                dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(curX, p.y + barH), fillCol, 3.0f);
-                if (hovered || held) {
-                    float mx = ImGui::GetIO().MousePos.x;
-                    float ratio = std::max(0.0f, std::min(1.0f, (mx - p.x) / avail));
-                    float preview = std::round(ratio * vMax / 0.05f) * 0.05f;
-                    float px2 = p.x + avail * (std::min(preview, vMax) / vMax);
-                    dl->AddLine(ImVec2(px2, p.y), ImVec2(px2, p.y + barH), IM_COL32(255,255,255,160), 1.0f);
-                }
-                struct IdealLine { float val; ImU32 col; };
-                IdealLine ideals[3] = {
-                                       { state.idealVoxel1to2,  IM_COL32(255,220, 60,220) },
-                                       { state.idealVoxel1to15, IM_COL32(255,160, 40,220) },
-                                       { state.idealVoxel1to1,  IM_COL32(255, 80, 60,220) },
-                                       };
-                for (auto& il : ideals) {
-                    if (il.val <= 0.0f || il.val > vMax) continue;
-                    float lx = p.x + avail * (il.val / vMax);
-                    dl->AddLine(ImVec2(lx, p.y - 2), ImVec2(lx, p.y + barH + 2), il.col, 2.0f);
-                    char buf[8]; snprintf(buf, sizeof(buf), "%.2f", il.val);
-                    ImVec2 ts = ImGui::CalcTextSize(buf);
-                    float tx = lx - ts.x * 0.5f;
-                    if (tx < p.x) tx = p.x;
-                    if (tx + ts.x > p.x + avail) tx = p.x + avail - ts.x;
-                    dl->AddText(ImVec2(tx, p.y + barH + 3),
-                                (il.col & 0x00FFFFFF) | 0xCC000000, buf);
-                }
-                ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + barH + 14));
+
+        // ----------------------------------------------------------------
+        //  QCR Tuning  (Shift+Ctrl+P / AutoQCR 共通、折りたたみ既定 OFF)
+        // ----------------------------------------------------------------
+        //  g_qcrSubsetK と g_qcrMaxTrials は RegistrationActions.h で
+        //  inline 定義されており、runQuadCyclicRansac() の中で読まれる。
+        //  AutoQCR (= runAutoQuadCyclicRansac) は 9 個の ORIENT preset
+        //  それぞれに対して runQuadCyclicRansac を呼ぶので、ここで設定
+        //  した K / Max trials は AutoQCR の各 trial にも自動的に効く。
+        //
+        //  位置: 旧 "Shift+Ctrl+P Tuning" として下方に置いていたが、
+        //  AutoQCR との関係が見えにくかったため AutoQCR ボタン直下に移動。
+        if (ImGui::CollapsingHeader("QCR Tuning  (Shift+Ctrl+P / AutoQCR)")) {
+            ImGui::Indent(8);
+            // K subset size: 3 (Fischler-Bolles min), 4-5 (more stable, over-determined)
+            ImGui::TextColored(colMuted(), "Subset size K:");
+            if (ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d")) {
+                // value clamped inside runQuadCyclicRansac if out of range
             }
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
+            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
+                               "  K=3: %d-pt exact fit (max variety)\n"
+                               "  K=4: over-det. (balanced)\n"
+                               "  K=5: over-det. (most stable)",
+                               g_qcrSubsetK);
+            // Trial count cap (K=4/5 expensive: stride sample to stay under cap)
             ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max trials (Stage 1 cap):");
+            ImGui::SliderInt("##qcrCap", &g_qcrMaxTrials, 10000, 500000, "%d");
+            // -------------------------------------------------------
+            //  Rotation hard limits (post-Umeyama)
+            //  -----------------------------------------------------
+            //   per-axis : 各軸 (X/Y/Z) Euler 角の |angle| max
+            //   total    : axis-angle 表現の総回転量 (arccos((tr(R)-1)/2))
+            //  AutoQCR の 15 preset は最大 ±40° (FAR) なので、
+            //  Umeyama drift を 30° 以下に絞ると「枠を大きく超えない」。
+            // -------------------------------------------------------
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max axis rotation (per-axis):");
+            ImGui::SliderFloat("##qcrMaxAxis", &g_qcrMaxAxisRotDeg,
+                               5.0f, 90.0f, "%.1f deg");
+            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
+                               "  X/Y/Z 単軸ごとの上限 (30° 推奨)");
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max total rotation (axis-angle):");
+            ImGui::SliderFloat("##qcrMaxTotal", &g_qcrMaxTotalRotDeg,
+                               5.0f, 90.0f, "%.1f deg");
+            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
+                               "  off-axis 大回転も含む総量 (30° 推奨)");
+            ImGui::Unindent(8);
+        }
+        ImGui::Spacing();
+
+        // ----------------------------------------------------------------
+        //  [Ctrl+G] V3-R BIPOP-CMA-ES (主動線、メイン Refinement)
+        // ----------------------------------------------------------------
+        //  Apply Init Pose → AutoQCR の後、g_activeQuadrantMask で絞った
+        //  4-quadrant subset に対し region-aware BIPOP-CMA-ES を回す。
+        //  キーボード Ctrl+G と等価。実体は main.cpp 側 onCtrlG lambda が
+        //  poseAutoSaveBeforeRegistration → runBipopCmaesV3R(mask) →
+        //  poseSaveToLibrary(RMSE, mask) を順に呼ぶ。
+        //
+        //  [UI整理] 以前ここには BIPOP-CMA-ES [Shift+V] と Silhouette
+        //  Alignment [Shift+E] の 2 ボタンが並んでいたが、日常運用で
+        //  使われないため REGISTRATION 末尾の Advanced CollapsingHeader
+        //  に退避し、ここを Ctrl+G 専用とした。
+        {
+            // 有効条件: registration phase 中で、quadrant ラベルが計算済み。
+            // useRegistration (= 既存 reg 完了済み) は問わない: Ctrl+G は
+            // Apply Init Pose 直後でも (refinement なしの状態から) 走らせる
+            // ことがある。
+            bool ctrlgDisabled = !state.quadLabelsReady
+                                 || state.activeQuadrantMask == 0x00;
+
+            // AutoQCR と同じ 2/3 + 1/3 レイアウト: ボタン本体 (左) +
+            // 6-DoF チェックボックス (右)。
+            float totalW = ImGui::GetContentRegionAvail().x;
+            float gap2 = ImGui::GetStyle().ItemSpacing.x;
+            float wCtrlg = totalW * (2.0f / 3.0f) - gap2;
+
+            if (glowButton("Ctrl+G  V3-R  [Refine]", colReg(),
+                           ctrlgDisabled, wCtrlg, 56))
+            {
+                state.regMethod = 3;   // BIPOP method (Shift+V/F/G と同じ slot)
+                if (actions.onCtrlG) actions.onCtrlG();
+            }
+
+            ImGui::SameLine(0.0f, gap2);
+            // 6-DoF checkbox (右側 1/3)
+            //   ON  = SIX_DOF_RIGID (scale=1 固定)
+            //   OFF = SEVEN_DOF     (scale 推定 ON)
+            //   左 floating パネルで 4-DoF (FOUR_DOF_XYRXRY) を選んでいる
+            //   場合は false 扱いで表示される (4-DoF != 6-DoF)。
+            bool lockScale = state.ctrlgLockScale;
+            if (ImGui::Checkbox("6-DoF##ctrlg", &lockScale)) {
+                const_cast<RegUIState&>(state).ctrlgLockScale = lockScale;
+                if (actions.onCtrlgLockScaleChanged)
+                    actions.onCtrlgLockScaleChanged(lockScale);
+            }
         }
 
         // --- Instrument Px Threshold ---
@@ -1441,43 +1741,17 @@ private:
         }
 
         // --- Iter Probe (K回 AutoProbe を連続呼び出し) ---
-        {
-            const float gap   = 4.0f;
-            const float availW = ImGui::GetContentRegionAvail().x;
-            const float halfW  = (availW - gap) * 0.66f;
-            const float ctrlW  = availW - halfW - gap;
+        //   [UI整理 - 削除済] AutoQCR で 9 preset 自動 sweep ができるため、
+        //   Iter Probe (= AutoProbe を K 回繰り返し) はもはや日常動線では
+        //   使われない。UI からは外したが、actions.onIterativeAutoProbe と
+        //   state.iterCycles は将来の再評価実験用に温存している。
+        //   復活させるときはここに button + DragInt を再配置する。
 
-            char iterLabel[48];
-            snprintf(iterLabel, sizeof(iterLabel), "Iter Probe x%d", state.iterCycles);
-            if(glowButton(iterLabel, colReg(), anyP, halfW, 52, 0)) {
-                if(actions.onIterativeAutoProbe)
-                    actions.onIterativeAutoProbe(state.iterCycles);
-            }
-            ImGui::SameLine(0.0f, gap);
-            ImGui::PushItemWidth(ctrlW);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 14);
-            ImGui::DragInt("##iterK", &state.iterCycles, 0.2f, 1, 64, "K=%d");
-            ImGui::PopItemWidth();
-        }
-        ImGui::Spacing();
-
-        // --- STAGE 2: BIPOP-CMA-ES ---
-        {
-            bool bipopDisabled = !state.useRegistration;
-            if(glowButton("BIPOP-CMA-ES  [Shift+V]", colReg(), bipopDisabled, -1, 52)) {
-                state.regMethod = 0; if(actions.onBipopCmaes) actions.onBipopCmaes();
-            }
-        }
-        ImGui::Spacing();
-
-        // --- STAGE 3: Silhouette Alignment ---
-        {
-            bool silhDisabled = !state.useRegistration;
-            if(glowButton("Silhouette Alignment  [Shift+E]", colReg(), silhDisabled, -1, 52)) {
-                if(actions.onSilhouetteAlign) actions.onSilhouetteAlign();
-            }
-        }
-        ImGui::Spacing();
+        // --- STAGE 2-3: BIPOP-CMA-ES / Silhouette Alignment ---
+        //   [UI整理 - Advanced 移動済] 旧 Shift+V / Shift+E ボタンは、Ctrl+G
+        //   がメイン refinement になった現運用ではほぼ使われない。
+        //   REGISTRATION 末尾の Advanced CollapsingHeader 内に退避済み
+        //   (キーボードショートカット Shift+V / Shift+E は引き続き有効)。
 
         // --- Manual Registration: Umeyama ---
         if(methodButton("Umeyama Manual", "", state.regMethod==2, state.regState, anyP && state.regMethod!=2, state.btnIconTex[RegUIState::ICON_UMEYAMA])) {
@@ -1548,24 +1822,42 @@ private:
             }
         }
 
-        // ---- Shift+Ctrl+P (QuadCyclic-RANSAC) tuning ----
+        // ---- QCR Tuning は AutoQCR の直下に移動済み (上部参照) ----
         ImGui::Spacing();
-        if (ImGui::CollapsingHeader("Shift+Ctrl+P Tuning")) {
+
+        // ====================================================================
+        //  Advanced (CollapsingHeader, 既定 OFF)
+        // --------------------------------------------------------------------
+        //  日常運用ではほぼ触らない項目をここに集約:
+        //    - Voxel size (= g_voxelSize): 全 FGR+ICP 系登録の解像度
+        //    - Ctrl+G / Ctrl+Shift+G の RIM-weighted / raycast コントロール
+        //      (main.cpp 側 drawCtrlGRimRaycastControls を onDrawAdvancedCtrlG
+        //      callback 経由で呼ぶ。floating "Ctrl+G Quadrant Selector" 窓と
+        //      同じ globals を操作するので両方表示でも同期する。)
+        //
+        //  [整理履歴]
+        //    - BIPOP-CMA-ES [Shift+V] / Silhouette Alignment [Shift+E] ボタン
+        //      は現運用で使われないため一旦削除 (キーボード Shift+V / Shift+E
+        //      は引き続き有効)。
+        //    - Voxel UI も regMethod==1 (Hemi Auto 選択時) 限定だった旧表示を
+        //      ここに常時表示として移動済み。
+        // ====================================================================
+        if (ImGui::CollapsingHeader("Advanced")) {
             ImGui::Indent(8);
-            // K subset size: 3 (Fischler-Bolles min), 4-5 (more stable, over-determined)
-            ImGui::TextColored(colMuted(), "Subset size K:");
-            if (ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d")) {
-                // value clamped inside runQuadCyclicRansac if out of range
-            }
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  K=3: %d-pt exact fit (max variety)\n"
-                               "  K=4: over-det. (balanced)\n"
-                               "  K=5: over-det. (most stable)",
-                               g_qcrSubsetK);
-            // Trial count cap (K=4/5 expensive: stride sample to stay under cap)
+
+            // ---- Voxel slider (旧 regMethod==1 限定表示 → ここに常時) ----
+            drawVoxelInfo();
             ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max trials (Stage 1 cap):");
-            ImGui::SliderInt("##qcrCap", &g_qcrMaxTrials, 10000, 500000, "%d");
+
+            // ---- Ctrl+G / Ctrl+Shift+G RIM/raycast 関連コントロール ----
+            //   main.cpp 側 drawCtrlGRimRaycastControls() がここに描画。
+            //   未配線の場合 (テスト環境等) は何も出ない。
+            if (actions.onDrawAdvancedCtrlG) {
+                ImGui::PushID("##adv_ctrlg");
+                actions.onDrawAdvancedCtrlG();
+                ImGui::PopID();
+            }
+
             ImGui::Unindent(8);
         }
         ImGui::Spacing();
@@ -2118,19 +2410,7 @@ public:  // drawDepthOverlayをpublicに変更（マスク選択モードから�
                         }
                     }
                     if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip(
-                            "When ON (default), the depth pipeline auto-detects\n"
-                            "the black FOV vignette and OR-merges it into\n"
-                            "instrument_segmentation_mask.png.\n"
-                            "\n"
-                            "When OFF, the saved occluder mask contains only the\n"
-                            "SAM2 instrument result (or no file at all if no\n"
-                            "instrument prompts were given). Equivalent to\n"
-                            "passing --no-vignette-detect to the external\n"
-                            "pipeline.\n"
-                            "\n"
-                            "The choice is baked at mask creation; press Run\n"
-                            "Depth (or the Instrument preview) to apply.");
+                        ImGui::SetTooltip("ON: 黒い視野 vignette を occluder mask に含める");
                     }
                     ImGui::Spacing();
 
@@ -2146,16 +2426,7 @@ public:  // drawDepthOverlayをpublicに変更（マスク選択モードから�
                             }
                         }
                         if (ImGui::IsItemHovered()) {
-                            ImGui::SetTooltip(
-                                "When ON, the next Run Depth / Instrument preview\n"
-                                "adds --cuda to the CLI so medsam2_da3_lite uses\n"
-                                "CUDAExecutionProvider.\n"
-                                "\n"
-                                "Harmless when the pipeline was built with\n"
-                                "USE_CUDA=OFF: it prints a warning and falls back\n"
-                                "to CPU.\n"
-                                "\n"
-                                "Applies to NEXT Run Depth, not the current frame.");
+                            ImGui::SetTooltip("次回 Run Depth に --cuda 付与 (CPU fallback あり)");
                         }
                         ImGui::Spacing();
                     }

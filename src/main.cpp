@@ -100,6 +100,27 @@ std::vector<glm::vec3> g_targetPoints;
 std::vector<glm::vec3> g_rejectedBoundaryPoints;   // 器具マスクで棄却された偽境界
 std::vector<glm::vec3> g_visibleSourcePoints;      // SilhouetteHemi 全可視ソース頂点
 std::vector<glm::vec3> g_silhouetteSourcePoints;   // SilhouetteHemi シルエット絞り込み後
+
+// Phase 7b Step 1 (Plain W) — extern 宣言は RegistrationActions.h
+std::vector<int> g_debugSourceRimChain;     // RIM 頂点 index chain (順序付け済)
+bool             g_showDebugSourceRimChain = false;
+
+// Phase 7b Step 1 PCA cache (populate 関数で書き込まれる、Step 3 で再利用)
+glm::vec3 g_debugSourceRimCentroid      = glm::vec3(0.0f);
+glm::vec3 g_debugSourceRimMajorNormal   = glm::vec3(0.0f, 0.0f, 1.0f);
+glm::vec3 g_debugSourceRimPrincipalAxis = glm::vec3(1.0f, 0.0f, 0.0f);
+double    g_debugSourceRimPlanarity     = 1.0;
+
+// Phase 7b Step 2 (Shift+W) — target side rim band 3D point cloud
+std::vector<glm::vec3> g_debugTargetBoundaryPoints;
+bool                   g_showDebugTargetBoundary = false;
+
+// Phase 7b Step 3 (Ctrl+W) — Shape Match coarse search outputs
+std::vector<glm::vec3> g_debugShapeMatchBestSrc;
+bool                   g_showDebugShapeMatch     = false;
+double                 g_debugShapeMatchBestCost = 0.0;
+int                    g_debugShapeMatchBestK    = -1;
+glm::mat4              g_debugShapeMatchBestTransform = glm::mat4(1.0f);
 bool g_showClusterVisualization = false;
 bool g_showBoundaryCandidates   = false;
 bool g_showSourceVisualization  = false;
@@ -601,7 +622,10 @@ static UmeyamaController gUmeyama;
 //     [5] gb      OFF (0.0)
 //     [6] board   OFF (0.0)
 //     [7] target  ON  (0.8) — 点群表示
-static float g_meshAlpha[8] = {0.8f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f};
+//
+// static を外しているのは Umeyama 2画面モードの右ビューで board / target の
+// 表示判定にこの値を参照するため (UmeyamaController.h が extern する)。
+float g_meshAlpha[8] = {0.8f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f};
 
 // =========================================================
 //  screenMesh の描画モード切替
@@ -613,10 +637,15 @@ static float g_meshAlpha[8] = {0.8f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f};
 //  g_screenMeshAsPoints  : true=点群 (デフォルト)、false=三角形
 //  g_screenMeshPointSize : GL_POINTS のサイズ [px]、ImGui で調整可
 //  g_screenMeshDensity   : 描画する頂点の割合 [%], 100 = 全頂点
+//
+//  static を外しているのは Umeyama 2画面モードの右ビューポートから
+//  同じ点群描画パスを呼ぶため (UmeyamaController.h が extern 参照する)。
+//  これがないと Umeyama 中は screenMesh が常に full-triangle で描画され、
+//  数十万頂点のターゲットでフレームレートが大幅低下する。
 // =========================================================
-static bool  g_screenMeshAsPoints  = true;
-static float g_screenMeshPointSize = 2.0f;
-static float g_screenMeshDensity   = 100.0f;
+bool  g_screenMeshAsPoints  = true;
+float g_screenMeshPointSize = 2.0f;
+float g_screenMeshDensity   = 100.0f;
 static SphereMesh g_sphereMarker;  // クラスタ・対応点描画用スフィア
 static ARSave::State g_arSave;    // AR保存＋プレビュー状態
 static ShaderProgram* g_pShader     = nullptr;  // AR保存用シェーダ参照
@@ -1022,8 +1051,9 @@ static void setupUICallbacks();
 static void showFPS(GLFWwindow* window);
 static void snapshotInitialPose();
 static void restoreInitialPose();
-static void applyInitRotation(bool startNewSession);   // Phase 2 拡張: preset + position 適用
+static void applyInitRotation(bool startNewSession, bool liver_only = false);   // Phase 2 拡張: preset + position 適用。liver_only=true で AutoQCR loop 用の liver-only モード (non-liver organ は触らない)。
 static void runAutoQuadCyclicRansac(bool lock_scale = false);   // Alt+Ctrl+P / AutoQCR ボタン: 9 ORIENT preset 自動探索 + ベスト 1 採用 (lock_scale=true で 6-DoF rigid)
+static void drawCtrlGRimRaycastControls();                       // Advanced セクション用 helper: Ctrl+G / Ctrl+Shift+G の RIM-weighted + RIM silhouette penalty コントロールを描画
 static void computeTargetSubsetAabbs();                // Phase 2 拡張: target cloud の AABB を 3 通り (full/+X/-X) 計算
 static void computeSourceLiverSubsetAabbs();           // Phase 2 拡張 v2: source liver の AABB を 3 通り計算
 
@@ -1279,8 +1309,11 @@ static ScreenMeshPointCache g_screenMeshPC;
 //
 //  シェーダは shaderProgram (basic) を流用。useTexture=false にして
 //  単色 (vertColor) で描く。lighting uniforms も一応セットしておく。
+//
+//  static を外している理由は UmeyamaController::render が右画面で
+//  screenMesh 描画にこの関数を呼ぶため。
 // =========================================================
-static void drawScreenMeshAsPoints(
+void drawScreenMeshAsPoints(
     mCutMesh* mesh,
     ShaderProgram& shader,
     const glm::mat4& model,
@@ -1403,6 +1436,11 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     const bool isShiftG     = (key == GLFW_KEY_G) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);  // V3 BIPOP-CMA-ES (Good performance)
     const bool isCtrlShiftG = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);   // V3-RS BIPOP-CMA-ES (silhouette anchor)
     const bool isCtrlG      = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V3-R BIPOP-CMA-ES (Region-aware, 4-quadrant subset)
+    // Shift+N        : Normal-Compatible refine (finishing pass after Ctrl+G)
+    // Ctrl+Shift+N   : SRT Variance-Weighted refine (ablation alt)
+    // Plain N        : kept as the SourceVis toggle (no scene requirement)
+    const bool isShiftN     = (key == GLFW_KEY_N) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);
+    const bool isCtrlShiftN = (key == GLFW_KEY_N) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);
     const bool needsScene = (key == GLFW_KEY_O      ||
                              key == GLFW_KEY_P      ||
                              isShiftV               ||
@@ -1411,6 +1449,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                              isShiftG               ||
                              isCtrlG                ||
                              isCtrlShiftG           ||
+                             isShiftN               ||
+                             isCtrlShiftN           ||
                              key == GLFW_KEY_D      ||
                              key == GLFW_KEY_COMMA  ||
                              key == GLFW_KEY_PERIOD);
@@ -1637,14 +1677,559 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         }
         break;
     case GLFW_KEY_N:
-        // ソース側可視化トグル: シアン=全可視頂点, マゼンタ=シルエット絞り込み後
-        g_showSourceVisualization = !g_showSourceVisualization;
-        std::cout << "[SourceVis] "
-                  << (g_showSourceVisualization ? "ON" : "OFF")
-                  << "  visible=" << g_visibleSourcePoints.size()
-                  << "  silhouette=" << g_silhouetteSourcePoints.size()
-                  << "  cosThresh=" << g_silhouetteSrcCosThresh
-                  << std::endl;
+        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
+            // ---- Ctrl+Shift+N : SRT Variance-Weighted Refine -----------
+            //   Same wrapper as Shift+N but method = SRT_VARIANCE. Uses
+            //   the same source filter (AR-vis + quad + caudal) and the
+            //   same L1/L2 rim & anchor controls. Intended for ablation
+            //   against Shift+N (NormalCompat). See
+            //   NormalCompatibleRefine.h for the per-correspondence
+            //   weighting differences.
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Ctrl+Shift+N] only valid in Registration mode"
+                          << std::endl;
+                break;
+            }
+            // If a Live session is already running, this keypress STOPS
+            // it (finalize -> the main render loop consumes pendingSave
+            // on the next frame and calls poseSaveToLibrary).
+            if (NormalRefineLive::active) {
+                std::cout << "[Ctrl+Shift+N] stopping active Live session"
+                          << std::endl;
+                finishNormalCompatRefineLive();
+                break;
+            }
+            std::cout << "[Ctrl+Shift+N] SRT-Variance refine session start  "
+                      << "mode=" << (g_normRefineLiveMode ? "LIVE (frame-driven)"
+                                                          : "BLOCKING (one shot)")
+                      << std::endl;
+            g_stepStartTime = std::chrono::steady_clock::now();
+            gUI.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            if (g_normRefineLiveMode) {
+                // Live (frame-driven, object-tracking-style visualisation).
+                // The main loop will tick this until convergence/max-iter
+                // and then consume pendingSave to call poseSaveToLibrary.
+                startNormalCompatRefineLive(
+                    NormalRefine::SRT_VARIANCE, g_activeQuadrantMask);
+            } else {
+                runNormalCompatRefineSession(
+                    NormalRefine::SRT_VARIANCE, g_activeQuadrantMask);
+                poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+            }
+        } else if (mods & GLFW_MOD_SHIFT) {
+            // ---- Shift+N : Normal-Compatible Refine (default polish) ---
+            //   "Finishing pass" after Ctrl+G has done the global search.
+            //   In LIVE mode (g_normRefineLiveMode=true, default), the
+            //   mesh visibly moves frame-by-frame like an SRT-3D object
+            //   tracker. In BLOCKING mode, the wrapper runs to completion
+            //   in one frame.
+            //
+            //   Source/target filters share the Ctrl+G panel toggles
+            //   (g_ctrlgUseArVisFilter, g_ctrlgUseCaudalOnly,
+            //    g_activeQuadrantMask) — no separate filter UI here.
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Shift+N] only valid in Registration mode"
+                          << std::endl;
+                break;
+            }
+            // Same Live-session "press to stop" semantic as Ctrl+Shift+N.
+            if (NormalRefineLive::active) {
+                std::cout << "[Shift+N] stopping active Live session"
+                          << std::endl;
+                finishNormalCompatRefineLive();
+                break;
+            }
+            std::cout << "[Shift+N] Normal-Compatible refine session start  "
+                      << "mode=" << (g_normRefineLiveMode ? "LIVE (frame-driven)"
+                                                          : "BLOCKING (one shot)")
+                      << std::endl;
+            g_stepStartTime = std::chrono::steady_clock::now();
+            gUI.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            if (g_normRefineLiveMode) {
+                startNormalCompatRefineLive(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+            } else {
+                runNormalCompatRefineSession(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+            }
+        } else {
+            // ---- Plain N : SourceVis toggle (existing behaviour) ------
+            //   Unchanged. ソース側可視化トグル: シアン=全可視頂点,
+            //   マゼンタ=シルエット絞り込み後
+            g_showSourceVisualization = !g_showSourceVisualization;
+            std::cout << "[SourceVis] "
+                      << (g_showSourceVisualization ? "ON" : "OFF")
+                      << "  visible=" << g_visibleSourcePoints.size()
+                      << "  silhouette=" << g_silhouetteSourcePoints.size()
+                      << "  cosThresh=" << g_silhouetteSrcCosThresh
+                      << std::endl;
+        }
+        break;
+    case GLFW_KEY_W:
+        // ---- Phase 7b: W-family (RIM Shape Match) ----
+        //   Plain W       : source RIM chain overlay toggle (green dots)
+        //   Shift+W       : target boundary overlay toggle (purple dots)
+        //   Ctrl+W        : Shape Match → mesh apply → PoseLibrary save
+        //                   (推奨運用: → 続けてユーザが手動で Ctrl+G)
+        //   Ctrl+Shift+W  : Shape Match + rim axis sweep + save (Step 4b)
+        //                   ICP は skip、rim 絶対保持優先
+        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
+            // ==== Ctrl+Shift+W : Step 4 — apply best T + Live bridge ====
+            //   詳細設計 §3-4 の本番フロー:
+            //     1. coarse search (auto-trigger source/target populate)
+            //     2. best T を全 organ mesh に applyIncrementalTransform
+            //     3. poseAutoSaveBeforeRegistration() で Undo 用 snapshot
+            //     4. startNormalCompatRefineLive で Live ICP に bridge
+            //   失敗時は Ctrl+Z (Undo) で Apply Init Pose 状態に戻れる。
+            //
+            //   Stop semantic: Live が active なら停止 (Shift+N と同じ流儀)
+            if (NormalRefineLive::active) {
+                std::cout << "[Ctrl+Shift+W] stopping active Live session"
+                          << std::endl;
+                finishNormalCompatRefineLive();
+                break;
+            }
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Ctrl+Shift+W] requires a loaded scene"
+                          << " (Registration mode)" << std::endl;
+                break;
+            }
+            // Same label auto-trigger as Plain W / Ctrl+W
+            if (!g_liverRegion.valid()) {
+                std::cout << "[Ctrl+Shift+W] g_liverRegion not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[Ctrl+Shift+W] g_liverLR not yet computed,"
+                          << " auto-running..." << std::endl;
+                recomputeLiverLR();
+            }
+            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
+                std::cout << "[Ctrl+Shift+W] caudal-only ON but g_liverCC"
+                          << " not yet computed, auto-running..." << std::endl;
+                recomputeLiverCC();
+            }
+            // 1. Coarse search (this also populates source/target if missing)
+            std::cout << "[Ctrl+Shift+W] Step 4 start: running coarse search..."
+                      << std::endl;
+            if (!runDebugShapeMatchCoarse()) {
+                std::cout << "[Ctrl+Shift+W] coarse search failed — abort,"
+                          << " mesh unchanged" << std::endl;
+                break;
+            }
+            std::cout << "[Ctrl+Shift+W] best T: cost="
+                      << g_debugShapeMatchBestCost
+                      << "  k=" << g_debugShapeMatchBestK
+                      << std::endl;
+
+            // 2. Undo snapshot BEFORE moving mesh
+            poseAutoSaveBeforeRegistration();
+
+            // 3. Apply best T to all organ meshes
+            //    (everything moves rigidly: liver, tumor, vessels, ...)
+            auto organs = getOrganList();
+            int n_valid = 0;
+            for (auto* m : organs) if (m) n_valid++;
+            std::cout << "[Ctrl+Shift+W] applying best T to "
+                      << n_valid << " organ meshes..." << std::endl;
+            NormalRefine::applyIncrementalTransform(
+                glm::dmat4(g_debugShapeMatchBestTransform), organs);
+
+            // 4. Turn off Step 3 preview since mesh is now AT that position
+            //    (the red dots would overlap the green dots awkwardly)
+            g_showDebugShapeMatch = false;
+            g_debugShapeMatchBestSrc.clear();
+
+            // ---- Phase 7b Step 4b — Rim Axis Rotation Sweep -----------
+            //   既存の Live ICP は rim 合致を維持しないので、ユーザの
+            //   「RIM フィットは絶対保持」要件に応えるべく rim 軸まわり
+            //   1D 回転で全頂点最適を取り、ICP を skip する。
+            //
+            //   g_shapeMatchAxisSweepCompare=true なら Variant A (full)
+            //   と Variant B (rim-only) を両方走らせ、それぞれの best
+            //   rotation を一旦適用 → 0-iter session で CompRMSE 計測 →
+            //   逆 rotation で元に戻し → RMSE 良い方を最終採用する。
+            if (g_shapeMatchAxisSweepEnabled) {
+                std::cout << "[Ctrl+Shift+W] Step 4b: rim axis rotation"
+                          << " sweep starting..." << std::endl;
+
+                // (a) rim axis / centroid を baseline T で world frame に
+                //     変換 (g_debugSourceRim* は Apply Init Pose 状態 = T 前)
+                const glm::mat3 R_best(g_debugShapeMatchBestTransform);
+                const glm::vec3 rim_axis_after_T = glm::normalize(
+                    R_best * g_debugSourceRimMajorNormal);
+                const glm::vec3 rim_centroid_after_T = glm::vec3(
+                    g_debugShapeMatchBestTransform
+                    * glm::vec4(g_debugSourceRimCentroid, 1.0f));
+
+                // ==== Variant A: full vertex sweep =====================
+                std::vector<glm::vec3> src_full;
+                if (liverMesh3D) {
+                    const size_t n = liverMesh3D->mVertices.size() / 3;
+                    src_full.reserve(n);
+                    for (size_t i = 0; i < n; i++) {
+                        src_full.emplace_back(
+                            liverMesh3D->mVertices[i*3],
+                            liverMesh3D->mVertices[i*3+1],
+                            liverMesh3D->mVertices[i*3+2]);
+                    }
+                }
+                std::vector<glm::vec3> tgt_sub;
+                {
+                    auto cachedTgt = Reg3DCustom::getCachedTargetCloud();
+                    if (cachedTgt && !cachedTgt->points.empty()) {
+                        const size_t N_tgt  = cachedTgt->points.size();
+                        const int    N_want = std::max(100,
+                                                       g_shapeMatchAxisSweepTgtSubN);
+                        const size_t stride = std::max<size_t>(1,
+                                                               N_tgt / (size_t)N_want);
+                        tgt_sub.reserve(N_tgt / stride + 1);
+                        for (size_t i = 0; i < N_tgt; i += stride) {
+                            tgt_sub.push_back(cachedTgt->points[i]);
+                        }
+                    }
+                }
+
+                std::vector<RimShape::AxisSweepResult> results_A;
+                bool A_ok = false;
+                if (!src_full.empty() && !tgt_sub.empty()) {
+                    std::cout << "[Ctrl+Shift+W] === Variant A (full vertex"
+                              << " symmetric chamfer) ===" << std::endl;
+                    A_ok = RimShape::runRimAxisRotationSweep(
+                        src_full, tgt_sub,
+                        rim_centroid_after_T, rim_axis_after_T,
+                        g_shapeMatchAxisSweepN,
+                        results_A, &std::cout);
+                }
+
+                // ==== Variant B: rim-only sweep ========================
+                std::vector<RimShape::AxisSweepResult> results_B;
+                bool B_ok = false;
+                if (g_shapeMatchAxisSweepCompare) {
+                    std::vector<glm::vec3> src_rim;
+                    if (liverMesh3D && !g_debugSourceRimChain.empty()) {
+                        src_rim.reserve(g_debugSourceRimChain.size());
+                        for (int idx : g_debugSourceRimChain) {
+                            if (idx < 0) continue;
+                            const size_t k = size_t(idx) * 3;
+                            if (k + 2 < liverMesh3D->mVertices.size()) {
+                                src_rim.emplace_back(
+                                    liverMesh3D->mVertices[k],
+                                    liverMesh3D->mVertices[k+1],
+                                    liverMesh3D->mVertices[k+2]);
+                            }
+                        }
+                    }
+                    if (!src_rim.empty()
+                        && !g_debugTargetBoundaryPoints.empty())
+                    {
+                        std::cout << "[Ctrl+Shift+W] === Variant B (rim-only"
+                                  << " chamfer, src=" << src_rim.size()
+                                  << " tgt=" << g_debugTargetBoundaryPoints.size()
+                                  << ") ===" << std::endl;
+                        B_ok = RimShape::runRimAxisRotationSweep(
+                            src_rim, g_debugTargetBoundaryPoints,
+                            rim_centroid_after_T, rim_axis_after_T,
+                            g_shapeMatchAxisSweepN,
+                            results_B, &std::cout);
+                    } else {
+                        std::cout << "[Ctrl+Shift+W] Variant B skipped:"
+                                  << " src_rim=" << src_rim.size()
+                                  << " tgt_boundary="
+                                  << g_debugTargetBoundaryPoints.size()
+                                  << std::endl;
+                    }
+                }
+
+                const glm::mat4 rot_A = (A_ok && !results_A.empty())
+                    ? results_A[0].axis_rotation_T : glm::mat4(1.0f);
+                const glm::mat4 rot_B = (B_ok && !results_B.empty())
+                    ? results_B[0].axis_rotation_T : glm::mat4(1.0f);
+
+                // ==== RMSE 比較: 各 variant を適用 → 0-iter session で
+                //     CompRMSE 計測 → 逆 rotation で元に戻す
+                //     (poseSaveToLibrary は呼ばないので PoseLibrary には
+                //      評価セッションのエントリは追加されない)
+                auto measure_rmse = [&](const glm::mat4& R)->double {
+                    NormalRefine::applyIncrementalTransform(
+                        glm::dmat4(R), organs);
+                    const int saved = g_normRefineMaxIter;
+                    g_normRefineMaxIter = 0;
+                    runNormalCompatRefineSession(
+                        NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                    g_normRefineMaxIter = saved;
+                    const double rmse = registrationHandle.compRmse;
+                    // 初期値に戻す (Shape Match best T 適用後の状態)
+                    NormalRefine::applyIncrementalTransform(
+                        glm::dmat4(glm::inverse(R)), organs);
+                    return rmse;
+                };
+
+                const double rmse_A = A_ok ? measure_rmse(rot_A)
+                                            : std::numeric_limits<double>::infinity();
+                const double rmse_B = B_ok ? measure_rmse(rot_B)
+                                            : std::numeric_limits<double>::infinity();
+
+                bool A_wins = (rmse_A <= rmse_B);
+                if (!A_ok && !B_ok) {
+                    std::cout << "[Ctrl+Shift+W] both variants failed,"
+                              << " keeping baseline T" << std::endl;
+                } else {
+                    if (!A_ok) A_wins = false;
+                    if (!B_ok) A_wins = true;
+                    const glm::mat4 winner = A_wins ? rot_A : rot_B;
+                    const float win_angle = A_wins
+                        ? (results_A.empty() ? 0.0f : results_A[0].angle_deg)
+                        : (results_B.empty() ? 0.0f : results_B[0].angle_deg);
+                    const double win_cost = A_wins
+                        ? (results_A.empty() ? 0.0 : results_A[0].cost)
+                        : (results_B.empty() ? 0.0 : results_B[0].cost);
+
+                    std::cout << "[Ctrl+Shift+W] === Variant comparison ==="
+                              << "  A(full) RMSE="
+                              << (A_ok ? std::to_string(rmse_A) : "N/A")
+                              << "  B(rim) RMSE="
+                              << (B_ok ? std::to_string(rmse_B) : "N/A")
+                              << "  winner=" << (A_wins ? "A(full)" : "B(rim)")
+                              << "  angle=" << win_angle << "deg"
+                              << "  sweep_cost=" << win_cost
+                              << std::endl;
+
+                    g_debugShapeMatchAxisSweepT     = winner;
+                    g_debugShapeMatchAxisSweepCost  = win_cost;
+                    g_debugShapeMatchAxisSweepAngle = win_angle;
+
+                    NormalRefine::applyIncrementalTransform(
+                        glm::dmat4(winner), organs);
+                }
+
+                // (f) Final save: max_iter=0 で session 再実行 + 確定 save
+                std::cout << "[Ctrl+Shift+W] saving final pose to PoseLibrary"
+                          << " (max_iter=0 pseudo-session)..." << std::endl;
+                const int saved_max_iter = g_normRefineMaxIter;
+                g_normRefineMaxIter = 0;
+                g_stepStartTime  = std::chrono::steady_clock::now();
+                gUI.state.regMethod = 3;
+                if (g_normRefineLiveMode) {
+                    startNormalCompatRefineLive(
+                        NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                } else {
+                    runNormalCompatRefineSession(
+                        NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                    poseSaveToLibrary(SaveCriterion::EITHER,
+                                      g_activeQuadrantMask);
+                }
+                g_normRefineMaxIter = saved_max_iter;
+                break;
+            }
+
+            // ---- Phase 7b Step 4a — fallback to original Live ICP -----
+            //     (g_shapeMatchAxisSweepEnabled = false のとき)
+            // 5. Bridge to Live ICP (Phase 6 既存配線)
+            //    Phase 7b Step 4a: g_shapeMatchLiveMaxIter で「Shape Match
+            //    を絶対維持に近づける」ため max_iter を一時的に override。
+            //    prepareNormalRefineSession 内で nrp.maxTotalIterations =
+            //    g_normRefineMaxIter としてキャプチャされるので、
+            //    start 後すぐ復元しても session には override 値が残る。
+            const int saved_max_iter = g_normRefineMaxIter;
+            if (g_shapeMatchLiveMaxIter > 0) {
+                g_normRefineMaxIter = g_shapeMatchLiveMaxIter;
+                std::cout << "[Ctrl+Shift+W] Live ICP max_iter override:"
+                          << " " << saved_max_iter << " -> "
+                          << g_normRefineMaxIter
+                          << " (Phase 7b absolute-maintenance mode)"
+                          << std::endl;
+            }
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            gUI.state.regMethod = 3;
+            if (g_normRefineLiveMode) {
+                std::cout << "[Ctrl+Shift+W] bridging to NormalCompat LIVE"
+                          << " (frame-driven)..." << std::endl;
+                startNormalCompatRefineLive(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                // main loop ticks until finish; poseSaveToLibrary fires
+                // via pendingSave (existing Phase 6 wiring).
+            } else {
+                std::cout << "[Ctrl+Shift+W] bridging to NormalCompat"
+                          << " BLOCKING (one-shot)..." << std::endl;
+                runNormalCompatRefineSession(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+            }
+            // Restore: session already captured the override value.
+            // Subsequent Shift+N etc. use the user's normal default.
+            g_normRefineMaxIter = saved_max_iter;
+            break;
+        }
+        if ((mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT)) {
+            // ==== Ctrl+W : Shape Match → mesh apply → PoseLibrary save ====
+            //   旧 Step 3 (preview のみ) を廃止し、mesh を実際に Shape
+            //   Match best T で動かして PoseLibrary に直接保存する。
+            //   ユーザ運用想定:
+            //     Apply Init Pose → Ctrl+W → (ユーザが手動で) Ctrl+G
+            //   Ctrl+W で Shape Match による良い初期姿勢を確定し、
+            //   その状態から Ctrl+G の V3-R BIPOP-CMA-ES を走らせる流れ。
+            //   ICP / axis sweep は Ctrl+Shift+W (Step 4b) が担当。
+            //
+            //   Stop semantic: Live が active なら停止
+            if (NormalRefineLive::active) {
+                std::cout << "[Ctrl+W] stopping active Live session"
+                          << std::endl;
+                finishNormalCompatRefineLive();
+                break;
+            }
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Ctrl+W] requires a loaded scene"
+                          << " (Registration mode)" << std::endl;
+                break;
+            }
+            // Auto-trigger labels (same as Plain W / Ctrl+Shift+W)
+            if (!g_liverRegion.valid()) {
+                std::cout << "[Ctrl+W] g_liverRegion not yet computed,"
+                          << " auto-running recomputeLiverRegion()..."
+                          << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[Ctrl+W] g_liverLR not yet computed,"
+                          << " auto-running recomputeLiverLR()..."
+                          << std::endl;
+                recomputeLiverLR();
+            }
+            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
+                std::cout << "[Ctrl+W] caudal-only ON but g_liverCC not"
+                          << " yet computed, auto-running..." << std::endl;
+                recomputeLiverCC();
+            }
+            // 1. Run coarse search → best T
+            std::cout << "[Ctrl+W] running Shape Match coarse search..."
+                      << std::endl;
+            if (!runDebugShapeMatchCoarse()) {
+                std::cout << "[Ctrl+W] coarse search failed — abort,"
+                          << " mesh unchanged" << std::endl;
+                break;
+            }
+            std::cout << "[Ctrl+W] best T: cost="
+                      << g_debugShapeMatchBestCost
+                      << "  k=" << g_debugShapeMatchBestK
+                      << std::endl;
+
+            // 2. Undo snapshot (for Ctrl+Z safety)
+            poseAutoSaveBeforeRegistration();
+
+            // 3. Apply best T to all organ meshes
+            {
+                auto organs = getOrganList();
+                int n_valid = 0;
+                for (auto* m : organs) if (m) n_valid++;
+                std::cout << "[Ctrl+W] applying best T to "
+                          << n_valid << " organ meshes..." << std::endl;
+                NormalRefine::applyIncrementalTransform(
+                    glm::dmat4(g_debugShapeMatchBestTransform), organs);
+            }
+
+            // 4. Clear any leftover preview state (from older code path)
+            g_showDebugShapeMatch = false;
+            g_debugShapeMatchBestSrc.clear();
+
+            // 5. Save to PoseLibrary via max_iter=0 pseudo-session
+            //    (mesh の現在位置で metrics 計算 + PoseLibrary に save)
+            std::cout << "[Ctrl+W] saving pose to PoseLibrary"
+                      << " (max_iter=0 pseudo-session, no ICP)..."
+                      << std::endl;
+            const int saved_max_iter = g_normRefineMaxIter;
+            g_normRefineMaxIter = 0;
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            gUI.state.regMethod = 3;
+            if (g_normRefineLiveMode) {
+                startNormalCompatRefineLive(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                // main loop ticks → 0 iters → finish → save via pendingSave
+            } else {
+                runNormalCompatRefineSession(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                poseSaveToLibrary(SaveCriterion::EITHER,
+                                  g_activeQuadrantMask);
+            }
+            g_normRefineMaxIter = saved_max_iter;
+            break;
+        }
+        if ((mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL)) {
+            // ==== Shift+W : Step 2 — target boundary overlay (purple) ====
+            // Toggle, mirrors Plain W's semantic.
+            if (g_showDebugTargetBoundary) {
+                g_showDebugTargetBoundary = false;
+                std::cout << "[W/TgtBound] overlay OFF (was ON, "
+                          << g_debugTargetBoundaryPoints.size()
+                          << " pts cached)" << std::endl;
+                break;
+            }
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Shift+W] requires a loaded scene"
+                          << " (Registration mode) — drop an image and"
+                          << " press R first" << std::endl;
+                break;
+            }
+            const bool ok = populateDebugTargetBoundary();
+            g_showDebugTargetBoundary = ok;
+            std::cout << "[W/TgtBound] overlay "
+                      << (ok ? "ON" : "OFF (populate failed)")
+                      << "  size=" << g_debugTargetBoundaryPoints.size()
+                      << "  (purple dots, target is static — no live"
+                      << " fetch needed)" << std::endl;
+            break;
+        }
+        if (mods == 0) {
+            // Toggle semantic, matching Plain N (SourceVis toggle):
+            //   ON  -> turn off, keep the chain in memory
+            //   OFF -> (re)populate from current g_liverRegion + toggle ON
+            if (g_showDebugSourceRimChain) {
+                g_showDebugSourceRimChain = false;
+                std::cout << "[W/RimChain] overlay OFF (was ON, "
+                          << g_debugSourceRimChain.size() << " pts cached)"
+                          << std::endl;
+                break;
+            }
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[W] requires a loaded scene"
+                          << " (Registration mode) — drop an image and"
+                          << " press R first" << std::endl;
+                break;
+            }
+            // Auto-trigger region/LR/CC labelling if missing (same
+            // pattern as Shift+O / Shift+N / Ctrl+G). Region+LR は必須
+            // (quadrant subset の前提)、CC は caudal-only ON のときだけ
+            // 必要だが、トグル切替で頻繁に必要になるので予防的に確保。
+            if (!g_liverRegion.valid()) {
+                std::cout << "[W] g_liverRegion not yet computed,"
+                          << " auto-running recomputeLiverRegion()..."
+                          << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[W] g_liverLR not yet computed,"
+                          << " auto-running recomputeLiverLR()..."
+                          << std::endl;
+                recomputeLiverLR();
+            }
+            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
+                std::cout << "[W] caudal-only ON but g_liverCC not yet"
+                          << " computed, auto-running recomputeLiverCC()..."
+                          << std::endl;
+                recomputeLiverCC();
+            }
+            const bool ok = populateDebugSourceRimChain();
+            g_showDebugSourceRimChain = ok;
+            std::cout << "[W/RimChain] overlay "
+                      << (ok ? "ON" : "OFF (populate failed)")
+                      << "  size=" << g_debugSourceRimChain.size()
+                      << "  (green dots, fetched live from"
+                      << " liverMesh3D->mVertices)" << std::endl;
+        }
         break;
     case GLFW_KEY_P:
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_ALT)) {
@@ -2054,7 +2639,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
 
         if (mods & GLFW_MOD_SHIFT) {
             // -----------------------------------------------------------------
-            //  Shift+M: cam-mm + OpenGL flip STL export (EchoLiver dataset 評価用)
+            //  Shift+M (v4): cam-mm + (X flip + Z flip) STL export
+            //                (EchoLiver dataset 評価用、TRE 13.03 mm 達成版)
             //
             //  目的: registered organ mesh (cam frame, scene 単位) を
             //        Adagolodjo の出力フォーマット (cam-mm OpenGL 規約) に
@@ -2072,7 +2658,21 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             //  numerically stable なため。同じ scale 係数を全 organ に適用する
             //  (uniform similarity transform 前提なので、全 organ で本来同じ値)。
             //
-            //  Z 反転は反射 (det=-1) なので triangle winding 逆転 → index swap。
+            //  3 つの変換 (v4 = X flip + Z flip + scale restore):
+            //    v_out.x = -SCALE_RESTORE * v_internal.x   ← X flip (mirrorMeshAndCloudX 戻し)
+            //    v_out.y = +SCALE_RESTORE * v_internal.y
+            //    v_out.z = -SCALE_RESTORE * v_internal.z   ← Z flip (OpenGL +Z back 規約)
+            //
+            //  X flip は mirrorMeshAndCloudX で screenMesh / targetCloud にだけ
+            //  入った内部 X 反転を最終出力で「戻す」目的 (organ はその反転を
+            //  受けていないが、処理空間が X 反転している状態で配置されている)。
+            //  これを入れないと TRE が ~60 mm 級まで悪化する (v3 の症状)。
+            //
+            //  X+Z 二重反射の合成は det (+1)(-1)(-1) = +1 で Y 軸まわり 180° 回転と
+            //  等価。triangle winding は保存されるので index swap は不要。
+            //  (v3 の Z-only 反転 det=-1 では winding 補正のため index swap が
+            //  必要だったが、v4 では除去)
+            //
             //  Evaluation.m が読込時に y,z 反転 → cam OpenCV (LUS GT 比較フレーム)。
             //
             //  no-registration 状態で実行しても extent は CT 真値と一致する
@@ -2105,7 +2705,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             std::cout << "[Shift+M] g_originalLiverDiagMm=" << g_originalLiverDiagMm
                       << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
                       << "  SCALE_RESTORE=" << SCALE_RESTORE
-                      << "  (CT-truth based)" << std::endl;
+                      << "  (CT-truth based, X+Z flip)" << std::endl;
 
             auto exportCamMmStl =
                 [&](const mCutMesh* src, const std::string& outPath, const char* label) {
@@ -2115,15 +2715,12 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     }
                     mCutMesh out = *src;
                     for (size_t i = 0; i + 2 < out.mVertices.size(); i += 3) {
-                        out.mVertices[i  ] =  out.mVertices[i  ] * SCALE_RESTORE;
-                        out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;
-                        out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;
+                        out.mVertices[i  ] = -out.mVertices[i  ] * SCALE_RESTORE;  // X flip (mirrorMeshAndCloudX 戻し)
+                        out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;  // Y keep
+                        out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;  // Z flip (OpenGL +Z back)
                     }
-                    // Z 反転は反射 (det=-1) なので triangle winding 逆転。
-                    // STL は法線を頂点順序から計算するので index 入れ替えで戻す。
-                    for (size_t i = 0; i + 2 < out.mIndices.size(); i += 3) {
-                        std::swap(out.mIndices[i+1], out.mIndices[i+2]);
-                    }
+                    // X+Z 二重反射: det = (-1)*(+1)*(-1) = +1 → Y 軸まわり 180° 回転と等価。
+                    // triangle winding は保存されるので index swap 不要。
                     out.exportStlFile(outPath);
                     Reg3DCustom::printMeshBBox(out, label);
                 };
@@ -2133,8 +2730,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             exportCamMmStl(liverMesh3D, REG_MODEL_PATH + "liver_cam_mm.stl",
                            "liver_cam_mm (Adagolodjo-format)");
 
-            std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm + OpenGL flip"
-                      << "  (scale = CT_diag / current_diag, Z negate)" << std::endl;
+            std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm (Adagolodjo format)"
+                      << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
 
             // -----------------------------------------------------------------
             //  Snapshot: 再現性のため Run Depth 入力一式 + 出力 STL を
@@ -3575,6 +4172,32 @@ int main() {
 
         syncUIState();
 
+        // ----------------------------------------------------------------
+        //  [Phase 6 LIVE] Normal-Compatible Refine tick.
+        //  -------------------------------------------------------------
+        //  When a live session is active (= user pressed Shift+N or
+        //  Ctrl+Shift+N with g_normRefineLiveMode=true), advance ONE
+        //  refineStep per render frame. Each tick:
+        //    - runs one refineStep on the persistent NormalRefineLive::state
+        //    - applies the resulting incremental transform to organMeshes
+        //    - tracks bestRMSE / bestCumulativeTransform
+        //    - if converged / max-iter, calls finishNormalCompatRefineLive
+        //      which sets pendingSave for the consumer immediately below.
+        //
+        //  No-op when no live session is in flight (returns immediately).
+        //  Placed BEFORE rendering so the mesh update is visible the same
+        //  frame.
+        // ----------------------------------------------------------------
+        tickNormalCompatRefineLive();
+        // Consume pendingSave: after finish() flagged it, call
+        //   poseSaveToLibrary here (the function is only reachable from
+        //   main.cpp because PoseLibrary.h includes after the actions
+        //   header). Mirrors the blocking wrapper's post-save call.
+        if (NormalRefineLive::pendingSave) {
+            poseSaveToLibrary(SaveCriterion::EITHER, NormalRefineLive::mask);
+            NormalRefineLive::pendingSave = false;
+        }
+
         // マスク選択モードでは通常のUIを表示しない
         if (gApp.mode != AppMode::kMaskSelection) {
             gUI.draw(gWindowWidth, gWindowHeight);
@@ -3592,8 +4215,11 @@ int main() {
         //  - 解剖学的配置: 上=anterior, 下=posterior, 左=患者の右, 右=患者の左
         //  - subset 頂点数 (重複排除後) をリアルタイム表示
         //  - ラベル未計算の場合は警告表示 (Shift+R / Y を促す)
+        //  - Umeyama 2画面モード中は非表示 (画面中央の overlay と被るため、
+        //    また毎フレーム O(N) の countByQuadrant / makeQuadrantSubsetIdx
+        //    が走るので Umeyama 時の体感カクつき要因にもなる)
         // ----------------------------------------------------------------
-        if (gApp.mode == AppMode::kRegistration) {
+        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
             ImGui::SetNextWindowBgAlpha(0.7f);
             ImGui::Begin("Ctrl+G Quadrant Selector",
                          nullptr,
@@ -3917,6 +4543,134 @@ int main() {
                 ImGui::SetTooltip("Target boundaryDist < threshold -> "
                                   "treated as RIM (image-side rim membership).\n"
                                   "Same semantic as Shift+P kBoundaryPxTh (default 12).");
+            }
+
+            // Phase 7b Step 2 (Shift+W) で紫点が instrument の境界に
+            // 漏れる場合はここで threshold を上げる。Shift+N / V3R-W /
+            // V3R / Phase 7b 全部が同じ g_instrumentPxThresh を参照する
+            // ので、ここで変えると Ctrl+G の RIM 抽出にも即時反映される。
+            // 既存の Inst Px スライダ (HemiAuto モード regMethod==1 のみ
+            // 表示) と完全に同じ global を共有。
+            ImGui::SliderFloat("inst threshold [px]",
+                               &g_instrumentPxThresh, 0.0f, 50.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Target points with instrumentDist < threshold\n"
+                                  "are excluded from RIM (instrument-aware\n"
+                                  "boundary rejection).\n"
+                                  "Shared with Shift+N / V3R / Phase 7b Shift+W.\n"
+                                  "Increase if instrument outline leaks into the\n"
+                                  "RIM band (visible as purple dots in Shift+W).");
+            }
+
+            // Phase 7b Step 3 — Rotation-angle constraint for Ctrl+W
+            // Shape Match. cos_angle = (trace(R)-1)/2 below threshold
+            // incurs a penalty. Effectively limits Shape Match to small
+            // adjustment rotations, trusting Apply Init Pose for the
+            // overall anatomy orientation.
+            ImGui::SliderFloat("rot cos thresh (Ctrl+W)",
+                               &g_shapeMatchAnatomyThresh, -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Phase 7b Ctrl+W: cos((trace(R)-1)/2) below this\n"
+                                  "threshold incurs a penalty.\n"
+                                  "  +1.0 = strict (R must be identity)\n"
+                                  "  +0.5 = allow up to 60° rotation\n"
+                                  "   0.0 = allow up to 90° rotation (default,\n"
+                                  "         excludes sign=1/2/3 180° flip candidates)\n"
+                                  "  -1.0 = no constraint");
+            }
+            {
+                float lam = (float)g_shapeMatchAnatomyLambda;
+                if (ImGui::SliderFloat("rot lambda (Ctrl+W)",
+                                       &lam, 0.0f, 5.0f, "%.2f")) {
+                    g_shapeMatchAnatomyLambda = (double)lam;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Phase 7b Ctrl+W: rotation-angle penalty\n"
+                                      "weight. 0 = disable constraint.\n"
+                                      "1 = 180° flip incurs penalty 1.0 (= 10×\n"
+                                      "typical chamfer 0.1, effective rejection).");
+                }
+            }
+
+            // Phase 7b Step 4a — sign-mask filter for Shape Match.
+            // sign=0 only = "trust Apply Init Pose, allow only identity-
+            // like rotations". Sign 1/2/3 are 180° flip candidates which
+            // can hit wrong poses even with rotation penalty.
+            {
+                bool sign0_only = (g_shapeMatchSignMode == 0x1);
+                if (ImGui::Checkbox("sign=0 only (Ctrl+W: no flip)",
+                                    &sign0_only))
+                {
+                    g_shapeMatchSignMode = sign0_only ? 0x1 : 0xF;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Phase 7b Ctrl+W: when ON, try only\n"
+                                      "sign=0 (t+,n+) = identity-like rotation,\n"
+                                      "30 candidates instead of 120.\n"
+                                      "When OFF, try all 4 signs (180° flips\n"
+                                      "included, 120 candidates).\n"
+                                      "ON = trust Apply Init Pose orientation.");
+                }
+            }
+
+            // Phase 7b Step 4a — Live ICP iter cap for Ctrl+Shift+W.
+            // When Shape Match is followed by Live ICP, cap the iters so
+            // the ICP stays close to the Shape Match solution instead of
+            // wandering off and getting rescued by early-stop.
+            ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
+                             &g_shapeMatchLiveMaxIter, 0, 200);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (Step 4a fallback):\n"
+                                  "temporarily override g_normRefineMaxIter\n"
+                                  "for Live ICP after Shape Match.\n"
+                                  "  0 or negative = no override (use Shift+N default 200)\n"
+                                  "  20 = strong absolute-maintenance (default)\n"
+                                  "  5-10 = even stronger\n"
+                                  "Only used when 'use rim-axis sweep' is OFF.");
+            }
+
+            // Phase 7b Step 4b — Rim Axis Rotation Sweep (default ON)
+            // Replaces Live ICP with a 1D sweep around the rim normal
+            // axis. Preserves rim alignment absolutely and excludes
+            // flipped poses via all-vertex chamfer.
+            ImGui::Separator();
+            ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W: skip ICP)",
+                            &g_shapeMatchAxisSweepEnabled);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (Step 4b, default ON):\n"
+                                  "After Shape Match best T applied, sweep\n"
+                                  "rotations around rim normal axis with\n"
+                                  "all-vertex chamfer. Picks best angle and\n"
+                                  "SKIPS Live ICP entirely.\n"
+                                  "  ON  = rim fit absolutely preserved\n"
+                                  "  OFF = fallback to Live ICP (Step 4a)");
+            }
+            ImGui::SliderInt("axis sweep N angles",
+                             &g_shapeMatchAxisSweepN, 8, 90);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Number of rotation samples in 360°.\n"
+                                  "36 = 10° step (default).\n"
+                                  "Higher = finer but slower.");
+            }
+            ImGui::SliderInt("axis sweep tgt subN",
+                             &g_shapeMatchAxisSweepTgtSubN, 500, 20000);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Target points uniformly downsampled to\n"
+                                  "this count before chamfer.\n"
+                                  "5000 = balanced (~1-2s for default N=36).\n"
+                                  "Higher = more accurate but slower.");
+            }
+            ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
+                            &g_shapeMatchAxisSweepCompare);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (default ON):\n"
+                                  "Run both Variant A (full vertex sym\n"
+                                  "chamfer) AND Variant B (rim chain vs\n"
+                                  "target boundary) sweeps. Apply each\n"
+                                  "winner-candidate rotation, measure\n"
+                                  "CompRMSE via 0-iter session, restore,\n"
+                                  "then pick the variant with lower RMSE.\n"
+                                  "OFF = Variant A only (~700ms faster).");
             }
 
             ImGui::Checkbox("Show RIM pairs",
@@ -4337,11 +5091,298 @@ int main() {
             ImGui::Separator();
             ImGui::TextDisabled("Press Ctrl+G to run V3-R with this selection");
             ImGui::TextDisabled("Press Ctrl+Shift+G to run V3-RS (silhouette anchor)");
+            ImGui::TextDisabled("Press Shift+N / Ctrl+Shift+N for Normal-Compat / SRT polish");
 
             ImGui::End();
         }
 
-        if (gApp.mode == AppMode::kRegistration) {
+        // ----------------------------------------------------------------
+        //  Normal-Compatible Refine (Shift+N) panel
+        //  -------------------------------------------------------------
+        //  Companion panel to "Ctrl+G Quadrant Selector". Configures the
+        //  finishing-pass refinement that runs after Ctrl+G:
+        //    Apply Init Pose → Ctrl+P → Ctrl+G → Shift+N (polish)
+        //                                       ↘ Ctrl+Shift+N (SRT-Variance polish)
+        //
+        //  Source/target filters are SHARED with Ctrl+G (AR-vis / Caudal /
+        //  Quadrant globals are read by the wrapper directly). Only the
+        //  rim weights (Phase 2 L1) and anchor controls (Phase 3 L2) live
+        //  here, plus per-iteration solver knobs.
+        // ----------------------------------------------------------------
+        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
+            ImGui::SetNextWindowBgAlpha(0.7f);
+            ImGui::Begin("Normal-Compatible Refine (Shift+N)",
+                         nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize);
+
+            ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
+                               "Finishing-pass refinement after Ctrl+G");
+            ImGui::Spacing();
+
+            // Master enable.
+            ImGui::Checkbox("Enabled", &g_normRefineEnabled);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Master switch. When OFF, pressing Shift+N or "
+                    "Ctrl+Shift+N logs the abort and does not touch the\n"
+                    "pose. Useful for quickly disabling the feature\n"
+                    "without unbinding the key.");
+            }
+
+            // ---- Live mode toggle (Phase 6) -----------------------------
+            //   ON  : object-tracking-style visualisation — mesh moves
+            //         frame-by-frame as the optimisation progresses.
+            //   OFF : blocking wrapper — mesh snaps to final pose at
+            //         the end of a 4-8s pause. Same math either way.
+            ImGui::SameLine();
+            ImGui::Checkbox("Live mode", &g_normRefineLiveMode);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON  (default): frame-driven refinement.\n"
+                    "  Each render frame runs refineStep, the mesh\n"
+                    "  visibly moves toward the target. Like an SRT-3D\n"
+                    "  object tracker. Press Shift+N again to stop.\n"
+                    "\n"
+                    "OFF: blocking wrapper.\n"
+                    "  The whole loop runs in one frame; the mesh moves\n"
+                    "  once at the end. Faster total wall-clock but no\n"
+                    "  intermediate visualisation. Useful when you only\n"
+                    "  care about the final pose.");
+            }
+            // [Phase 6 UX] Steps/frame slider — directly controls
+            //   animation speed. Only meaningful when Live is ON.
+            if (g_normRefineLiveMode) {
+                ImGui::SliderInt("Steps/frame",
+                                 &g_normRefineLiveStepsPerFrame, 1, 10);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "How many refineStep calls per render frame in\n"
+                        "Live mode. Each refineStep does itersPerFrame\n"
+                        "internal sub-iterations (default 2).\n"
+                        "  1  : slowest, most dramatic animation.\n"
+                        "  3-5: faster but motion still visible.\n"
+                        "  10 : effectively blocking spread over frames.");
+                }
+            }
+
+            // ---- LIVE running banner + Cancel button --------------------
+            if (g_normRefineLiveActive) {
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                                   "● LIVE TRACKING — iter %d / %d",
+                                   g_normRefineLastIter,
+                                   g_normRefineMaxIter);
+                if (g_normRefineLiveCurrentRMSE >= 0.0f) {
+                    ImGui::Text("  current RMSE = %.5f   best = %.5f",
+                                g_normRefineLiveCurrentRMSE,
+                                g_normRefineLastBestRMSE);
+                }
+                ImGui::Text("  initial RMSE = %.5f   gain = %.1f%%",
+                            g_normRefineLastInitialRMSE,
+                            g_normRefineLastInitialRMSE > 0.0f
+                                ? 100.0f * (1.0f - g_normRefineLastBestRMSE
+                                                 / g_normRefineLastInitialRMSE)
+                                : 0.0f);
+                if (g_normRefineLiveAnchorPhase == 1) {
+                    ImGui::TextColored(ImVec4(0.96f, 0.82f, 0.30f, 1.0f),
+                                       "  anchor phase ACTIVE");
+                } else if (g_normRefineLiveAnchorPhase == 0) {
+                    ImGui::TextDisabled("  anchor phase ended (pure NN)");
+                }
+                ImGui::TextDisabled("  (press Shift+N to stop early)");
+                if (ImGui::Button("Cancel (revert)", ImVec2(-1, 0))) {
+                    cancelNormalCompatRefineLive("user-cancel-button");
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Force-abort the live session, revert the mesh\n"
+                        "to its pre-press pose, and save a REJECTED\n"
+                        "entry to the Pose Library.");
+                }
+            }
+
+            // ---- Source filter mirror (read-only status, lives in Ctrl+G panel) ----
+            ImGui::Separator();
+            ImGui::TextDisabled("Source filter (shared with Ctrl+G panel):");
+            {
+                const auto maskStr = LiverLeftRightLabel::quadrantMaskString(
+                    g_activeQuadrantMask);
+                ImGui::Text("  quadrant = %s  (0x%X)",
+                            maskStr.c_str(), (unsigned)g_activeQuadrantMask);
+                ImGui::Text("  AR-vis = %s,  Caudal-only = %s",
+                            g_ctrlgUseArVisFilter ? "ON" : "OFF",
+                            g_ctrlgUseCaudalOnly  ? "ON" : "OFF");
+                if (g_ctrlgUseArVisFilter && g_ctrlgUseCaudalOnly) {
+                    ImGui::Text("  combine = %s",
+                                g_ctrlgArvisCaudalCombine == 1 ? "OR" : "AND");
+                }
+            }
+
+            // ---- Per-iteration solver knobs ----
+            ImGui::Separator();
+            ImGui::TextDisabled("Solver");
+            ImGui::SliderFloat("distanceThreshold",
+                               &g_normRefineDistThresh, 0.01f, 0.50f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Sigmoid centre for the per-correspondence weight.\n"
+                    "Larger -> more far points contribute (good when ICP\n"
+                    "needs long-range attraction). Scales with scene size.\n"
+                    "Header default 0.15.");
+            }
+            ImGui::SliderFloat("minNormalCos",
+                               &g_normRefineMinNormalCos, 0.0f, 0.9f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Annealed start cosine threshold. NormalCompat\n"
+                    "(Shift+N) ignores this; SRT_Variance (Ctrl+Shift+N)\n"
+                    "uses it to reject correspondences whose normals\n"
+                    "disagree more than acos(this) radians at iter 0.\n"
+                    "Header default 0.30 (~72.5° accepted at iter 0).");
+            }
+            ImGui::SliderInt("maxIter", &g_normRefineMaxIter, 20, 500);
+            ImGui::SliderInt("itersPerFrame", &g_normRefineItersPerFrame, 1, 5);
+
+            // ---- Phase 7a: Pure RIM mode -----------------------------
+            //   HARD filter (vs L1's soft weight). When ON, only rim-to-rim
+            //   correspondences are used. Source = liver verts AND
+            //   LiverRegionLabel::RIM (intersected with current quadrant
+            //   / AR-vis / Caudal selection). Target = boundaryDist <
+            //   g_ctrlgRimTgtThreshPx (instrument-aware).
+            //
+            //   Recommended workflow: enable AFTER Ctrl+M (Shape Match,
+            //   Phase 7b) has aligned the rims globally, then Shift+N
+            //   polishes the residual using rim-only ICP.
+            ImGui::Separator();
+            ImGui::Checkbox("RIM-only mode (hard filter)", &g_normRefinePureRim);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Phase 7a: restrict refinement to RIM-to-RIM matches.\n"
+                    "\n"
+                    "Source = liver verts AND LiverRegionLabel::RIM\n"
+                    "         (intersected with current Ctrl+G filters)\n"
+                    "Target = boundaryDist < g_ctrlgRimTgtThreshPx\n"
+                    "         (instrument-aware)\n"
+                    "\n"
+                    "Pros: 4-5x faster, focuses on the curve we care about.\n"
+                    "Cons: rim is roughly 1D, so in-plane rotation is\n"
+                    "      under-constrained — works best AFTER a good\n"
+                    "      initial alignment (Ctrl+G or Ctrl+M).\n"
+                    "\n"
+                    "Independent of beta_rim_src/tgt (L1 weight). L1 betas\n"
+                    "still apply AMONG the rim points that survive the\n"
+                    "filter when both are on.");
+            }
+            if (g_normRefinePureRim) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "[ACTIVE]");
+            }
+
+            // ---- Phase 2 L1: Rim multiplicative weights ----
+            ImGui::Separator();
+            ImGui::TextDisabled("L1: Rim weight (Phase 2)");
+            ImGui::SliderFloat("beta_rim_src",
+                               &g_normRefineBetaRimSrc, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Multiplicative boost for source-rim correspondences.\n"
+                    "  0.0  : source-rim points get the same weight as\n"
+                    "         interior points (header byte-identical).\n"
+                    "  1.0  : rim points contribute DOUBLE.\n"
+                    "  3.0  : rim points contribute 4x.\n"
+                    "Source rim = LiverRegionLabel::RIM (mesh-intrinsic),\n"
+                    "available iff g_liverRegion is computed.");
+            }
+            ImGui::SliderFloat("beta_rim_tgt",
+                               &g_normRefineBetaRimTgt, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Multiplicative boost for target-rim correspondences.\n"
+                    "Target rim = boundaryDist < g_ctrlgRimTgtThreshPx\n"
+                    "(image-side rim membership; same threshold the\n"
+                    "Ctrl+G panel uses, so changing the slider there\n"
+                    "also changes what counts as 'rim' here).");
+            }
+            ImGui::TextDisabled("Tgt rim threshold (Ctrl+G panel): %.1f px",
+                                g_ctrlgRimTgtThreshPx);
+
+            // ---- Phase 3 L2: Anchor pair carry-over from last Ctrl+G ----
+            ImGui::Separator();
+            ImGui::TextDisabled("L2: Anchor pair (Phase 3)");
+
+            const bool anchorAvail =
+                !g_lastRimPairSrcVertIdx.empty() &&
+                (g_lastRimPairSrcVertIdx.size() == g_lastRimPairTgtPos.size());
+            if (anchorAvail) {
+                ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
+                                   "  %d anchor pairs available",
+                                   (int)g_lastRimPairSrcVertIdx.size());
+            } else {
+                ImGui::TextColored(ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                                   "  No anchor pairs (run Ctrl+G first)");
+            }
+
+            ImGui::Checkbox("Use anchor pairs", &g_normRefineUseAnchor);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Use the rim-pair correspondences captured by the\n"
+                    "most-recent Ctrl+G / Ctrl+Shift+G (Phase F.5) as a\n"
+                    "warm start. During the first anchorPhaseIter outer\n"
+                    "iterations, anchored vertices use the anchor target\n"
+                    "instead of the runtime KDTree nearest neighbour.\n"
+                    "After the phase ends, anchors are silently dropped\n"
+                    "and the loop converges via pure NN.\n"
+                    "\n"
+                    "When NO anchors are available (e.g. fresh session),\n"
+                    "this toggle has no effect — the wrapper passes empty\n"
+                    "anchor arrays and runs in pure-NN mode.");
+            }
+            ImGui::SliderInt("anchorPhaseIter",
+                             &g_normRefineAnchorPhaseIter, 0, 100);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Number of outer iterations during which anchors\n"
+                    "override KDTree NN for vertices that own an anchor.\n"
+                    "0 = effectively disable anchors; 20 = default;\n"
+                    "100 = run anchored to the very end (rarely useful).");
+            }
+            ImGui::SliderFloat("anchorBlend",
+                               &g_normRefineAnchorBlend, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Blend factor inside the anchor phase:\n"
+                    "  1.0 : pure anchor (target = anchor position).\n"
+                    "  0.5 : midpoint between anchor and current NN.\n"
+                    "  0.0 : ignore anchor entirely (= toggle OFF).");
+            }
+
+            // ---- Last-session status ----
+            ImGui::Separator();
+            ImGui::TextDisabled("Status (last session)");
+            if (g_normRefineLastInitialRMSE >= 0.0f) {
+                const char* methodName =
+                    (g_normRefineLastMethod == 1)
+                        ? "SRT_VARIANCE" : "NORMAL_COMPAT";
+                ImGui::Text("  method: %s", methodName);
+                ImGui::Text("  iter: %d / %d   initialRMSE: %.5f",
+                            g_normRefineLastIter, g_normRefineMaxIter,
+                            g_normRefineLastInitialRMSE);
+                ImGui::Text("  bestRMSE: %.5f   %s   %s",
+                            g_normRefineLastBestRMSE,
+                            g_normRefineLastConverged ? "converged" : "max-iter",
+                            g_normRefineLastAccepted  ? "ACCEPTED"  : "REJECTED");
+            } else {
+                ImGui::TextDisabled("  (no session yet — press Shift+N)");
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Shift+N: Normal-Compat   |   "
+                                "Ctrl+Shift+N: SRT-Variance");
+
+            ImGui::End();
+        }
+
+        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
             ImGui::SetNextWindowBgAlpha(0.7f);
             ImGui::Begin("ScreenMesh Display",
                          nullptr,
@@ -4381,19 +5422,26 @@ int main() {
             ImGui::End();
         }
 
-        // Pose Library ウィンドウ (元コード line 4699 通り、mode guard 無しで毎フレーム呼ぶ。
-        // showWindow == false なら drawPoseLibraryWindow 側で early-return)
-        drawPoseLibraryWindow();
+        // Pose Library / AR preview / SilOverlay preview
+        //   Umeyama 2画面モード中は全部スキップ。drawUmeyamaOverlay が画面中央に
+        //   ステータス + 大きなボタン群 (Undo/Execute/Cancel) を出し、サイドバーも
+        //   消えるので、その上にこれらのフローティングウィンドウが被ると
+        //   クリック取りこぼし・視認性低下・体感カクつきの原因になる。
+        if (!gUmeyama.active) {
+            // Pose Library ウィンドウ (元コード line 4699 通り、mode guard 無しで毎フレーム呼ぶ。
+            // showWindow == false なら drawPoseLibraryWindow 側で early-return)
+            drawPoseLibraryWindow();
 
-        // ARスクリーンショットのプレビューウィンドウ
-        float vpW = gUI.getViewportWidth(gWindowWidth);
-        ARSave::drawPreviewWindow(g_arSave, vpW, (float)gWindowHeight);
+            // ARスクリーンショットのプレビューウィンドウ
+            float vpW = gUI.getViewportWidth(gWindowWidth);
+            ARSave::drawPreviewWindow(g_arSave, vpW, (float)gWindowHeight);
 
-        // V3RS Phase 2 diagnostic: silhouette IoU overlay window.
-        // Toggled via F9. Reuses the same viewport width / window
-        // height computed for ARSave above.
-        SilOverlay::drawPreviewWindow(
-            SilOverlay::g_silOverlay, vpW, (float)gWindowHeight);
+            // V3RS Phase 2 diagnostic: silhouette IoU overlay window.
+            // Toggled via F9. Reuses the same viewport width / window
+            // height computed for ARSave above.
+            SilOverlay::drawPreviewWindow(
+                SilOverlay::g_silOverlay, vpW, (float)gWindowHeight);
+        }
 
         OrbitCam.UpdateCamera(dt);
 
@@ -4588,6 +5636,58 @@ int main() {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(1.0f, 0.2f, 0.9f),  // magenta
                                             rSil, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // Phase 7b Step 1 (Plain W): source RIM chain debug overlay.
+                //   `g_debugSourceRimChain` は頂点 index の chain。毎フレーム
+                //   liverMesh3D->mVertices から現在位置を fetch するので、
+                //   ICP / Live tracking で organ が動いてもマーカーが追従する
+                //   (Cyclic correspondence と同じパターン)。
+                if (g_showDebugSourceRimChain && liverMesh3D &&
+                    !g_debugSourceRimChain.empty())
+                {
+                    const float rRim = RegRatios::markerCluster() * 1.0f;
+                    const auto& V = liverMesh3D->mVertices;
+                    const int nV3 = (int)V.size();
+                    for (int idx : g_debugSourceRimChain) {
+                        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+                        glm::vec3 p(V[idx*3], V[idx*3+1], V[idx*3+2]);
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(0.2f, 1.0f, 0.2f),  // green
+                                            rRim, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // Phase 7b Step 2 (Shift+W): target boundary debug overlay.
+                //   `g_debugTargetBoundaryPoints` は 3D 座標を直接保持。
+                //   target は ICP で動かないので index lookup 不要 (source
+                //   側との非対称はそのため)。
+                if (g_showDebugTargetBoundary &&
+                    !g_debugTargetBoundaryPoints.empty())
+                {
+                    const float rTgt = RegRatios::markerCluster() * 0.9f;
+                    for (const auto& p : g_debugTargetBoundaryPoints) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(0.7f, 0.2f, 1.0f),  // purple
+                                            rTgt, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // Phase 7b Step 3 (Ctrl+W): Shape Match best candidate
+                //   predicted source position (赤点).
+                //   `g_debugShapeMatchBestSrc` は best T を source 現在
+                //   位置に適用して得た 3D 点群。mesh は動かないので、
+                //   緑 (source 現在) vs 赤 (best 予測) を視覚比較すれば
+                //   「Shape Match で source がどこに行くか」が一目で分
+                //   かる。
+                if (g_showDebugShapeMatch && !g_debugShapeMatchBestSrc.empty())
+                {
+                    const float rRed = RegRatios::markerCluster() * 1.1f;
+                    for (const auto& p : g_debugShapeMatchBestSrc) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(1.0f, 0.15f, 0.15f),  // red
+                                            rRed, view, projection, OrbitCam.cameraPos);
                     }
                 }
 
@@ -5174,6 +6274,12 @@ static void syncUIState() {
     s.activeQuadrantMask = g_activeQuadrantMask;
     const bool quadReady = g_liverRegion.valid() && g_liverLR.valid();
     s.quadLabelsReady = quadReady;
+
+    // Ctrl+G の 6-DoF/7-DoF checkbox 用同期: g_ctrlgSearchMode (enum) を
+    // bool に折りたたむ。SIX_DOF_RIGID → true、SEVEN_DOF/FOUR_DOF → false。
+    // 左 floating パネルで radio button を操作した場合もこの経路で反映される。
+    s.ctrlgLockScale =
+        (g_ctrlgSearchMode == CmaesRefineV3R::SearchMode::SIX_DOF_RIGID);
     if (quadReady) {
         LiverLeftRightLabel::countByQuadrant(
             g_liverRegion.labels, g_liverLR.labels,
@@ -5801,9 +6907,15 @@ static void setupUICallbacks() {
         g_rejectedBoundaryPoints.clear();
         g_visibleSourcePoints.clear();
         g_silhouetteSourcePoints.clear();
+        g_debugSourceRimChain.clear();           // Phase 7b Step 1 (Plain W)
+        g_debugTargetBoundaryPoints.clear();     // Phase 7b Step 2 (Shift+W)
+        g_debugShapeMatchBestSrc.clear();        // Phase 7b Step 3 (Ctrl+W)
         g_showClusterVisualization = false;
         g_showBoundaryCandidates   = false;
         g_showSourceVisualization  = false;
+        g_showDebugSourceRimChain  = false;      // Phase 7b Step 1 (Plain W)
+        g_showDebugTargetBoundary  = false;      // Phase 7b Step 2 (Shift+W)
+        g_showDebugShapeMatch      = false;      // Phase 7b Step 3 (Ctrl+W)
         g_showCorrespondencePoints = false;
         g_showCyclicCorrespondence = false;
         g_cyclicAvailable          = false;
@@ -5910,6 +7022,109 @@ static void setupUICallbacks() {
     //   - lock_scale=false : 7-DoF (scale 推定 ON、現状互換)
     a.onAutoQCR = [](bool lockScale) {
         runAutoQuadCyclicRansac(lockScale);
+    };
+
+    // --------------------------------------------------------------------
+    //  onInitRotPresetSilent : POSITION 変更時の自動 Orient 同期
+    // --------------------------------------------------------------------
+    //  ユーザが POSITION の 2x2 grid checkbox / Quick Presets を操作したとき、
+    //  RegistrationImGuiManager 側で mapQuadrantToOrientPreset によって
+    //  対応する Orient (Right/Base/Left) が算出され、その値が ここに渡ってくる。
+    //  registrationHandle.initRotPreset を更新するだけで、applyInitRotation
+    //  は呼ばない (Apply Init Pose ボタン押下時にまとめて適用される)。
+    a.onInitRotPresetSilent = [](int preset) {
+        registrationHandle.initRotPreset =
+            (RegistrationData::InitRotPreset)preset;
+        std::cout << "[InitRot] Auto-set by quadrant: "
+                  << RegistrationData::presetName(registrationHandle.initRotPreset)
+                  << "  (silent; applyInitRotation not called -- press Apply Init Pose)"
+                  << std::endl;
+    };
+
+    // --------------------------------------------------------------------
+    //  onDrawAdvancedCtrlG : Advanced セクションへ RIM/Raycast パネル統合
+    // --------------------------------------------------------------------
+    //  REGISTRATION → Advanced CollapsingHeader を開いたとき、
+    //  drawCtrlGRimRaycastControls がインラインで描画される。Floating
+    //  "Ctrl+G Quadrant Selector" 窓と同じ g_ctrlg* globals を操作するので、
+    //  両方の表示は自動的に同期する (ImGui ID stack は window 単位で独立)。
+    a.onDrawAdvancedCtrlG = []() {
+        drawCtrlGRimRaycastControls();
+    };
+
+    // ----------------------------------------------------------------
+    //  onCtrlG : V3-R BIPOP-CMA-ES (Region-aware refinement)
+    // ----------------------------------------------------------------
+    //  REGISTRATION セクション内 "Ctrl+G  V3-R  [Refine]" ボタンの
+    //  押下時に呼ばれる。キーボードの Ctrl+G dispatch
+    //  (GLFW_KEY_G case, "isCtrlG" 分岐) と等価のシーケンスを実行する。
+    //  両経路で同じ (trial_seed, callIdx) 状態から開始すれば結果は
+    //  byte-identical になる。
+    //
+    //  失敗時 (ラベル未計算 / subset 空) は本体に到達せず early-return。
+    //  UI ボタン側でも quadLabelsReady と activeQuadrantMask!=0 を
+    //  チェックして disabled 化するが、二重ガードしておく。
+    a.onCtrlG = []() {
+        std::cout << "[Ctrl+G/UI] V3-R (region-aware) session start" << std::endl;
+        const auto maskStr = LiverLeftRightLabel::quadrantMaskString(
+            g_activeQuadrantMask);
+        std::cout << "[Ctrl+G/UI] quadrant_mask = " << maskStr
+                  << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
+                  << std::dec << ")" << std::endl;
+
+        if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+            std::cerr << "[Ctrl+G/UI] ERROR: labels not computed"
+                      << " (Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
+                      << ", LR.valid="    << (g_liverLR.valid() ? "Y" : "N")
+                      << "). Press Apply Init Pose first to populate labels."
+                      << std::endl;
+            return;
+        }
+        auto subset = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+            g_liverRegion.labels, g_liverLR.labels,
+            g_activeQuadrantMask);
+        std::cout << "[Ctrl+G/UI] subset_size = " << subset.size()
+                  << " / " << g_liverRegion.labels.size()
+                  << " vertices (original-index space)";
+        if (g_activeQuadrantMask == LiverLeftRightLabel::QUAD_ALL) {
+            std::cout << "  (QUAD_ALL: byte-identical to V3 expected)";
+        }
+        std::cout << std::endl;
+
+        if (subset.empty()) {
+            std::cerr << "[Ctrl+G/UI] ERROR: subset is empty for mask=0x"
+                      << std::hex << (unsigned)g_activeQuadrantMask
+                      << std::dec
+                      << ". Select at least one quadrant in the POSITION panel."
+                      << std::endl;
+            return;
+        }
+
+        g_stepStartTime = std::chrono::steady_clock::now();
+        g_sessionBipopN++;
+        gUI.state.regMethod = 3;   // BIPOP method (same slot as Shift+V/F/G)
+        poseAutoSaveBeforeRegistration();
+        runBipopCmaesV3R(g_activeQuadrantMask);
+        poseSaveToLibrary(SaveCriterion::RMSE, g_activeQuadrantMask);
+    };
+
+    // ----------------------------------------------------------------
+    //  onCtrlgLockScaleChanged : サイドバー Ctrl+G 横の 6-DoF checkbox
+    // ----------------------------------------------------------------
+    //  チェック ON  → g_ctrlgSearchMode = SIX_DOF_RIGID
+    //  チェック OFF → g_ctrlgSearchMode = SEVEN_DOF
+    //  4-DoF (FOUR_DOF_XYRXRY) への切替は左 floating "Ctrl+G Quadrant
+    //  Selector" パネルの radio button 経由でのみ可能 (3 択 → 2 択に潰す
+    //  ことで主動線をシンプルに保つ)。floating パネル側で 4-DoF を選んで
+    //  いる状態でこの checkbox を触ると、6-DoF または 7-DoF に上書きされる。
+    a.onCtrlgLockScaleChanged = [](bool lock) {
+        g_ctrlgSearchMode = lock
+            ? CmaesRefineV3R::SearchMode::SIX_DOF_RIGID
+            : CmaesRefineV3R::SearchMode::SEVEN_DOF;
+        std::cout << "[Ctrl+G/UI] SearchMode → "
+                  << (lock ? "SIX_DOF_RIGID (scale=1)"
+                           : "SEVEN_DOF (T+R+Scale)")
+                  << std::endl;
     };
 
     a.onInitRotPresetChanged = [](int preset) {
@@ -6083,7 +7298,7 @@ static void setupUICallbacks() {
 //    依存ラベル (LiverRegion / LiverLR / LiverCC) が未計算なら auto-trigger
 //    する (Quad と同じ流儀)。失敗時は identity (回転スキップ) で安全側。
 // =========================================================
-static void applyInitRotation(bool startNewSession) {
+static void applyInitRotation(bool startNewSession, bool liver_only) {
     if (startNewSession) {
         poseStartNewSession();
     }
@@ -6117,6 +7332,10 @@ static void applyInitRotation(bool startNewSession) {
         return;
     }
     for (size_t i = 0; i < organs.size(); i++) {
+        // AutoQCR loop からの呼び出し (liver_only=true) では non-liver organ を
+        // 一切触らない。loop 中 non-liver は g_initOrganVertices の状態のまま
+        // 据え置かれ、winner 確定後の full-organ replay で 1 回だけ復元 + 変換される。
+        if (liver_only && organs[i] != liverMesh3D) continue;
         organs[i]->mVertices = g_initOrganVertices[i];
         organs[i]->mNormals  = g_initOrganNormals[i];
         setUp(*organs[i]);
@@ -6358,6 +7577,7 @@ static void applyInitRotation(bool startNewSession) {
         scale_factor, t_pos);
 
     for (auto* m : organs) {
+        if (liver_only && m != liverMesh3D) continue;
         applyMatrixToMeshVerticesAndNormals(m, R);
         setUp(*m);
     }
@@ -6618,23 +7838,57 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
     g_currentOrientLabel = lock_scale ? "AutoQCR6" : "AutoQCR7";
     g_currentOrientRunCount = 0;
 
+    // ---- 2.5. [Opt C] Liver normals を 1 回だけ pre-compute -------------
+    //   現状、各 trial の extractQuadCyclicMedoids が liverMesh3D->mNormals
+    //   が空 (or サイズ不一致) を検出して computeVertexNormalsFromFaces を
+    //   毎回実行している (~30ms × 9 = ~270ms 無駄)。
+    //
+    //   原因: g_initOrganNormals[0] が空のため、applyInitRotation の復元で
+    //   liverMesh3D->mNormals も空のままになる。applyMatrixToMeshVerticesAndNormals
+    //   は normals が空のときは何もしないので、結果として extractQuadCyclicMedoids
+    //   で初めて normals が computed される。
+    //
+    //   修正: snapshot 状態の liver geometry で 1 回だけ normals を計算し、
+    //   g_initOrganNormals[0] に焼き込む。以降の applyInitRotation 復元 +
+    //   applyMatrixToMeshVerticesAndNormals は正しい normals を保持する。
+    //
+    //   注: liverMesh3D の現在 state (Apply Init Pose 直後) を一時的に
+    //   clobber するが、すぐ下の loop の applyInitRotation で完全に上書き
+    //   されるので安全。
+    if (!g_initOrganNormals.empty() &&
+        g_initOrganNormals[0].size() != g_initOrganVertices[0].size()) {
+        std::cout << "[AutoQCR/OptC] Pre-computing liver normals once "
+                  << "(was missing in g_initOrganNormals[0])..." << std::endl;
+        liverMesh3D->mVertices = g_initOrganVertices[0];
+        liverMesh3D->mNormals.clear();
+        Reg3DCustom::computeVertexNormalsFromFaces(*liverMesh3D);
+        g_initOrganNormals[0] = liverMesh3D->mNormals;
+        std::cout << "[AutoQCR/OptC] cached "
+                  << (g_initOrganNormals[0].size() / 3)
+                  << " vertex normals into snapshot "
+                  << "(saves ~30ms × " << kNumPresets << " trials)" << std::endl;
+    }
+
     // ---- 3. Best 候補保持用バッファ -------------------------------------
     struct TrialResult {
         int             preset_idx     = -1;
         const char*     preset_name    = "";
         RegistrationData::InitRotPreset preset = RegistrationData::PRESET_BASE;
         bool            valid          = false;  // REGISTERED reached?
-        float           compRmse       = FLT_MAX;
-        float           compIoU2D      = 0.0f;
+        float           compRmse       = FLT_MAX;  // [Opt A] fast mode では chamfer proxy
+        float           compIoU2D      = 0.0f;     // [Opt A] fast mode では 0
+        // [Opt A] Determinism check 用の best chamfer (Stage 2 score)。
+        // g_lastQcrChamfer から consume。fast/full 両 path で同じ値が出るはず。
+        float           bestChamfer    = FLT_MAX;
         // Phase 1 観察用: runQuadCyclicRansac が publish した RANSAC prealign の
         // estScale。1.0 から離れているほど scale bias がかかっている疑いが強い。
         // 論文的合理範囲は [0.85, 1.10]、CMA-ES 救済特性を加味すると下方向は
         // 寛容、上方向は厳しめ。
         float           prealignScale  = -1.0f;
-        // best 再現用に organs の vertices/normals を保存
-        std::vector<std::vector<GLfloat>> verts;
-        std::vector<std::vector<GLfloat>> norms;
-        // registrationHandle を best に書き戻すための値
+        // (verts/norms の保存はやめた: loop 中 liver-only モードで動かし、
+        //  winner 確定後に full-organ replay で再現する方式に変更したため。)
+        // registrationHandle を best に書き戻すための値 (replay 失敗時の
+        // フォールバック用に保持)。
         float baseFitness = 0.0f, baseIcpRmse = 0.0f;
         float baseAvgError = 0.0f, baseRmse = 0.0f;
         float baseMaxError = 0.0f, baseScale = 1.0f;
@@ -6664,15 +7918,19 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
         registrationHandle.initRotPreset = preset;
         g_activeQuadrantMask             = saved_mask;
 
-        // (b) g_initOrganVertices から復元 + 姿勢適用
+        // (b) g_initOrganVertices から liver のみ復元 + 姿勢適用
         //     startNewSession=false  (loop 全体で 1 セッション)
-        applyInitRotation(/*startNewSession=*/false);
+        //     liver_only=true        (non-liver organ は触らない、winner replay で適用)
+        applyInitRotation(/*startNewSession=*/false, /*liver_only=*/true);
 
         // (c) Shift+Ctrl+P と同じ流儀で stepStartTime をリセット
         g_stepStartTime  = std::chrono::steady_clock::now();
         g_sessionBipopN  = 0;
 
         // (d) registration 実行 (PoseLibrary には一切触らない)
+        //     single_mesh_only=true で QCR を liver-only モードで実行。
+        //     ICP の per-iter vertex 変換が 6 organ → 1 organ に縮小される。
+        //     最重量の segment (~132K vert × ~15 iter) が消えるのが効く。
         //     Phase 1 観察用: runQuadCyclicRansac が末尾で publish する
         //     g_lastQcrPrealignScale を新規 trial 前に sentinel (-1) にクリア。
         //     trial 内で値が書き換わらなかった場合は -1 のまま読まれる (anomaly
@@ -6680,7 +7938,7 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
         //     lock_scale=true のときは内部で scale=1 固定 (rigid 6-DoF)。
         g_lastQcrPrealignScale = -1.0f;
         try {
-            runQuadCyclicRansac(lock_scale);
+            runQuadCyclicRansac(lock_scale, /*single_mesh_only=*/true);
         } catch (const std::exception& e) {
             std::cerr << "[AutoQCR " << trial_idx << "/" << kNumPresets
                       << "] runQuadCyclicRansac threw: " << e.what()
@@ -6698,18 +7956,24 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
         reg_count++;
 
         // (f) 結果を取り出して bestTrial と比較
-        //     consume-and-clear: scale を取得後、global を即クリアして次 trial
-        //     に持ち越さない (PoseLibrary の g_lastRimRmse パターンと同じ)。
-        const float trialScale = g_lastQcrPrealignScale;
-        g_lastQcrPrealignScale = -1.0f;
+        //     consume-and-clear: scale + chamfer を取得後、global を即クリアして
+        //     次 trial に持ち越さない (PoseLibrary の g_lastRimRmse パターンと同じ)。
+        //     [Opt A] fast mode では registrationHandle.compRmse 自体が chamfer
+        //     proxy になっているが、Determinism check 用に bestChamfer も
+        //     別途明示的に記録する (winner replay 後の比較に使う)。
+        const float trialScale   = g_lastQcrPrealignScale;
+        const float trialChamfer = g_lastQcrChamfer;
+        g_lastQcrPrealignScale   = -1.0f;
+        g_lastQcrChamfer         = -1.0f;
 
         TrialResult tr;
         tr.preset_idx    = pi;
         tr.preset_name   = presetName;
         tr.preset        = preset;
         tr.valid         = true;
-        tr.compRmse      = registrationHandle.compRmse;
-        tr.compIoU2D     = registrationHandle.compIoU2D;
+        tr.compRmse      = registrationHandle.compRmse;   // [Opt A] fast mode では chamfer
+        tr.compIoU2D     = registrationHandle.compIoU2D;  // [Opt A] fast mode では 0
+        tr.bestChamfer   = trialChamfer;                  // [Opt A] Determinism check 用
         tr.prealignScale = trialScale;
         tr.baseFitness   = registrationHandle.fitness;
         tr.baseIcpRmse   = registrationHandle.icpRmse;
@@ -6722,21 +7986,19 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
         tr.compCount     = registrationHandle.compCount;
 
         std::cout << "[AutoQCR " << trial_idx << "/" << kNumPresets
-                  << "] RMSE=" << tr.compRmse
-                  << "  IoU2D=" << tr.compIoU2D
+                  << "] chamfer=" << tr.compRmse   // [Opt A] fast mode で chamfer proxy
                   << "  scale=" << tr.prealignScale
+                  << "  (IoU2D=" << tr.compIoU2D << " — fast mode では 0)"
                   << std::endl;
 
         const bool isBest = (tr.compRmse < bestTrial.compRmse);
 
         // top-N サマリ更新 (compRmse 昇順、最大 5 件)
         {
-            // 軽量: O(N) 挿入。verts/norms は best 候補にだけ載せて
-            //       メモリを節約する。
-            TrialResult slim = tr;
-            slim.verts.clear();
-            slim.norms.clear();
-            topNSummary.push_back(slim);
+            // TrialResult から verts/norms メンバは削除済 (liver-only loop +
+            // winner replay 方式に変更したため、メッシュ snapshot は不要)。
+            // tr をそのまま push してよい (メタデータのみで軽量)。
+            topNSummary.push_back(tr);
             std::sort(topNSummary.begin(), topNSummary.end(),
                       [](const TrialResult& a, const TrialResult& b) {
                           return a.compRmse < b.compRmse;
@@ -6745,18 +8007,11 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
         }
 
         if (isBest) {
-            // best 候補: verts/norms をスナップ
-            tr.verts.resize(organs.size());
-            tr.norms.resize(organs.size());
-            for (size_t i = 0; i < organs.size(); i++) {
-                if (organs[i]) {
-                    tr.verts[i] = organs[i]->mVertices;
-                    tr.norms[i] = organs[i]->mNormals;
-                }
-            }
+            // verts/norms の保存はやめた: loop 後に winner trial を full-organ で
+            // 再実行する方式に変更したため、ここではメタデータだけ保存する。
             bestTrial = std::move(tr);
             std::cout << "[AutoQCR " << trial_idx << "/" << kNumPresets
-                      << "] *** NEW BEST *** RMSE=" << bestTrial.compRmse
+                      << "] *** NEW BEST *** chamfer=" << bestTrial.compRmse
                       << "  scale=" << bestTrial.prealignScale
                       << "  (ORIENT=" << bestTrial.preset_name << ")"
                       << std::endl;
@@ -6786,50 +8041,119 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
     //   scale > 1.0 寄りの解は後段の CMA-ES で救えない傾向がある。
     //   "[scale-bias?]" 注記は scale が論文的合理範囲 [0.85, 1.10] 外の
     //   trial に付ける (まだ採択判定には使わない — 観察のみ)。
+    //   [Opt A] fast mode では "compRmse" 列は chamfer proxy。winner 確定後の
+    //   replay で real RMSE が registrationHandle に書き込まれる。
     std::cout << "[AutoQCR] top-" << topNSummary.size()
-              << " (rank by compRMSE, scale observation):" << std::endl;
+              << " (rank by chamfer proxy [Opt A fast mode]):" << std::endl;
     for (size_t r = 0; r < topNSummary.size(); r++) {
         const auto& t = topNSummary[r];
         const bool scaleOutOfRange = (t.prealignScale > 0.0f) &&
                                      (t.prealignScale < 0.85f || t.prealignScale > 1.10f);
         std::cout << "    #" << (r + 1) << "  ORIENT=" << t.preset_name
-                  << "  RMSE=" << t.compRmse
-                  << "  IoU2D=" << t.compIoU2D
+                  << "  chamfer=" << t.compRmse
                   << "  scale=" << t.prealignScale
                   << (scaleOutOfRange ? "  [scale-bias?]" : "")
                   << std::endl;
     }
     std::cout << "[AutoQCR] *** WINNER *** ORIENT=" << bestTrial.preset_name
               << "  QUAD=" << LiverLeftRightLabel::quadrantMaskString(saved_mask)
-              << "  RMSE=" << bestTrial.compRmse
-              << "  IoU2D=" << bestTrial.compIoU2D
+              << "  chamfer=" << bestTrial.compRmse
               << "  scale=" << bestTrial.prealignScale
+              << "  (real RMSE computed in upcoming winner replay)"
               << std::endl;
 
-    // ---- 6. best 結果を organs に書き戻す --------------------------------
-    for (size_t i = 0; i < organs.size(); i++) {
-        if (!organs[i]) continue;
-        organs[i]->mVertices = bestTrial.verts[i];
-        organs[i]->mNormals  = bestTrial.norms[i];
-        setUp(*organs[i]);
-    }
-    registrationHandle.state           = RegistrationData::REGISTERED;
-    registrationHandle.useRegistration = true;
-    registrationHandle.fitness         = bestTrial.baseFitness;
-    registrationHandle.icpRmse         = bestTrial.baseIcpRmse;
-    registrationHandle.averageError    = bestTrial.baseAvgError;
-    registrationHandle.rmse            = bestTrial.baseRmse;
-    registrationHandle.maxError        = bestTrial.baseMaxError;
-    registrationHandle.scaleFactor     = bestTrial.baseScale;
-    registrationHandle.compRmse        = bestTrial.compRmse;
-    registrationHandle.compAvgError    = bestTrial.compAvgError;
-    registrationHandle.compMaxError    = bestTrial.compMaxError;
-    registrationHandle.compIoU2D       = bestTrial.compIoU2D;
-    registrationHandle.compCount       = bestTrial.compCount;
+    // ---- 6. Winner trial を full-organ モードで再実行 --------------------
+    //   loop 中は liver-only で走らせていたので、non-liver organ
+    //   (tumor/portal/vein/segment/gb) はまだ g_initOrganVertices 状態のまま。
+    //   winner の preset で applyInitRotation + runQuadCyclicRansac を
+    //   full-organ モードで再実行し、全 6 organ を winner pose に持っていく。
+    //
+    //   決定性: FGR seed は g_trialSeed + g_callIdx 依存。winner trial の
+    //   開始時 callIdx (= saved_callIdx_start + bestTrial.preset_idx) に
+    //   巻き戻してから呼ぶことで、Stage 1/Stage 2 enumeration と ICP は
+    //   loop 内で観測した winner と byte-identical な結果を再現する。
+    //   差異があれば WARN ログ (Stage 1/2 は決定的、ICP も入力同じなら同じ)。
+    //
+    //   コスト: ~1 full trial (~350-500ms)。loop 8 trial 分の full-organ
+    //   負荷 (~2-3s) と相殺して大幅な短縮になる。
+    std::cout << "\n[AutoQCR] Replaying winner trial (preset_idx="
+              << bestTrial.preset_idx << ", ORIENT=" << bestTrial.preset_name
+              << ") with full-organ propagation..." << std::endl;
 
-    // best trial 時の preset を「現在の選択」として残す。
-    //   QUADRANT は loop 中固定なので saved_mask のまま。
-    //   PoseLibrary entry の orient 表示と一致させるため。
+    const uint32_t saved_callIdx_after_loop = g_callIdx;
+    // [Opt A] loop の compRmse は fast mode で chamfer proxy になっているので、
+    // replay の real RMSE とは直接比較できない。代わりに「loop と replay の
+    // best chamfer (g_lastQcrChamfer publish 値)」が一致するかで決定性を検証する。
+    // chamfer は QCR Stage 1/Stage 2 enumeration の出力で、両 path で同じ
+    // pipeline で計算されるので、これが一致すれば pipeline 決定性 OK。
+    const float loop_recorded_chamfer = bestTrial.bestChamfer;
+
+    // Winner trial の callIdx に巻き戻す (FGR seed 再現のため)。
+    g_callIdx = saved_callIdx_start + (uint32_t)bestTrial.preset_idx;
+    registrationHandle.initRotPreset = bestTrial.preset;
+    g_activeQuadrantMask             = saved_mask;
+    g_stepStartTime                  = std::chrono::steady_clock::now();
+    g_lastQcrPrealignScale           = -1.0f;
+    g_lastQcrChamfer                 = -1.0f;
+
+    applyInitRotation(/*startNewSession=*/false, /*liver_only=*/false);
+    bool replayOk = true;
+    try {
+        runQuadCyclicRansac(lock_scale, /*single_mesh_only=*/false);
+    } catch (const std::exception& e) {
+        std::cerr << "[AutoQCR] winner replay threw: " << e.what() << std::endl;
+        replayOk = false;
+    }
+
+    // callIdx を loop 終了直後の値に戻す (downstream の seed 連続性を保つ)。
+    g_callIdx = saved_callIdx_after_loop;
+    // replay 後の g_lastQcrChamfer を consume (Determinism check 後に必要)。
+    const float replay_published_chamfer = g_lastQcrChamfer;
+    g_lastQcrChamfer = -1.0f;
+
+    if (!replayOk || registrationHandle.state != RegistrationData::REGISTERED) {
+        std::cerr << "[AutoQCR] WARN: winner replay did not reach REGISTERED. "
+                  << "Falling back to loop-recorded metrics; non-liver organs "
+                  << "may be stuck at init pose. compRmse will hold chamfer "
+                  << "proxy (not real RMSE)." << std::endl;
+        // bestTrial のメタデータで registrationHandle を上書き (旧 writeback 流儀)
+        // 注: [Opt A] により bestTrial.compRmse 等は chamfer proxy。real RMSE
+        // はこの fallback path では取得できない (winner replay 失敗のため)。
+        registrationHandle.state           = RegistrationData::REGISTERED;
+        registrationHandle.useRegistration = true;
+        registrationHandle.fitness         = bestTrial.baseFitness;
+        registrationHandle.icpRmse         = bestTrial.baseIcpRmse;
+        registrationHandle.averageError    = bestTrial.baseAvgError;
+        registrationHandle.rmse            = bestTrial.baseRmse;
+        registrationHandle.maxError        = bestTrial.baseMaxError;
+        registrationHandle.scaleFactor     = bestTrial.baseScale;
+        registrationHandle.compRmse        = bestTrial.compRmse;
+        registrationHandle.compAvgError    = bestTrial.compAvgError;
+        registrationHandle.compMaxError    = bestTrial.compMaxError;
+        registrationHandle.compIoU2D       = bestTrial.compIoU2D;
+        registrationHandle.compCount       = bestTrial.compCount;
+    } else {
+        // Replay 成功: 決定性チェック (loop と replay の best chamfer 一致確認)。
+        // chamfer は QCR Stage 1/Stage 2 の出力で、pipeline が決定的なら一致。
+        // 一致すれば computeUnifiedMetrics (KD tree KNN + boundary 分類) も
+        // 決定的に走ったはず → 全体の決定性 OK。
+        const float chamferDelta = std::abs(replay_published_chamfer - loop_recorded_chamfer);
+        if (chamferDelta > 1e-4f) {
+            std::cerr << "[AutoQCR] WARN: replay chamfer drift from loop record. "
+                      << "loop chamfer=" << loop_recorded_chamfer
+                      << " replay chamfer=" << replay_published_chamfer
+                      << "  (Δ=" << chamferDelta << "). "
+                      << "Determinism assumption may be broken." << std::endl;
+        } else {
+            std::cout << "[AutoQCR] Replay chamfer matches loop record "
+                      << "(chamfer=" << replay_published_chamfer
+                      << ", real RMSE from full metrics=" << registrationHandle.compRmse
+                      << ", real IoU2D=" << registrationHandle.compIoU2D
+                      << "). Determinism OK." << std::endl;
+        }
+    }
+
+    // preset / mask / orient label は winner で確定。
     registrationHandle.initRotPreset = bestTrial.preset;
     g_activeQuadrantMask             = saved_mask;
     g_currentOrientLabel = std::string(lock_scale ? "AutoQCR6/" : "AutoQCR7/")
@@ -6840,16 +8164,29 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
             LiverLeftRightLabel::quadrantMaskString(saved_mask);
     }
 
-    // metrics は best 候補と一致するはずだが、念のため再計算で同期。
-    // (compRmse/IoU が drift していたら以後の比較が壊れる)
-    computeUnifiedMetrics();
+    // runQuadCyclicRansac 内部で computeUnifiedMetrics 済みなので再計算不要だが、
+    // replay 失敗時の fallback パスを通った場合に備えて mark only。
     g_metricsValid = true;
+
+    // ---- 6.5. Ctrl+G スタイル診断 metrics を publish ----------------------
+    //   Ctrl+G の Phase F.5 が publish する診断指標 (RIM rmse / IoU_occluded /
+    //   Containment precision/recall) を AutoQCR の winner pose で計算し、
+    //   g_lastRim* / g_lastSilOccludedIoU2D / g_lastIoUOcc* globals に書き込む。
+    //   直後の poseSaveToLibrary がこれらを consume-and-clear で吸い上げ、
+    //   PoseLibrary entry に Ctrl+G 同等の metric 列を残す。
+    //   コスト: ~20-30ms。Determinism には影響しない (publish のみ)。
+    publishCtrlGStyleDiagnostics();
 
     // ---- 7. PoseLibrary に 1 件だけ追加 ---------------------------------
     //   - poseSaveToLibrary は session-best と比較するが、session を loop
     //     開始時に reset しているので必ず accept される。
     //   - mask 引数で entry のラベルが "AutoQCR/<orient>" 形式になる。
+    //   - elapsedSec は g_stepStartTime から計算される。winner replay 内で
+    //     g_stepStartTime が上書きされているので、ここで wall_t0 (AutoQCR
+    //     開始時刻) に巻き戻す。これで PoseLibrary entry の elapsed が
+    //     「ユーザが Alt+Ctrl+P を押してから完了するまでの実時間」になる。
     gUI.state.regMethod = 1;  // HemiAuto と同じ表示扱い
+    g_stepStartTime = wall_t0;
     poseSaveToLibrary(SaveCriterion::RMSE, saved_mask);
 
     std::cout << "[AutoQCR] PoseLibrary entry added "
@@ -6857,6 +8194,383 @@ static void runAutoQuadCyclicRansac(bool lock_scale) {
               << ", QUAD=" << LiverLeftRightLabel::quadrantMaskString(saved_mask)
               << ", callIdx range=" << saved_callIdx_start
               << ".." << (g_callIdx - 1) << ")" << std::endl;
+}
+
+// ==========================================================
+//  drawCtrlGRimRaycastControls (Advanced セクション用 helper)
+// ----------------------------------------------------------
+//  REGISTRATION → Advanced CollapsingHeader (sidebar) から
+//  onDrawAdvancedCtrlG callback 経由で呼ばれる。
+//  Ctrl+G の Rim-weighted (opt-in) + Ctrl+Shift+G の RIM
+//  silhouette penalty 2 セクションを同じ globals 越しに表示。
+//
+//  既存の floating 'Ctrl+G Quadrant Selector' 窓と SAME globals
+//  を操作するので、片方を変えればもう片方の表示も同期する
+//  (ImGui ID stack は window ごとに独立なので collision なし)。
+// ==========================================================
+static void drawCtrlGRimRaycastControls() {
+    //  Rim-weighted V3R extension (opt-in)
+    //  --------------------------------------------------------
+    //  Three controls stacked on top of the 4-quadrant selector.
+    //  When all three are at their defaults
+    //    (AR-vis = OFF, β = 0.0, Show RIM pairs = OFF)
+    //  Ctrl+G behaves identically to the original V3R (and at
+    //  QUAD_ALL, byte-identical to Shift+G). Ticking any of
+    //  them activates the corresponding extension.
+    // -----------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Rim-weighted (opt-in)");
+
+    ImGui::Checkbox("AR-visible only (filter source subset)",
+                    &g_ctrlgUseArVisFilter);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Restrict source vertices to those "
+                          "visible from the fixed AR camera "
+                          "(cam_pos=(0,0,0), look-at=+Z).\n"
+                          "Removes back-side mesh vertices that have no "
+                          "counterpart in the single-sided depth target.\n"
+                          "OFF = byte-identical to Shift+G at QUAD_ALL.");
+    }
+
+    // -----------------------------------------------------------
+    //  Only-Caudal (R-feat-2): anatomical CC-axis filter.
+    //  Independent of AR-vis. Uses g_liverCC labels (Shift+H).
+    //  Weak/uncomputed states only show a warning here -- the
+    //  CC sign Flip toggle lives in the Initial Orientation
+    //  panel (drawAnatomicalAxesStatus) to keep one source of
+    //  truth; avoid duplicating it on Ctrl+G.
+    // -----------------------------------------------------------
+    ImGui::Checkbox("Only Caudal rim (mesh-intrinsic)",
+                    &g_ctrlgUseCaudalOnly);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Restrict source vertices to the caudal "
+                          "(foot-side) half of the mesh, classified by "
+                          "LiverCranioCaudalLabel (Shift+H).\n"
+                          "Anatomical axis; transform-invariant (no "
+                          "camera tuning).\n"
+                          "Orthogonal to AR-visible: ticking both "
+                          "applies the Combine mode below.\n"
+                          "OFF = no caudal filter applied.");
+    }
+    // CC state notice (no Flip button here -- handled in
+    // Initial Orientation panel).
+    if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
+        ImGui::TextColored(
+            ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+            "  CC labels not yet computed - press Shift+H "
+            "or Apply Init Pose.");
+    } else if (g_ctrlgUseCaudalOnly && g_liverCC.valid() &&
+               g_liverCC.cc.weak) {
+        ImGui::TextColored(
+            ImVec4(0.96f, 0.32f, 0.32f, 1.0f),
+            "  [WEAK %.1f%%] verify CC sign in Initial "
+            "Orientation panel; use Flip CC if reversed.",
+            g_liverCC.cc.confidence * 100.0f);
+    }
+
+    // Combine mode (effective only when BOTH checkboxes are on).
+    // Always shown; greyed out when not applicable.
+    {
+        const bool both_on = g_ctrlgUseArVisFilter && g_ctrlgUseCaudalOnly;
+        if (!both_on) ImGui::BeginDisabled();
+        ImGui::Text("  Combine when both ON:");
+        ImGui::SameLine();
+        int mode = (int)g_ctrlgArvisCaudalCombine;
+        if (ImGui::RadioButton("AND##arvis_caudal", &mode, 0)) {
+            g_ctrlgArvisCaudalCombine = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("OR##arvis_caudal",  &mode, 1)) {
+            g_ctrlgArvisCaudalCombine = 1;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("AND: vertex must be AR-visible AND caudal "
+                              "(strict; smallest subset, default).\n"
+                              "OR : vertex passes if AR-visible OR caudal "
+                              "(lenient; mutual rescue).\n"
+                              "Effective only when both filters above are ON.");
+        }
+        if (!both_on) ImGui::EndDisabled();
+    }
+
+    ImGui::SliderFloat("beta (rim-rim weight boost)",
+                       &g_ctrlgBetaRimWeight, 0.0f, 10.0f, "%.2f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Multiplicative weight for pairs where\n"
+                          "  source vertex is on the LiverRegion::RIM band\n"
+                          "  AND target point's boundaryDist < threshold.\n"
+                          "w_i = 1 + beta * is_rim_src * is_rim_tgt.\n"
+                          "0.0 = uniform RMSE (byte-identical accumulator).\n"
+                          "1.0 = rim-rim pairs counted twice.\n"
+                          "3.0 = rim-rim pairs counted 4x.");
+    }
+
+    ImGui::SliderFloat("rim threshold [px]",
+                       &g_ctrlgRimTgtThreshPx, 4.0f, 30.0f, "%.1f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Target boundaryDist < threshold -> "
+                          "treated as RIM (image-side rim membership).\n"
+                          "Same semantic as Shift+P kBoundaryPxTh (default 12).");
+    }
+
+    // Phase 7b Step 2 — companion to the slider in the floating "Ctrl+G
+    // Quadrant Selector" window. Shares g_instrumentPxThresh, so changes
+    // here propagate everywhere (Shift+N / V3R / Phase 7b).
+    ImGui::SliderFloat("inst threshold [px]",
+                       &g_instrumentPxThresh, 0.0f, 50.0f, "%.1f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Target points with instrumentDist < threshold\n"
+                          "are excluded from RIM (instrument-aware\n"
+                          "boundary rejection).\n"
+                          "Shared with Shift+N / V3R / Phase 7b Shift+W.\n"
+                          "Increase if instrument outline leaks into the\n"
+                          "RIM band (visible as purple dots in Shift+W).");
+    }
+
+    // Phase 7b Step 3 — Rotation-angle constraint
+    // (companion to the floating Ctrl+G window sliders).
+    ImGui::SliderFloat("rot cos thresh (Ctrl+W)",
+                       &g_shapeMatchAnatomyThresh, -1.0f, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Phase 7b Ctrl+W: cos((trace(R)-1)/2) below this\n"
+                          "incurs penalty. 0 = 90° max (default), -1 = off.");
+    }
+    {
+        float lam = (float)g_shapeMatchAnatomyLambda;
+        if (ImGui::SliderFloat("rot lambda (Ctrl+W)",
+                               &lam, 0.0f, 5.0f, "%.2f")) {
+            g_shapeMatchAnatomyLambda = (double)lam;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Rotation penalty weight. 0 = off, 1 = default.");
+        }
+    }
+    // Phase 7b Step 4a — companion sliders
+    {
+        bool sign0_only = (g_shapeMatchSignMode == 0x1);
+        if (ImGui::Checkbox("sign=0 only (Ctrl+W: no flip)",
+                            &sign0_only))
+        {
+            g_shapeMatchSignMode = sign0_only ? 0x1 : 0xF;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("ON = sign=0 (no flip) only, 30 candidates.\n"
+                              "OFF = all 4 signs incl. 180° flips, 120 cand.");
+        }
+    }
+    ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
+                     &g_shapeMatchLiveMaxIter, 0, 200);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Cap Live ICP iters (Step 4a fallback).\n"
+                          "Only used when 'use rim-axis sweep' is OFF.");
+    }
+    // Phase 7b Step 4b — Axis sweep toggles
+    ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W)",
+                    &g_shapeMatchAxisSweepEnabled);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("ON (default) = skip ICP, sweep rim axis.\n"
+                          "OFF = use Live ICP (Step 4a).");
+    }
+    ImGui::SliderInt("axis sweep N",
+                     &g_shapeMatchAxisSweepN, 8, 90);
+    ImGui::SliderInt("axis sweep tgt subN",
+                     &g_shapeMatchAxisSweepTgtSubN, 500, 20000);
+    ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
+                    &g_shapeMatchAxisSweepCompare);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Run both variants, pick lower CompRMSE.\n"
+                          "OFF = Variant A (full vertex) only.");
+    }
+
+    ImGui::Checkbox("Show RIM pairs",
+                    &g_ctrlgShowRimPairs);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Visualize the rim sets used by beta "
+                          "weighting:\n  orange = source RIM (mesh-intrinsic)\n"
+                          "  magenta = target RIM (image boundary).\n"
+                          "Buffers are populated at next Ctrl+G press.");
+    }
+
+    // 状態表示: viz バッファの中身が分かるとデバッグしやすい
+    if (g_ctrlgRimVizAvailable) {
+        ImGui::Text("RimViz buffers: src=%d  tgt=%d",
+                    (int)g_ctrlgRimSrcVertIdx.size(),
+                    (int)g_ctrlgRimTgtPos.size());
+    } else if (g_ctrlgShowRimPairs) {
+        ImGui::TextDisabled(
+            "RimViz: press Ctrl+G to populate");
+    }
+
+    // -----------------------------------------------------------
+    // [Phase D] Colored RIM pairs (K representatives).
+    //   Independent from Show RIM pairs above. Shows K paired
+    //   source+target spheres in matching HSV colors so the
+    //   operator can see WHICH rim vertex maps to WHICH target
+    //   point at the current pose. Pairs are sampled from the
+    //   ~20k captured at Ctrl+G Phase F.5 (or restored from a
+    //   PoseLibrary entry after Apply). 4 sampling modes:
+    //     - ArcUniform: even spacing around tgt centroid (default)
+    //     - WorstK    : K longest src-tgt distances (diagnostic)
+    //     - BestK     : K shortest distances
+    //     - Random    : seeded uniform (reshufflable)
+    // -----------------------------------------------------------
+    ImGui::Checkbox("Show colored pairs (K)",
+                    &g_ctrlgShowColoredRimPairs);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Overlay K representative rim-rim pairs "
+                          "drawn in matching HSV colors so each "
+                          "src↔tgt mapping is visually identifiable.\n"
+                          "Data source: g_lastRimPair* (set by "
+                          "Ctrl+G / Ctrl+Shift+G Phase F.5; restored "
+                          "by Pose Library Apply).\n"
+                          "Pairs follow the mesh through subsequent "
+                          "ICP/Apply (source is a full-mesh vertex "
+                          "index; target is fixed world coords).\n"
+                          "Independent from Show RIM pairs above — "
+                          "leave both ON for max info.");
+    }
+    if (g_ctrlgShowColoredRimPairs) {
+        ImGui::Indent();
+        ImGui::SliderInt("K pairs", &g_ctrlgColoredRimN, 5, 30);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How many representative pairs to draw "
+                              "(5–30). 10 is the sweet spot — small "
+                              "enough to differentiate by HSV hue, "
+                              "large enough to span the rim.");
+        }
+        const char* modeItems =
+            "ArcUniform\0WorstK\0BestK\0Random\0";
+        ImGui::Combo("Sample mode",
+                     &g_ctrlgColoredRimMode, modeItems);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "ArcUniform : evenly spaced around tgt centroid "
+                "(stable across runs — default).\n"
+                "WorstK     : K longest src↔tgt distances "
+                "(diagnostic: where is the rim misaligned?).\n"
+                "BestK      : K shortest distances "
+                "(sanity check).\n"
+                "Random     : seeded uniform sample. Use the "
+                "Reshuffle button to draw a new sample.");
+        }
+        // Reshuffle only affects Random mode (other modes are
+        // deterministic). Disable the button outside Random so
+        // the UI signals this clearly instead of accepting clicks
+        // that produce no visible change.
+        const bool reshuffleActive =
+            (g_ctrlgColoredRimMode ==
+             (int)RimPairSampling::Mode::Random);
+        if (!reshuffleActive) ImGui::BeginDisabled();
+        if (ImGui::Button("Reshuffle")) {
+            g_ctrlgColoredRimSeed++;
+        }
+        if (!reshuffleActive) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            if (reshuffleActive) {
+                ImGui::SetTooltip(
+                    "Draw a new K-sample with a fresh seed.\n"
+                    "Active only in Random mode.");
+            } else {
+                ImGui::SetTooltip(
+                    "Reshuffle is only available in Random mode.\n"
+                    "ArcUniform / WorstK / BestK are deterministic — "
+                    "pressing this button would have no effect.");
+            }
+        }
+        ImGui::SameLine();
+        if (!g_lastRimPairSrcVertIdx.empty()) {
+            ImGui::TextDisabled("(%d pairs avail.)",
+                                (int)g_lastRimPairSrcVertIdx.size());
+        } else {
+            ImGui::TextDisabled("(no pairs — press Ctrl+G)");
+        }
+        ImGui::Unindent();
+    }
+
+    // ----- [NEW UI-1b] RIM silhouette penalty ----------------
+    ImGui::Checkbox("RIM silhouette penalty (boundary-to-boundary)",
+                    &g_ctrlgsUseRimSil);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Add a boundary-alignment penalty to the cost:\n"
+            "  cost += lambda_rim_sil * mean(dist_to_target_boundary)\n"
+            "\n"
+            "Evaluated only at SOURCE-BOUNDARY raster cells (source\n"
+            "cells with at least one non-source 4-neighbour). For\n"
+            "each such cell:\n"
+            "  outside target mask -> contribute 1.0 (max).\n"
+            "  inside target mask  -> contribute min(d/max_px, 1.0)\n"
+            "where d is the image-pixel distance to the target\n"
+            "silhouette boundary, from the SAM2 distance map.\n"
+            "\n"
+            "Silhouette-space analogue of Ctrl+G's beta-rim weighting:\n"
+            "forces source RIM to target RIM coincidence rather than\n"
+            "mere area overlap. Catches drift patterns where source\n"
+            "covers target area well but with bulges/dents at the rim.\n"
+            "\n"
+            "Default OFF.");
+    }
+    ImGui::SliderFloat("lambda_rim_sil",
+                       &g_ctrlgsLambdaRimSil, 0.0f, 2.0f, "%.3f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Weight for the RIM silhouette penalty.\n"
+            "  0.0  : no effect.\n"
+            "  0.2  : weak.\n"
+            "  0.3  : recommended starting point.\n"
+            "  1.0+ : boundary-dominant.\n"
+            "Only active when 'RIM silhouette penalty' is ON.");
+    }
+    ImGui::SliderFloat("rim_sil_max_px",
+                       &g_ctrlgsRimSilMaxPx, 10.0f, 300.0f, "%.0f");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Image-pixel normalisation cap for the RIM penalty.\n"
+            "Source-boundary cells AT the target boundary contribute\n"
+            "0; cells >= max_px away from the boundary saturate to 1.\n"
+            "  50  : tight (small drift heavily penalised).\n"
+            "  100 : recommended starting point.\n"
+            "  200 : loose (only large drift penalised).\n"
+            "Only active when 'RIM silhouette penalty' is ON.");
+    }
+
+    // [NEW UI-RIM-ANAT] Anatomic-mode toggle
+    ImGui::Checkbox("Use anatomical RIM (vs. raster boundary)",
+                    &g_ctrlgsRimSilAnatomic);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Switch the source-rim definition between two modes:\n"
+            "\n"
+            "OFF (legacy raster boundary):\n"
+            "  Source RIM = every cell on the rasterised silhouette\n"
+            "  outline (4-neighbour test on the source hitmap).\n"
+            "  Includes the outlines of detached blobs / artefacts;\n"
+            "  doesn't know anything about anatomy. Pure geometric.\n"
+            "\n"
+            "ON (anatomical RIM):\n"
+            "  Source RIM = vertices labelled LiverRegionLabel::RIM,\n"
+            "  filtered by quadrant + AR-vis + Caudal the SAME way\n"
+            "  the Ctrl+G 'Show RIM pairs' checkbox filters them.\n"
+            "  These are exactly the orange spheres you see in the\n"
+            "  AR view when RimViz is enabled. rim_sil is the mean\n"
+            "  distance from each VISIBLE projected RIM vertex to\n"
+            "  the target silhouette boundary.\n"
+            "\n"
+            "F9 viz: in anatomic mode, panels 4 & 6 highlight cells\n"
+            "where any anatomical RIM vertex projected, NOT the full\n"
+            "silhouette outline. Lets you check whether the rim\n"
+            "Ctrl+G already cares about coincides with the SAM2\n"
+            "boundary.\n"
+            "\n"
+            "Only active when 'RIM silhouette penalty' is ON.\n"
+            "Default OFF -- legacy behaviour.");
+    }
+    if (g_ctrlgsRimSilAnatomic && !g_ctrlgsUseRimSil) {
+        ImGui::TextColored(
+            ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+            "  NOTE: anatomic toggle ON but rim_sil penalty OFF -- has no effect");
+    }
 }
 
 static void snapshotInitialPose() {
