@@ -20,3 +20,33 @@ depth_output/camera_capture.*
 testImages/
 data/screenshots/
 registration_model/
+
+# Temporary depth output folders
+depth_outputPT2/
+depth_outputPT3/
+depth_outputpt3/
+depth_outputpt？３ｄPrint/
+depthoutputpt1/
+depth_output_pt1/
+depth_output？２/
+
+# Model folders
+model1/
+model22/
+modelPt1/
+modelPt2/
+modelPt3/
+modelPT2/
+modelPT3/
+modelpt4/
+modelmy/
+model_mylow/
+model\high/
+
+# Dataset folders  
+DatasetEchoLiver/
+
+# Japanese named files
+レジストレーション*.h
+元の長い*.h
+元の長い*.cpp
