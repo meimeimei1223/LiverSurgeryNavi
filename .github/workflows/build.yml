@@ -13,11 +13,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libglew-dev libglfw3-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
-      - name: Download ONNX Runtime
+      - name: Download ONNX Runtime (GPU)
         run: |
-          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.15.1/onnxruntime-linux-x64-1.15.1.tgz
-          tar xf onnxruntime-linux-x64-1.15.1.tgz
-          rm onnxruntime-linux-x64-1.15.1.tgz
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.15.1/onnxruntime-linux-x64-gpu-1.15.1.tgz
+          tar xf onnxruntime-linux-x64-gpu-1.15.1.tgz
+          rm onnxruntime-linux-x64-gpu-1.15.1.tgz
       - name: Download ONNX models
         run: |
           pip install huggingface_hub onnx protobuf
@@ -45,7 +45,7 @@ jobs:
               print(f'  {f}: {sz/1024/1024:.1f} MB')
           "
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=$PWD/onnxruntime-linux-x64-1.15.1
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=$PWD/onnxruntime-linux-x64-gpu-1.15.1 -DENABLE_CUDA=ON
       - name: Build
         run: cmake --build build -j$(nproc)
       - name: Package
@@ -53,7 +53,9 @@ jobs:
           mkdir -p package/LiverSurgeryNavi/onnx_models
           cp build/bin/LiverSurgeryNavi package/LiverSurgeryNavi/
           cp build/bin/medsam2_da3_lite package/LiverSurgeryNavi/
-          cp onnxruntime-linux-x64-1.15.1/lib/libonnxruntime.so* package/LiverSurgeryNavi/
+          cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime.so* package/LiverSurgeryNavi/
+          cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_cuda.so* package/LiverSurgeryNavi/ 2>/dev/null || true
+          cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_shared.so* package/LiverSurgeryNavi/ 2>/dev/null || true
           cp -r shaders package/LiverSurgeryNavi/
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
@@ -73,10 +75,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download ONNX Runtime
+      - name: Download ONNX Runtime (GPU)
         shell: bash
         run: |
-          curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.15.1/onnxruntime-win-x64-1.15.1.zip -o ort.zip
+          curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.15.1/onnxruntime-win-x64-gpu-1.15.1.zip -o ort.zip
           unzip -q ort.zip
           rm ort.zip
       - name: Download ONNX models
@@ -108,7 +110,7 @@ jobs:
           "
       - name: Configure
         shell: bash
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DONNXRUNTIME_ROOT=$PWD/onnxruntime-win-x64-1.15.1
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DONNXRUNTIME_ROOT=$PWD/onnxruntime-win-x64-gpu-1.15.1 -DENABLE_CUDA=ON
       - name: Build
         run: cmake --build build --config Release
       - name: Package
@@ -117,7 +119,9 @@ jobs:
           mkdir -p package/LiverSurgeryNavi/onnx_models
           cp build/bin/Release/LiverSurgeryNavi.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/LiverSurgeryNavi.exe package/LiverSurgeryNavi/
           cp build/bin/Release/medsam2_da3_lite.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/medsam2_da3_lite.exe package/LiverSurgeryNavi/
-          cp onnxruntime-win-x64-1.15.1/lib/onnxruntime.dll package/LiverSurgeryNavi/
+          cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime.dll package/LiverSurgeryNavi/
+          cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_cuda.dll package/LiverSurgeryNavi/ 2>/dev/null || true
+          cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_shared.dll package/LiverSurgeryNavi/ 2>/dev/null || true
           cp -r shaders package/LiverSurgeryNavi/
           cp -r data package/LiverSurgeryNavi/
           cp -r model package/LiverSurgeryNavi/
