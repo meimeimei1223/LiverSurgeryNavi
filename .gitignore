@@ -17,6 +17,13 @@ onnxruntime-*/
 bin/
 depth_output/*.ppm
 depth_output/camera_capture.*
+depth_output/*.png
+depth_output/*.jpg
+depth_output/*.obj
+depth_output/*.mtl
+depth_output/*.txt
+depth_output/screenshots/
+depth_output/occlusion/
 testImages/
 data/screenshots/
 registration_model/
