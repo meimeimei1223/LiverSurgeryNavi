@@ -680,6 +680,15 @@ static struct {
 } g_cameraBackupState;
 bool g_showCorrespondencePoints = false;
 
+// Missing rim visualization variables (removed dependencies)
+bool g_ctrlgShowRimPairs = false;
+bool g_ctrlgRimVizAvailable = false;
+bool g_ctrlgShowColoredRimPairs = false;
+std::vector<int> g_ctrlgRimSrcVertIdx;
+std::vector<glm::vec3> g_ctrlgRimTgtPos;
+std::vector<int> g_lastRimPairSrcVertIdx;
+std::vector<glm::vec3> g_lastRimPairTgtPos;
+
 // =========================================================
 //  Debug: AABB 可視化 (チャット 10)
 // ---------------------------------------------------------
