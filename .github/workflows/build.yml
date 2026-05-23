@@ -57,9 +57,8 @@ jobs:
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_cuda.so* package/LiverSurgeryNavi/ 2>/dev/null || true
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_shared.so* package/LiverSurgeryNavi/ 2>/dev/null || true
           cp -r shaders package/LiverSurgeryNavi/
-          cp -r data package/LiverSurgeryNavi/
-          cp -r model package/LiverSurgeryNavi/
-          cp -r depth_output package/LiverSurgeryNavi/
+          mkdir -p package/LiverSurgeryNavi/depth_output
+          echo "# Output folder for depth estimation results" > package/LiverSurgeryNavi/depth_output/.gitkeep
           cp onnx_models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/onnx_models/
           cp onnx_models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/onnx_models/
           cp onnx_models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/onnx_models/
@@ -72,7 +71,7 @@ jobs:
           name: LiverSurgeryNavi-Linux
           path: package/LiverSurgeryNavi
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - name: Download ONNX Runtime (GPU)
@@ -123,9 +122,8 @@ jobs:
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_cuda.dll package/LiverSurgeryNavi/ 2>/dev/null || true
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_shared.dll package/LiverSurgeryNavi/ 2>/dev/null || true
           cp -r shaders package/LiverSurgeryNavi/
-          cp -r data package/LiverSurgeryNavi/
-          cp -r model package/LiverSurgeryNavi/
-          cp -r depth_output package/LiverSurgeryNavi/
+          mkdir -p package/LiverSurgeryNavi/depth_output
+          echo "# Output folder for depth estimation results" > package/LiverSurgeryNavi/depth_output/.gitkeep
           cp onnx_models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/onnx_models/
           cp onnx_models/sam2_hiera_tiny.encoder.onnx package/LiverSurgeryNavi/onnx_models/
           cp onnx_models/sam2_hiera_tiny.decoder.onnx package/LiverSurgeryNavi/onnx_models/
