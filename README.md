@@ -1,12 +1,13 @@
 # LiverSurgeryNavi
 Liver Surgery Navigation System — 3D Registration + Depth Estimation + Segmentation with **GPU Acceleration**
 
-## 🚀 GPU-Accelerated Performance
+## 🚀 GPU Acceleration for Depth Estimation
 
-This system now includes **CUDA GPU support** for dramatically faster inference:
-- **10-50x faster** depth estimation and segmentation
+The depth estimation module now supports **CUDA GPU acceleration**:
+- **~2x faster** depth estimation inference
 - GPU-accelerated ONNX Runtime with CUDA provider
 - Automatic GPU detection and fallback to CPU if unavailable
+- Works on both Linux and Windows with proper CUDA setup
 
 ## Quick Start (Pre-built Package)
 
@@ -31,9 +32,9 @@ You can switch between 3 models using the "Depth Model" combo box in the UI.
 
 | Model | Size | Inference (GPU) | Inference (CPU) | Included |
 |-------|------|-----------------|-----------------|----------|
-| **Small** (default) | 101MB | ~0.05s | ~0.8s | Yes |
-| **Base** | 394MB | ~0.12s | ~2.1s | Manual download |
-| **Large** | 1.3GB | ~0.35s | ~6.5s | Manual download |
+| **Small** (default) | 101MB | ~0.4s | ~0.8s | Yes |
+| **Base** | 394MB | ~1.0s | ~2.1s | Manual download |
+| **Large** | 1.3GB | ~3.2s | ~6.5s | Manual download |
 
 Small is included in the package. To use Base or Large, follow the download instructions below.
 
@@ -103,6 +104,11 @@ After downloading, the models will appear in the "Depth Model" combo box in the 
 - NVIDIA Driver ≥ 450.80.02
 - **Note:** System automatically falls back to CPU if GPU is unavailable
 
+#### Tested Configuration (Working Setup)
+- **Ubuntu 22.04** with NVIDIA RTX GPU
+- **CUDA 12.x** with Driver 550.x
+- This exact configuration has been verified to work with ~2x speedup for depth estimation
+
 ### Dependencies
 
 #### Bundled (in third_party/)
@@ -119,7 +125,12 @@ sudo apt install build-essential cmake libglew-dev libglfw3-dev
 #### Windows
 - Visual Studio 2022
 - GLEW/GLFW bundled in win_deps/
-- CUDA Toolkit (optional for GPU support)
+
+##### Windows GPU Setup (for GPU acceleration)
+1. Install [CUDA Toolkit 11.8+](https://developer.nvidia.com/cuda-downloads)
+2. Install latest NVIDIA drivers
+3. Add CUDA to PATH: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin`
+4. The pre-built package includes GPU-enabled binaries
 
 #### ONNX Runtime (only when building from source)
 Pre-built packages already include **GPU-enabled** ONNX Runtime. If building from source:
