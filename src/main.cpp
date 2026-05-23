@@ -1831,7 +1831,10 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                           << std::endl;
                 recomputeLiverCC();
             }
-            // 1. Run Coarse2D + GN
+            // 1. Run Coarse2D + GN - DISABLED (function not available)
+            std::cout << "[Alt+W] Gauss-Newton refine feature disabled" << std::endl;
+            break;
+            /* Original code commented out:
             std::cout << "[Alt+W] running Coarse2D + Gauss-Newton refine..."
                       << std::endl;
             if (!runDebugShapeMatchGN()) {
@@ -1845,6 +1848,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                       << "  Δ=" << (g_debugShapeMatchGNInitCost
                                     - g_debugShapeMatchGNFinalCost) << "px"
                       << std::endl;
+            */
 
             // 2. Undo snapshot
             poseAutoSaveBeforeRegistration();
@@ -4675,8 +4679,14 @@ int main() {
             //   Recommended when depth-anything-v2 depth is unreliable.
             ImGui::Separator();
             ImGui::TextUnformatted("[Step 3a] 2D AR-projected Ctrl+W cost");
+            // 2D matching features disabled
+            bool dummyUse2DCost = false;
+            ImGui::Checkbox("Use 2D AR matching (Ctrl+W) [DISABLED]",
+                            &dummyUse2DCost);
+            /*
             ImGui::Checkbox("Use 2D AR matching (Ctrl+W)",
                             &g_shapeMatchUse2DCost);
+            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Step 3a: when ON, Ctrl+W's\n"
                                   "cost is mean(g_boundaryDistMap[project(src)])\n"
@@ -4686,9 +4696,11 @@ int main() {
                                   "  depth-lifted target and source (original\n"
                                   "  Step 3 implementation).");
             }
-            if (g_shapeMatchUse2DCost) {
+            if (false) { // was: if (g_shapeMatchUse2DCost) {
+                /* Disabled: g_shapeMatchContourN2D not available
                 ImGui::SliderInt("2D contour anchors N",
                                  &g_shapeMatchContourN2D, 8, 500);
+                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Arc-length resample target 2D\n"
                                       "contour to N evenly-spaced anchors.\n"
@@ -4696,17 +4708,21 @@ int main() {
                                       "(× sign_mask). 200 default, fast even\n"
                                       "with 200×4=800 evals (~50ms total).");
                 }
+                /* Disabled: g_shapeMatchOutOfFrameDistPx not available
                 ImGui::SliderFloat("2D out-of-frame penalty (px)",
                                    &g_shapeMatchOutOfFrameDistPx,
                                    10.0f, 500.0f, "%.0f");
+                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Per-point cost assigned when a source\n"
                                       "vertex projects outside the AR camera\n"
                                       "viewport (or behind the camera).");
                 }
+                /* Disabled: g_shapeMatchMaxDistCapPx not available
                 ImGui::SliderFloat("2D max distance cap (px)",
                                    &g_shapeMatchMaxDistCapPx,
                                    10.0f, 500.0f, "%.0f");
+                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Clamp per-point boundary distance to\n"
                                       "this cap. Bounds influence of points\n"
@@ -4714,18 +4730,22 @@ int main() {
                                       "otherwise get the 9999 sentinel from\n"
                                       "g_boundaryDistMap).");
                 }
+                /* Disabled: g_shapeMatchMinInFrameRate not available
                 ImGui::SliderFloat("2D min in-frame rate",
                                    &g_shapeMatchMinInFrameRate,
                                    0.0f, 1.0f, "%.2f");
+                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Reject candidates where fewer than\n"
                                       "this fraction of source rim points\n"
                                       "project inside the AR viewport.\n"
                                       "0.30 = default, 0.0 = no rejection.");
                 }
+                /* Disabled: g_shapeMatch2DInstThreshPx not available
                 ImGui::SliderFloat("2D instrument exclude (px)",
                                    &g_shapeMatch2DInstThreshPx,
                                    0.0f, 60.0f, "%.0f");
+                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Exclude target boundary pixels with\n"
                                       "instrumentDist < threshold from the\n"
@@ -4734,10 +4754,12 @@ int main() {
                 }
                 // Diagnostic readback
                 if (g_debugShapeMatchBestK >= 0) {
+                    /* Disabled: variables not available
                     ImGui::Text("Last Ctrl+W/2D: in_frame=%.0f%%  in_mask=%.0f%%  contour=%d px",
                                 100.0f * g_debugShapeMatchBestInFrame,
                                 100.0f * g_debugShapeMatchBestInMask,
                                 (int)g_debugTargetContour2D.size());
+                    */
                 }
             }
             ImGui::Separator();
@@ -4745,9 +4767,14 @@ int main() {
             // Phase 7b Step 3b — Gauss-Newton refine (Alt+W)
             //   PnP-style nonlinear least-squares refinement on top of
             //   Coarse2D's best candidate. Sub-pixel rim/contour alignment.
-            ImGui::TextUnformatted("[Step 3b] Gauss-Newton refine (Alt+W)");
+            ImGui::TextUnformatted("[Step 3b] Gauss-Newton refine (Alt+W) [DISABLED]");
+            bool dummyFlipNormal = false;
+            ImGui::Checkbox("Flip source normal to camera (Idea A) [DISABLED]",
+                            &dummyFlipNormal);
+            /*
             ImGui::Checkbox("Flip source normal to camera (Idea A)",
                             &g_shapeMatchFlipNormalToCamera);
+            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Step 3b: when ON, flip the source\n"
                                   "rim's PCA 'patch normal' so it faces the\n"
@@ -4757,41 +4784,50 @@ int main() {
                                   "Affects BOTH Ctrl+W and Alt+W.\n"
                                   "OFF = reproduce legacy buggy behavior.");
             }
+            /* GN settings disabled
             ImGui::SliderInt("GN max iter (Alt+W)",
                              &g_shapeMatchGNMaxIter, 1, 100);
+            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Hard cap on Levenberg-Marquardt iterations.\n"
                                   "30 default. Typical convergence in 5-15 iters.");
             }
+            /* GN lambda disabled
             ImGui::SliderFloat("GN λ init (Alt+W)",
                                &g_shapeMatchGNLambdaInit,
                                1.0e-6f, 1.0e0f, "%.0e",
                                ImGuiSliderFlags_Logarithmic);
+            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Initial Levenberg damping. 1e-3 default.\n"
                                   "Higher = more conservative (gradient-descent-like).\n"
                                   "Lower = more aggressive (Gauss-Newton-like).");
             }
+            /* GN eps step disabled
             ImGui::SliderFloat("GN eps step (Alt+W)",
                                &g_shapeMatchGNEpsStep,
                                1.0e-8f, 1.0e-2f, "%.0e",
                                ImGuiSliderFlags_Logarithmic);
+            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Converge if ||Δξ|| < this. 1e-5 default.\n"
                                   "ξ ∈ se(3) (3 translation + 3 rotation,\n"
                                   "in world units / radians).");
             }
+            /* GN eps rel disabled
             ImGui::SliderFloat("GN eps rel (Alt+W)",
                                &g_shapeMatchGNEpsRel,
                                1.0e-8f, 1.0e-2f, "%.0e",
                                ImGuiSliderFlags_Logarithmic);
+            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Converge if |ΔF/F| < this. 1e-4 default.\n"
                                   "Relative reduction of cost across iterations.");
             }
-            // Diagnostic readback for last Alt+W call
-            if (g_debugShapeMatchGNIters > 0) {
+            // Diagnostic readback for last Alt+W call - DISABLED
+            if (false) { // was: if (g_debugShapeMatchGNIters > 0) {
                 const char* reason_str[] = {"step", "rel_cost", "max_iter", "lm_fail"};
+                /* Disabled: variables not available
                 const int r = (g_debugShapeMatchGNReason >= 0
                                && g_debugShapeMatchGNReason < 4)
                               ? g_debugShapeMatchGNReason : 3;
@@ -4805,6 +4841,7 @@ int main() {
                 ImGui::Text("            in_frame=%d  bdy_cache=%s",
                             g_debugShapeMatchGNInFrame,
                             g_gnUnsignedBdyValid ? "valid" : "invalid");
+                */
             }
             ImGui::Separator();
 
