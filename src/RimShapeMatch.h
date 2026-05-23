@@ -41,12 +41,14 @@
 #include <utility>
 #include <cmath>
 #include <limits>
+#include <queue>           // GN: BFS for unsigned boundary distance map
 
 #include <Eigen/Dense>
 #include <glm/glm.hpp>
 
 #include "mCutMesh.h"
 #include "LiverRegionLabel.h"
+#include "DepthUtils.h"            // BoundaryDistMap, g_boundaryDistMap (Phase 7b Step 3a 2D)
 
 namespace RimShape {
 
@@ -931,6 +933,976 @@ inline bool runRimAxisRotationSweep(
     }
     return true;
 }
+
+// =====================================================================
+//  Phase 7b Step 3a — Full-2D matching (depth-free)
+// =====================================================================
+//
+//  Motivation
+//    The original Step 3 used 3D chamfer between source rim chain and
+//    target boundary points that were *lifted* from screenMesh depth.
+//    Depth estimates from depth-anything-v2 carry several-cm noise in
+//    typical liver scenes, which contaminated the target 3D positions
+//    and the cost ranking. The "ground truth" the user actually has is
+//    the 2D SAM2 segmentation boundary; lifting it to 3D throws away
+//    information.
+//
+//  Full-2D pipeline (Ctrl+W when g_shapeMatchUse2DCost == true)
+//    - Source: stays 3D (CT mesh + walkRimChain order, depth-reliable)
+//    - Target: 2D contour traced from g_boundaryDistMap, arc-length
+//      resampled to N anchors in pixel space (no lift)
+//    - Per anchor:
+//        back-project pixel to 3D at source-centroid depth → 3D anchor
+//        finite-diff neighbour anchors → 3D tangent at that depth
+//        solveTwoAxisAlignment(src_axis_3D, src_normal_3D,
+//                              t_tangent_3D, cam_axis_world)
+//        T = R, translation = anchor_3D - R · src_centroid_3D
+//    - Cost: forward-project transformed source 3D rim to 2D pixels and
+//      look up g_boundaryDistMap. O(|src|) per evaluation.
+//
+//  Why "cam_axis_world" as target normal
+//    The source PCA normal points roughly along the rim patch's normal.
+//    For surgical liver views the rim normal is approximately parallel
+//    to the camera viewing direction (we look at the liver "edge on").
+//    Using cam_axis as the target normal forces R to bring src_normal
+//    in line with the camera axis — i.e. makes the rim face the camera.
+//    sign bit 1 (n flip) handles the case where src_normal is the
+//    opposite PCA sign (PCA eigenvectors have ambiguous orientation).
+//
+//  Why "max_dist_cap" matters
+//    g_boundaryDistMap stores BFS distance to boundary INSIDE the mask
+//    and a sentinel 9999.0f OUTSIDE the mask. For Shape Match cost we
+//    cap any sample to max_dist_cap_px to bound the influence of points
+//    landing outside the mask (otherwise one outlier dominates the
+//    mean). The cap also acts as the "out-of-mask" penalty.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// traceContour2D
+//   2D Moore-Neighbor-style 8-connectivity walk on boundary pixels.
+//
+//   A "boundary pixel" is bdy.data[i] < bdy_px_thresh (typically 1.5f =
+//   the inner 1-px ring of the mask boundary as BFS-distance < 1.5).
+//   Pixels where the optional instrument distance map is below
+//   inst_px_thresh are excluded (instruments break a single rim into
+//   multiple visible arcs; we want separate segments).
+//
+//   Algorithm
+//     1. Build is_boundary mask
+//     2. For each unvisited boundary pixel, start a greedy walk:
+//          - At each step, pick the first unvisited 8-neighbour that is
+//            also boundary; if none, end this segment
+//     3. Filter segments with fewer than 10 pixels
+//     4. Sort segments by size descending (largest first)
+//
+//   Returns true iff at least one segment remained after filtering.
+//   Segments are *ordered* polylines (chain[i+1] is adjacent to chain[i]).
+// ---------------------------------------------------------------------
+inline bool traceContour2D(const BoundaryDistMap& bdy,
+                           float bdy_px_thresh,
+                           const BoundaryDistMap* inst_or_null,
+                           float inst_px_thresh,
+                           std::vector<std::vector<glm::vec2>>& segments_out,
+                           std::ostream* log = nullptr)
+{
+    segments_out.clear();
+    if (!bdy.valid || bdy.width <= 0 || bdy.height <= 0) {
+        if (log) (*log) << "[TraceContour2D] boundary map invalid"
+                   << std::endl;
+        return false;
+    }
+    const int W = bdy.width, H = bdy.height;
+
+    // Build is_boundary mask (exclude instrument-occluded boundary if
+    // instrument map is provided AND its size matches)
+    std::vector<uint8_t> is_b(W * H, 0);
+    int n_boundary = 0, n_inst_excluded = 0;
+    const bool use_inst = (inst_or_null != nullptr) && inst_or_null->valid
+                          && inst_or_null->width  == W
+                          && inst_or_null->height == H;
+    for (int i = 0; i < W * H; i++) {
+        const float bd = bdy.data[i];
+        if (bd >= bdy_px_thresh) continue;
+        if (bd >= 9000.0f)        continue;            // outside-mask sentinel
+        if (use_inst && inst_or_null->data[i] < inst_px_thresh) {
+            n_inst_excluded++;
+            continue;
+        }
+        is_b[i] = 1;
+        n_boundary++;
+    }
+
+    if (n_boundary == 0) {
+        if (log) (*log) << "[TraceContour2D] no boundary pixels (bdy_th="
+                   << bdy_px_thresh << ", inst_th=" << inst_px_thresh
+                   << ", inst_excluded=" << n_inst_excluded << ")"
+                   << std::endl;
+        return false;
+    }
+
+    // 8-connectivity: order chosen so 4-conn neighbours come first for
+    // cleaner chains where possible.
+    const int dx8[] = { 1, -1,  0,  0,  1,  1, -1, -1};
+    const int dy8[] = { 0,  0,  1, -1,  1, -1,  1, -1};
+    std::vector<uint8_t> visited(W * H, 0);
+
+    for (int sy = 0; sy < H; sy++) {
+        for (int sx = 0; sx < W; sx++) {
+            if (!is_b[sy * W + sx] || visited[sy * W + sx]) continue;
+            std::vector<glm::vec2> seg;
+            int cx = sx, cy = sy;
+            visited[cy * W + cx] = 1;
+            seg.emplace_back(float(cx), float(cy));
+            while (true) {
+                int next_x = -1, next_y = -1;
+                for (int d = 0; d < 8; d++) {
+                    int nx = cx + dx8[d], ny = cy + dy8[d];
+                    if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    if (!is_b[ny * W + nx] || visited[ny * W + nx]) continue;
+                    next_x = nx; next_y = ny;
+                    break;
+                }
+                if (next_x < 0) break;
+                cx = next_x; cy = next_y;
+                visited[cy * W + cx] = 1;
+                seg.emplace_back(float(cx), float(cy));
+            }
+            if ((int)seg.size() >= 10) {
+                segments_out.push_back(std::move(seg));
+            }
+        }
+    }
+
+    std::sort(segments_out.begin(), segments_out.end(),
+              [](const std::vector<glm::vec2>& a,
+                 const std::vector<glm::vec2>& b) {
+                  return a.size() > b.size();
+              });
+
+    if (log) {
+        int total = 0;
+        for (auto& s : segments_out) total += (int)s.size();
+        (*log) << "[TraceContour2D] " << W << "x" << H
+               << "  boundary_pixels=" << n_boundary
+               << "  inst_excluded=" << n_inst_excluded
+               << "  segments=" << segments_out.size()
+               << "  total_traced=" << total
+               << "  largest=" << (segments_out.empty()
+                                       ? 0 : (int)segments_out[0].size())
+               << std::endl;
+    }
+    return !segments_out.empty();
+}
+
+
+// ---------------------------------------------------------------------
+// resampleArcLength2D
+//   Resample a 2D polyline to N evenly-spaced points along arc length.
+//   Mid-bucket parametrisation (t_k = (k+0.5) * L / N) gives endpoint-
+//   symmetric distribution.
+// ---------------------------------------------------------------------
+inline void resampleArcLength2D(const std::vector<glm::vec2>& contour,
+                                int N,
+                                std::vector<glm::vec2>& resampled_out)
+{
+    resampled_out.clear();
+    if (contour.size() < 2 || N < 1) return;
+
+    std::vector<float> cum(contour.size(), 0.0f);
+    for (size_t i = 1; i < contour.size(); i++) {
+        cum[i] = cum[i-1] + glm::length(contour[i] - contour[i-1]);
+    }
+    const float total_len = cum.back();
+    if (total_len < 1e-6f) return;
+
+    resampled_out.reserve(N);
+    for (int k = 0; k < N; k++) {
+        const float t = (float(k) + 0.5f) * total_len / float(N);
+        auto it = std::upper_bound(cum.begin(), cum.end(), t);
+        if (it == cum.begin()) {
+            resampled_out.push_back(contour.front());
+            continue;
+        }
+        if (it == cum.end()) {
+            resampled_out.push_back(contour.back());
+            continue;
+        }
+        const size_t idx = std::distance(cum.begin(), it);
+        const float  seg_len = cum[idx] - cum[idx-1];
+        const float  alpha = (seg_len > 1e-6f)
+                                 ? (t - cum[idx-1]) / seg_len
+                                 : 0.0f;
+        resampled_out.push_back(
+            contour[idx-1] * (1.0f - alpha) + contour[idx] * alpha);
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// unprojectPixelAtWorldDepth
+//   Back-project pixel (px, py) along the view ray to the world plane
+//   that contains depth_ref_world.
+//
+//   Implementation: forward-project depth_ref_world to find its NDC.z,
+//   then back-project (u_ndc, v_ndc, ndc_z, 1) through inv(proj*view).
+//   This works for any view/proj combination, not just our AR fixed
+//   camera (matches the inv-VP pattern in CmaesUtils::extractSourceContour).
+// ---------------------------------------------------------------------
+inline glm::vec3 unprojectPixelAtWorldDepth(
+    const glm::vec2& pixel,
+    const glm::vec3& depth_ref_world,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H)
+{
+    const glm::mat4 VP = proj * view;
+    const glm::vec4 ref_clip = VP * glm::vec4(depth_ref_world, 1.0f);
+    if (std::abs(ref_clip.w) < 1e-9f) return depth_ref_world;
+    const float ndc_z = ref_clip.z / ref_clip.w;
+
+    // Pixel → NDC (image origin top-left, Y growing down → NDC y flip)
+    const float u_ndc =  2.0f * pixel.x / float(W) - 1.0f;
+    const float v_ndc =  1.0f - 2.0f * pixel.y / float(H);
+
+    const glm::mat4 invVP = glm::inverse(VP);
+    const glm::vec4 world_h =
+        invVP * glm::vec4(u_ndc, v_ndc, ndc_z, 1.0f);
+    if (std::abs(world_h.w) < 1e-9f) return depth_ref_world;
+    return glm::vec3(world_h) / world_h.w;
+}
+
+
+// ---------------------------------------------------------------------
+// project2DBoundaryDistance
+//   Forward-project src points to 2D AR camera, mean(boundary distance)
+//   via g_boundaryDistMap lookup. Returns -1 if invalid input.
+//
+//   Per-point cost rule:
+//     - clip.w <= 0  → behind camera   → out_of_frame_dist_px
+//     - NDC outside [-1,+1]            → out_of_frame_dist_px
+//     - inside frame, bd >= 9000       → max_dist_cap_px   (outside mask)
+//     - inside frame, bd <  9000       → min(bd, max_dist_cap_px)
+//
+//   The cap bounds the influence of "wildly off" candidates so the
+//   mean stays interpretable. Without the cap, a single point landing
+//   on a 9999 sentinel pixel would drown out the other 250+ in the rim.
+// ---------------------------------------------------------------------
+inline double project2DBoundaryDistance(
+    const std::vector<glm::vec3>& src_pts_world,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    const BoundaryDistMap& bdy,
+    float out_of_frame_dist_px,
+    float max_dist_cap_px,
+    int* n_in_frame_out = nullptr,
+    int* n_in_mask_out  = nullptr)
+{
+    if (src_pts_world.empty() || !bdy.valid) {
+        if (n_in_frame_out) *n_in_frame_out = 0;
+        if (n_in_mask_out)  *n_in_mask_out  = 0;
+        return -1.0;
+    }
+    const glm::mat4 VP = proj * view;
+    double sum = 0.0;
+    int n_in_frame = 0;
+    int n_in_mask  = 0;
+    const int Nv = (int)src_pts_world.size();
+    const float cap = max_dist_cap_px;
+
+    for (int i = 0; i < Nv; i++) {
+        const glm::vec4 clip = VP * glm::vec4(src_pts_world[i], 1.0f);
+        if (clip.w <= 1e-9f) {
+            sum += out_of_frame_dist_px;
+            continue;
+        }
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        if (ndcx < -1.0f || ndcx > 1.0f ||
+            ndcy < -1.0f || ndcy > 1.0f) {
+            sum += out_of_frame_dist_px;
+            continue;
+        }
+        n_in_frame++;
+        const float u = (ndcx + 1.0f) * 0.5f;
+        const float v = (1.0f - ndcy) * 0.5f;
+        int px = int(u * float(bdy.width));
+        int py = int(v * float(bdy.height));
+        if (px < 0) px = 0; else if (px >= bdy.width)  px = bdy.width  - 1;
+        if (py < 0) py = 0; else if (py >= bdy.height) py = bdy.height - 1;
+        const float bd = bdy.data[py * bdy.width + px];
+        if (bd < 9000.0f) {
+            n_in_mask++;
+            sum += std::min(bd, cap);
+        } else {
+            sum += cap;
+        }
+    }
+    if (n_in_frame_out) *n_in_frame_out = n_in_frame;
+    if (n_in_mask_out)  *n_in_mask_out  = n_in_mask;
+    return sum / double(Nv);
+}
+
+
+// ---------------------------------------------------------------------
+// runShapeMatchCoarse2D
+//   Full-2D coarse search per Phase 7b Step 3a design.
+//
+//   Inputs (3D, from source side):
+//     src_pts_world           : source rim points in world space (current pose)
+//     src_centroid_3D         : source rim centroid (PCA cache)
+//     src_principal_axis_3D   : source rim principal axis (PCA cache)
+//     src_major_normal_3D     : source rim patch normal (PCA cache)
+//
+//   Inputs (2D, from target side):
+//     tgt_anchors_2D          : N evenly-spaced pixels along contour
+//
+//   Per anchor k (and per enabled sign):
+//     a_3D       = unprojectPixelAtWorldDepth(tgt_anchors[k], src_centroid)
+//     am_3D, ap_3D = same for neighbours k-1, k+1   (chain order)
+//     t_tangent_3D = ap_3D - am_3D                  (in image plane)
+//     t_normal_3D  = camera_axis_world              (image plane normal)
+//     R = solveTwoAxisAlignment(s_axis_3D, s_normal_3D,
+//                                  t_tangent_3D, t_normal_3D)
+//     T_translation = a_3D - R · src_centroid_3D
+//     cost = project2DBoundaryDistance(R·src_pts_world + T_translation, ...)
+//
+//   Candidates with in-frame fraction below min_in_frame_rate get a
+//   large sortable rejection cost (1e9 + in_rate).
+// ---------------------------------------------------------------------
+inline bool runShapeMatchCoarse2D(
+    const std::vector<glm::vec3>& src_pts_world,
+    const glm::vec3& src_centroid_3D,
+    const glm::vec3& src_principal_axis_3D,
+    const glm::vec3& src_major_normal_3D,
+    const std::vector<glm::vec2>& tgt_anchors_2D,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    const BoundaryDistMap& bdy,
+    float out_of_frame_dist_px,
+    float max_dist_cap_px,
+    float min_in_frame_rate,
+    std::vector<CoarseCandidate>& candidates_out,
+    std::ostream* log = nullptr,
+    uint8_t sign_mask = 0x1,
+    float max_rot_deg = 180.0f)   // Step 3b: hard reject rotations above this
+{
+    candidates_out.clear();
+    if (src_pts_world.empty()) {
+        if (log) (*log) << "[Coarse2D] empty source" << std::endl;
+        return false;
+    }
+    const int M = (int)tgt_anchors_2D.size();
+    if (M < 3) {
+        if (log) (*log) << "[Coarse2D] need >=3 anchors, got " << M
+                   << std::endl;
+        return false;
+    }
+    if (!bdy.valid) {
+        if (log) (*log) << "[Coarse2D] boundary map invalid" << std::endl;
+        return false;
+    }
+
+    int n_signs = 0;
+    for (int s = 0; s < 4; s++) if (sign_mask & (1 << s)) n_signs++;
+    if (n_signs == 0) {
+        if (log) (*log) << "[Coarse2D] sign_mask=0 disables all signs"
+                   << std::endl;
+        return false;
+    }
+
+    // Camera viewing direction in world ("into the scene"). For our AR
+    // fixed camera (lookAt(0, +Z)) this is approximately (0, 0, +1).
+    // We use the inverse view to transform the camera-space forward
+    // vector (0,0,-1, 0) back to world space — that's the direction
+    // the camera looks toward in world coordinates.
+    const glm::mat4 view_inv = glm::inverse(view);
+    glm::vec3 cam_axis_world =
+        glm::vec3(view_inv * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+    const float cam_axis_len = glm::length(cam_axis_world);
+    if (cam_axis_len < 1e-6f) {
+        if (log) (*log) << "[Coarse2D] zero camera axis" << std::endl;
+        return false;
+    }
+    cam_axis_world /= cam_axis_len;
+
+    candidates_out.reserve(size_t(M) * size_t(n_signs));
+    std::vector<glm::vec3> src_transformed;
+    src_transformed.reserve(src_pts_world.size());
+
+    int n_rejected_inframe = 0;
+    int n_tried            = 0;
+    int n_skipped_tangent  = 0;
+    int n_rejected_rot     = 0;     // Step 3b: hard reject above max_rot_deg
+
+    for (int k = 0; k < M; k++) {
+        const int im = (k - 1 + M) % M;
+        const int ip = (k + 1) % M;
+        const glm::vec3 a_3D  = unprojectPixelAtWorldDepth(
+            tgt_anchors_2D[k],  src_centroid_3D, view, proj, W, H);
+        const glm::vec3 am_3D = unprojectPixelAtWorldDepth(
+            tgt_anchors_2D[im], src_centroid_3D, view, proj, W, H);
+        const glm::vec3 ap_3D = unprojectPixelAtWorldDepth(
+            tgt_anchors_2D[ip], src_centroid_3D, view, proj, W, H);
+        const glm::vec3 t_tangent_raw = ap_3D - am_3D;
+        if (glm::length(t_tangent_raw) < 1e-9f) {
+            n_skipped_tangent++;
+            continue;
+        }
+
+        for (int sign = 0; sign < 4; sign++) {
+            if (!(sign_mask & (1 << sign))) continue;
+            const glm::vec3 t_tangent_signed =
+                (sign & 1) ? -t_tangent_raw : t_tangent_raw;
+            const glm::vec3 t_normal_signed =
+                (sign & 2) ? -cam_axis_world : cam_axis_world;
+
+            const glm::mat3 R = solveTwoAxisAlignment(
+                src_principal_axis_3D, src_major_normal_3D,
+                t_tangent_signed,       t_normal_signed);
+            const glm::vec3 t_vec = a_3D - R * src_centroid_3D;
+
+            src_transformed.clear();
+            for (const auto& p : src_pts_world) {
+                src_transformed.push_back(R * p + t_vec);
+            }
+            int n_in_frame = 0, n_in_mask = 0;
+            const double cost = project2DBoundaryDistance(
+                src_transformed, view, proj, W, H, bdy,
+                out_of_frame_dist_px, max_dist_cap_px,
+                &n_in_frame, &n_in_mask);
+            n_tried++;
+
+            double final_cost = cost;
+            const float in_rate = (src_pts_world.empty()
+                                       ? 0.0f
+                                       : float(n_in_frame)
+                                             / float(src_pts_world.size()));
+            if (in_rate < min_in_frame_rate) {
+                final_cost = 1e9 + double(1.0f - in_rate);
+                n_rejected_inframe++;
+            }
+
+            // Step 3b: hard reject candidates whose rotation exceeds
+            //   max_rot_deg from identity. Trusts the user's Init Pose
+            //   as the rotational anchor; Coarse2D only refines within
+            //   the cone. Skip the candidate entirely (not even kept
+            //   as a "penalized" rank, so it can never win).
+            //   cos(angle) = (trace(R) - 1) / 2
+            const float cos_angle_cand =
+                0.5f * (R[0][0] + R[1][1] + R[2][2] - 1.0f);
+            const float cos_thresh_hard =
+                std::cos(glm::radians(max_rot_deg));
+            if (cos_angle_cand < cos_thresh_hard) {
+                n_rejected_rot++;
+                continue;   // skip this candidate entirely
+            }
+
+            glm::mat4 T4(1.0f);
+            T4[0] = glm::vec4(R[0], 0.0f);
+            T4[1] = glm::vec4(R[1], 0.0f);
+            T4[2] = glm::vec4(R[2], 0.0f);
+            T4[3] = glm::vec4(t_vec, 1.0f);
+
+            candidates_out.push_back({T4, final_cost, k, k, sign});
+        }
+    }
+
+    if (log) {
+        (*log) << "[Coarse2D] M_anchors=" << M
+               << "  signs=" << n_signs
+               << "(mask=0x" << std::hex << (int)sign_mask << std::dec
+               << ")  src=" << src_pts_world.size()
+               << "  cands=" << candidates_out.size()
+               << "  tried=" << n_tried
+               << "  rejected_inframe=" << n_rejected_inframe
+               << "  rejected_rot=" << n_rejected_rot
+               << " (max=" << max_rot_deg << "°)"
+               << "  skipped_tangent=" << n_skipped_tangent
+               << "  cam_axis=(" << cam_axis_world.x << ","
+               << cam_axis_world.y << "," << cam_axis_world.z << ")"
+               << std::endl;
+    }
+
+    return !candidates_out.empty();
+}
+
+
+// =====================================================================
+//  Phase 7b Step 3b — Gauss-Newton refinement (Alt+W)
+// =====================================================================
+//
+//  Treats rim alignment as a PnP-style nonlinear least squares:
+//
+//    Unknown: ξ ∈ se(3) = [ρ; ω] ∈ ℝ⁶  (translation 3 + rotation 3)
+//    Observations: rim 3D points p_i (CT, reliable)
+//    Target: unsigned distance-to-boundary field bdy(pixel)
+//
+//    Residual:  r_i(ξ) = bdy( π(view · exp(ξ)·T_0 · p_i) )
+//    Cost:      F(ξ)  = Σ_i r_i²
+//    Update:    ξ ← ξ − (JᵀJ + λI)⁻¹ Jᵀ r          (Levenberg-Marquardt)
+//
+//  Jacobian chain (left perturbation, T_{k+1} = exp(Δξ)·T_k):
+//
+//    ∂r/∂ξ = (∂bdy/∂pixel) · (∂pixel/∂p_world) · (∂p_world/∂Δξ)
+//             1×2              2×3                  3×6
+//
+//    ∂p_world/∂Δξ = [I_3 | −[p_w]_×]
+//
+//    Letting M = projMat · viewMat, w = clip.w, ndc = clip.xyz/w:
+//      ∂pixel.x/∂p_world =  W/(2w) · ( M_row0_xyz − ndc.x · M_row3_xyz )
+//      ∂pixel.y/∂p_world = −H/(2w) · ( M_row1_xyz − ndc.y · M_row3_xyz )
+//
+//    ∂bdy/∂pixel via exact bilinear gradient at the sub-pixel sample.
+//
+//  Why unsigned distance map (not g_boundaryDistMap directly):
+//    g_boundaryDistMap is piecewise constant (sentinel 9999) outside the
+//    SAM2 mask → no gradient there → GN can't pull outside points back.
+//    We BFS from the boundary contour without the mask gate, producing
+//    a smooth field that pulls rim points toward the boundary from
+//    either side. One-time build per Shift+W (or invalidate on Run Depth).
+//
+//  Performance: ~1 ms per iteration with 254 rim points + 6×6 ldlt
+//               solve. Typical convergence in 5–15 iters → ~10–20 ms.
+//               Coarse2D (1 ms) + GN (15 ms) ≈ 20 ms total per Alt+W.
+//
+//  Convention: ξ = [ρ; ω] (rho first 3, omega last 3). T_new = exp(Δξ)·T.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// skewSym
+//   Build the 3×3 skew-symmetric matrix [v]× such that [v]× · w = v × w.
+//   GLM is column-major, so we construct by columns:
+//     [v]× = [[0,-v.z, v.y], [v.z, 0,-v.x], [-v.y, v.x, 0]]
+// ---------------------------------------------------------------------
+inline glm::mat3 skewSym(const glm::vec3& v)
+{
+    return glm::mat3(
+        glm::vec3( 0.0f,  v.z, -v.y),   // column 0
+        glm::vec3(-v.z,  0.0f,  v.x),   // column 1
+        glm::vec3( v.y, -v.x,  0.0f));  // column 2
+}
+
+
+// ---------------------------------------------------------------------
+// expSE3
+//   Lie-algebra exponential map: ξ = [ρ; ω] ∈ se(3) → T ∈ SE(3).
+//
+//     θ = ||ω||
+//     R = I + A·[ω]× + B·[ω]×²   (Rodrigues)
+//     V = I + B·[ω]× + C·[ω]×²
+//     t = V · ρ
+//     T = [R t; 0 1]
+//
+//   Coefficients (Taylor-stable near θ=0):
+//     A = sin(θ)/θ                    ≈ 1 − θ²/6 + …
+//     B = (1 − cos(θ))/θ²             ≈ 1/2 − θ²/24 + …
+//     C = (θ − sin(θ))/θ³             ≈ 1/6 − θ²/120 + …
+// ---------------------------------------------------------------------
+inline glm::mat4 expSE3(const glm::vec3& rho, const glm::vec3& omega)
+{
+    const float theta2 = glm::dot(omega, omega);
+    const float theta  = std::sqrt(theta2);
+    float A, B, C;
+    if (theta < 1e-4f) {
+        const float t4 = theta2 * theta2;
+        A = 1.0f   - theta2 / 6.0f   + t4 / 120.0f;
+        B = 0.5f   - theta2 / 24.0f  + t4 / 720.0f;
+        C = 1.0f/6.0f - theta2 / 120.0f + t4 / 5040.0f;
+    } else {
+        const float s = std::sin(theta);
+        const float c = std::cos(theta);
+        A = s / theta;
+        B = (1.0f - c) / theta2;
+        C = (theta - s) / (theta2 * theta);
+    }
+    const glm::mat3 W   = skewSym(omega);
+    const glm::mat3 W2  = W * W;
+    const glm::mat3 I3  = glm::mat3(1.0f);
+    const glm::mat3 R   = I3 + A * W + B * W2;
+    const glm::mat3 V   = I3 + B * W + C * W2;
+    const glm::vec3 t   = V * rho;
+
+    glm::mat4 T(1.0f);
+    T[0] = glm::vec4(R[0], 0.0f);
+    T[1] = glm::vec4(R[1], 0.0f);
+    T[2] = glm::vec4(R[2], 0.0f);
+    T[3] = glm::vec4(t,    1.0f);
+    return T;
+}
+
+
+// ---------------------------------------------------------------------
+// buildUnsignedBoundaryMap
+//   BFS-propagated distance to the SAM2 boundary contour, filling BOTH
+//   sides (inside and outside the mask). Output values:
+//      0      = on the boundary
+//      1..N   = pixel-distance to nearest boundary pixel
+//
+//   Boundary seeds = pixels where bdy_inside.data[i] < 1.5f and not the
+//   9999 sentinel (i.e. inner 1-px ring of the mask boundary).
+//
+//   Disconnected regions get 1000.0f (a soft "far away" cap; the BFS
+//   should normally reach everything in a connected image).
+//
+//   Cost: O(W·H), one full-image BFS pass. ~10–20 ms on 1920×1080.
+// ---------------------------------------------------------------------
+inline bool buildUnsignedBoundaryMap(
+    const BoundaryDistMap& bdy_inside,
+    std::vector<float>& dist_out,
+    int& W_out, int& H_out,
+    std::ostream* log = nullptr)
+{
+    if (!bdy_inside.valid || bdy_inside.width <= 0 || bdy_inside.height <= 0) {
+        if (log) (*log) << "[GN/UnsignedBdy] input bdy invalid" << std::endl;
+        return false;
+    }
+    W_out = bdy_inside.width;
+    H_out = bdy_inside.height;
+    dist_out.assign(size_t(W_out) * size_t(H_out), -1.0f);
+
+    std::queue<std::pair<int,int>> q;
+    int n_seeds = 0;
+    for (int y = 0; y < H_out; y++) {
+        for (int x = 0; x < W_out; x++) {
+            const float v = bdy_inside.data[y * W_out + x];
+            if (v >= 0.0f && v < 1.5f && v < 9000.0f) {
+                dist_out[y * W_out + x] = 0.0f;
+                q.push({x, y});
+                n_seeds++;
+            }
+        }
+    }
+    if (n_seeds == 0) {
+        if (log) (*log) << "[GN/UnsignedBdy] no boundary seeds" << std::endl;
+        return false;
+    }
+
+    const int dx4[] = { 1, -1,  0,  0 };
+    const int dy4[] = { 0,  0,  1, -1 };
+    while (!q.empty()) {
+        auto [cx, cy] = q.front(); q.pop();
+        const float cd = dist_out[cy * W_out + cx];
+        for (int d = 0; d < 4; d++) {
+            int nx = cx + dx4[d], ny = cy + dy4[d];
+            if (nx < 0 || nx >= W_out || ny < 0 || ny >= H_out) continue;
+            int ni = ny * W_out + nx;
+            if (dist_out[ni] < 0.0f) {
+                dist_out[ni] = cd + 1.0f;
+                q.push({nx, ny});
+            }
+        }
+    }
+    for (size_t i = 0; i < dist_out.size(); i++) {
+        if (dist_out[i] < 0.0f) dist_out[i] = 1000.0f;
+    }
+    if (log) {
+        float maxd = 0.0f;
+        for (float v : dist_out) {
+            if (v < 999.0f && v > maxd) maxd = v;
+        }
+        (*log) << "[GN/UnsignedBdy] built " << W_out << "x" << H_out
+               << "  seeds=" << n_seeds << "  reached_max=" << maxd << "px"
+               << std::endl;
+    }
+    return true;
+}
+
+
+// ---------------------------------------------------------------------
+// GNResult
+//   Returned by runShapeMatchGN. cost_history contains the cost at the
+//   start and after each ACCEPTED LM step (rejected steps not logged).
+// ---------------------------------------------------------------------
+struct GNResult {
+    glm::mat4 final_T       = glm::mat4(1.0f);
+    double    initial_cost  = 0.0;
+    double    final_cost    = 0.0;
+    int       n_iter        = 0;
+    bool      converged     = false;
+    int       reason        = 2;   // 0=step, 1=rel_cost, 2=max_iter, 3=lm_fail
+    int       n_in_frame    = 0;   // at final pose
+    std::vector<double> cost_history;
+};
+
+
+// ---------------------------------------------------------------------
+// runShapeMatchGN
+//   Levenberg-Marquardt refinement of T such that src_pts_world
+//   project onto the boundary contour. T_init is the starting transform
+//   (typically the best Coarse2D candidate).
+//
+//   The implementation samples bdy_unsigned with exact bilinear
+//   gradient at each sub-pixel sample, builds a 6×6 normal equation per
+//   iteration, and applies left perturbation T_new = exp(Δξ) · T.
+//
+//   max_iter        : hard cap on iterations (default 30)
+//   lm_lambda_init  : initial LM damping (default 1e-3)
+//   eps_step        : converge if ||Δξ|| < eps_step
+//   eps_rel         : converge if |ΔF/F| < eps_rel
+//
+//   On reject: λ ×= 4 (up to 1e9). On accept: λ /= 2.
+// ---------------------------------------------------------------------
+inline bool runShapeMatchGN(
+    const std::vector<glm::vec3>& src_pts_world,
+    const glm::mat4& T_init,
+    const glm::mat4& view, const glm::mat4& proj,
+    const std::vector<float>& bdy_unsigned,
+    int bdy_W, int bdy_H,
+    int   max_iter,
+    float lm_lambda_init,
+    float eps_step,
+    float eps_rel,
+    GNResult& result_out,
+    std::ostream* log = nullptr,
+    bool  translation_only = false,    // Step 3b: lock rotation (Alt+W default)
+    float lm_lambda_min    = 1.0e-3f,  // Step 3b: prevent depth runaway
+    float max_step_norm    = 0.05f)    // Step 3b: trust-region on ||Δξ||
+{
+    result_out = GNResult{};
+    result_out.final_T = T_init;
+    if (src_pts_world.empty() || bdy_unsigned.empty()) {
+        if (log) (*log) << "[GN] empty input" << std::endl;
+        return false;
+    }
+    if (bdy_W <= 2 || bdy_H <= 2 ||
+        (int)bdy_unsigned.size() < bdy_W * bdy_H) {
+        if (log) (*log) << "[GN] bdy_unsigned size mismatch" << std::endl;
+        return false;
+    }
+
+    const glm::mat4 M = proj * view;     // VP matrix
+    // Row slices of M (xyz only) for the perspective Jacobian.
+    // GLM is column-major: M[col][row] = element (row, col).
+    const glm::vec3 Mr0_xyz(M[0][0], M[1][0], M[2][0]);
+    const glm::vec3 Mr1_xyz(M[0][1], M[1][1], M[2][1]);
+    const glm::vec3 Mr3_xyz(M[0][3], M[1][3], M[2][3]);
+    const int N = (int)src_pts_world.size();
+
+    // Bilinear sample with exact bilinear gradient (in pixel units).
+    auto sample_with_grad = [&](float px, float py,
+                                float& gx, float& gy) -> float {
+        if (px < 0.0f) px = 0.0f;
+        if (py < 0.0f) py = 0.0f;
+        if (px > float(bdy_W - 2)) px = float(bdy_W - 2);
+        if (py > float(bdy_H - 2)) py = float(bdy_H - 2);
+        const int x0 = int(std::floor(px));
+        const int y0 = int(std::floor(py));
+        const float fx = px - float(x0);
+        const float fy = py - float(y0);
+        const float v00 = bdy_unsigned[y0     * bdy_W + x0];
+        const float v10 = bdy_unsigned[y0     * bdy_W + (x0 + 1)];
+        const float v01 = bdy_unsigned[(y0+1) * bdy_W + x0];
+        const float v11 = bdy_unsigned[(y0+1) * bdy_W + (x0 + 1)];
+        const float v = (1.0f - fx) * (1.0f - fy) * v00
+                      +         fx  * (1.0f - fy) * v10
+                      + (1.0f - fx) *         fy  * v01
+                      +         fx  *         fy  * v11;
+        gx = (1.0f - fy) * (v10 - v00) + fy * (v11 - v01);
+        gy = (1.0f - fx) * (v01 - v00) + fx * (v11 - v10);
+        return v;
+    };
+
+    // Cost evaluation only (no Jacobian). Out-of-frame penalty = 100 px,
+    // matches the Coarse2D outside cap so the LM "cost" stays comparable.
+    auto eval_cost = [&](const glm::mat4& T, int* n_in_frame_out) -> double {
+        double sum = 0.0;
+        int n_in_frame = 0;
+        for (int i = 0; i < N; i++) {
+            const glm::vec4 p_T  = T * glm::vec4(src_pts_world[i], 1.0f);
+            const glm::vec4 clip = M * p_T;
+            if (clip.w <= 1e-9f) { sum += 100.0; continue; }
+            const float inv_w = 1.0f / clip.w;
+            const float ndcx = clip.x * inv_w;
+            const float ndcy = clip.y * inv_w;
+            if (ndcx < -1.0f || ndcx > 1.0f ||
+                ndcy < -1.0f || ndcy > 1.0f) {
+                sum += 100.0;
+                continue;
+            }
+            n_in_frame++;
+            const float px = (ndcx + 1.0f) * 0.5f * float(bdy_W);
+            const float py = (1.0f - ndcy) * 0.5f * float(bdy_H);
+            float gx, gy;
+            sum += sample_with_grad(px, py, gx, gy);
+        }
+        if (n_in_frame_out) *n_in_frame_out = n_in_frame;
+        return sum / double(N);
+    };
+
+    glm::mat4 T = T_init;
+    int n_in_frame_curr = 0;
+    double cost = eval_cost(T, &n_in_frame_curr);
+    result_out.initial_cost = cost;
+    result_out.cost_history.push_back(cost);
+    result_out.n_in_frame   = n_in_frame_curr;
+
+    if (log) {
+        (*log) << "[GN] start cost=" << cost << "px in_frame="
+               << n_in_frame_curr << "/" << N
+               << " lambda=" << lm_lambda_init
+               << " λ_min=" << lm_lambda_min
+               << " step_max=" << max_step_norm
+               << " mode=" << (translation_only ? "TRANS_ONLY(3-DoF)" : "FULL(6-DoF)")
+               << std::endl;
+    }
+
+    double lambda = lm_lambda_init;
+    int    iter = 0;
+    bool   converged = false;
+    int    reason = 2;  // default = max_iter
+
+    for (iter = 1; iter <= max_iter; iter++) {
+        // Build 6×6 normal equations from in-frame points only.
+        Eigen::Matrix<double, 6, 6> JTJ = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> JTr = Eigen::Matrix<double, 6, 1>::Zero();
+        int n_used = 0;
+
+        for (int i = 0; i < N; i++) {
+            const glm::vec4 p_T  = T * glm::vec4(src_pts_world[i], 1.0f);
+            const glm::vec3 p_w(p_T.x, p_T.y, p_T.z);
+            const glm::vec4 clip = M * p_T;
+            if (clip.w <= 1e-9f) continue;
+            const float inv_w = 1.0f / clip.w;
+            const float ndcx = clip.x * inv_w;
+            const float ndcy = clip.y * inv_w;
+            if (ndcx < -1.0f || ndcx > 1.0f ||
+                ndcy < -1.0f || ndcy > 1.0f) continue;
+            const float px = (ndcx + 1.0f) * 0.5f * float(bdy_W);
+            const float py = (1.0f - ndcy) * 0.5f * float(bdy_H);
+            float gx_px, gy_px;
+            const float r = sample_with_grad(px, py, gx_px, gy_px);
+
+            // ∂pixel/∂p_world  ∈ ℝ²ˣ³
+            const float sx =  0.5f * float(bdy_W) * inv_w;
+            const float sy = -0.5f * float(bdy_H) * inv_w;
+            const glm::vec3 dpx_dp = sx * (Mr0_xyz - ndcx * Mr3_xyz);
+            const glm::vec3 dpy_dp = sy * (Mr1_xyz - ndcy * Mr3_xyz);
+
+            // ∂r/∂p_world = gx · dpx_dp + gy · dpy_dp  ∈ ℝ¹ˣ³
+            const glm::vec3 L = gx_px * dpx_dp + gy_px * dpy_dp;
+
+            // Left perturbation: ∂p_world/∂ξ = [ I | -[p_w]_× ]
+            // J_i = L · [ I | -[p_w]_× ] = [ L , -L · [p_w]_× ]
+            //     = [ L , L × p_w ]    (row-vector × skew identity)
+            // Because L · skew(p) = -p × L = L × (-p) → −L·skew(p) = p × L … hmm.
+            // Derivation: L · skew(p) = -(p × L) (treating L as row). So
+            // -L · skew(p) = p × L. Equivalently L × p has different sign.
+            // We need to double-check; pick the sign that physically pulls
+            // p toward the gradient. We'll use: -L · skew(p_w) = cross(p_w, L)
+            const glm::vec3 J_w = glm::cross(p_w, L);
+
+            Eigen::Matrix<double, 6, 1> Ji;
+            Ji(0) = L.x;   Ji(1) = L.y;   Ji(2) = L.z;
+            Ji(3) = J_w.x; Ji(4) = J_w.y; Ji(5) = J_w.z;
+
+            JTJ.noalias() += Ji * Ji.transpose();
+            JTr.noalias() += Ji * double(r);
+            n_used++;
+        }
+
+        if (n_used < 6) {
+            if (log) (*log) << "[GN] iter " << iter
+                       << " too few used points (" << n_used
+                       << ") — abort" << std::endl;
+            reason = 3;
+            break;
+        }
+
+        // Solve (JTJ + λI) Δξ = −JTr
+        // For translation_only mode: zero out the rotation block (last 3
+        //   rows/cols of JTJ and last 3 rows of JTr) so the solver only
+        //   moves the translation 3-vector. Equivalent to a separate 3×3
+        //   solve, but kept in one path for code unity.
+        Eigen::Matrix<double, 6, 6> H = JTJ;
+        Eigen::Matrix<double, 6, 1> g = JTr;
+        if (translation_only) {
+            // Lock rotation: set rotation block to identity·1, rotation
+            //   gradient to 0. Solver returns Δξ_rot = 0 exactly.
+            for (int i = 3; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    H(i, j) = (i == j) ? 1.0 : 0.0;
+                    H(j, i) = (i == j) ? 1.0 : 0.0;
+                }
+                g(i) = 0.0;
+            }
+        }
+        for (int d = 0; d < 6; d++) H(d, d) += lambda;
+        Eigen::Matrix<double, 6, 1> dxi = H.ldlt().solve(-g);
+
+        // Step 3b: trust-region clamp on ||Δξ||
+        //   Prevents the huge first-step explosion (||dxi||=0.62 seen in
+        //   the log) that lets PnP escape into depth-degenerate minima.
+        //   max_step_norm=0.05 ≈ 5cm + 3°, comfortable per LM iter.
+        const double dxi_norm_raw = dxi.norm();
+        if (dxi_norm_raw > double(max_step_norm)) {
+            dxi *= double(max_step_norm) / dxi_norm_raw;
+        }
+
+        const glm::vec3 rho(   float(dxi(0)), float(dxi(1)), float(dxi(2)));
+        const glm::vec3 omega( float(dxi(3)), float(dxi(4)), float(dxi(5)));
+        const glm::mat4 T_trial = expSE3(rho, omega) * T;
+
+        int n_in_frame_trial = 0;
+        const double cost_trial = eval_cost(T_trial, &n_in_frame_trial);
+        const double dxi_norm   = dxi.norm();
+
+        if (log) {
+            (*log) << "[GN] iter " << iter
+                   << "  cost " << cost << "→" << cost_trial << "px"
+                   << "  ||dxi||=" << dxi_norm
+                   << "  λ=" << lambda
+                   << "  used=" << n_used << "/" << N
+                   << "  in_frame=" << n_in_frame_trial << "/" << N
+                   << ((cost_trial < cost) ? " [accept]" : " [reject]")
+                   << std::endl;
+        }
+
+        if (cost_trial < cost) {
+            const double rel = std::abs(cost_trial - cost)
+                               / std::max(1e-9, cost);
+            cost = cost_trial;
+            T = T_trial;
+            lambda = std::max((double)lm_lambda_min, lambda * 0.5);
+            result_out.cost_history.push_back(cost);
+            result_out.n_in_frame = n_in_frame_trial;
+
+            if (dxi_norm < eps_step) {
+                converged = true; reason = 0; break;
+            }
+            if (rel < eps_rel) {
+                converged = true; reason = 1; break;
+            }
+        } else {
+            lambda *= 4.0;
+            if (lambda > 1e9) {
+                if (log) (*log) << "[GN] λ exploded — abort" << std::endl;
+                reason = 3;
+                break;
+            }
+        }
+    }
+
+    result_out.final_T   = T;
+    result_out.final_cost = cost;
+    result_out.n_iter    = iter;
+    result_out.converged = converged;
+    result_out.reason    = reason;
+
+    if (log) {
+        const char* reason_str[] = {"step", "rel", "max_iter", "lm_fail"};
+        (*log) << "[GN] done iters=" << iter
+               << "  cost " << result_out.initial_cost
+               << " → " << cost << "px"
+               << "  Δ=" << (result_out.initial_cost - cost)
+               << "  converged=" << (converged ? "Y" : "N")
+               << "  reason=" << reason_str[std::min(3, reason)]
+               << "  in_frame=" << result_out.n_in_frame << "/" << N
+               << std::endl;
+    }
+    return true;
+}
+
 
 } // namespace RimShape
 

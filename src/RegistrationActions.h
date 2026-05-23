@@ -219,6 +219,128 @@ inline int  g_shapeMatchAxisSweepTgtSubN = 5000;
 //   合計 ~700ms 追加だが信頼性向上。
 inline bool g_shapeMatchAxisSweepCompare = true;
 
+// =====================================================================
+// Phase 7b Step 3a — Full-2D Ctrl+W cost (depth-free)
+// =====================================================================
+//   When ON (default), runDebugShapeMatchCoarse switches its cost
+//   evaluation from 3D chamfer (legacy Step 3) to 2D AR-projected
+//   boundary distance lookup. Target side is the 2D contour traced
+//   directly from g_boundaryDistMap — no screenMesh depth lift.
+//
+//   `g_shapeMatchUse2DCost`        : master toggle (Use 2D AR matching).
+//   `g_shapeMatchContourN2D`       : arc-length resample count for the
+//                                    2D contour → coarse anchor count.
+//                                    default 200 (vs legacy 30 in 3D)
+//                                    since 2D evaluation is ~1000× faster.
+//   `g_shapeMatchMinInFrameRate`   : reject candidates whose projection
+//                                    has < this fraction of source rim
+//                                    inside the image frame.
+//   `g_shapeMatchOutOfFrameDistPx` : penalty value assigned to source
+//                                    points projecting outside the
+//                                    viewport. Used inside cost mean.
+//   `g_shapeMatchMaxDistCapPx`     : per-point cost cap. Caps both the
+//                                    inside-mask distance values and
+//                                    the "outside mask" sentinel.
+//                                    Bounds the influence of outliers.
+//   `g_shapeMatch2DInstThreshPx`   : instrument distance threshold for
+//                                    excluding target boundary pixels
+//                                    near surgical instruments. 0 to
+//                                    disable. Reuses pixel-domain
+//                                    convention of g_ctrlgsInstrumentThreshPx.
+inline bool  g_shapeMatchUse2DCost         = true;
+inline int   g_shapeMatchContourN2D        = 200;
+inline float g_shapeMatchMinInFrameRate    = 0.30f;
+inline float g_shapeMatchOutOfFrameDistPx  = 100.0f;
+inline float g_shapeMatchMaxDistCapPx      = 100.0f;
+inline float g_shapeMatch2DInstThreshPx    = 20.0f;
+
+// Phase 7b Step 3a — 2D contour cache + last cost diagnostics.
+//   `g_debugTargetContour2D`         : the largest contour segment from
+//                                      Shift+W's last trace, in pixel
+//                                      space. Used by Ctrl+W (2D mode)
+//                                      and for the on-screen overlay.
+//   `g_debugTargetContour2DSegSizes` : per-segment sizes (segments[0]
+//                                      is the one stored above; later
+//                                      ones are dropped for now).
+//   `g_debugShapeMatchBestInFrame`   : in-frame fraction of best cand
+//                                      (post-2D-eval). For UI display.
+//   `g_debugShapeMatchBestInMask`    : ditto, in-mask fraction.
+extern std::vector<glm::vec2> g_debugTargetContour2D;
+extern std::vector<int>       g_debugTargetContour2DSegSizes;
+inline float g_debugShapeMatchBestInFrame = 0.0f;
+inline float g_debugShapeMatchBestInMask  = 0.0f;
+
+// =====================================================================
+// Phase 7b Step 3b — Gauss-Newton refinement (Alt+W)
+// =====================================================================
+//
+//   Alt+W runs Coarse2D first to get a good initial T, then refines
+//   it with PnP-style Levenberg-Marquardt against an UNSIGNED
+//   boundary distance field (smooth on both sides of the mask).
+//   Sub-pixel rim/contour alignment, ~10–20 ms refine.
+//
+//   Source-normal sign normalization (default ON, "Idea A"):
+//     PCA eigenvectors carry a ± sign ambiguity. We flip the source
+//     rim's PCA "normal" so it faces the camera before passing it to
+//     solveTwoAxisAlignment. Without this, sign=0 candidates can
+//     systematically resolve to a 180°-flipped pose. This benefits
+//     both Ctrl+W and Alt+W (toggle for legacy reproduction).
+//
+//   GN parameters:
+//     g_shapeMatchGNMaxIter      : LM iteration cap
+//     g_shapeMatchGNLambdaInit   : initial Levenberg damping
+//     g_shapeMatchGNEpsStep      : converge if ||Δξ|| below this
+//     g_shapeMatchGNEpsRel       : converge if |ΔF/F| below this
+//
+//   Cached unsigned-distance map:
+//     g_gnUnsignedBdy  / W / H / Valid — built once, reused across
+//     Alt+W calls. Invalidated when g_boundaryDistMap.invalidate()
+//     fires (Run Depth, segmentation mask reload).
+inline bool   g_shapeMatchFlipNormalToCamera = true;
+inline int    g_shapeMatchGNMaxIter          = 30;
+inline float  g_shapeMatchGNLambdaInit       = 1.0e-3f;
+inline float  g_shapeMatchGNEpsStep          = 1.0e-5f;
+inline float  g_shapeMatchGNEpsRel           = 1.0e-4f;
+
+// Step 3b (revised) — robustness controls (default values mirror the
+// fix for the depth-runaway observed in the first Alt+W trial).
+//
+//   g_shapeMatchCoarseMaxRotDeg    : Coarse2D の hard rotation cap.
+//       Init Pose を回転基準として絶対視するなら 45° 以下に。Step 3a
+//       の rot cos threshold は「soft penalty」だったため大幅回転候補
+//       が cost で勝ってしまっていた。これは hard reject (continue) で
+//       絶対通さない。Ctrl+W / Alt+W 双方の Coarse2D 探索に効く。
+//       180° = 制約なし (legacy 動作)。45° 推奨。
+//   g_shapeMatchGNTranslationOnly  : Alt+W で回転を完全ロックする。
+//       PnP の depth 縮退を構造的に排除。Init Pose の回転を信頼すれば
+//       並進 3-DoF のみで rim を合わせれば十分。
+//   g_shapeMatchGNLambdaMin        : LM ダンピング下限。1e-3 が
+//       depth 暴走を防ぐ最小値 (実測。1e-9 まで落とすと破綻)。
+//   g_shapeMatchGNStepMax          : trust region cap on ||Δξ|| per
+//       iteration. 0.05 ≈ 5 cm + 3° / iter。初回ステップの大暴れを抑止。
+//   g_shapeMatchAltWSkipCoarse     : Alt+W から Coarse2D を完全スキップ。
+//       「現在 mesh 姿勢からの局所 refine のみ」モード。Init Pose 後の
+//       polish 用途として推奨 (default ON)。
+//       OFF = 旧動作 (Coarse2D → GN)。
+inline float  g_shapeMatchCoarseMaxRotDeg    = 45.0f;
+inline bool   g_shapeMatchGNTranslationOnly  = true;
+inline float  g_shapeMatchGNLambdaMin        = 1.0e-3f;
+inline float  g_shapeMatchGNStepMax          = 0.05f;
+inline bool   g_shapeMatchAltWSkipCoarse     = true;
+
+extern std::vector<float> g_gnUnsignedBdy;
+extern int                g_gnUnsignedBdyW;
+extern int                g_gnUnsignedBdyH;
+extern bool               g_gnUnsignedBdyValid;
+
+// GN diagnostics (filled by last Alt+W call, displayed in panel + log)
+inline double g_debugShapeMatchGNInitCost   = 0.0;
+inline double g_debugShapeMatchGNFinalCost  = 0.0;
+inline int    g_debugShapeMatchGNIters      = 0;
+inline bool   g_debugShapeMatchGNConverged  = false;
+inline int    g_debugShapeMatchGNReason     = -1;     // 0=step,1=rel,2=max,3=fail
+inline int    g_debugShapeMatchGNInFrame    = 0;
+
 // Debug snapshot of last axis sweep (visualizers / logging)
 inline glm::mat4 g_debugShapeMatchAxisSweepT       = glm::mat4(1.0f);
 inline double    g_debugShapeMatchAxisSweepCost    = 0.0;
@@ -8863,6 +8985,53 @@ inline bool populateDebugTargetBoundary()
         std::cout << "[W/TgtBound] no points pass filter — abort" << std::endl;
         return false;
     }
+
+    // -----------------------------------------------------------------
+    // Phase 7b Step 3a — also extract 2D contour directly from
+    // g_boundaryDistMap. This is the "real" target lying in 2D pixel
+    // space, used by Ctrl+W when g_shapeMatchUse2DCost == true.
+    //
+    // We populate this alongside the 3D points so Shift+W gives the
+    // 2D path everything it needs without an extra key press. The 3D
+    // points above stay for legacy 3D Ctrl+W and for the purple-dot
+    // debug overlay (depth-lifted, debug-only).
+    // -----------------------------------------------------------------
+    g_debugTargetContour2D.clear();
+    g_debugTargetContour2DSegSizes.clear();
+    if (g_boundaryDistMap.valid && g_boundaryDistMap.width  > 0
+                                && g_boundaryDistMap.height > 0)
+    {
+        std::vector<std::vector<glm::vec2>> segments;
+        const float bdy_th  = 1.5f;
+        const float inst_th = g_shapeMatch2DInstThreshPx;
+        const BoundaryDistMap* inst_ptr =
+            (inst_th > 0.0f && g_instrumentDistMap.valid)
+                ? &g_instrumentDistMap : nullptr;
+        const bool traced = RimShape::traceContour2D(
+            g_boundaryDistMap, bdy_th, inst_ptr, inst_th,
+            segments, &std::cout);
+        if (traced && !segments.empty()) {
+            g_debugTargetContour2D = std::move(segments[0]);
+            g_debugTargetContour2DSegSizes.reserve(segments.size() + 1);
+            g_debugTargetContour2DSegSizes.push_back(
+                (int)g_debugTargetContour2D.size());
+            for (size_t i = 1; i < segments.size(); i++) {
+                g_debugTargetContour2DSegSizes.push_back(
+                    (int)segments[i].size());
+            }
+            std::cout << "[W/TgtBound/2D] using largest segment: "
+                      << g_debugTargetContour2D.size() << " pixels"
+                      << "  (total segments=" << segments.size() << ")"
+                      << std::endl;
+        } else {
+            std::cout << "[W/TgtBound/2D] no 2D contour traced —"
+                      << " Ctrl+W 2D mode will fail" << std::endl;
+        }
+    } else {
+        std::cout << "[W/TgtBound/2D] g_boundaryDistMap invalid"
+                  << " — Ctrl+W 2D mode unavailable" << std::endl;
+    }
+
     return true;
 }
 
@@ -8933,6 +9102,198 @@ inline bool runDebugShapeMatchCoarse()
                   << std::endl;
         return false;
     }
+
+    // =================================================================
+    // Phase 7b Step 3a — Branch on 2D vs 3D cost
+    //   2D path: depth-free, uses g_boundaryDistMap directly.
+    //   3D path: legacy chamfer between depth-lifted target and source.
+    // =================================================================
+    if (g_shapeMatchUse2DCost) {
+        // ---- 2D path: full-2D coarse search ------------------------
+        if (!g_boundaryDistMap.valid) {
+            std::cout << "[Ctrl+W/2D] g_boundaryDistMap invalid — "
+                      << "fall back to 3D path" << std::endl;
+            // fall through to legacy 3D below via flag flip
+            // (so user gets a result instead of nothing)
+            goto LEGACY_3D_PATH;
+        }
+        if (g_debugTargetContour2D.size() < 8) {
+            std::cout << "[Ctrl+W/2D] target 2D contour too short ("
+                      << g_debugTargetContour2D.size()
+                      << ") — fall back to 3D path" << std::endl;
+            goto LEGACY_3D_PATH;
+        }
+
+        // Resample 2D contour to N anchors
+        const int N_anchors = std::max(8, g_shapeMatchContourN2D);
+        std::vector<glm::vec2> anchors2D;
+        RimShape::resampleArcLength2D(g_debugTargetContour2D,
+                                      N_anchors, anchors2D);
+        if ((int)anchors2D.size() < 8) {
+            std::cout << "[Ctrl+W/2D] resample produced too few anchors ("
+                      << anchors2D.size() << ") — fall back to 3D"
+                      << std::endl;
+            goto LEGACY_3D_PATH;
+        }
+
+        // AR fixed camera (same convention as runShiftE / IoU metrics)
+        const glm::mat4 silView = buildSilhouetteView();
+        const glm::mat4 silProj = buildSilhouetteProj();
+        const int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+        const int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+
+        // ---- Source normal sign normalization (Idea A) -------------
+        // PCA eigenvectors carry ± ambiguity. Flip the source rim's
+        // PCA "patch normal" so it faces the camera; otherwise sign=0
+        // candidates systematically produce a 180°-flipped pose
+        // (observed: cos_range=[-0.96, -0.78] = ~140-165° rotation).
+        // Controlled by g_shapeMatchFlipNormalToCamera (default ON).
+        glm::vec3 src_normal_adj = g_debugSourceRimMajorNormal;
+        if (g_shapeMatchFlipNormalToCamera) {
+            const glm::vec3 cam_axis_world = glm::vec3(
+                glm::inverse(silView) * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+            if (glm::dot(src_normal_adj, cam_axis_world) < 0.0f) {
+                src_normal_adj = -src_normal_adj;
+                std::cout << "[Ctrl+W/2D] src_normal flipped to face camera"
+                          << "  (cam_axis · orig_normal < 0)" << std::endl;
+            }
+        }
+
+        std::cout << "[Ctrl+W/2D] silW=" << silW << " silH=" << silH
+                  << "  bdy=" << g_boundaryDistMap.width
+                  << "x" << g_boundaryDistMap.height
+                  << "  anchors=" << anchors2D.size()
+                  << "  src=" << src_pts.size()
+                  << "  oof_dist=" << g_shapeMatchOutOfFrameDistPx << "px"
+                  << "  cap=" << g_shapeMatchMaxDistCapPx << "px"
+                  << "  min_inframe=" << g_shapeMatchMinInFrameRate
+                  << "  flipN2cam=" << (g_shapeMatchFlipNormalToCamera ? "Y" : "N")
+                  << std::endl;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<RimShape::CoarseCandidate> candidates;
+        if (!RimShape::runShapeMatchCoarse2D(
+                src_pts,
+                g_debugSourceRimCentroid,
+                g_debugSourceRimPrincipalAxis,
+                src_normal_adj,
+                anchors2D,
+                silView, silProj, silW, silH,
+                g_boundaryDistMap,
+                g_shapeMatchOutOfFrameDistPx,
+                g_shapeMatchMaxDistCapPx,
+                g_shapeMatchMinInFrameRate,
+                candidates, &std::cout,
+                g_shapeMatchSignMode,
+                g_shapeMatchCoarseMaxRotDeg))
+        {
+            std::cout << "[Ctrl+W/2D] coarse search failed —"
+                      << " fall back to 3D" << std::endl;
+            goto LEGACY_3D_PATH;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(
+                              t1 - t0).count();
+
+        if (candidates.empty()) {
+            std::cout << "[Ctrl+W/2D] no candidates produced —"
+                      << " fall back to 3D" << std::endl;
+            goto LEGACY_3D_PATH;
+        }
+
+        // Rotation-angle penalty (same as 3D path, sign=1/2/3 control)
+        const float  anat_thresh = g_shapeMatchAnatomyThresh;
+        const double anat_lambda = g_shapeMatchAnatomyLambda;
+        int n_penalized = 0;
+        float min_cos = 1.0f, max_cos = -1.0f;
+        if (anat_lambda > 0.0) {
+            for (auto& cand : candidates) {
+                if (cand.cost >= 1e9) continue;        // already rejected
+                const glm::mat3 R(cand.transform);
+                const float trace = R[0][0] + R[1][1] + R[2][2];
+                float ca = (trace - 1.0f) * 0.5f;
+                if (ca > 1.0f) ca = 1.0f;
+                if (ca < -1.0f) ca = -1.0f;
+                if (ca < min_cos) min_cos = ca;
+                if (ca > max_cos) max_cos = ca;
+                if (ca < anat_thresh) {
+                    cand.cost += anat_lambda * double(anat_thresh - ca);
+                    n_penalized++;
+                }
+            }
+        }
+        std::cout << "[Ctrl+W/2D] Rotation penalty: thresh=" << anat_thresh
+                  << " lambda=" << anat_lambda
+                  << " cos_range=[" << min_cos << "," << max_cos << "]"
+                  << " penalized=" << n_penalized << "/" << candidates.size()
+                  << std::endl;
+
+        // Best + top-5
+        int best_i = 0;
+        for (int i = 1; i < (int)candidates.size(); i++) {
+            if (candidates[i].cost < candidates[best_i].cost) best_i = i;
+        }
+        g_debugShapeMatchBestCost = candidates[best_i].cost;
+        g_debugShapeMatchBestK    = candidates[best_i].target_anchor_k;
+        g_debugShapeMatchBestTransform = candidates[best_i].transform;
+
+        // Re-evaluate best candidate to fill in-frame/in-mask diagnostics
+        {
+            std::vector<glm::vec3> src_best;
+            src_best.reserve(src_pts.size());
+            const glm::mat4& Tb = candidates[best_i].transform;
+            for (const auto& p : src_pts) {
+                const glm::vec4 v4 = Tb * glm::vec4(p, 1.0f);
+                src_best.emplace_back(v4.x, v4.y, v4.z);
+            }
+            int n_in_frame = 0, n_in_mask = 0;
+            (void)RimShape::project2DBoundaryDistance(
+                src_best, silView, silProj, silW, silH,
+                g_boundaryDistMap,
+                g_shapeMatchOutOfFrameDistPx,
+                g_shapeMatchMaxDistCapPx,
+                &n_in_frame, &n_in_mask);
+            g_debugShapeMatchBestInFrame =
+                (src_pts.empty()) ? 0.0f
+                                  : float(n_in_frame) / float(src_pts.size());
+            g_debugShapeMatchBestInMask =
+                (src_pts.empty()) ? 0.0f
+                                  : float(n_in_mask)  / float(src_pts.size());
+
+            g_debugShapeMatchBestSrc = std::move(src_best);
+        }
+
+        // Top-K log
+        std::vector<int> idx_sorted(candidates.size());
+        for (size_t i = 0; i < candidates.size(); i++) idx_sorted[i] = (int)i;
+        std::sort(idx_sorted.begin(), idx_sorted.end(),
+                  [&](int a, int b){ return candidates[a].cost < candidates[b].cost; });
+
+        std::cout << "[Ctrl+W/2D] ShapeMatch coarse2D"
+                  << "  elapsed=" << ms << "ms"
+                  << "  best_cost=" << g_debugShapeMatchBestCost << "px"
+                  << "  best_k=" << g_debugShapeMatchBestK
+                  << "  best_sign=" << candidates[best_i].sign_code
+                  << "(t" << ((candidates[best_i].sign_code & 1) ? "-" : "+")
+                  << ",n" << ((candidates[best_i].sign_code & 2) ? "-" : "+")
+                  << ")  in_frame=" << g_debugShapeMatchBestInFrame
+                  << "  in_mask="   << g_debugShapeMatchBestInMask
+                  << std::endl;
+        const int show = std::min<int>(5, (int)idx_sorted.size());
+        for (int t_rank = 0; t_rank < show; t_rank++) {
+            const int i = idx_sorted[t_rank];
+            std::cout << "    rank " << (t_rank + 1)
+                      << ": k=" << candidates[i].target_anchor_k
+                      << " sign=" << candidates[i].sign_code
+                      << "(t" << ((candidates[i].sign_code & 1) ? "-" : "+")
+                      << ",n" << ((candidates[i].sign_code & 2) ? "-" : "+")
+                      << ")  cost=" << candidates[i].cost << "px"
+                      << std::endl;
+        }
+        return true;
+    }
+
+LEGACY_3D_PATH:
 
     // ---- Sort target by PCA angle ----------------------------------
     glm::vec3 tgt_centroid, tgt_normal, tgt_axis;
@@ -9053,5 +9414,198 @@ inline bool runDebugShapeMatchCoarse()
                   << ")  cost=" << candidates[i].cost
                   << std::endl;
     }
+    return true;
+}
+
+
+// =====================================================================
+// Phase 7b Step 3b — Gauss-Newton refinement (Alt+W)
+// =====================================================================
+//
+// runDebugShapeMatchGN
+//   Alt+W's core function:
+//     1. Run Coarse2D (forced 2D path) → initial T_coarse + src/tgt populate
+//     2. Build / cache unsigned boundary distance map (BFS from contour
+//        in both directions, so GN gets a gradient outside the SAM2 mask)
+//     3. Levenberg-Marquardt refine: T_GN = arg min Σ bdy(π(T·p_i))²
+//     4. Update g_debugShapeMatchBestTransform / BestCost / BestSrc with
+//        the refined result. The main.cpp Alt+W handler then applies it.
+//
+// Returns true if Coarse2D succeeded (GN failure still returns true with
+// the coarse T retained — best-effort).
+//
+// Why we call runDebugShapeMatchCoarse() directly rather than duplicating
+// its body: that function already handles auto-populate, sign-mask, PCA
+// cache reuse, and the Idea-A source-normal flip. We just bolt GN on top.
+//
+// Performance: coarse ~1ms + unsigned bdy build ~15ms (cached after 1st
+// call) + GN 5-15 iters × ~1ms = ~20ms typical refresh, ~2ms repeated.
+// =====================================================================
+inline bool runDebugShapeMatchGN()
+{
+    // =================================================================
+    // Alt+W (Step 3b revised)
+    // -----------------------------------------------------------------
+    // Two modes, selected by g_shapeMatchAltWSkipCoarse:
+    //
+    //   SkipCoarse=ON  (default, recommended):
+    //     Trust the current mesh pose (Apply Init Pose result) and run
+    //     GN refine STARTING FROM IDENTITY on the current world-space
+    //     rim. Coarse2D is NOT invoked. The 6-DoF (or 3-DoF translation-
+    //     only) LM solves a tiny perturbation on top of the user's
+    //     init pose. Pose break-down is structurally impossible because
+    //     the trust region cap on ||Δξ|| is 0.05 (≈ 5cm + 3° / iter).
+    //
+    //   SkipCoarse=OFF (legacy):
+    //     Coarse2D first (forces 2D path), then GN refine from coarse
+    //     best transform. Old Step 3b behavior. Kept for comparison
+    //     and for situations where the init pose is bad.
+    //
+    // Both modes feed g_shapeMatchGNTranslationOnly through to the
+    // solver. With TRANS_ONLY=ON the rotation block of JTJ is locked
+    // to identity so Δω = 0 by construction; rim alignment becomes a
+    // pure 3-DoF translation fit, immune to depth-degeneracy.
+    // =================================================================
+
+    if (!liverMesh3D) {
+        std::cout << "[Alt+W] no liverMesh3D — abort" << std::endl;
+        return false;
+    }
+    if (!g_boundaryDistMap.valid) {
+        std::cout << "[Alt+W] g_boundaryDistMap invalid — load a depth"
+                  << " scene first" << std::endl;
+        return false;
+    }
+
+    // Auto-populate prerequisites
+    if (g_debugSourceRimChain.empty()) {
+        std::cout << "[Alt+W] auto-running populateDebugSourceRimChain()..."
+                  << std::endl;
+        if (!populateDebugSourceRimChain()) {
+            std::cout << "[Alt+W] failed to populate source rim chain"
+                      << std::endl;
+            return false;
+        }
+    }
+
+    double coarse_cost = -1.0;
+    glm::mat4 T_init(1.0f);
+
+    if (g_shapeMatchAltWSkipCoarse) {
+        // ---- SkipCoarse mode: refine from identity on current pose --
+        std::cout << "[Alt+W] SKIP_COARSE mode — refining current pose"
+                  << " (no Coarse2D)" << std::endl;
+    } else {
+        // ---- Legacy mode: Coarse2D first --------------------------
+        const bool saved_use_2d = g_shapeMatchUse2DCost;
+        g_shapeMatchUse2DCost = true;
+        const bool coarse_ok = runDebugShapeMatchCoarse();
+        g_shapeMatchUse2DCost = saved_use_2d;
+        if (!coarse_ok) {
+            std::cout << "[Alt+W] Coarse2D failed — abort" << std::endl;
+            g_debugShapeMatchGNInitCost  = 0.0;
+            g_debugShapeMatchGNFinalCost = 0.0;
+            g_debugShapeMatchGNIters     = 0;
+            g_debugShapeMatchGNConverged = false;
+            g_debugShapeMatchGNReason    = 3;
+            return false;
+        }
+        T_init      = g_debugShapeMatchBestTransform;
+        coarse_cost = g_debugShapeMatchBestCost;
+    }
+
+    // ---- Build / cache unsigned boundary distance map --------------
+    if (!g_gnUnsignedBdyValid) {
+        std::cout << "[Alt+W] building unsigned boundary distance map..."
+                  << std::endl;
+        if (!RimShape::buildUnsignedBoundaryMap(
+                g_boundaryDistMap,
+                g_gnUnsignedBdy, g_gnUnsignedBdyW, g_gnUnsignedBdyH,
+                &std::cout))
+        {
+            std::cout << "[Alt+W] unsigned bdy build failed — abort"
+                      << std::endl;
+            return false;
+        }
+        g_gnUnsignedBdyValid = true;
+    }
+
+    // ---- Collect current rim source points (world space) ----------
+    std::vector<glm::vec3> src_pts;
+    src_pts.reserve(g_debugSourceRimChain.size());
+    const auto& V = liverMesh3D->mVertices;
+    const int nV3 = (int)V.size();
+    for (int idx : g_debugSourceRimChain) {
+        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+        src_pts.emplace_back(V[idx*3], V[idx*3+1], V[idx*3+2]);
+    }
+    if (src_pts.empty()) {
+        std::cout << "[Alt+W] no source rim points — abort" << std::endl;
+        return false;
+    }
+
+    // ---- Levenberg-Marquardt refine -------------------------------
+    const glm::mat4 silView = buildSilhouetteView();
+    const glm::mat4 silProj = buildSilhouetteProj();
+
+    RimShape::GNResult gn;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool gn_ok = RimShape::runShapeMatchGN(
+        src_pts, T_init,
+        silView, silProj,
+        g_gnUnsignedBdy, g_gnUnsignedBdyW, g_gnUnsignedBdyH,
+        g_shapeMatchGNMaxIter,
+        g_shapeMatchGNLambdaInit,
+        g_shapeMatchGNEpsStep,
+        g_shapeMatchGNEpsRel,
+        gn, &std::cout,
+        g_shapeMatchGNTranslationOnly,
+        g_shapeMatchGNLambdaMin,
+        g_shapeMatchGNStepMax);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double gn_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    if (!gn_ok) {
+        std::cout << "[Alt+W] GN reported failure" << std::endl;
+        g_debugShapeMatchGNInitCost  = coarse_cost > 0 ? coarse_cost : 0.0;
+        g_debugShapeMatchGNFinalCost = coarse_cost > 0 ? coarse_cost : 0.0;
+        g_debugShapeMatchGNIters     = 0;
+        g_debugShapeMatchGNConverged = false;
+        g_debugShapeMatchGNReason    = 3;
+        return false;
+    }
+
+    // ---- Adopt GN result ------------------------------------------
+    g_debugShapeMatchBestTransform = gn.final_T;
+    g_debugShapeMatchBestCost      = gn.final_cost;
+    g_debugShapeMatchGNInitCost    = gn.initial_cost;
+    g_debugShapeMatchGNFinalCost   = gn.final_cost;
+    g_debugShapeMatchGNIters       = gn.n_iter;
+    g_debugShapeMatchGNConverged   = gn.converged;
+    g_debugShapeMatchGNReason      = gn.reason;
+    g_debugShapeMatchGNInFrame     = gn.n_in_frame;
+
+    g_debugShapeMatchBestSrc.clear();
+    g_debugShapeMatchBestSrc.reserve(src_pts.size());
+    for (const auto& p : src_pts) {
+        const glm::vec4 v4 = gn.final_T * glm::vec4(p, 1.0f);
+        g_debugShapeMatchBestSrc.emplace_back(v4.x, v4.y, v4.z);
+    }
+
+    const char* reason_str[] = {"step", "rel_cost", "max_iter", "lm_fail"};
+    std::cout << "[Alt+W] GN refined ("
+              << (g_shapeMatchAltWSkipCoarse ? "SkipCoarse" : "Coarse+GN")
+              << "/"
+              << (g_shapeMatchGNTranslationOnly ? "TransOnly3DoF" : "Full6DoF")
+              << "):"
+              << "  cost " << gn.initial_cost << "→" << gn.final_cost << "px"
+              << "  Δ=" << (gn.initial_cost - gn.final_cost) << "px"
+              << "  iters=" << gn.n_iter
+              << "  " << reason_str[std::min(3, gn.reason)]
+              << "  conv=" << (gn.converged ? "Y" : "N")
+              << "  in_frame=" << gn.n_in_frame << "/" << src_pts.size()
+              << "  t=" << gn_ms << "ms"
+              << std::endl;
+
     return true;
 }

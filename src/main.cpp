@@ -680,15 +680,6 @@ static struct {
 } g_cameraBackupState;
 bool g_showCorrespondencePoints = false;
 
-// Missing rim visualization variables (removed dependencies)
-bool g_ctrlgShowRimPairs = false;
-bool g_ctrlgRimVizAvailable = false;
-bool g_ctrlgShowColoredRimPairs = false;
-std::vector<int> g_ctrlgRimSrcVertIdx;
-std::vector<glm::vec3> g_ctrlgRimTgtPos;
-std::vector<int> g_lastRimPairSrcVertIdx;
-std::vector<glm::vec3> g_lastRimPairTgtPos;
-
 // =========================================================
 //  Debug: AABB 可視化 (チャット 10)
 // ---------------------------------------------------------
@@ -1840,10 +1831,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                           << std::endl;
                 recomputeLiverCC();
             }
-            // 1. Run Coarse2D + GN - DISABLED (function not available)
-            std::cout << "[Alt+W] Gauss-Newton refine feature disabled" << std::endl;
-            break;
-            /* Original code commented out:
+            // 1. Run Coarse2D + GN
             std::cout << "[Alt+W] running Coarse2D + Gauss-Newton refine..."
                       << std::endl;
             if (!runDebugShapeMatchGN()) {
@@ -1857,7 +1845,6 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                       << "  Δ=" << (g_debugShapeMatchGNInitCost
                                     - g_debugShapeMatchGNFinalCost) << "px"
                       << std::endl;
-            */
 
             // 2. Undo snapshot
             poseAutoSaveBeforeRegistration();
@@ -1973,8 +1960,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             //   と Variant B (rim-only) を両方走らせ、それぞれの best
             //   rotation を一旦適用 → 0-iter session で CompRMSE 計測 →
             //   逆 rotation で元に戻し → RMSE 良い方を最終採用する。
-            // Axis sweep disabled - variable undefined
-            if (false) { // g_shapeMatchAxisSweepEnabled) {
+            if (g_shapeMatchAxisSweepEnabled) {
                 std::cout << "[Ctrl+Shift+W] Step 4b: rim axis rotation"
                           << " sweep starting..." << std::endl;
 
@@ -2005,7 +1991,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     if (cachedTgt && !cachedTgt->points.empty()) {
                         const size_t N_tgt  = cachedTgt->points.size();
                         const int    N_want = std::max(100,
-                                                       5000); // g_shapeMatchAxisSweepTgtSubN);
+                                                       g_shapeMatchAxisSweepTgtSubN);
                         const size_t stride = std::max<size_t>(1,
                                                                N_tgt / (size_t)N_want);
                         tgt_sub.reserve(N_tgt / stride + 1);
@@ -2023,15 +2009,14 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     A_ok = RimShape::runRimAxisRotationSweep(
                         src_full, tgt_sub,
                         rim_centroid_after_T, rim_axis_after_T,
-                        36, // g_shapeMatchAxisSweepN,
+                        g_shapeMatchAxisSweepN,
                         results_A, &std::cout);
                 }
 
                 // ==== Variant B: rim-only sweep ========================
                 std::vector<RimShape::AxisSweepResult> results_B;
                 bool B_ok = false;
-                // Disabled - variable undefined
-                if (false) { // g_shapeMatchAxisSweepCompare) {
+                if (g_shapeMatchAxisSweepCompare) {
                     std::vector<glm::vec3> src_rim;
                     if (liverMesh3D && !g_debugSourceRimChain.empty()) {
                         src_rim.reserve(g_debugSourceRimChain.size());
@@ -2056,7 +2041,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                         B_ok = RimShape::runRimAxisRotationSweep(
                             src_rim, g_debugTargetBoundaryPoints,
                             rim_centroid_after_T, rim_axis_after_T,
-                            36, // g_shapeMatchAxisSweepN,
+                            g_shapeMatchAxisSweepN,
                             results_B, &std::cout);
                     } else {
                         std::cout << "[Ctrl+Shift+W] Variant B skipped:"
@@ -2158,9 +2143,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             //    g_normRefineMaxIter としてキャプチャされるので、
             //    start 後すぐ復元しても session には override 値が残る。
             const int saved_max_iter = g_normRefineMaxIter;
-            // Live max iter disabled - variable undefined
-            if (false) { // g_shapeMatchLiveMaxIter > 0) {
-                g_normRefineMaxIter = 20; // g_shapeMatchLiveMaxIter;
+            if (g_shapeMatchLiveMaxIter > 0) {
+                g_normRefineMaxIter = g_shapeMatchLiveMaxIter;
                 std::cout << "[Ctrl+Shift+W] Live ICP max_iter override:"
                           << " " << saved_max_iter << " -> "
                           << g_normRefineMaxIter
@@ -4686,19 +4670,22 @@ int main() {
                                   "RIM band (visible as purple dots in Shift+W).");
             }
 
+            // ===============================================================
+            // Phase 7b Step 3a/3b — Shape Match (Ctrl+W / Alt+W) panel
+            // ---------------------------------------------------------------
+            // Wrapped in a CollapsingHeader so the panel is easy to find
+            // inside the long Ctrl+G Quadrant Selector window. The header
+            // is open by default the first time the window is built.
+            // ===============================================================
+            ImGui::Separator();
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            if (ImGui::CollapsingHeader("Shape Match (Ctrl+W / Alt+W)##phase7b")) {
             // Phase 7b Step 3a — Full-2D Ctrl+W cost (depth-free)
             //   Uses g_boundaryDistMap directly + AR-camera projection.
             //   Recommended when depth-anything-v2 depth is unreliable.
-            ImGui::Separator();
             ImGui::TextUnformatted("[Step 3a] 2D AR-projected Ctrl+W cost");
-            // 2D matching features disabled
-            bool dummyUse2DCost = false;
-            ImGui::Checkbox("Use 2D AR matching (Ctrl+W) [DISABLED]",
-                            &dummyUse2DCost);
-            /*
             ImGui::Checkbox("Use 2D AR matching (Ctrl+W)",
                             &g_shapeMatchUse2DCost);
-            */
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Step 3a: when ON, Ctrl+W's\n"
                                   "cost is mean(g_boundaryDistMap[project(src)])\n"
@@ -4708,11 +4695,9 @@ int main() {
                                   "  depth-lifted target and source (original\n"
                                   "  Step 3 implementation).");
             }
-            if (false) { // was: if (g_shapeMatchUse2DCost) {
-                /* Disabled: g_shapeMatchContourN2D not available
+            if (g_shapeMatchUse2DCost) {
                 ImGui::SliderInt("2D contour anchors N",
                                  &g_shapeMatchContourN2D, 8, 500);
-                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Arc-length resample target 2D\n"
                                       "contour to N evenly-spaced anchors.\n"
@@ -4720,21 +4705,17 @@ int main() {
                                       "(× sign_mask). 200 default, fast even\n"
                                       "with 200×4=800 evals (~50ms total).");
                 }
-                /* Disabled: g_shapeMatchOutOfFrameDistPx not available
                 ImGui::SliderFloat("2D out-of-frame penalty (px)",
                                    &g_shapeMatchOutOfFrameDistPx,
                                    10.0f, 500.0f, "%.0f");
-                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Per-point cost assigned when a source\n"
                                       "vertex projects outside the AR camera\n"
                                       "viewport (or behind the camera).");
                 }
-                /* Disabled: g_shapeMatchMaxDistCapPx not available
                 ImGui::SliderFloat("2D max distance cap (px)",
                                    &g_shapeMatchMaxDistCapPx,
                                    10.0f, 500.0f, "%.0f");
-                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Clamp per-point boundary distance to\n"
                                       "this cap. Bounds influence of points\n"
@@ -4742,22 +4723,18 @@ int main() {
                                       "otherwise get the 9999 sentinel from\n"
                                       "g_boundaryDistMap).");
                 }
-                /* Disabled: g_shapeMatchMinInFrameRate not available
                 ImGui::SliderFloat("2D min in-frame rate",
                                    &g_shapeMatchMinInFrameRate,
                                    0.0f, 1.0f, "%.2f");
-                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Reject candidates where fewer than\n"
                                       "this fraction of source rim points\n"
                                       "project inside the AR viewport.\n"
                                       "0.30 = default, 0.0 = no rejection.");
                 }
-                /* Disabled: g_shapeMatch2DInstThreshPx not available
                 ImGui::SliderFloat("2D instrument exclude (px)",
                                    &g_shapeMatch2DInstThreshPx,
                                    0.0f, 60.0f, "%.0f");
-                */
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Exclude target boundary pixels with\n"
                                       "instrumentDist < threshold from the\n"
@@ -4766,84 +4743,97 @@ int main() {
                 }
                 // Diagnostic readback
                 if (g_debugShapeMatchBestK >= 0) {
-                    /* Disabled: variables not available
                     ImGui::Text("Last Ctrl+W/2D: in_frame=%.0f%%  in_mask=%.0f%%  contour=%d px",
                                 100.0f * g_debugShapeMatchBestInFrame,
                                 100.0f * g_debugShapeMatchBestInMask,
                                 (int)g_debugTargetContour2D.size());
-                    */
                 }
             }
             ImGui::Separator();
 
             // Phase 7b Step 3b — Gauss-Newton refine (Alt+W)
-            //   PnP-style nonlinear least-squares refinement on top of
-            //   Coarse2D's best candidate. Sub-pixel rim/contour alignment.
-            ImGui::TextUnformatted("[Step 3b] Gauss-Newton refine (Alt+W) [DISABLED]");
-            bool dummyFlipNormal = false;
-            ImGui::Checkbox("Flip source normal to camera (Idea A) [DISABLED]",
-                            &dummyFlipNormal);
-            /*
+            //   Revised: SkipCoarse (trust init pose) + TransOnly (3-DoF)
+            //   by default. Prevents the depth-runaway observed when
+            //   full 6-DoF GN escapes into a depth-degenerate minimum.
+            ImGui::TextUnformatted("[Step 3b] Gauss-Newton refine (Alt+W)");
             ImGui::Checkbox("Flip source normal to camera (Idea A)",
                             &g_shapeMatchFlipNormalToCamera);
-            */
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Phase 7b Step 3b: when ON, flip the source\n"
-                                  "rim's PCA 'patch normal' so it faces the\n"
-                                  "camera before passing to Coarse2D.\n"
-                                  "Fixes the systematic 180° pose flip\n"
-                                  "(observed cos_range=[-0.96,-0.78]).\n"
-                                  "Affects BOTH Ctrl+W and Alt+W.\n"
-                                  "OFF = reproduce legacy buggy behavior.");
+                ImGui::SetTooltip("Step 3b: flip the source rim's PCA\n"
+                                  "patch normal to face the camera before\n"
+                                  "passing to Coarse2D. Fixes 180° flip.\n"
+                                  "Affects BOTH Ctrl+W and Alt+W.");
             }
-            /* GN settings disabled
+            ImGui::SliderFloat("Coarse max rot [deg] (Ctrl+W)",
+                               &g_shapeMatchCoarseMaxRotDeg, 0.0f, 180.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Step 3b Plan A: HARD reject Coarse2D\n"
+                                  "candidates whose rotation exceeds this\n"
+                                  "many degrees from identity (trace-based\n"
+                                  "angle). 45° = trust Init Pose as the\n"
+                                  "rotation reference. 180° = no constraint.\n"
+                                  "This is a hard reject (continue), NOT\n"
+                                  "the old soft penalty.");
+            }
+            ImGui::Separator();
+            ImGui::Checkbox("Alt+W: skip Coarse2D (trust current pose)",
+                            &g_shapeMatchAltWSkipCoarse);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Step 3b Plan B: Alt+W bypasses Coarse2D\n"
+                                  "entirely and refines the CURRENT mesh\n"
+                                  "pose with GN. Recommended after\n"
+                                  "Apply Init Pose has set a good baseline.\n"
+                                  "OFF = legacy (Coarse2D → GN, can break\n"
+                                  "      a good init pose).");
+            }
+            ImGui::Checkbox("Alt+W: translation-only refine (3-DoF)",
+                            &g_shapeMatchGNTranslationOnly);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Step 3b Plan B: lock rotation, only\n"
+                                  "translate (tx, ty, tz) in GN.\n"
+                                  "Eliminates depth-degeneracy of 6-DoF PnP.\n"
+                                  "Best paired with SkipCoarse=ON for\n"
+                                  "a pure translation polish after Init Pose.");
+            }
             ImGui::SliderInt("GN max iter (Alt+W)",
                              &g_shapeMatchGNMaxIter, 1, 100);
-            */
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Hard cap on Levenberg-Marquardt iterations.\n"
-                                  "30 default. Typical convergence in 5-15 iters.");
-            }
-            /* GN lambda disabled
             ImGui::SliderFloat("GN λ init (Alt+W)",
                                &g_shapeMatchGNLambdaInit,
                                1.0e-6f, 1.0e0f, "%.0e",
                                ImGuiSliderFlags_Logarithmic);
-            */
+            ImGui::SliderFloat("GN λ MIN (Alt+W)",
+                               &g_shapeMatchGNLambdaMin,
+                               1.0e-9f, 1.0e0f, "%.0e",
+                               ImGuiSliderFlags_Logarithmic);
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Initial Levenberg damping. 1e-3 default.\n"
-                                  "Higher = more conservative (gradient-descent-like).\n"
-                                  "Lower = more aggressive (Gauss-Newton-like).");
+                ImGui::SetTooltip("Step 3b: LM damping floor. Prevents the\n"
+                                  "depth-degenerate escape (observed:\n"
+                                  "λ → 1e-9 → ||dxi|| spike). 1e-3 keeps\n"
+                                  "the solver always partly gradient-descent.\n"
+                                  "Lower = more aggressive GN.");
             }
-            /* GN eps step disabled
+            ImGui::SliderFloat("GN step max ||Δξ|| (Alt+W)",
+                               &g_shapeMatchGNStepMax, 0.001f, 1.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Step 3b: trust-region clamp on the\n"
+                                  "per-iteration update norm. 0.05 ≈\n"
+                                  "5 cm + 3°. Caps the first-step explosion.");
+            }
             ImGui::SliderFloat("GN eps step (Alt+W)",
                                &g_shapeMatchGNEpsStep,
                                1.0e-8f, 1.0e-2f, "%.0e",
                                ImGuiSliderFlags_Logarithmic);
-            */
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Converge if ||Δξ|| < this. 1e-5 default.\n"
-                                  "ξ ∈ se(3) (3 translation + 3 rotation,\n"
-                                  "in world units / radians).");
-            }
-            /* GN eps rel disabled
             ImGui::SliderFloat("GN eps rel (Alt+W)",
                                &g_shapeMatchGNEpsRel,
                                1.0e-8f, 1.0e-2f, "%.0e",
                                ImGuiSliderFlags_Logarithmic);
-            */
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Converge if |ΔF/F| < this. 1e-4 default.\n"
-                                  "Relative reduction of cost across iterations.");
-            }
-            // Diagnostic readback for last Alt+W call - DISABLED
-            if (false) { // was: if (g_debugShapeMatchGNIters > 0) {
+            // Diagnostic readback for last Alt+W call
+            if (g_debugShapeMatchGNIters > 0) {
                 const char* reason_str[] = {"step", "rel_cost", "max_iter", "lm_fail"};
-                /* Disabled: variables not available
                 const int r = (g_debugShapeMatchGNReason >= 0
                                && g_debugShapeMatchGNReason < 4)
                               ? g_debugShapeMatchGNReason : 3;
-                ImGui::Text("Last Alt+W: cost %.2f → %.2f px  Δ=%.2f  iters=%d  %s  %s",
+                ImGui::Text("Last Alt+W: %.2f → %.2f px  Δ=%.2f  iters=%d  %s  %s",
                             g_debugShapeMatchGNInitCost,
                             g_debugShapeMatchGNFinalCost,
                             g_debugShapeMatchGNInitCost - g_debugShapeMatchGNFinalCost,
@@ -4853,8 +4843,8 @@ int main() {
                 ImGui::Text("            in_frame=%d  bdy_cache=%s",
                             g_debugShapeMatchGNInFrame,
                             g_gnUnsignedBdyValid ? "valid" : "invalid");
-                */
             }
+            } // close: if (CollapsingHeader("Shape Match..."))
             ImGui::Separator();
 
             // Phase 7b Step 3 — Rotation-angle constraint for Ctrl+W
@@ -4912,9 +4902,8 @@ int main() {
             // When Shape Match is followed by Live ICP, cap the iters so
             // the ICP stays close to the Shape Match solution instead of
             // wandering off and getting rescued by early-stop.
-            // Live max iter slider disabled - variable undefined
-            /*ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
-                             &g_shapeMatchLiveMaxIter, 0, 200);*/
+            ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
+                             &g_shapeMatchLiveMaxIter, 0, 200);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (Step 4a fallback):\n"
                                   "temporarily override g_normRefineMaxIter\n"
@@ -4930,9 +4919,8 @@ int main() {
             // axis. Preserves rim alignment absolutely and excludes
             // flipped poses via all-vertex chamfer.
             ImGui::Separator();
-            // Axis sweep checkbox disabled - variable undefined
-            /*ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W: skip ICP)",
-                            &g_shapeMatchAxisSweepEnabled);*/
+            ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W: skip ICP)",
+                            &g_shapeMatchAxisSweepEnabled);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (Step 4b, default ON):\n"
                                   "After Shape Match best T applied, sweep\n"
@@ -4942,26 +4930,23 @@ int main() {
                                   "  ON  = rim fit absolutely preserved\n"
                                   "  OFF = fallback to Live ICP (Step 4a)");
             }
-            // Axis sweep N angles slider disabled - variable undefined
-            /*ImGui::SliderInt("axis sweep N angles",
-                             &g_shapeMatchAxisSweepN, 8, 90);*/
+            ImGui::SliderInt("axis sweep N angles",
+                             &g_shapeMatchAxisSweepN, 8, 90);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Number of rotation samples in 360°.\n"
                                   "36 = 10° step (default).\n"
                                   "Higher = finer but slower.");
             }
-            // Axis sweep tgt subN slider disabled - variable undefined
-            /*ImGui::SliderInt("axis sweep tgt subN",
-                             &g_shapeMatchAxisSweepTgtSubN, 500, 20000);*/
+            ImGui::SliderInt("axis sweep tgt subN",
+                             &g_shapeMatchAxisSweepTgtSubN, 500, 20000);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Target points uniformly downsampled to\n"
                                   "this count before chamfer.\n"
                                   "5000 = balanced (~1-2s for default N=36).\n"
                                   "Higher = more accurate but slower.");
             }
-            // Dual variant checkbox disabled - variable undefined
-            /*ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
-                            &g_shapeMatchAxisSweepCompare);*/
+            ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
+                            &g_shapeMatchAxisSweepCompare);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (default ON):\n"
                                   "Run both Variant A (full vertex sym\n"
@@ -6987,11 +6972,7 @@ static void setupUICallbacks() {
                           + " 2>&1";
 
         std::cout << "[Calib] " << cmd << std::endl;
-#ifdef _WIN32
-        FILE* pipe = _popen(cmd.c_str(), "r");
-#else
         FILE* pipe = popen(cmd.c_str(), "r");
-#endif
         if (!pipe) {
             g_calibResult.message = "popen failed";
             std::cerr << "[Calib] " << g_calibResult.message << std::endl;
@@ -6999,11 +6980,7 @@ static void setupUICallbacks() {
         }
         char buf[512];
         while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
-#ifdef _WIN32
-        int exitCode = _pclose(pipe);
-#else
         int exitCode = pclose(pipe);
-#endif
 
         if (exitCode != 0) {
             g_calibResult.message = "calibration_tool exit code " + std::to_string(exitCode);
@@ -8667,30 +8644,25 @@ static void drawCtrlGRimRaycastControls() {
                               "OFF = all 4 signs incl. 180° flips, 120 cand.");
         }
     }
-    // Live max iter slider disabled - variable undefined
-    /*ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
-                     &g_shapeMatchLiveMaxIter, 0, 200);*/
+    ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
+                     &g_shapeMatchLiveMaxIter, 0, 200);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Cap Live ICP iters (Step 4a fallback).\n"
                           "Only used when 'use rim-axis sweep' is OFF.");
     }
     // Phase 7b Step 4b — Axis sweep toggles
-    // Axis sweep checkbox disabled - variable undefined
-    /*ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W)",
-                    &g_shapeMatchAxisSweepEnabled);*/
+    ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W)",
+                    &g_shapeMatchAxisSweepEnabled);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("ON (default) = skip ICP, sweep rim axis.\n"
                           "OFF = use Live ICP (Step 4a).");
     }
-    // Axis sweep N slider disabled - variable undefined
-    /*ImGui::SliderInt("axis sweep N",
-                     &g_shapeMatchAxisSweepN, 8, 90);*/
-    // Axis sweep tgt subN slider disabled - variable undefined
-    /*ImGui::SliderInt("axis sweep tgt subN",
-                     &g_shapeMatchAxisSweepTgtSubN, 500, 20000);*/
-    // Dual variant checkbox disabled - variable undefined
-    /*ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
-                    &g_shapeMatchAxisSweepCompare);*/
+    ImGui::SliderInt("axis sweep N",
+                     &g_shapeMatchAxisSweepN, 8, 90);
+    ImGui::SliderInt("axis sweep tgt subN",
+                     &g_shapeMatchAxisSweepTgtSubN, 500, 20000);
+    ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
+                    &g_shapeMatchAxisSweepCompare);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Run both variants, pick lower CompRMSE.\n"
                           "OFF = Variant A (full vertex) only.");
