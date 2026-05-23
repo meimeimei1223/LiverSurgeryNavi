@@ -1,7 +1,0 @@
-fx 992.157
-fy 992.157
-cx 965.604
-cy 585.736
-width 1920
-height 1080
-name   custom
