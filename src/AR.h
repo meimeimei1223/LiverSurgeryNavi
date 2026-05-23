@@ -414,7 +414,11 @@ inline bool capture(
         auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
                        now.time_since_epoch()) % 1000;
         struct tm lt;
-        localtime_r(&tt, &lt);
+#ifdef _WIN32
+        localtime_s(&lt, &tt);  // Windows
+#else
+        localtime_r(&tt, &lt);  // Unix/Linux
+#endif
         char stamp[64];
         std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d_%02d%02d%02d_%03d",
                       lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday,

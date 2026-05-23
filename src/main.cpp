@@ -121,6 +121,23 @@ bool                   g_showDebugShapeMatch     = false;
 double                 g_debugShapeMatchBestCost = 0.0;
 int                    g_debugShapeMatchBestK    = -1;
 glm::mat4              g_debugShapeMatchBestTransform = glm::mat4(1.0f);
+
+// Phase 7b Step 3a (Ctrl+W, 2D mode) — target 2D contour cache.
+//   populated by Shift+W (populateDebugTargetBoundary), consumed by
+//   Ctrl+W when g_shapeMatchUse2DCost is true. Pixel coordinates in
+//   the g_boundaryDistMap frame.
+std::vector<glm::vec2> g_debugTargetContour2D;
+std::vector<int>       g_debugTargetContour2DSegSizes;
+
+// Phase 7b Step 3b (Alt+W) — Gauss-Newton refinement cache.
+//   g_gnUnsignedBdy: unsigned distance-to-boundary field for the entire
+//   image (BFS from boundary contour in both directions, providing a
+//   smooth gradient field for LM optimization). Built lazily on first
+//   Alt+W call, invalidated by g_boundaryDistMap.invalidate() callers.
+std::vector<float> g_gnUnsignedBdy;
+int                g_gnUnsignedBdyW     = 0;
+int                g_gnUnsignedBdyH     = 0;
+bool               g_gnUnsignedBdyValid = false;
 bool g_showClusterVisualization = false;
 bool g_showBoundaryCandidates   = false;
 bool g_showSourceVisualization  = false;
@@ -1776,6 +1793,96 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         //                   (推奨運用: → 続けてユーザが手動で Ctrl+G)
         //   Ctrl+Shift+W  : Shape Match + rim axis sweep + save (Step 4b)
         //                   ICP は skip、rim 絶対保持優先
+        //   Alt+W         : Shape Match Coarse2D + Gauss-Newton refine
+        //                   (Phase 7b Step 3b — PnP-style sub-pixel refine)
+        if ((mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL)
+                                  && !(mods & GLFW_MOD_SHIFT)) {
+            // ==== Alt+W : Coarse2D + Gauss-Newton refine + apply + save ==
+            //   Flow:
+            //     1. runDebugShapeMatchGN() → runs Coarse2D then LM refine
+            //        (updates g_debugShapeMatchBestTransform with refined T)
+            //     2. Apply refined T to all organ meshes
+            //     3. Save to PoseLibrary via 0-iter pseudo-session
+            //   Mirrors Ctrl+W's structure but with the GN-refined transform.
+            if (NormalRefineLive::active) {
+                std::cout << "[Alt+W] stopping active Live session"
+                          << std::endl;
+                finishNormalCompatRefineLive();
+                break;
+            }
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Alt+W] requires a loaded scene (Registration mode)"
+                          << std::endl;
+                break;
+            }
+            // Auto-trigger labels (same as Ctrl+W)
+            if (!g_liverRegion.valid()) {
+                std::cout << "[Alt+W] auto-running recomputeLiverRegion()..."
+                          << std::endl;
+                recomputeLiverRegion();
+            }
+            if (!g_liverLR.valid()) {
+                std::cout << "[Alt+W] auto-running recomputeLiverLR()..."
+                          << std::endl;
+                recomputeLiverLR();
+            }
+            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
+                std::cout << "[Alt+W] auto-running recomputeLiverCC()..."
+                          << std::endl;
+                recomputeLiverCC();
+            }
+            // 1. Run Coarse2D + GN
+            std::cout << "[Alt+W] running Coarse2D + Gauss-Newton refine..."
+                      << std::endl;
+            if (!runDebugShapeMatchGN()) {
+                std::cout << "[Alt+W] failed — abort, mesh unchanged"
+                          << std::endl;
+                break;
+            }
+            std::cout << "[Alt+W] refined T:"
+                      << "  cost=" << g_debugShapeMatchBestCost << "px"
+                      << "  GN iters=" << g_debugShapeMatchGNIters
+                      << "  Δ=" << (g_debugShapeMatchGNInitCost
+                                    - g_debugShapeMatchGNFinalCost) << "px"
+                      << std::endl;
+
+            // 2. Undo snapshot
+            poseAutoSaveBeforeRegistration();
+
+            // 3. Apply refined T to all organ meshes
+            {
+                auto organs = getOrganList();
+                int n_valid = 0;
+                for (auto* m : organs) if (m) n_valid++;
+                std::cout << "[Alt+W] applying refined T to "
+                          << n_valid << " organ meshes..." << std::endl;
+                NormalRefine::applyIncrementalTransform(
+                    glm::dmat4(g_debugShapeMatchBestTransform), organs);
+            }
+
+            // 4. Clear preview state
+            g_showDebugShapeMatch = false;
+            g_debugShapeMatchBestSrc.clear();
+
+            // 5. Save to PoseLibrary
+            std::cout << "[Alt+W] saving pose to PoseLibrary"
+                      << " (max_iter=0 pseudo-session)..." << std::endl;
+            const int saved_max_iter = g_normRefineMaxIter;
+            g_normRefineMaxIter = 0;
+            g_stepStartTime  = std::chrono::steady_clock::now();
+            gUI.state.regMethod = 3;
+            if (g_normRefineLiveMode) {
+                startNormalCompatRefineLive(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+            } else {
+                runNormalCompatRefineSession(
+                    NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
+                poseSaveToLibrary(SaveCriterion::EITHER,
+                                  g_activeQuadrantMask);
+            }
+            g_normRefineMaxIter = saved_max_iter;
+            break;
+        }
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ==== Ctrl+Shift+W : Step 4 — apply best T + Live bridge ====
             //   詳細設計 §3-4 の本番フロー:
@@ -3626,6 +3733,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     g_boundaryDistMap.invalidate();
     g_instrumentDistMap.invalidate();    // 器具マスクも再読み込みさせる
     g_projectedLiverMask.invalidate();
+    g_gnUnsignedBdyValid = false;        // Alt+W GN cache: depends on boundary
     std::cout << "[RunDepth] invalidated boundary map & projected liver mask"
               << "  (will be rebuilt from new segmentation_mask.png)"
               << std::endl;
@@ -4561,6 +4669,144 @@ int main() {
                                   "Increase if instrument outline leaks into the\n"
                                   "RIM band (visible as purple dots in Shift+W).");
             }
+
+            // Phase 7b Step 3a — Full-2D Ctrl+W cost (depth-free)
+            //   Uses g_boundaryDistMap directly + AR-camera projection.
+            //   Recommended when depth-anything-v2 depth is unreliable.
+            ImGui::Separator();
+            ImGui::TextUnformatted("[Step 3a] 2D AR-projected Ctrl+W cost");
+            ImGui::Checkbox("Use 2D AR matching (Ctrl+W)",
+                            &g_shapeMatchUse2DCost);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Phase 7b Step 3a: when ON, Ctrl+W's\n"
+                                  "cost is mean(g_boundaryDistMap[project(src)])\n"
+                                  "  - depth-free (target lives in 2D pixel space)\n"
+                                  "  - O(|src|) lookup, ~1000x faster than 3D chamfer\n"
+                                  "When OFF: legacy 3D chamfer between\n"
+                                  "  depth-lifted target and source (original\n"
+                                  "  Step 3 implementation).");
+            }
+            if (g_shapeMatchUse2DCost) {
+                ImGui::SliderInt("2D contour anchors N",
+                                 &g_shapeMatchContourN2D, 8, 500);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Arc-length resample target 2D\n"
+                                      "contour to N evenly-spaced anchors.\n"
+                                      "Each anchor produces 1..4 candidates\n"
+                                      "(× sign_mask). 200 default, fast even\n"
+                                      "with 200×4=800 evals (~50ms total).");
+                }
+                ImGui::SliderFloat("2D out-of-frame penalty (px)",
+                                   &g_shapeMatchOutOfFrameDistPx,
+                                   10.0f, 500.0f, "%.0f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Per-point cost assigned when a source\n"
+                                      "vertex projects outside the AR camera\n"
+                                      "viewport (or behind the camera).");
+                }
+                ImGui::SliderFloat("2D max distance cap (px)",
+                                   &g_shapeMatchMaxDistCapPx,
+                                   10.0f, 500.0f, "%.0f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Clamp per-point boundary distance to\n"
+                                      "this cap. Bounds influence of points\n"
+                                      "landing outside the mask (which\n"
+                                      "otherwise get the 9999 sentinel from\n"
+                                      "g_boundaryDistMap).");
+                }
+                ImGui::SliderFloat("2D min in-frame rate",
+                                   &g_shapeMatchMinInFrameRate,
+                                   0.0f, 1.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Reject candidates where fewer than\n"
+                                      "this fraction of source rim points\n"
+                                      "project inside the AR viewport.\n"
+                                      "0.30 = default, 0.0 = no rejection.");
+                }
+                ImGui::SliderFloat("2D instrument exclude (px)",
+                                   &g_shapeMatch2DInstThreshPx,
+                                   0.0f, 60.0f, "%.0f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Exclude target boundary pixels with\n"
+                                      "instrumentDist < threshold from the\n"
+                                      "2D contour trace. 0 = disable.\n"
+                                      "(Reapply with Shift+W after change.)");
+                }
+                // Diagnostic readback
+                if (g_debugShapeMatchBestK >= 0) {
+                    ImGui::Text("Last Ctrl+W/2D: in_frame=%.0f%%  in_mask=%.0f%%  contour=%d px",
+                                100.0f * g_debugShapeMatchBestInFrame,
+                                100.0f * g_debugShapeMatchBestInMask,
+                                (int)g_debugTargetContour2D.size());
+                }
+            }
+            ImGui::Separator();
+
+            // Phase 7b Step 3b — Gauss-Newton refine (Alt+W)
+            //   PnP-style nonlinear least-squares refinement on top of
+            //   Coarse2D's best candidate. Sub-pixel rim/contour alignment.
+            ImGui::TextUnformatted("[Step 3b] Gauss-Newton refine (Alt+W)");
+            ImGui::Checkbox("Flip source normal to camera (Idea A)",
+                            &g_shapeMatchFlipNormalToCamera);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Phase 7b Step 3b: when ON, flip the source\n"
+                                  "rim's PCA 'patch normal' so it faces the\n"
+                                  "camera before passing to Coarse2D.\n"
+                                  "Fixes the systematic 180° pose flip\n"
+                                  "(observed cos_range=[-0.96,-0.78]).\n"
+                                  "Affects BOTH Ctrl+W and Alt+W.\n"
+                                  "OFF = reproduce legacy buggy behavior.");
+            }
+            ImGui::SliderInt("GN max iter (Alt+W)",
+                             &g_shapeMatchGNMaxIter, 1, 100);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Hard cap on Levenberg-Marquardt iterations.\n"
+                                  "30 default. Typical convergence in 5-15 iters.");
+            }
+            ImGui::SliderFloat("GN λ init (Alt+W)",
+                               &g_shapeMatchGNLambdaInit,
+                               1.0e-6f, 1.0e0f, "%.0e",
+                               ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Initial Levenberg damping. 1e-3 default.\n"
+                                  "Higher = more conservative (gradient-descent-like).\n"
+                                  "Lower = more aggressive (Gauss-Newton-like).");
+            }
+            ImGui::SliderFloat("GN eps step (Alt+W)",
+                               &g_shapeMatchGNEpsStep,
+                               1.0e-8f, 1.0e-2f, "%.0e",
+                               ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Converge if ||Δξ|| < this. 1e-5 default.\n"
+                                  "ξ ∈ se(3) (3 translation + 3 rotation,\n"
+                                  "in world units / radians).");
+            }
+            ImGui::SliderFloat("GN eps rel (Alt+W)",
+                               &g_shapeMatchGNEpsRel,
+                               1.0e-8f, 1.0e-2f, "%.0e",
+                               ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Converge if |ΔF/F| < this. 1e-4 default.\n"
+                                  "Relative reduction of cost across iterations.");
+            }
+            // Diagnostic readback for last Alt+W call
+            if (g_debugShapeMatchGNIters > 0) {
+                const char* reason_str[] = {"step", "rel_cost", "max_iter", "lm_fail"};
+                const int r = (g_debugShapeMatchGNReason >= 0
+                               && g_debugShapeMatchGNReason < 4)
+                              ? g_debugShapeMatchGNReason : 3;
+                ImGui::Text("Last Alt+W: cost %.2f → %.2f px  Δ=%.2f  iters=%d  %s  %s",
+                            g_debugShapeMatchGNInitCost,
+                            g_debugShapeMatchGNFinalCost,
+                            g_debugShapeMatchGNInitCost - g_debugShapeMatchGNFinalCost,
+                            g_debugShapeMatchGNIters,
+                            g_debugShapeMatchGNConverged ? "[conv]" : "[no-conv]",
+                            reason_str[r]);
+                ImGui::Text("            in_frame=%d  bdy_cache=%s",
+                            g_debugShapeMatchGNInFrame,
+                            g_gnUnsignedBdyValid ? "valid" : "invalid");
+            }
+            ImGui::Separator();
 
             // Phase 7b Step 3 — Rotation-angle constraint for Ctrl+W
             // Shape Match. cos_angle = (trace(R)-1)/2 below threshold
@@ -6687,7 +6933,11 @@ static void setupUICallbacks() {
                           + " 2>&1";
 
         std::cout << "[Calib] " << cmd << std::endl;
+#ifdef _WIN32
+        FILE* pipe = _popen(cmd.c_str(), "r");
+#else
         FILE* pipe = popen(cmd.c_str(), "r");
+#endif
         if (!pipe) {
             g_calibResult.message = "popen failed";
             std::cerr << "[Calib] " << g_calibResult.message << std::endl;
@@ -6695,7 +6945,11 @@ static void setupUICallbacks() {
         }
         char buf[512];
         while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
+#ifdef _WIN32
+        int exitCode = _pclose(pipe);
+#else
         int exitCode = pclose(pipe);
+#endif
 
         if (exitCode != 0) {
             g_calibResult.message = "calibration_tool exit code " + std::to_string(exitCode);
