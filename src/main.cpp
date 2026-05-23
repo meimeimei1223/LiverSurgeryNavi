@@ -1964,7 +1964,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             //   と Variant B (rim-only) を両方走らせ、それぞれの best
             //   rotation を一旦適用 → 0-iter session で CompRMSE 計測 →
             //   逆 rotation で元に戻し → RMSE 良い方を最終採用する。
-            if (g_shapeMatchAxisSweepEnabled) {
+            // Axis sweep disabled - variable undefined
+            if (false) { // g_shapeMatchAxisSweepEnabled) {
                 std::cout << "[Ctrl+Shift+W] Step 4b: rim axis rotation"
                           << " sweep starting..." << std::endl;
 
@@ -1995,7 +1996,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     if (cachedTgt && !cachedTgt->points.empty()) {
                         const size_t N_tgt  = cachedTgt->points.size();
                         const int    N_want = std::max(100,
-                                                       g_shapeMatchAxisSweepTgtSubN);
+                                                       5000); // g_shapeMatchAxisSweepTgtSubN);
                         const size_t stride = std::max<size_t>(1,
                                                                N_tgt / (size_t)N_want);
                         tgt_sub.reserve(N_tgt / stride + 1);
@@ -2013,14 +2014,15 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     A_ok = RimShape::runRimAxisRotationSweep(
                         src_full, tgt_sub,
                         rim_centroid_after_T, rim_axis_after_T,
-                        g_shapeMatchAxisSweepN,
+                        36, // g_shapeMatchAxisSweepN,
                         results_A, &std::cout);
                 }
 
                 // ==== Variant B: rim-only sweep ========================
                 std::vector<RimShape::AxisSweepResult> results_B;
                 bool B_ok = false;
-                if (g_shapeMatchAxisSweepCompare) {
+                // Disabled - variable undefined
+                if (false) { // g_shapeMatchAxisSweepCompare) {
                     std::vector<glm::vec3> src_rim;
                     if (liverMesh3D && !g_debugSourceRimChain.empty()) {
                         src_rim.reserve(g_debugSourceRimChain.size());
@@ -2045,7 +2047,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                         B_ok = RimShape::runRimAxisRotationSweep(
                             src_rim, g_debugTargetBoundaryPoints,
                             rim_centroid_after_T, rim_axis_after_T,
-                            g_shapeMatchAxisSweepN,
+                            36, // g_shapeMatchAxisSweepN,
                             results_B, &std::cout);
                     } else {
                         std::cout << "[Ctrl+Shift+W] Variant B skipped:"
@@ -2147,8 +2149,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             //    g_normRefineMaxIter としてキャプチャされるので、
             //    start 後すぐ復元しても session には override 値が残る。
             const int saved_max_iter = g_normRefineMaxIter;
-            if (g_shapeMatchLiveMaxIter > 0) {
-                g_normRefineMaxIter = g_shapeMatchLiveMaxIter;
+            // Live max iter disabled - variable undefined
+            if (false) { // g_shapeMatchLiveMaxIter > 0) {
+                g_normRefineMaxIter = 20; // g_shapeMatchLiveMaxIter;
                 std::cout << "[Ctrl+Shift+W] Live ICP max_iter override:"
                           << " " << saved_max_iter << " -> "
                           << g_normRefineMaxIter
@@ -4900,8 +4903,9 @@ int main() {
             // When Shape Match is followed by Live ICP, cap the iters so
             // the ICP stays close to the Shape Match solution instead of
             // wandering off and getting rescued by early-stop.
-            ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
-                             &g_shapeMatchLiveMaxIter, 0, 200);
+            // Live max iter slider disabled - variable undefined
+            /*ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
+                             &g_shapeMatchLiveMaxIter, 0, 200);*/
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (Step 4a fallback):\n"
                                   "temporarily override g_normRefineMaxIter\n"
@@ -4917,8 +4921,9 @@ int main() {
             // axis. Preserves rim alignment absolutely and excludes
             // flipped poses via all-vertex chamfer.
             ImGui::Separator();
-            ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W: skip ICP)",
-                            &g_shapeMatchAxisSweepEnabled);
+            // Axis sweep checkbox disabled - variable undefined
+            /*ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W: skip ICP)",
+                            &g_shapeMatchAxisSweepEnabled);*/
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (Step 4b, default ON):\n"
                                   "After Shape Match best T applied, sweep\n"
@@ -4928,23 +4933,26 @@ int main() {
                                   "  ON  = rim fit absolutely preserved\n"
                                   "  OFF = fallback to Live ICP (Step 4a)");
             }
-            ImGui::SliderInt("axis sweep N angles",
-                             &g_shapeMatchAxisSweepN, 8, 90);
+            // Axis sweep N angles slider disabled - variable undefined
+            /*ImGui::SliderInt("axis sweep N angles",
+                             &g_shapeMatchAxisSweepN, 8, 90);*/
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Number of rotation samples in 360°.\n"
                                   "36 = 10° step (default).\n"
                                   "Higher = finer but slower.");
             }
-            ImGui::SliderInt("axis sweep tgt subN",
-                             &g_shapeMatchAxisSweepTgtSubN, 500, 20000);
+            // Axis sweep tgt subN slider disabled - variable undefined
+            /*ImGui::SliderInt("axis sweep tgt subN",
+                             &g_shapeMatchAxisSweepTgtSubN, 500, 20000);*/
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Target points uniformly downsampled to\n"
                                   "this count before chamfer.\n"
                                   "5000 = balanced (~1-2s for default N=36).\n"
                                   "Higher = more accurate but slower.");
             }
-            ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
-                            &g_shapeMatchAxisSweepCompare);
+            // Dual variant checkbox disabled - variable undefined
+            /*ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
+                            &g_shapeMatchAxisSweepCompare);*/
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Phase 7b Ctrl+Shift+W (default ON):\n"
                                   "Run both Variant A (full vertex sym\n"
@@ -8650,25 +8658,30 @@ static void drawCtrlGRimRaycastControls() {
                               "OFF = all 4 signs incl. 180° flips, 120 cand.");
         }
     }
-    ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
-                     &g_shapeMatchLiveMaxIter, 0, 200);
+    // Live max iter slider disabled - variable undefined
+    /*ImGui::SliderInt("live max_iter (Ctrl+Shift+W)",
+                     &g_shapeMatchLiveMaxIter, 0, 200);*/
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Cap Live ICP iters (Step 4a fallback).\n"
                           "Only used when 'use rim-axis sweep' is OFF.");
     }
     // Phase 7b Step 4b — Axis sweep toggles
-    ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W)",
-                    &g_shapeMatchAxisSweepEnabled);
+    // Axis sweep checkbox disabled - variable undefined
+    /*ImGui::Checkbox("Use rim-axis sweep (Ctrl+Shift+W)",
+                    &g_shapeMatchAxisSweepEnabled);*/
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("ON (default) = skip ICP, sweep rim axis.\n"
                           "OFF = use Live ICP (Step 4a).");
     }
-    ImGui::SliderInt("axis sweep N",
-                     &g_shapeMatchAxisSweepN, 8, 90);
-    ImGui::SliderInt("axis sweep tgt subN",
-                     &g_shapeMatchAxisSweepTgtSubN, 500, 20000);
-    ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
-                    &g_shapeMatchAxisSweepCompare);
+    // Axis sweep N slider disabled - variable undefined
+    /*ImGui::SliderInt("axis sweep N",
+                     &g_shapeMatchAxisSweepN, 8, 90);*/
+    // Axis sweep tgt subN slider disabled - variable undefined
+    /*ImGui::SliderInt("axis sweep tgt subN",
+                     &g_shapeMatchAxisSweepTgtSubN, 500, 20000);*/
+    // Dual variant checkbox disabled - variable undefined
+    /*ImGui::Checkbox("dual-variant compare (A:full vs B:rim)",
+                    &g_shapeMatchAxisSweepCompare);*/
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Run both variants, pick lower CompRMSE.\n"
                           "OFF = Variant A (full vertex) only.");
