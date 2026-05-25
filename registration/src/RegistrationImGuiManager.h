@@ -1627,65 +1627,8 @@ private:
         }
         ImGui::Spacing();
 
-        // ----------------------------------------------------------------
-        //  QCR Tuning  (Shift+Ctrl+P / AutoQCR 共通、折りたたみ既定 OFF)
-        // ----------------------------------------------------------------
-        //  g_qcrSubsetK と g_qcrMaxTrials は RegistrationActions.h で
-        //  inline 定義されており、runQuadCyclicRansac() の中で読まれる。
-        //  AutoQCR (= runAutoQuadCyclicRansac) は 9 個の ORIENT preset
-        //  それぞれに対して runQuadCyclicRansac を呼ぶので、ここで設定
-        //  した K / Max trials は AutoQCR の各 trial にも自動的に効く。
-        //
-        //  位置: 旧 "Shift+Ctrl+P Tuning" として下方に置いていたが、
-        //  AutoQCR との関係が見えにくかったため AutoQCR ボタン直下に移動。
-        if (ImGui::CollapsingHeader("QCR Tuning  (Shift+Ctrl+P / AutoQCR)")) {
-            ImGui::Indent(8);
-            // [Phase 8] AutoQCR 6-DoF lock (relocated from the main button rim).
-            //   ON  = rigid (scale=1)   OFF = 7-DoF T+R+Scale
-            {
-                bool lockScale = state.autoQcrLockScale;
-                if (ImGui::Checkbox("AutoQCR 6-DoF lock (scale=1)##qcr_lock", &lockScale)) {
-                    const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
-                }
-            }
-            ImGui::Spacing();
-            // K subset size: 3 (Fischler-Bolles min), 4-5 (more stable, over-determined)
-            ImGui::TextColored(colMuted(), "Subset size K:");
-            if (ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d")) {
-                // value clamped inside runQuadCyclicRansac if out of range
-            }
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  K=3: %d-pt exact fit (max variety)\n"
-                               "  K=4: over-det. (balanced)\n"
-                               "  K=5: over-det. (most stable)",
-                               g_qcrSubsetK);
-            // Trial count cap (K=4/5 expensive: stride sample to stay under cap)
-            ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max trials (Stage 1 cap):");
-            ImGui::SliderInt("##qcrCap", &g_qcrMaxTrials, 10000, 500000, "%d");
-            // -------------------------------------------------------
-            //  Rotation hard limits (post-Umeyama)
-            //  -----------------------------------------------------
-            //   per-axis : 各軸 (X/Y/Z) Euler 角の |angle| max
-            //   total    : axis-angle 表現の総回転量 (arccos((tr(R)-1)/2))
-            //  AutoQCR の 15 preset は最大 ±40° (FAR) なので、
-            //  Umeyama drift を 30° 以下に絞ると「枠を大きく超えない」。
-            // -------------------------------------------------------
-            ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max axis rotation (per-axis):");
-            ImGui::SliderFloat("##qcrMaxAxis", &g_qcrMaxAxisRotDeg,
-                               5.0f, 90.0f, "%.1f deg");
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  X/Y/Z 単軸ごとの上限 (30° 推奨)");
-            ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max total rotation (axis-angle):");
-            ImGui::SliderFloat("##qcrMaxTotal", &g_qcrMaxTotalRotDeg,
-                               5.0f, 90.0f, "%.1f deg");
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  off-axis 大回転も含む総量 (30° 推奨)");
-            ImGui::Unindent(8);
-        }
-        ImGui::Spacing();
+        // [Phase 9b] QCR Tuning block merged into the "Tuning & Advanced"
+        // collapsing header near the bottom of this section.
 
         // ----------------------------------------------------------------
         //  [Ctrl+G] V3-R BIPOP-CMA-ES (主動線、メイン Refinement)
@@ -1816,11 +1759,42 @@ private:
         //    - Voxel UI も regMethod==1 (Hemi Auto 選択時) 限定だった旧表示を
         //      ここに常時表示として移動済み。
         // ====================================================================
-        if (ImGui::CollapsingHeader("Advanced")) {
+        // [Phase 9b] Merged "QCR Tuning" + "Advanced" into a single end-of-
+        // section header so the two debug/expert headers no longer occupy two
+        // separate rows. Layout: AutoQCR section -> separator -> Ctrl+G section.
+        if (ImGui::CollapsingHeader("Tuning & Advanced")) {
             ImGui::Indent(8);
 
-            // [Phase 8] Ctrl+G 6-DoF lock (relocated from the main button rim).
-            //   ON = SIX_DOF_RIGID (scale=1)   OFF = SEVEN_DOF (scale estimated)
+            // ===== AutoQCR section =====
+            ImGui::TextColored(colMuted(), "AutoQCR (Alt+Ctrl+P / Shift+Ctrl+P):");
+            {
+                bool lockScale = state.autoQcrLockScale;
+                if (ImGui::Checkbox("AutoQCR 6-DoF lock (scale=1)##qcr_lock", &lockScale)) {
+                    const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
+                }
+            }
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Subset size K:");
+            ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d");
+            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
+                               "  K=3: exact fit  K=4: balanced  K=5: stable");
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max trials (Stage 1 cap):");
+            ImGui::SliderInt("##qcrCap", &g_qcrMaxTrials, 10000, 500000, "%d");
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max axis rotation (per-axis):");
+            ImGui::SliderFloat("##qcrMaxAxis", &g_qcrMaxAxisRotDeg,
+                               5.0f, 90.0f, "%.1f deg");
+            ImGui::TextColored(colMuted(), "Max total rotation (axis-angle):");
+            ImGui::SliderFloat("##qcrMaxTotal", &g_qcrMaxTotalRotDeg,
+                               5.0f, 90.0f, "%.1f deg");
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // ===== Ctrl+G section =====
+            ImGui::TextColored(colMuted(), "Ctrl+G / Ctrl+Shift+G (V3-R):");
             {
                 bool lockScale = state.ctrlgLockScale;
                 if (ImGui::Checkbox("Ctrl+G 6-DoF lock (scale=1)##ctrlg_lock_adv", &lockScale)) {
@@ -1830,14 +1804,8 @@ private:
                 }
             }
             ImGui::Spacing();
-
-            // ---- Voxel slider (旧 regMethod==1 限定表示 → ここに常時) ----
             drawVoxelInfo();
             ImGui::Spacing();
-
-            // ---- Ctrl+G / Ctrl+Shift+G RIM/raycast 関連コントロール ----
-            //   main.cpp 側 drawCtrlGRimRaycastControls() がここに描画。
-            //   未配線の場合 (テスト環境等) は何も出ない。
             if (actions.onDrawAdvancedCtrlG) {
                 ImGui::PushID("##adv_ctrlg");
                 actions.onDrawAdvancedCtrlG();
