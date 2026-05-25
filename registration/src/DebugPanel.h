@@ -29,6 +29,42 @@
 
 #include "imgui.h"
 #include "RegistrationImGuiManager.h"   // for RegUIState / RegUIActions
+#include "SilOverlayDebug.h"            // for SilOverlay::g_silOverlay (F9)
+
+// =============================================================================
+// Phase 5 (W tab) — externs for silhouette-sweep RIM debug globals.
+// These are `inline bool/float/int` at GLOBAL scope in RegistrationActions.h,
+// which main.cpp includes AFTER this header, so the W tab needs extern decls to
+// read/write them. (SilOverlay::g_silOverlay is namespace-scoped and provided
+// by the SilOverlayDebug.h include above — NOT redeclared here.)
+// =============================================================================
+extern bool g_debugShow2DProjPopup_RawRim;
+extern bool g_debugShow2DProjPopup_RawRimSmoothed;
+extern bool g_debugShow2DProjPopup_RawRimOrdered;
+extern bool g_debugShow2DProjPopup_Source;
+extern bool g_debugShow2DProjPopup_Target;
+
+extern float g_rawRimSmooth_GridPx;
+extern int   g_rawRimSmooth_KnnK;
+extern int   g_rawRimSmooth_KnnIters;
+extern bool  g_rawRimSmooth_ShowRawOverlay;
+
+extern float g_rawRimOrder_MaxEdgePx;
+extern int   g_rawRimOrder_NPivots;
+extern bool  g_rawRimOrder_ShowMST;
+extern bool  g_rawRimOrder_ShowCleaned;
+
+extern int g_silSwSrcRimMethod;          // 0=ENVELOPE, 1=MST_LONGEST_PATH
+
+extern int  g_silhouetteSweepFrames1;
+extern int  g_silhouetteSweepFrames2;
+extern bool g_silhouetteSweepLog;
+extern bool g_silhouetteSweepAnimate;
+
+extern bool  g_silSwCheckA_Enable;
+extern float g_silSwCheckA_RotCapDeg;
+extern bool  g_silSwCheckB_Enable;
+extern float g_silSwCheckB_CCToleranceDeg;
 
 namespace DebugPanel {
 
@@ -119,7 +155,126 @@ inline void draw(State& st, RegistrationImGuiManager& gUI) {
 inline void drawTabG  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("G tab — Phase 3 will populate"); }
 inline void drawTabO  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("O tab — Phase 6 will populate"); }
 inline void drawTabN  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("N tab — Phase 4 will populate"); }
-inline void drawTabW  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("W tab — Phase 5 will populate"); }
+inline void drawTabW(RegUIState& /*s*/, RegUIActions& /*a*/) {
+    ImGui::TextColored(ImVec4(0.85f, 0.75f, 1.0f, 1.0f),
+                       "W — Shift+W series — RIM 2D projection debug");
+    ImGui::TextWrapped(
+        "Each checkbox opens a separate ImGui popup window in the main frame. "
+        "Keyboard shortcuts (Shift+W base + suffix) continue to work; these "
+        "toggles are just a single place to find them.");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Section 1: Stage 0 — Raw/Smoothed/Ordered RIM popups =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Stage 0 — Source RIM discretization debug:");
+    ImGui::Checkbox("CB0  Raw RIM 2D projection (points only)##w_raw",
+                    &g_debugShow2DProjPopup_RawRim);
+    ImGui::Checkbox("CB0.1  Smoothed RIM (grid + KNN)##w_sm",
+                    &g_debugShow2DProjPopup_RawRimSmoothed);
+    if (g_debugShow2DProjPopup_RawRimSmoothed) {
+        ImGui::Indent(16);
+        ImGui::SliderFloat("Grid px##w_sm_grid",
+                           &g_rawRimSmooth_GridPx, 5.0f, 50.0f, "%.1f");
+        ImGui::SliderInt("KNN K##w_sm_k", &g_rawRimSmooth_KnnK, 1, 20);
+        ImGui::SliderInt("KNN iters##w_sm_iter", &g_rawRimSmooth_KnnIters, 1, 10);
+        ImGui::Checkbox("Show raw overlay##w_sm_raw",
+                        &g_rawRimSmooth_ShowRawOverlay);
+        ImGui::Unindent(16);
+    }
+
+    ImGui::Checkbox("CB0.2  Ordered RIM (MST + longest path)##w_ord",
+                    &g_debugShow2DProjPopup_RawRimOrdered);
+    if (g_debugShow2DProjPopup_RawRimOrdered) {
+        ImGui::Indent(16);
+        ImGui::SliderFloat("MST edge max px##w_ord_edge",
+                           &g_rawRimOrder_MaxEdgePx, 20.0f, 300.0f, "%.0f");
+        ImGui::SliderInt("Pivots##w_ord_pivots", &g_rawRimOrder_NPivots, 5, 50);
+        ImGui::Checkbox("Show MST overlay##w_ord_mst", &g_rawRimOrder_ShowMST);
+        ImGui::Checkbox("Show cleaned overlay##w_ord_clean",
+                        &g_rawRimOrder_ShowCleaned);
+        ImGui::Unindent(16);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Section 2: Stage 3d — Source / Target rim popups =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Stage 3d — Source / Target rim popups:");
+    ImGui::Checkbox("CB1  Source 2D projection (envelope + pivots)##w_src",
+                    &g_debugShow2DProjPopup_Source);
+    ImGui::Checkbox("CB2  Target lower-half + anchors##w_tgt",
+                    &g_debugShow2DProjPopup_Target);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Section 3: Source RIM method =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Source RIM method (Ctrl+Alt+W sweep):");
+    {
+        int m = g_silSwSrcRimMethod;
+        if (ImGui::RadioButton("MST longest path  (default, open arch)##w_method_mst",
+                               m == 1)) g_silSwSrcRimMethod = 1;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Envelope (legacy)##w_method_env",
+                               m == 0)) g_silSwSrcRimMethod = 0;
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Section 4: Sweep safety checks =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Sweep candidate filters:");
+    ImGui::Checkbox("Check A: rotation cap##w_chka", &g_silSwCheckA_Enable);
+    if (g_silSwCheckA_Enable) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120);
+        ImGui::SliderFloat("##w_chka_deg", &g_silSwCheckA_RotCapDeg,
+                           5.0f, 90.0f, "+/-%.0f deg");
+    }
+    ImGui::Checkbox("Check B: CC orientation##w_chkb", &g_silSwCheckB_Enable);
+    if (g_silSwCheckB_Enable) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120);
+        ImGui::SliderFloat("##w_chkb_deg", &g_silSwCheckB_CCToleranceDeg,
+                           5.0f, 45.0f, "+/-%.0f deg");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Section 5: Sweep animation =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Sweep animation:");
+    ImGui::Checkbox("Animate##w_anim", &g_silhouetteSweepAnimate);
+    ImGui::SameLine();
+    ImGui::Checkbox("Verbose log##w_log", &g_silhouetteSweepLog);
+    ImGui::Spacing();
+    ImGui::SliderInt("Phase 1 frames##w_f1", &g_silhouetteSweepFrames1, 1, 240);
+    ImGui::SliderInt("Phase 2 frames##w_f2", &g_silhouetteSweepFrames2, 1, 120);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Section 6: F9 silhouette IoU button (also in G tab) =====
+    ImGui::TextColored(ImVec4(0.85f, 1.0f, 0.7f, 1.0f),
+                       "Silhouette IoU diagnostic:");
+    if (ImGui::Button("F9: Toggle Silhouette IoU window##w_f9")) {
+        SilOverlay::g_silOverlay.showWindow = !SilOverlay::g_silOverlay.showWindow;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(SilOverlay::g_silOverlay.showWindow
+                            ? "(currently open)"
+                            : "(currently closed)");
+}
 inline void drawTabU  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("U tab — Phase 6 will populate"); }
 inline void drawTabViz(RegUIState& s, RegUIActions& a) {
     ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),

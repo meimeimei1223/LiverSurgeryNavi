@@ -6151,6 +6151,21 @@ int main() {
             ImGui::TextDisabled("Press Ctrl+Shift+G to run V3-RS (silhouette anchor)");
             ImGui::TextDisabled("Press Shift+N / Ctrl+Shift+N for Normal-Compat / SRT polish");
 
+            // [PHASE-5] F9 silhouette IoU toggle — also available from W tab.
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.85f, 1.0f, 0.7f, 1.0f),
+                               "Silhouette IoU diagnostic:");
+            if (ImGui::Button("F9: Toggle Silhouette IoU window##g_f9")) {
+                SilOverlay::g_silOverlay.showWindow =
+                    !SilOverlay::g_silOverlay.showWindow;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(SilOverlay::g_silOverlay.showWindow
+                                    ? "(currently open)"
+                                    : "(currently closed)");
+
         };  // end g_debugPanel.drawGBody (migrated Ctrl+G Quadrant Selector)
 
         // ----------------------------------------------------------------
