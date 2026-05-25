@@ -4467,11 +4467,12 @@ int main() {
         //    また毎フレーム O(N) の countByQuadrant / makeQuadrantSubsetIdx
         //    が走るので Umeyama 時の体感カクつき要因にもなる)
         // ----------------------------------------------------------------
-        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
-            ImGui::SetNextWindowBgAlpha(0.7f);
-            ImGui::Begin("Ctrl+G Quadrant Selector",
-                         nullptr,
-                         ImGuiWindowFlags_AlwaysAutoResize);
+        // [PHASE-3] The full Ctrl+G Quadrant Selector content is no longer a
+        // standalone floating window. It is registered here as a hook (a lambda
+        // capturing frame-loop locals by reference) and rendered inside
+        // Debug Panel > G tab by DebugPanel::draw() below, under the same
+        // kRegistration && !gUmeyama.active guard. All functionality preserved.
+        g_debugPanel.drawGBody = [&]() {
 
             const bool labelsReady = g_liverRegion.valid() && g_liverLR.valid();
             if (!labelsReady) {
@@ -6150,8 +6151,7 @@ int main() {
             ImGui::TextDisabled("Press Ctrl+Shift+G to run V3-RS (silhouette anchor)");
             ImGui::TextDisabled("Press Shift+N / Ctrl+Shift+N for Normal-Compat / SRT polish");
 
-            ImGui::End();
-        }
+        };  // end g_debugPanel.drawGBody (migrated Ctrl+G Quadrant Selector)
 
         // ----------------------------------------------------------------
         //  Normal-Compatible Refine (Shift+N) panel

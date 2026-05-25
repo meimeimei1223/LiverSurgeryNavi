@@ -25,6 +25,8 @@
 //    DebugPanel::draw(g_debugPanel, gUI);
 // =============================================================================
 
+#include <functional>
+
 #include "imgui.h"
 #include "RegistrationImGuiManager.h"   // for RegUIState / RegUIActions
 
@@ -43,6 +45,13 @@ enum Tab {
 struct State {
     bool showWindow   = false;
     int  activeTab    = TAB_G;  // initial tab on first open
+
+    // Optional per-tab body hooks set from main.cpp. When set, the hook is
+    // rendered inside that tab instead of the local stub. Used for tabs whose
+    // content depends on many main.cpp-local symbols (e.g. the migrated Ctrl+G
+    // Quadrant Selector panel — Phase 3) and is therefore registered as a
+    // lambda capturing frame-loop locals by reference.
+    std::function<void()> drawGBody;   // Phase 3: full Ctrl+G panel body
 };
 
 // Internal tab draw functions (later phases populate these).
@@ -66,7 +75,8 @@ inline void draw(State& st, RegistrationImGuiManager& gUI) {
         if (ImGui::BeginTabBar("##debugpanel_tabs", ImGuiTabBarFlags_None)) {
             if (ImGui::BeginTabItem("G")) {
                 st.activeTab = TAB_G;
-                drawTabG(gUI.state, gUI.actions);
+                if (st.drawGBody) st.drawGBody();   // Phase 3: migrated Ctrl+G panel
+                else              drawTabG(gUI.state, gUI.actions);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("O")) {
