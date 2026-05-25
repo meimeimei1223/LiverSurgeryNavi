@@ -107,6 +107,36 @@ inline void drawTabO  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("O tab 
 inline void drawTabN  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("N tab — Phase 4 will populate"); }
 inline void drawTabW  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("W tab — Phase 5 will populate"); }
 inline void drawTabU  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("U tab — Phase 6 will populate"); }
-inline void drawTabViz(RegUIState&, RegUIActions&) { ImGui::TextDisabled("Viz tab — Phase 2/7 will populate"); }
+inline void drawTabViz(RegUIState& s, RegUIActions& a) {
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Visualization toggles  (keyboard shortcuts in parens)");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ----- Registration-result viz -----
+    ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Registration cluster (key J):");
+    {
+        bool clusterVis = s.clusterVis;
+        if (ImGui::Checkbox("Cluster markers  (green=src, blue=tgt-int, yellow=tgt-bnd)##viz_cluster",
+                            &clusterVis)) {
+            if (a.onToggleClusterVis) a.onToggleClusterVis();
+        }
+    }
+    {
+        bool corresVis = s.correspondenceVis;
+        if (ImGui::Checkbox("Correspondence points  (Umeyama board+object)##viz_corres",
+                            &corresVis)) {
+            if (a.onToggleCorrespondenceVis) a.onToggleCorrespondenceVis();
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextDisabled("More visualizations (B / N keys) — Phase 7 will surface.");
+    ImGui::TextDisabled("Screen-mesh point density / debug AABB — Phase 7 will move here.");
+}
 
 } // namespace DebugPanel

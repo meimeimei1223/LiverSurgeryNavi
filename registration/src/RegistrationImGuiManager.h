@@ -1808,19 +1808,8 @@ private:
                 if(state.clusterVis && actions.onToggleClusterVis) actions.onToggleClusterVis();
             }
         }
-        ImGui::Spacing();
-        {
-            float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
-            if(colorButton(state.correspondenceVis ? "CorresPoints ON" : "CorresPoints OFF",
-                            state.correspondenceVis ? colGreen() : colDim(), false, false, bw2)) {
-                if(actions.onToggleCorrespondenceVis) actions.onToggleCorrespondenceVis();
-            }
-            ImGui::SameLine();
-            if(colorButton(state.clusterVis ? "Cluster ON" : "Cluster OFF",
-                            state.clusterVis ? colGreen() : colDim(), false, false, bw2)) {
-                if(actions.onToggleClusterVis) actions.onToggleClusterVis();
-            }
-        }
+        // [PHASE-2] Cluster / CorresPoints viz toggles relocated to
+        // Debug Panel > Viz tab (Ctrl+D).
 
         // ---- QCR Tuning は AutoQCR の直下に移動済み (上部参照) ----
         ImGui::Spacing();
