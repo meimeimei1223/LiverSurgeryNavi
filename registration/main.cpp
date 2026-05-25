@@ -68,6 +68,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "RegistrationImGuiManager.h"
+#include "DebugPanel.h"
 #include "UmeyamaController.h"
 // PoseLibrary.h は RegistrationActions.h の後で include する
 // (RegistrationActions.h 内の inline computeUnifiedMetrics 定義を見えてからで
@@ -632,6 +633,7 @@ static SimpleCameraPreview gCamera;
 static AppContext             gApp;
 static MaskPicker::Renderer   gMaskRenderer;
 RegistrationImGuiManager gUI;          // PoseLibrary.h からも extern 参照されるため非static
+static DebugPanel::State g_debugPanel;  // Ctrl+D で開閉する統合デバッグパネル
 static UmeyamaController gUmeyama;
 // 臓器6個 + board(6) + target(7)  ≥0.75="ON", 0.01~0.74="50%", <0.01="OFF"
 //   起動デフォルト: liver と target だけ ON、それ以外は全 OFF
@@ -1391,6 +1393,14 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         std::cout << "[Key] '" << (char)key
                   << "' requires a loaded scene -- drop an image and"
                      " press R to run the depth pipeline." << std::endl;
+        return;
+    }
+
+    // Ctrl+D — toggle the consolidated Debug Panel. Handled before the switch
+    // so it does not fall through to the plain-D (AR save) case below.
+    if (key == GLFW_KEY_D && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT)) {
+        g_debugPanel.showWindow = !g_debugPanel.showWindow;
+        std::cout << "[DebugPanel] " << (g_debugPanel.showWindow ? "ON" : "OFF") << std::endl;
         return;
     }
 
@@ -6467,6 +6477,12 @@ int main() {
                 }
             }
             ImGui::End();
+        }
+
+        // Consolidated Debug Panel (Ctrl+D). Same registration / non-Umeyama
+        // guard as the legacy floating panels above.
+        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
+            DebugPanel::draw(g_debugPanel, gUI);
         }
 
         // Pose Library / AR preview / SilOverlay preview
