@@ -1552,30 +1552,59 @@ private:
 
         bool anyP = (state.regState > 0 && state.regState < 4);
 
-        drawInitOrientationPanel();
+        // [Phase 8] INITIAL ORIENTATION as a collapsing header. Label shows
+        // current Q-mask + Orient preset so it stays readable when collapsed.
+        {
+            constexpr uint8_t kMaskNone = 0x00;
+            constexpr uint8_t kMaskAll  = 0x0F;
+            char qstr[24];
+            if (state.activeQuadrantMask == kMaskNone)      std::snprintf(qstr, sizeof(qstr), "NONE");
+            else if (state.activeQuadrantMask == kMaskAll)  std::snprintf(qstr, sizeof(qstr), "ALL");
+            else std::snprintf(qstr, sizeof(qstr), "0x%02X", (unsigned)state.activeQuadrantMask);
 
-        // --- STAGE 1: Hemi Auto (2/3 width) + AutoProbe (1/3 width) ---
+            char hdrLabel[96];
+            std::snprintf(hdrLabel, sizeof(hdrLabel),
+                          "INITIAL ORIENTATION  [Q:%s | %s]###initorient_hdr",
+                          qstr, presetLabel(state.initRotPreset));
+
+            // Auto-open before any registration / labels exist; fold up after.
+            if (!state.useRegistration && !state.quadLabelsReady) {
+                ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.10f, 0.12f, 0.16f, 0.7f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.15f, 0.18f, 0.24f, 0.8f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.20f, 0.24f, 0.32f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.55f, 0.70f, 0.90f, 1.0f));
+            bool ioOpen = ImGui::CollapsingHeader(hdrLabel);
+            ImGui::PopStyleColor(4);
+
+            if (ioOpen) {
+                drawInitOrientationPanel();  // unchanged
+            }
+        }
+
+        // --- STAGE 1: Hemi Quad (Shift+O, 2/3 width) + Probe (1/3 width) ---
+        // [Phase 8 rename] Hemi Auto -> Hemi Quad (Shift+O): calls onQuadAuto
+        // (AR-fixed-view ∩ quadrant intersection, the improved method) instead
+        // of onHemiAuto. onHemiAuto is preserved in RegUIActions for keyboard
+        // and other code paths; only this sidebar button is rerouted. The
+        // v:0.50 voxel readout is dropped (same value lives in Debug Panel O
+        // tab and sidebar Advanced).
         {
             const float gap     = 4.0f;
             const float availW  = ImGui::GetContentRegionAvail().x;
             const float hemiW   = (availW - gap) * 0.66f;
 
-            if(glowButton("Hemi Auto", colReg(), anyP && state.regMethod!=1, hemiW, 52, state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
-                state.regMethod = 1; if(actions.onHemiAuto) actions.onHemiAuto();
-            }
-            {
-                ImVec2 p = ImGui::GetItemRectMin();
-                ImVec2 sz = ImGui::GetItemRectSize();
-                char buf[16]; snprintf(buf, sizeof(buf), "v:%.2f", state.hemiVoxelSize);
-                ImVec2 ts = ImGui::CalcTextSize(buf);
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(p.x + sz.x - ts.x - 6, p.y + (sz.y - ts.y) * 0.5f),
-                    IM_COL32(120,220,160,180), buf);
+            if(glowButton("Hemi Quad (Shift+O)", colReg(),
+                          anyP && state.regMethod!=1, hemiW, 52,
+                          state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
+                state.regMethod = 1;
+                if(actions.onQuadAuto) actions.onQuadAuto();
             }
 
-            // AutoProbe: HemiAuto の右隣 (残り 1/3)
             ImGui::SameLine(0.0f, gap);
-            if(glowButton("AutoProbe", colReg(), anyP, -1, 52, 0)) {
+            if(glowButton("Probe", colReg(), anyP, -1, 52, 0)) {
                 if(actions.onAutoProbe) actions.onAutoProbe();
             }
         }
@@ -1588,34 +1617,14 @@ private:
         //  AutoQCR ボタン、右 1/3 が 6-DoF lock チェックボックス。
         //  チェック ON (default) = rigid (DICOM mm + metric depth)、
         //  チェック OFF = 7-DoF T+R+Scale (Shift+Ctrl+P 互換)。
+        // [Phase 8] AutoQCR is now a full-width button. The 6-DoF/7-DoF lock
+        // checkbox moved into the QCR Tuning collapsing header below (keeps the
+        // main button clean). `anyP` disables it only while another
+        // registration is running; prerequisites are guarded inside
+        // runAutoQuadCyclicRansac.
         {
-            float totalW = ImGui::GetContentRegionAvail().x;
-            float gap2 = ImGui::GetStyle().ItemSpacing.x;
-            float wAutoQcr = totalW * (2.0f / 3.0f) - gap2;
-            const char* label = state.autoQcrLockScale
-                                    ? "AutoQCR  6-DoF"
-                                    : "AutoQCR  7-DoF";
-            // [BUGFIX] 旧コード:
-            //   bool anyP2 = (state.cameraState == 2 || state.hasLocalImage);
-            //   if(glowButton(label, colReg(), anyP2, ...)) {
-            // anyP2 は「画像ソースが用意済み」を表す true 値だったが、
-            // それを `disabled` に渡していたため、画像をロードした直後に
-            // ボタンが灰色になる polarity bug が発生していた (= 主要動線で
-            // ボタンが押せなくなる)。AutoProbe と同じ `anyP` (= 他登録が
-            // 実行中) に統一。前提 (Apply Init Pose 済み等) は
-            // runAutoQuadCyclicRansac 内のガードで早期 return される。
-            if(glowButton(label, colReg(), anyP, wAutoQcr, 52, 0)) {
+            if(glowButton("AutoQCR", colReg(), anyP, -1, 52, 0)) {
                 if(actions.onAutoQCR) actions.onAutoQCR(state.autoQcrLockScale);
-            }
-
-            ImGui::SameLine(0.0f, gap2);
-            // 6-DoF checkbox (右側 1/3)
-            bool lockScale = state.autoQcrLockScale;
-            if (ImGui::Checkbox("6-DoF", &lockScale)) {
-                // RegUIState は const 参照では渡らないため、
-                // const_cast せずトグルだけしておく(次フレームの sync で
-                // 反映される設計でも OK だが、即時反映が欲しいので直接書く)。
-                const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
             }
         }
         ImGui::Spacing();
@@ -1633,6 +1642,15 @@ private:
         //  AutoQCR との関係が見えにくかったため AutoQCR ボタン直下に移動。
         if (ImGui::CollapsingHeader("QCR Tuning  (Shift+Ctrl+P / AutoQCR)")) {
             ImGui::Indent(8);
+            // [Phase 8] AutoQCR 6-DoF lock (relocated from the main button rim).
+            //   ON  = rigid (scale=1)   OFF = 7-DoF T+R+Scale
+            {
+                bool lockScale = state.autoQcrLockScale;
+                if (ImGui::Checkbox("AutoQCR 6-DoF lock (scale=1)##qcr_lock", &lockScale)) {
+                    const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
+                }
+            }
+            ImGui::Spacing();
             // K subset size: 3 (Fischler-Bolles min), 4-5 (more stable, over-determined)
             ImGui::TextColored(colMuted(), "Subset size K:");
             if (ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d")) {
@@ -1694,51 +1712,18 @@ private:
 
             // AutoQCR と同じ 2/3 + 1/3 レイアウト: ボタン本体 (左) +
             // 6-DoF チェックボックス (右)。
-            float totalW = ImGui::GetContentRegionAvail().x;
-            float gap2 = ImGui::GetStyle().ItemSpacing.x;
-            float wCtrlg = totalW * (2.0f / 3.0f) - gap2;
-
-            if (glowButton("Ctrl+G  V3-R  [Refine]", colReg(),
-                           ctrlgDisabled, wCtrlg, 56))
+            // [Phase 8] Ctrl+G full-width button (shorter label). The 6-DoF
+            // lock checkbox moved into the Advanced collapsing header below
+            // (the Debug Panel G tab covers the 4-DoF / search-dimension radio).
+            if (glowButton("Ctrl+G", colReg(), ctrlgDisabled, -1, 56))
             {
                 state.regMethod = 3;   // BIPOP method (Shift+V/F/G と同じ slot)
                 if (actions.onCtrlG) actions.onCtrlG();
             }
-
-            ImGui::SameLine(0.0f, gap2);
-            // 6-DoF checkbox (右側 1/3)
-            //   ON  = SIX_DOF_RIGID (scale=1 固定)
-            //   OFF = SEVEN_DOF     (scale 推定 ON)
-            //   左 floating パネルで 4-DoF (FOUR_DOF_XYRXRY) を選んでいる
-            //   場合は false 扱いで表示される (4-DoF != 6-DoF)。
-            bool lockScale = state.ctrlgLockScale;
-            if (ImGui::Checkbox("6-DoF##ctrlg", &lockScale)) {
-                const_cast<RegUIState&>(state).ctrlgLockScale = lockScale;
-                if (actions.onCtrlgLockScaleChanged)
-                    actions.onCtrlgLockScaleChanged(lockScale);
-            }
         }
 
-        // --- Instrument Px Threshold ---
-        // 器具マスクが有効な時だけ表示。スライダー値が変わったら次の HemiAuto
-        // (Key O) で再分類されるので、Bキーで赤点を見ながら調整できる。
-        if (state.regMethod == 1 && state.instrumentMaskActive) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.04f, 0.04f, 0.4f));
-            ImGui::BeginChild("##instinfo", ImVec2(-1, 42), false);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
-            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.0f), "  Inst Px");
-            ImGui::SameLine();
-            float v = state.instrumentPxThresh;
-            ImGui::SetNextItemWidth(-8);
-            if (ImGui::SliderFloat("##instpx", &v, 0.0f, 50.0f, "%.0f px")) {
-                if (actions.onInstrumentPxThreshChanged) {
-                    actions.onInstrumentPxThreshChanged(v);
-                }
-            }
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-        }
+        // [Phase 8] Instrument Px Threshold slider relocated to Debug Panel
+        // O tab (always accessible there, not conditional). Sidebar stays clean.
 
         // --- Iter Probe (K回 AutoProbe を連続呼び出し) ---
         //   [UI整理 - 削除済] AutoQCR で 9 preset 自動 sweep ができるため、
@@ -1782,32 +1767,34 @@ private:
         }
 
         ImGui::Spacing();
+        // [Phase 8] Pose Library label includes entry count when > 0.
         {
             float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
-            if(colorButton(state.poseLibraryOpen ? "Pose Library ON" : "Pose Library",
-                            state.poseLibraryOpen ? colGreen() : colReg(), false, false, bw2)) {
+            char libLabel[48];
+            if (state.poseEntryCount > 0) {
+                std::snprintf(libLabel, sizeof(libLabel),
+                              state.poseLibraryOpen ? "Pose Library (%d) ON"
+                                                    : "Pose Library (%d)",
+                              state.poseEntryCount);
+            } else {
+                std::snprintf(libLabel, sizeof(libLabel),
+                              state.poseLibraryOpen ? "Pose Library ON"
+                                                    : "Pose Library");
+            }
+            if(colorButton(libLabel,
+                           state.poseLibraryOpen ? colGreen() : colReg(), false, false, bw2)) {
                 if(actions.onPoseLibraryToggle) actions.onPoseLibraryToggle();
             }
             ImGui::SameLine();
-            if(colorButton("Undo", state.poseUndoAvailable ? colRed() : colDim(),
+            if(colorButton("Pose Undo", state.poseUndoAvailable ? colRed() : colDim(),
                             false, !state.poseUndoAvailable, bw2)) {
                 if(actions.onPoseUndo) actions.onPoseUndo();
             }
         }
 
-        ImGui::Spacing();
-        {
-            // [PHASE-0 BUGFIX] Removed misrouted "Clear CorresPoints" button.
-            // It was wired to MaskPicker::clear() which clears DEPTH-stage
-            // SAM2 mask clicks, not registration correspondence points.
-            // Umeyama point pair clearing is handled by the in-overlay Undo
-            // button. DEPTH mask reset is handled by onResetRegistration
-            // and the DEPTH section's existing controls.
-            if(colorButton("Reset Reg", colRed(), false, false, -1)) {
-                if(actions.onResetRegistration) actions.onResetRegistration();
-                if(state.clusterVis && actions.onToggleClusterVis) actions.onToggleClusterVis();
-            }
-        }
+        // [Phase 8] Reset is now part of the 3-column footer at the bottom of
+        // this section (Deform / Depth / Reset). Reset no longer auto-toggles
+        // cluster viz off — that belongs to the user (Debug Panel Viz tab).
         // [PHASE-2] Cluster / CorresPoints viz toggles relocated to
         // Debug Panel > Viz tab (Ctrl+D).
 
@@ -1834,6 +1821,18 @@ private:
         if (ImGui::CollapsingHeader("Advanced")) {
             ImGui::Indent(8);
 
+            // [Phase 8] Ctrl+G 6-DoF lock (relocated from the main button rim).
+            //   ON = SIX_DOF_RIGID (scale=1)   OFF = SEVEN_DOF (scale estimated)
+            {
+                bool lockScale = state.ctrlgLockScale;
+                if (ImGui::Checkbox("Ctrl+G 6-DoF lock (scale=1)##ctrlg_lock_adv", &lockScale)) {
+                    const_cast<RegUIState&>(state).ctrlgLockScale = lockScale;
+                    if (actions.onCtrlgLockScaleChanged)
+                        actions.onCtrlgLockScaleChanged(lockScale);
+                }
+            }
+            ImGui::Spacing();
+
             // ---- Voxel slider (旧 regMethod==1 限定表示 → ここに常時) ----
             drawVoxelInfo();
             ImGui::Spacing();
@@ -1851,20 +1850,28 @@ private:
         }
         ImGui::Spacing();
 
+        // [Phase 8] Footer: 3-column nav (Deform / Depth / Reset). All three
+        // are "leave this section" actions; grouping them communicates that.
+        // Reset stays red as a warning.
         ImGui::Spacing(); ImGui::Spacing();
         {
-            float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
+            float bw3 = (ImGui::GetContentRegionAvail().x - 8) / 3.0f;
             bool canDeform = (state.regState == 4 && state.mainMode == 0);
+
             if(canDeform) {
-                if(glowButton("Proceed Deform >>", colDeform(), false, bw2, 36)) {
+                if(glowButton("Deform >>", colDeform(), false, bw3, 36)) {
                     if (actions.onSwitchToDeformMode) actions.onSwitchToDeformMode();
                 }
             } else {
-                colorButton("Proceed Deform >>", colDim(), false, true, bw2, 36);
+                colorButton("Deform >>", colDim(), false, true, bw3, 36);
             }
             ImGui::SameLine();
-            if(colorButton("<< Back Depth", colDepth(), false, false, bw2, 36)) {
+            if(colorButton("<< Depth", colDepth(), false, false, bw3, 36)) {
                 regPhaseActive_ = false;
+                if (actions.onResetRegistration) actions.onResetRegistration();
+            }
+            ImGui::SameLine();
+            if(colorButton("Reset", colRed(), false, false, bw3, 36)) {
                 if (actions.onResetRegistration) actions.onResetRegistration();
             }
         }
