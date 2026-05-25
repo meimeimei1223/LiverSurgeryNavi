@@ -52,6 +52,7 @@ struct State {
     // Quadrant Selector panel — Phase 3) and is therefore registered as a
     // lambda capturing frame-loop locals by reference.
     std::function<void()> drawGBody;   // Phase 3: full Ctrl+G panel body
+    std::function<void()> drawNBody;   // Phase 4: Normal-Compatible Refine panel
 };
 
 // Internal tab draw functions (later phases populate these).
@@ -86,7 +87,8 @@ inline void draw(State& st, RegistrationImGuiManager& gUI) {
             }
             if (ImGui::BeginTabItem("N")) {
                 st.activeTab = TAB_N;
-                drawTabN(gUI.state, gUI.actions);
+                if (st.drawNBody) st.drawNBody();   // Phase 4: migrated Normal-Compat Refine
+                else              drawTabN(gUI.state, gUI.actions);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("W")) {

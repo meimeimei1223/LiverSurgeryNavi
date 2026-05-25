@@ -6166,11 +6166,10 @@ int main() {
         //  rim weights (Phase 2 L1) and anchor controls (Phase 3 L2) live
         //  here, plus per-iteration solver knobs.
         // ----------------------------------------------------------------
-        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
-            ImGui::SetNextWindowBgAlpha(0.7f);
-            ImGui::Begin("Normal-Compatible Refine (Shift+N)",
-                         nullptr,
-                         ImGuiWindowFlags_AlwaysAutoResize);
+        // [PHASE-4] Normal-Compatible Refine content relocated into Debug Panel
+        // > N tab. Registered as a hook (lambda capturing frame-loop locals by
+        // reference); rendered by DebugPanel::draw() under the same guard.
+        g_debugPanel.drawNBody = [&]() {
 
             ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
                                "Finishing-pass refinement after Ctrl+G");
@@ -6436,8 +6435,7 @@ int main() {
             ImGui::TextDisabled("Shift+N: Normal-Compat   |   "
                                 "Ctrl+Shift+N: SRT-Variance");
 
-            ImGui::End();
-        }
+        };  // end g_debugPanel.drawNBody (migrated Normal-Compatible Refine)
 
         if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
             ImGui::SetNextWindowBgAlpha(0.7f);
