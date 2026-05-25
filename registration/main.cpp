@@ -1371,6 +1371,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     const bool isShiftG     = (key == GLFW_KEY_G) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);  // V3 BIPOP-CMA-ES (Good performance)
     const bool isCtrlShiftG = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);   // V3-RS BIPOP-CMA-ES (silhouette anchor)
     const bool isCtrlG      = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V3-R BIPOP-CMA-ES (Region-aware, 4-quadrant subset)
+    const bool isAltG       = (key == GLFW_KEY_G) && (mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V1 BIPOP-CMA-ES (旧 Shift+V)
+    const bool isAltShiftG  = (key == GLFW_KEY_G) && (mods & GLFW_MOD_ALT) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);   // V2 BIPOP-CMA-ES Fast (旧 Shift+F)
     // Shift+N        : Normal-Compatible refine (finishing pass after Ctrl+G)
     // Ctrl+Shift+N   : SRT Variance-Weighted refine (ablation alt)
     // Plain N        : kept as the SourceVis toggle (no scene requirement)
@@ -1384,6 +1386,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                              isShiftG               ||
                              isCtrlG                ||
                              isCtrlShiftG           ||
+                             isAltG                 ||  // [key-reorg] V1 (旧 Shift+V)
+                             isAltShiftG            ||  // [key-reorg] V2 (旧 Shift+F)
                              isShiftN               ||
                              isCtrlShiftN           ||
                              key == GLFW_KEY_D      ||
@@ -1444,6 +1448,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         break;
     case GLFW_KEY_V:
         if (mods & GLFW_MOD_SHIFT) {
+            std::cout << "[DEPRECATION] Shift+V is moving to Alt+G next release"
+                      << std::endl;
             // 元コード line 6256-6266 (キー Shift+V) の順序
             g_stepStartTime = std::chrono::steady_clock::now();
             g_sessionBipopN++;
@@ -1466,6 +1472,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         // for the speedup; Phase 3 adds OpenMP. Plain F (no shift)
         // is intentionally left unbound for future use.
         if (mods & GLFW_MOD_SHIFT) {
+            std::cout << "[DEPRECATION] Shift+F is moving to Alt+Shift+G next release"
+                      << std::endl;
             g_stepStartTime = std::chrono::steady_clock::now();
             g_sessionBipopN++;
             gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V)
@@ -1491,6 +1499,32 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         //          S4 完了: CmaesRefineV3R::runBipopCmaesV3R を呼ぶ。
         //          QUAD_ALL のとき Shift+G (V3) と数値 byte-identical
         //          (HANDOVER §2.6 受け入れ基準)。
+        // ----- Alt+G : V1 BIPOP-CMA-ES (旧 Shift+V) -----
+        //   byte-identical to the legacy Shift+V branch (same order:
+        //   g_stepStartTime / g_sessionBipopN++ / regMethod=3 /
+        //   poseAutoSaveBeforeRegistration / runBipopCmaes / poseSaveToLibrary).
+        //   Must be tested BEFORE the Ctrl+Shift+G branch (mod-order).
+        if ((mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL)
+                                  && !(mods & GLFW_MOD_SHIFT)) {
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaes();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+            break;
+        }
+        // ----- Alt+Shift+G : V2 BIPOP-CMA-ES Fast (旧 Shift+F) -----
+        if ((mods & GLFW_MOD_ALT) && (mods & GLFW_MOD_SHIFT)
+                                  && !(mods & GLFW_MOD_CONTROL)) {
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V)
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaesV2();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+            break;
+        }
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ----- Ctrl+Shift+G : V3-RS (silhouette-anchored) -----
             // Independent of Ctrl+G; calls a fresh wrapper that reads
