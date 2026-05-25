@@ -85,17 +85,20 @@ the panel body now renders only when its tab is open, not every frame.
 
 ---
 
-## Deferred — next-time tasks
+## Phases 5/6/8 — completed (per UI_REFACTOR_PLAN_v2.md)
 
-| Phase | Title | Why deferred / what's needed |
-|---|---|---|
-| **5** | W tab | Plan's flag names don't exist. Re-scope to toggle the **actual** 3 silhouette-sweep RIM popups (`silsw_*_popup`) + an F9 button, using the hook pattern. First confirm the real gating flags around main.cpp:7388/8758/8940. |
-| **6** | O tab + U tab | New content using `RegUIState` fields the plan assumes (`hemiVoxelSize`, `idealVoxel1to1/15/2`, `instrumentPxThresh`, `iterCycles`, `boardPtCount`, `targetPtCount`, `avgError`, `rmse`, `maxError`, `scaleFactor`) and actions (`onHemiVoxelChanged`, `onInstrumentPxThreshChanged`, `onIterativeAutoProbe`). **Verify each field/callback exists in RegistrationImGuiManager.h before writing**; add missing ones to `RegUIState` + `syncUIState()` if needed. |
-| **8** | Main sidebar final layout | Large rewrite of `drawRegistrationSection()` (CollapsingHeader for INITIAL ORIENTATION, rename Hemi Auto → Hemi Quad, drop 6-DoF checkboxes, 3-column footer, etc.). Pure layout; do last. Diff `onXxx` callbacks before/after to ensure none dropped. |
+All remaining phases are now implemented (plan v2's reconnaissance was accurate
+— every flag/field/callback verified to exist before writing):
 
-The G/N/W/O/U/Viz tab stubs already exist in `DebugPanel.h`; G/N/Viz are wired
-to hooks. O and U still show their Phase-stub placeholder text and the W tab
-shows its stub — these are the visible "not yet done" markers.
+| Phase | Title | Commit | Notes / deviations |
+|---|---|---|---|
+| **5** | W tab — silhouette-sweep RIM popup toggles + F9 | `b345bad` | Globals reached via `extern` (inline at global scope in RegistrationActions.h, included after DebugPanel.h). **Deviation:** `g_silOverlay` is namespace-scoped (`SilOverlay::`), so used qualified via the SilOverlayDebug.h include — NOT plan v2's (wrong) global extern. F9 button also added to the G-tab hook (`##g_f9`). |
+| **6** | O tab (HemiAuto knobs) + U tab (Umeyama stats) | `afc9823` | Pure `RegUIState`/`RegUIActions`; no externs/hooks. Also retired the unreachable drawTabG/drawTabN "will populate" fallback text. |
+| **8** | Main sidebar final layout cleanup | `b69c0ea` | Callback pre/post diff matched exactly (`-onHemiAuto -onInstrumentPxThreshChanged -onToggleClusterVis +onQuadAuto`). **Deviation:** AutoQCR/Ctrl+G are full-width buttons with the 6-DoF lock inside the existing collapsing headers, instead of plan v2's fragile side-by-side button+CollapsingHeader layout (ImGui aligns a tall button poorly beside a header). Same functionality, robust layout. |
+
+All 6 Debug Panel tabs (G/O/N/W/U/Viz) now show real content; no "will populate"
+placeholders remain. The refactor (Phases 0–8) is functionally complete pending
+GUI verification.
 
 ---
 
