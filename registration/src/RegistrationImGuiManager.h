@@ -302,6 +302,9 @@ private:
     bool infoExpanded_ = false;
     bool showRestartConfirm_ = false;
     bool regPhaseActive_ = false;
+    bool initOrientShouldCollapse_ = false;   // [Phase 9c] One-shot: set by the
+                                              // Apply Init Pose button, consumed
+                                              // next frame to fold INITIAL ORIENT.
     float sidebarWidth_ = 400.0f;
 
     // ---- INITIAL ORIENTATION panel: CollapsingHeader open states ----
@@ -1152,9 +1155,8 @@ private:
         if (orientExpanded_) {
             childH += 3.0f * (22.0f + 4.0f);           // orientation 3 行
         }
-        childH += 6.0f                                 // spacing before Apply
-                  + (24.0f + 6.0f)                       // apply button
-                  + 8.0f;                                // tail padding
+        childH += 8.0f;                                // tail padding only
+                                                       // (Phase 9d: Apply moved out)
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.06f, 0.10f, 0.5f));
         ImGui::BeginChild("##initOrient", ImVec2(-1, childH), false);
@@ -1471,31 +1473,10 @@ private:
         }
 
         // ============================================================
-        //  [§D] Apply Init Pose (主動線、常時表示、最下部)
+        //  [§D] Apply Init Pose moved to drawRegistrationSection (Phase 9d):
+        //  it now lives OUTSIDE this CollapsingHeader so it stays visible even
+        //  when INITIAL ORIENTATION is folded.
         // ============================================================
-        //  POSITION / ORIENTATION を確定したあとにこのボタンで applyInitRotation
-        //  を実行する。ORIENTATION が折りたたみのとき、現在値は ORIENTATION ヘッダ
-        //  の "[Base]" 等で確認できる。
-        ImGui::Spacing();
-        {
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImVec4(0.10f, 0.30f, 0.55f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                  ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                  ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.95f, 0.97f, 1.00f, 1.0f));
-            bool empty = (state.activeQuadrantMask == kMaskNone);
-            if (empty) ImGui::BeginDisabled();
-            if (ImGui::Button("Apply Init Pose", ImVec2(-1, 24.0f))) {
-                if (actions.onApplyInitPose) actions.onApplyInitPose();
-            }
-            if (empty) ImGui::EndDisabled();
-            ImGui::PopStyleColor(4);
-            ImGui::PopStyleVar();
-        }
 
         ImGui::Spacing();
         ImGui::EndChild();
@@ -1565,8 +1546,14 @@ private:
                           "INITIAL ORIENTATION  [Q:%s | %s]###initorient_hdr",
                           qstr, presetLabel(state.initRotPreset));
 
+            // [Phase 9c] One-shot fold from Apply Init Pose. Cleared on consume
+            // so the user can manually re-open the header any time afterwards.
+            if (initOrientShouldCollapse_) {
+                ImGui::SetNextItemOpen(false, ImGuiCond_Always);
+                initOrientShouldCollapse_ = false;
+            }
             // Auto-open before any registration / labels exist; fold up after.
-            if (!state.useRegistration && !state.quadLabelsReady) {
+            else if (!state.useRegistration && !state.quadLabelsReady) {
                 ImGui::SetNextItemOpen(true, ImGuiCond_Once);
             }
 
@@ -1578,9 +1565,31 @@ private:
             ImGui::PopStyleColor(4);
 
             if (ioOpen) {
-                drawInitOrientationPanel();  // unchanged
+                drawInitOrientationPanel();  // contents only (Apply moved out, Phase 9d)
             }
         }
+
+        // [Phase 9d] Apply Init Pose — main-line button, ALWAYS visible (outside
+        // the CollapsingHeader). Disabled if no quadrant selected. Pressing it
+        // also triggers the Phase 9c one-shot auto-fold on the next frame.
+        {
+            constexpr uint8_t kMaskNone_apply = 0x00;
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.10f, 0.30f, 0.55f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.95f, 0.97f, 1.00f, 1.0f));
+            bool empty = (state.activeQuadrantMask == kMaskNone_apply);
+            if (empty) ImGui::BeginDisabled();
+            if (ImGui::Button("Apply Init Pose", ImVec2(-1, 28.0f))) {
+                if (actions.onApplyInitPose) actions.onApplyInitPose();
+                initOrientShouldCollapse_ = true;   // [Phase 9c]
+            }
+            if (empty) ImGui::EndDisabled();
+            ImGui::PopStyleColor(4);
+            ImGui::PopStyleVar();
+        }
+        ImGui::Spacing();
 
         // --- STAGE 1: Hemi Quad (Shift+O, 2/3 width) + Probe (1/3 width) ---
         // [Phase 8 rename] Hemi Auto -> Hemi Quad (Shift+O): calls onQuadAuto
