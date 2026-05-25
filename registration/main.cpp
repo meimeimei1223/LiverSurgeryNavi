@@ -2411,20 +2411,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         rebuildOBJWithCurrentThreshold();
         break;
     }
-    case GLFW_KEY_R: {
-        // [key-reorg Phase 4] Shift+R (liver region viz) moved to Ctrl+D > Viz tab.
-        // Plain R: 既存の Run depth (image-only mode)
-        if (gApp.mode != AppMode::kImageOnly) {
-            std::cout << "[R] only valid in image-only mode" << std::endl;
-            break;
-        }
-        if (!gApp.image.loaded) {
-            std::cout << "[R] no image loaded" << std::endl;
-            break;
-        }
-        runDepthAndUpdateScene(gApp);
-        break;
-    }
+    // [key-reorg Phase 10] GLFW_KEY_R removed: Run depth via sidebar "Run Depth" button.
     // [key-reorg Phase 4] GLFW_KEY_T / GLFW_KEY_Y / GLFW_KEY_H removed:
     //   Shift+T (region recompute), Shift+Y (LR recompute), Y (LR viz),
     //   Shift+H (CC viz), H (4-quadrant viz) all moved to Ctrl+D > Viz tab
@@ -2447,29 +2434,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
         }
         break;
-    case GLFW_KEY_K: {
-        // カメラから深度推定を実行
-        if (!gCamera.active) {
-            std::cout << "[K] Camera is not active. Starting camera..." << std::endl;
-            if (!gCamera.start()) {
-                std::cerr << "[K] Failed to start camera" << std::endl;
-                break;
-            }
-        }
-
-        std::cout << "[K] Running depth estimation from camera..." << std::endl;
-        if (runCameraDepthEstimation()) {
-            std::cout << "[K] Depth estimation completed successfully" << std::endl;
-            // 自動的にRegistrationモードに切り替え
-            if (gApp.mode != AppMode::kRegistration) {
-                gApp.mode = AppMode::kRegistration;
-                std::cout << "[K] Switched to Registration mode" << std::endl;
-            }
-        } else {
-            std::cerr << "[K] Depth estimation failed" << std::endl;
-        }
-        break;
-    }
+    // [key-reorg Phase 10] GLFW_KEY_K removed: camera depth via sidebar
+    //   "Run Depth" button (camera mode uses the same button).
     case GLFW_KEY_J: {
         // カメラフレームをJPEGファイルとして保存
         if (!gCamera.active) {
@@ -2485,24 +2451,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         }
         break;
     }
-    case GLFW_KEY_S: {
-        // カメラモードで静止画キャプチャ（Sキー = Snapshot）
-        if (gCamera.active && !gCamera.captured) {
-            gCamera.captureCurrentFrame();
-            gApp.image.path = "[Camera Captured]";
-            std::cout << "[S] Camera frame captured for mask selection" << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_L: {
-        // カメラモードでライブビューに戻る（Lキー = Live）
-        if (gCamera.active && gCamera.captured) {
-            gCamera.releaseCapture();
-            gApp.image.path = "[Camera Live]";
-            std::cout << "[L] Returned to camera live view" << std::endl;
-        }
-        break;
-    }
+    // [key-reorg Phase 10] GLFW_KEY_S / GLFW_KEY_L removed: snapshot / live-view
+    //   handled by the sidebar camera toggle ("Capture" / "Re-Capture").
     case GLFW_KEY_M: {
         if (gApp.mode != AppMode::kRegistration) {
             std::cout << "[M] only valid in Registration mode" << std::endl;
