@@ -6306,17 +6306,33 @@ int main() {
             ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
                                "Visualization toggles (formerly keyboard):");
 
-            // V key family
-            ImGui::Checkbox("Cluster visualization (was V)##viz_cluster_full",
-                            &g_showClusterVisualization);
-            // B key family
+            // [Phase 5.5] Cluster viz (was V) already exists above as
+            // drawTabViz's "Cluster markers" (onToggleClusterVis). Duplicate
+            // checkbox removed to avoid two toggles for the same global.
+
+            // B key family (cyclic correspondence: pure toggle; needs Shift+P
+            // to have run first to have pairs to show).
             ImGui::Checkbox("Cyclic Correspondence - Shift+P pairs (was Shift+B)##viz_cyclic",
                             &g_showCyclicCorrespondence);
-            // W key family
-            ImGui::Checkbox("Debug Source Rim Chain - green dots (was W)##viz_rim_src",
-                            &g_showDebugSourceRimChain);
-            ImGui::Checkbox("Debug Target Boundary - purple dots (was Shift+W)##viz_rim_tgt",
-                            &g_showDebugTargetBoundary);
+
+            // W key family — enabling must POPULATE the overlay data (mirror the
+            // old plain-W / Shift+W keys), otherwise the flag is on but nothing
+            // is drawn. On populate failure the toggle is reverted.
+            if (ImGui::Checkbox("Debug Source Rim Chain - green dots (was W)##viz_rim_src",
+                                &g_showDebugSourceRimChain)) {
+                if (g_showDebugSourceRimChain) {
+                    if (!g_liverRegion.valid()) recomputeLiverRegion();
+                    if (!g_liverLR.valid())     recomputeLiverLR();
+                    if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) recomputeLiverCC();
+                    if (!populateDebugSourceRimChain()) g_showDebugSourceRimChain = false;
+                }
+            }
+            if (ImGui::Checkbox("Debug Target Boundary - purple dots (was Shift+W)##viz_rim_tgt",
+                                &g_showDebugTargetBoundary)) {
+                if (g_showDebugTargetBoundary) {
+                    if (!populateDebugTargetBoundary()) g_showDebugTargetBoundary = false;
+                }
+            }
 
             // Liver label viz
             ImGui::Spacing();
