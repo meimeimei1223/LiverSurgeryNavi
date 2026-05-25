@@ -1797,15 +1797,15 @@ private:
 
         ImGui::Spacing();
         {
-            float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
-            if(colorButton("Reset Reg", colRed(), false, false, bw2)) {
+            // [PHASE-0 BUGFIX] Removed misrouted "Clear CorresPoints" button.
+            // It was wired to MaskPicker::clear() which clears DEPTH-stage
+            // SAM2 mask clicks, not registration correspondence points.
+            // Umeyama point pair clearing is handled by the in-overlay Undo
+            // button. DEPTH mask reset is handled by onResetRegistration
+            // and the DEPTH section's existing controls.
+            if(colorButton("Reset Reg", colRed(), false, false, -1)) {
                 if(actions.onResetRegistration) actions.onResetRegistration();
                 if(state.clusterVis && actions.onToggleClusterVis) actions.onToggleClusterVis();
-            }
-            ImGui::SameLine();
-            bool hasPoints = (state.boardPtCount + state.objPtCount) > 0;
-            if(colorButton("Clear CorresPoints", hasPoints ? colRed() : colDim(), false, !hasPoints, bw2)) {
-                if(actions.onClearPoints) actions.onClearPoints();
             }
         }
         ImGui::Spacing();
