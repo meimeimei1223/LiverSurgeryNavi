@@ -1144,7 +1144,7 @@ private:
         childH += 6.0f                                 // section separator
                   + fontH + 2.0f                         // POSITION sub-header
                   + fontH                                // anatomy hint
-                  + 64.0f                                // 2x2 grid
+                  + 32.0f                                // 1x4 grid (Phase 9a, was 64 for 2x2)
                   + fontH + 4.0f                         // mask text
                   + (22.0f + 4.0f)                       // quick presets
                   + 6.0f                                 // spacing before ORIENTATION
@@ -1262,14 +1262,15 @@ private:
         };
 
         ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 0.85f), "  POSITION");
-        ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 0.85f),
-                           "  Top=anterior, Left=patient's right");
+        // [Phase 9a] Removed "Top=anterior, Left=patient's right" hint — the
+        // 2x2 spatial mapping it described no longer applies in the 1x4
+        // horizontal layout (just reading order: ant_R, ant_L, pos_R, pos_L).
 
-        // ---- 2x2 grid (Ctrl+G と同じレイアウト) ----
+        // ---- 1x4 grid (horizontal, Phase 9a; was 2x2) ----
         {
             const ImGuiTableFlags tableFlags =
                 ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchSame;
-            if (ImGui::BeginTable("##initorient_quad_grid", 2, tableFlags)) {
+            if (ImGui::BeginTable("##initorient_quad_grid", 4, tableFlags)) {
                 auto checkbox_cell = [&](const char* shortName,
                                          int nv,
                                          uint8_t bit)
@@ -1293,15 +1294,12 @@ private:
                     ImGui::PopID();
                 };
 
-                // Row 1: anterior
+                // [Phase 9a] Single row, 4 columns. Same callbacks as 2x2.
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 checkbox_cell("ant_R", state.quadNAR, kMaskAR);
                 ImGui::TableNextColumn();
                 checkbox_cell("ant_L", state.quadNAL, kMaskAL);
-
-                // Row 2: posterior
-                ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 checkbox_cell("pos_R", state.quadNPR, kMaskPR);
                 ImGui::TableNextColumn();
