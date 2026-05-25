@@ -6461,9 +6461,9 @@ int main() {
             ImGui::Separator();
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Other markers:");
-            ImGui::Checkbox("Boundary candidates (B key)##viz_b",
+            ImGui::Checkbox("Boundary candidates (was B)##viz_b",
                             &g_showBoundaryCandidates);
-            ImGui::Checkbox("Source visualization (N key)##viz_n",
+            ImGui::Checkbox("Source visualization (was N)##viz_n",
                             &g_showSourceVisualization);
 
             ImGui::Spacing();
@@ -6502,6 +6502,85 @@ int main() {
                     ImGui::Text("|err| = %.4f m  (%.1f mm)", d, d * 1000.0f);
                 }
             }
+
+            // ---- [Phase 1] viz toggles migrated from keyboard ---------------
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                               "Visualization toggles (formerly keyboard):");
+
+            // V key family
+            ImGui::Checkbox("Cluster visualization (was V)##viz_cluster_full",
+                            &g_showClusterVisualization);
+            // B key family
+            ImGui::Checkbox("Cyclic Correspondence - Shift+P pairs (was Shift+B)##viz_cyclic",
+                            &g_showCyclicCorrespondence);
+            // W key family
+            ImGui::Checkbox("Debug Source Rim Chain - green dots (was W)##viz_rim_src",
+                            &g_showDebugSourceRimChain);
+            ImGui::Checkbox("Debug Target Boundary - purple dots (was Shift+W)##viz_rim_tgt",
+                            &g_showDebugTargetBoundary);
+
+            // Liver label viz
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Liver labels:");
+            if (ImGui::Checkbox("Liver Region (anterior/rim/posterior) - was Shift+R##viz_region",
+                                &g_showLiverRegion)) {
+                if (g_showLiverRegion && !g_liverRegion.valid()) recomputeLiverRegion();
+            }
+            if (ImGui::Checkbox("Liver Left/Right - was Y##viz_lr",
+                                &g_showLiverLR)) {
+                if (g_showLiverLR && !g_liverLR.valid()) recomputeLiverLR();
+            }
+            if (ImGui::Checkbox("Liver Cranio/Caudal - was Shift+H##viz_cc",
+                                &g_showLiverCC)) {
+                if (g_showLiverCC && !g_liverCC.valid()) recomputeLiverCC();
+            }
+            if (ImGui::Checkbox("Liver 4-Quadrant overlay - was H##viz_quad",
+                                &g_showLiverQuad)) {
+                if (g_showLiverQuad &&
+                    g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
+                    g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty()) {
+                    recomputeLiverQuad();
+                }
+            }
+
+            // Recompute buttons (formerly Shift+T / Shift+Y)
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Recompute labels:");
+            if (ImGui::Button("Recompute Region  (was Shift+T)##btn_recompute_region")) {
+                std::cout << "[Region] recomputing with target_rim_mm = "
+                          << g_rimTargetMm << std::endl;
+                recomputeLiverRegion();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Recompute LR  (was Shift+Y)##btn_recompute_lr")) {
+                std::cout << "[LR] recomputing  right_pure_fraction = "
+                          << g_lrPureFrac << "  right_full_fraction = "
+                          << g_lrFullFrac << std::endl;
+                recomputeLiverLR();
+            }
+
+            // Debug dumps (formerly Shift+I / F10)
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Debug dumps:");
+            if (ImGui::Button("Dump IoU debug PNG  (was Shift+I)##btn_iou_dump")) {
+                if (gApp.mode == AppMode::kRegistration) {
+                    glm::mat4 silView = buildSilhouetteView();
+                    glm::mat4 silProj = buildSilhouetteProj();
+                    int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+                    int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+                    IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
+                                   liverMesh3D, silView, silProj, silW, silH, 8);
+                } else {
+                    std::cout << "[IoU dump] requires Registration mode" << std::endl;
+                }
+            }
+            if (ImGui::Button("Vertex-Squash diagnose  (was F10)##btn_vsq_diag")) {
+                diagnoseVertexSquashV3RS(g_activeQuadrantMask);
+            }
+            // ---- end Phase 1 migration -------------------------------------
         };  // end g_debugPanel.drawVizExtra (migrated ScreenMesh Display + B/N viz)
 
         // Consolidated Debug Panel (Ctrl+D). Same registration / non-Umeyama
