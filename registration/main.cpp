@@ -1365,9 +1365,8 @@ static void rebuildOBJWithCurrentThreshold() {
 static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
-    const bool isShiftV   = (key == GLFW_KEY_V) && (mods & GLFW_MOD_SHIFT);
+    // [key-reorg Phase 5] isShiftV / isShiftF removed (Shift+V/F -> Alt+G/Alt+Shift+G).
     const bool isShiftE   = (key == GLFW_KEY_E) && (mods & GLFW_MOD_SHIFT);
-    const bool isShiftF   = (key == GLFW_KEY_F) && (mods & GLFW_MOD_SHIFT);  // V2 BIPOP-CMA-ES (Fast)
     const bool isShiftG     = (key == GLFW_KEY_G) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);  // V3 BIPOP-CMA-ES (Good performance)
     const bool isCtrlShiftG = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);   // V3-RS BIPOP-CMA-ES (silhouette anchor)
     const bool isCtrlG      = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V3-R BIPOP-CMA-ES (Region-aware, 4-quadrant subset)
@@ -1380,9 +1379,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     const bool isCtrlShiftN = (key == GLFW_KEY_N) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);
     const bool needsScene = (key == GLFW_KEY_O      ||
                              key == GLFW_KEY_P      ||
-                             isShiftV               ||
                              isShiftE               ||
-                             isShiftF               ||
                              isShiftG               ||
                              isCtrlG                ||
                              isCtrlShiftG           ||
@@ -1446,42 +1443,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::RMSE);
         }
         break;
-    case GLFW_KEY_V:
-        if (mods & GLFW_MOD_SHIFT) {
-            std::cout << "[DEPRECATION] Shift+V is moving to Alt+G next release"
-                      << std::endl;
-            // 元コード line 6256-6266 (キー Shift+V) の順序
-            g_stepStartTime = std::chrono::steady_clock::now();
-            g_sessionBipopN++;
-            gUI.state.regMethod = 3;
-            poseAutoSaveBeforeRegistration();
-            runBipopCmaes();
-            poseSaveToLibrary(SaveCriterion::RMSE);
-        } else {
-            g_showClusterVisualization = !g_showClusterVisualization;
-            std::cout << "Cluster visualization: "
-                      << (g_showClusterVisualization ? "ON" : "OFF") << std::endl;
-        }
-        break;
-    case GLFW_KEY_F:
-        // Shift+F: BIPOP-CMA-ES V2 ("Fast"). V1-equivalent path that
-        // runs CmaesRefine::runV2(). Phase 1 forces eval_mode=FULL_MESH
-        // so CompRMSE is bit-identical to Shift+V from the same
-        // (g_trialSeed, g_callIdx) state -- this is the validation
-        // hook for the V2 refactor. Phase 2 will switch to SUBSET_RMSE
-        // for the speedup; Phase 3 adds OpenMP. Plain F (no shift)
-        // is intentionally left unbound for future use.
-        if (mods & GLFW_MOD_SHIFT) {
-            std::cout << "[DEPRECATION] Shift+F is moving to Alt+Shift+G next release"
-                      << std::endl;
-            g_stepStartTime = std::chrono::steady_clock::now();
-            g_sessionBipopN++;
-            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V)
-            poseAutoSaveBeforeRegistration();
-            runBipopCmaesV2();
-            poseSaveToLibrary(SaveCriterion::RMSE);
-        }
-        break;
+    // [key-reorg Phase 5] GLFW_KEY_V / GLFW_KEY_F removed:
+    //   Shift+V (V1 BIPOP) -> Alt+G  ;  Shift+F (V2 BIPOP) -> Alt+Shift+G
+    //   plain V (cluster viz) -> Ctrl+D > Viz tab
     case GLFW_KEY_G:
         // Shift+G: BIPOP-CMA-ES V3 ("Good performance"). Pure-function
         // refactor of V2 with liver-only snapshot, matrix-based per-Run
@@ -1628,31 +1592,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::RMSE);
         }
         break;
-    case GLFW_KEY_B:
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+B: Cyclic Boundary Registration (Shift+P) の対応点表示トグル
-            //   24 セクターを HSV サイクルで着色、source (大球) / target (中球)
-            //   を同色で描画 → 同じ色の球同士がペア。空セクターは非表示。
-            //   Shift+P を一度実行した後に有効になる。
-            g_showCyclicCorrespondence = !g_showCyclicCorrespondence;
-            std::cout << "[CyclicCorr] "
-                      << (g_showCyclicCorrespondence ? "ON" : "OFF")
-                      << "  available=" << (g_cyclicAvailable ? "YES" : "NO (run Shift+P first)")
-                      << "  sectors=" << g_cyclicSectors
-                      << "  best_shift=" << g_cyclicBestShift
-                      << "  best_dir=" << (g_cyclicBestRev ? "reverse(CCW)" : "forward(CW)")
-                      << std::endl;
-        } else {
-            // B: 境界候補の可視化トグル: 緑=採用境界, 赤=器具マスクで棄却された偽境界
-            g_showBoundaryCandidates = !g_showBoundaryCandidates;
-            std::cout << "[BoundaryCandidates] "
-                      << (g_showBoundaryCandidates ? "ON" : "OFF")
-                      << "  accepted=" << g_targetPoints.size()
-                      << "  rejected=" << g_rejectedBoundaryPoints.size()
-                      << "  threshold=" << g_instrumentPxThresh << "px"
-                      << std::endl;
-        }
-        break;
+    // [key-reorg Phase 4] GLFW_KEY_B removed: B (boundary candidates) and
+    //   Shift+B (cyclic correspondence) viz toggles moved to Ctrl+D > Viz tab.
     case GLFW_KEY_N:
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ---- Ctrl+Shift+N : SRT Variance-Weighted Refine -----------
@@ -1732,18 +1673,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
                 poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
             }
-        } else {
-            // ---- Plain N : SourceVis toggle (existing behaviour) ------
-            //   Unchanged. ソース側可視化トグル: シアン=全可視頂点,
-            //   マゼンタ=シルエット絞り込み後
-            g_showSourceVisualization = !g_showSourceVisualization;
-            std::cout << "[SourceVis] "
-                      << (g_showSourceVisualization ? "ON" : "OFF")
-                      << "  visible=" << g_visibleSourcePoints.size()
-                      << "  silhouette=" << g_silhouetteSourcePoints.size()
-                      << "  cosThresh=" << g_silhouetteSrcCosThresh
-                      << std::endl;
         }
+        // [key-reorg Phase 4] plain N (source visualization toggle) moved to
+        // Ctrl+D > Viz tab. Shift+N / Ctrl+Shift+N (refine) kept above.
         break;
     case GLFW_KEY_W:
         // ---- Phase 7b: W-family (RIM Shape Match) ----
@@ -2269,78 +2201,11 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             g_normRefineMaxIter = saved_max_iter;
             break;
         }
-        if ((mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL)) {
-            // ==== Shift+W : Step 2 — target boundary overlay (purple) ====
-            // Toggle, mirrors Plain W's semantic.
-            if (g_showDebugTargetBoundary) {
-                g_showDebugTargetBoundary = false;
-                std::cout << "[W/TgtBound] overlay OFF (was ON, "
-                          << g_debugTargetBoundaryPoints.size()
-                          << " pts cached)" << std::endl;
-                break;
-            }
-            if (gApp.mode != AppMode::kRegistration) {
-                std::cout << "[Shift+W] requires a loaded scene"
-                          << " (Registration mode) — drop an image and"
-                          << " press R first" << std::endl;
-                break;
-            }
-            const bool ok = populateDebugTargetBoundary();
-            g_showDebugTargetBoundary = ok;
-            std::cout << "[W/TgtBound] overlay "
-                      << (ok ? "ON" : "OFF (populate failed)")
-                      << "  size=" << g_debugTargetBoundaryPoints.size()
-                      << "  (purple dots, target is static — no live"
-                      << " fetch needed)" << std::endl;
-            break;
-        }
-        if (mods == 0) {
-            // Toggle semantic, matching Plain N (SourceVis toggle):
-            //   ON  -> turn off, keep the chain in memory
-            //   OFF -> (re)populate from current g_liverRegion + toggle ON
-            if (g_showDebugSourceRimChain) {
-                g_showDebugSourceRimChain = false;
-                std::cout << "[W/RimChain] overlay OFF (was ON, "
-                          << g_debugSourceRimChain.size() << " pts cached)"
-                          << std::endl;
-                break;
-            }
-            if (gApp.mode != AppMode::kRegistration) {
-                std::cout << "[W] requires a loaded scene"
-                          << " (Registration mode) — drop an image and"
-                          << " press R first" << std::endl;
-                break;
-            }
-            // Auto-trigger region/LR/CC labelling if missing (same
-            // pattern as Shift+O / Shift+N / Ctrl+G). Region+LR は必須
-            // (quadrant subset の前提)、CC は caudal-only ON のときだけ
-            // 必要だが、トグル切替で頻繁に必要になるので予防的に確保。
-            if (!g_liverRegion.valid()) {
-                std::cout << "[W] g_liverRegion not yet computed,"
-                          << " auto-running recomputeLiverRegion()..."
-                          << std::endl;
-                recomputeLiverRegion();
-            }
-            if (!g_liverLR.valid()) {
-                std::cout << "[W] g_liverLR not yet computed,"
-                          << " auto-running recomputeLiverLR()..."
-                          << std::endl;
-                recomputeLiverLR();
-            }
-            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
-                std::cout << "[W] caudal-only ON but g_liverCC not yet"
-                          << " computed, auto-running recomputeLiverCC()..."
-                          << std::endl;
-                recomputeLiverCC();
-            }
-            const bool ok = populateDebugSourceRimChain();
-            g_showDebugSourceRimChain = ok;
-            std::cout << "[W/RimChain] overlay "
-                      << (ok ? "ON" : "OFF (populate failed)")
-                      << "  size=" << g_debugSourceRimChain.size()
-                      << "  (green dots, fetched live from"
-                      << " liverMesh3D->mVertices)" << std::endl;
-        }
+        // [key-reorg Phase 4] Shift+W (target boundary overlay) and plain W
+        // (source rim chain overlay) viz toggles moved to Ctrl+D > Viz tab
+        // ("Debug Target Boundary" / "Debug Source Rim Chain"). The W-family
+        // ACTION shortcuts (Ctrl+W, Ctrl+Shift+W, Alt+W, Ctrl+Alt+W) are kept
+        // above.
         break;
     case GLFW_KEY_P:
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_ALT)) {
@@ -2461,23 +2326,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::IOU);
         }
         break;
-    case GLFW_KEY_I:
-        // Shift+I : dump IoU debug bitmaps (hitmap, target mask, composite,
-        // boundary map) to DEPTH_OUTPUT_PATH.  Useful when registrationHandle
-        // .compIoU2D looks wrong: open the PNGs to see whether the right
-        // mask is being used and where the liver silhouette actually lands.
-        if ((mods & GLFW_MOD_SHIFT) && gApp.mode == AppMode::kRegistration) {
-            glm::mat4 silView = buildSilhouetteView();
-            glm::mat4 silProj = buildSilhouetteProj();
-            int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
-            int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
-            IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
-                           liverMesh3D, silView, silProj, silW, silH, /*step=*/8);
-        } else if (mods & GLFW_MOD_SHIFT) {
-            std::cout << "[Shift+I] requires Registration mode (run depth first)"
-                      << std::endl;
-        }
-        break;
+    // [key-reorg Phase 4] GLFW_KEY_I removed: Shift+I (IoU debug dump) moved to
+    //   Ctrl+D > Viz tab "Dump IoU debug PNG" button.
     case GLFW_KEY_Q:
         // Pose Library ウィンドウ開閉
         g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
@@ -2562,22 +2412,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         break;
     }
     case GLFW_KEY_R: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+R: 肝臓領域 (anterior/rim/posterior) の可視化トグル
-            //   赤=前面コア, 橙=ヘリ帯, 青=後面
-            //   初回 ON 時に自動計算 (~数百 ms)。
-            //   登録 (CMA-ES 等) で頂点が動いてもラベルは頂点 index に
-            //   紐づくので球マーカーは追従する。
-            g_showLiverRegion = !g_showLiverRegion;
-            if (g_showLiverRegion && !g_liverRegion.valid()) {
-                recomputeLiverRegion();
-            }
-            std::cout << "[Region] visualization: "
-                      << (g_showLiverRegion ? "ON" : "OFF")
-                      << "  available=" << (g_liverRegion.valid() ? "YES" : "NO")
-                      << std::endl;
-            break;
-        }
+        // [key-reorg Phase 4] Shift+R (liver region viz) moved to Ctrl+D > Viz tab.
         // Plain R: 既存の Run depth (image-only mode)
         if (gApp.mode != AppMode::kImageOnly) {
             std::cout << "[R] only valid in image-only mode" << std::endl;
@@ -2590,83 +2425,10 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         runDepthAndUpdateScene(gApp);
         break;
     }
-    case GLFW_KEY_T: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+T: 肝臓領域ラベルの再計算 (現在の g_rimTargetMm で)。
-            //   メッシュを差し替えた後や、rim 厚さを変えたいときに使う。
-            std::cout << "[Region] recomputing with target_rim_mm = "
-                      << g_rimTargetMm << std::endl;
-            recomputeLiverRegion();
-        }
-        break;
-    }
-    case GLFW_KEY_Y: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+Y: 肝臓左右ラベルの再計算 (現在の g_lrPureFrac, g_lrFullFrac で)。
-            //   メッシュを差し替えた後や、fraction を変えたいときに使う。
-            std::cout << "[LR] recomputing with right_pure_fraction = "
-                      << g_lrPureFrac << "  right_full_fraction = "
-                      << g_lrFullFrac << std::endl;
-            recomputeLiverLR();
-        } else {
-            // Y: 肝臓左右領域 (pure-R / boundary / pure-L) の可視化トグル。
-            //   緑=純右, 黄=境界, 紫=純左
-            //   初回 ON 時に自動計算 (~数百 ms)。
-            //   登録 (CMA-ES 等) で頂点が動いてもラベルは頂点 index に
-            //   紐づくので球マーカーは追従する。
-            g_showLiverLR = !g_showLiverLR;
-            if (g_showLiverLR && !g_liverLR.valid()) {
-                recomputeLiverLR();
-            }
-            std::cout << "[LR] visualization: "
-                      << (g_showLiverLR ? "ON" : "OFF")
-                      << "  available=" << (g_liverLR.valid() ? "YES" : "NO")
-                      << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_H: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+H: 肝臓 cranial/caudal 可視化トグル (Phase 1)。
-            //   黄=CRANIAL(頭側), 青=CAUDAL(足側)
-            //   初回 ON 時に Shift+R / Y のラベルを必要なら自動計算 → v7 実行。
-            //   confidence < 5% で [WEAK] を std::cout に出力 (UI Flip は Phase 2 で検討)。
-            //   Phase 1 段階では registration には未統合 (可視化のみ)。
-            g_showLiverCC = !g_showLiverCC;
-            if (g_showLiverCC && !g_liverCC.valid()) {
-                recomputeLiverCC();
-            }
-            std::cout << "[CC] visualization: "
-                      << (g_showLiverCC ? "ON" : "OFF")
-                      << "  available=" << (g_liverCC.valid() ? "YES" : "NO");
-            if (g_liverCC.valid()) {
-                std::cout << "  confidence="
-                          << (g_liverCC.cc.confidence * 100.0f) << "%"
-                          << (g_liverCC.cc.weak ? " [WEAK]" : "");
-            }
-            std::cout << std::endl;
-            break;
-        }
-        // ---- plain H: 4象限可視化トグル (anterior/rim/posterior と pure_R/boundary/pure_L
-        //    の組合せを「重複所属」方式で 4 象限に分けて表示)。
-        //    緑=ant_right, 紫=ant_left, 青=pos_right, 橙=pos_left
-        //    初回 ON 時に Shift+R / Y のラベルを必要なら自動計算。
-        //    rim と boundary は重複所属するので、該当頂点は複数の球マーカーが重なる。
-        g_showLiverQuad = !g_showLiverQuad;
-        if (g_showLiverQuad && (g_quadVizIdxAR.empty() &&
-                                g_quadVizIdxAL.empty() &&
-                                g_quadVizIdxPR.empty() &&
-                                g_quadVizIdxPL.empty())) {
-            recomputeLiverQuad();
-        }
-        bool valid = !(g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
-                       g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty());
-        std::cout << "[Quad] visualization: "
-                  << (g_showLiverQuad ? "ON" : "OFF")
-                  << "  available=" << (valid ? "YES" : "NO")
-                  << std::endl;
-        break;
-    }
+    // [key-reorg Phase 4] GLFW_KEY_T / GLFW_KEY_Y / GLFW_KEY_H removed:
+    //   Shift+T (region recompute), Shift+Y (LR recompute), Y (LR viz),
+    //   Shift+H (CC viz), H (4-quadrant viz) all moved to Ctrl+D > Viz tab
+    //   (checkboxes with auto-recompute + "Recompute Region/LR" buttons).
     case GLFW_KEY_U:
         if (gApp.mode == AppMode::kImageOnly) MaskPicker::undo(gApp);
         break;
