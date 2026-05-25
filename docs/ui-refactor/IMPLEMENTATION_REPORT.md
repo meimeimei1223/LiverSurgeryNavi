@@ -100,6 +100,22 @@ All 6 Debug Panel tabs (G/O/N/W/U/Viz) now show real content; no "will populate"
 placeholders remain. The refactor (Phases 0–8) is functionally complete pending
 GUI verification.
 
+## Phase 9 — cleaner sidebar pass (per UI_REFACTOR_PHASE9_PLAN.md)
+
+| Phase | Title | Commit |
+|---|---|---|
+| **9a** | POSITION quadrant grid 2x2 -> 1x4 (drop spatial hint) | `a7ddc16` |
+| **9b** | Merge QCR Tuning + Advanced into one "Tuning & Advanced" header | `578dc43` |
+| **9c+9d** | Auto-collapse INITIAL ORIENTATION after Apply; hoist Apply Init Pose outside the header (always visible) | `64d01cd` |
+
+Sidebar is now 8 always-visible rows. Callback diff after Phase 9 vs the Phase-8
+baseline: `+onApplyInitPose` (button relocated into drawRegistrationSection),
+plus the Phase-8 set (`-onHemiAuto -onInstrumentPxThreshChanged
+-onToggleClusterVis +onQuadAuto`) — no unintended changes.
+
+Note: `build/` is the CLI verification dir; Qt Creator uses `build/Desktop-*`.
+If Qt Creator's cache was cleared, Run CMake to reconfigure.
+
 ---
 
 ## Verification status
