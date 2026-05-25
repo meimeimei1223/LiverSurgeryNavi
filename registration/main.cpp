@@ -2340,15 +2340,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseUndo();
         }
         break;
-    case GLFW_KEY_F2:
-        OrbitCam.resetToInitialState();
-        if (gApp.mode == AppMode::kRegistration) {
-            OrbitCam.rotation = glm::angleAxis(glm::radians(180.0f),
-                                               glm::vec3(0.0f, 1.0f, 0.0f));
-            OrbitCam.currentTarget = TARGET_TEXTURE;
-        }
-        std::cout << "Camera reset" << std::endl;
-        break;
+    // [key-reorg Phase 11] GLFW_KEY_F2 removed: camera reset via sidebar
+    //   "Cam Init" button (onResetCamera lambda is equivalent, incl. the
+    //   Registration-mode 180-deg Y rotation + currentTarget=TARGET_TEXTURE).
     case GLFW_KEY_A:
         gApp.arMode = !gApp.arMode;
         std::cout << "[AR] background overlay: "
@@ -2371,32 +2365,10 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         }
         break;
 
-    case GLFW_KEY_F9:
-        // V3RS Phase 2 diagnostic: toggle silhouette IoU overlay window.
-        // Window contents are filled by the per-Run + Final captures
-        // performed inside runBipopCmaesV3RS (RegistrationActions.h).
-        // Pattern mirrors GLFW_KEY_A (AR-mode toggle).
-        SilOverlay::g_silOverlay.showWindow =
-            !SilOverlay::g_silOverlay.showWindow;
-        std::cout << "[F9] V3RS silhouette overlay: "
-                  << (SilOverlay::g_silOverlay.showWindow ? "ON" : "OFF")
-                  << std::endl;
-        break;
-
-    case GLFW_KEY_F10:
-        // V3RS vertex-squash raster diagnostic (HANDOVER §5.2, Phase A).
-        // Measurement-only: rasterizes the quadrant-filtered liver
-        // silhouette at the CURRENT static pose with BOTH the hot-path
-        // triangle-bbox splat AND a plain vertex-squash 3x3, prints the
-        // [V3RS/vsq-diag] hole / write-count / edge-length comparison,
-        // and uploads both composites to the F9 overlay's Diagnostic
-        // slot. Does NOT run CMA-ES and does NOT touch the optimiser or
-        // the liver pose. Guards (mesh / labels / boundary map) live
-        // inside diagnoseVertexSquashV3RS. Quadrant filter uses the
-        // same g_activeQuadrantMask the Ctrl+Shift+G cost function does.
-        diagnoseVertexSquashV3RS(g_activeQuadrantMask);
-        break;
-
+    // [key-reorg Phase 11] GLFW_KEY_F9 / GLFW_KEY_F10 removed:
+    //   F9 (silhouette IoU overlay window) -> Ctrl+D > Viz tab checkbox
+    //     "Show Silhouette Overlay window".
+    //   F10 (vertex-squash diagnose) -> Ctrl+D > Viz tab button (added Phase 1).
     case GLFW_KEY_COMMA: {
         const float step = (mods & GLFW_MOD_SHIFT) ? 0.05f : 0.01f;
         g_silhouetteCosThreshold = std::max(0.0f,
@@ -6342,6 +6314,9 @@ int main() {
             if (ImGui::Button("Vertex-Squash diagnose  (was F10)##btn_vsq_diag")) {
                 diagnoseVertexSquashV3RS(g_activeQuadrantMask);
             }
+            // [key-reorg Phase 11] F9 -> checkbox for the Silhouette IoU window.
+            ImGui::Checkbox("Show Silhouette Overlay window  (was F9)##viz_sil_overlay",
+                            &SilOverlay::g_silOverlay.showWindow);
             // ---- end Phase 1 migration -------------------------------------
         };  // end g_debugPanel.drawVizExtra (migrated ScreenMesh Display + B/N viz)
 
