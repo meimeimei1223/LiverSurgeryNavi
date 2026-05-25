@@ -152,9 +152,67 @@ inline void draw(State& st, RegistrationImGuiManager& gUI) {
 }
 
 // ----- Phase 1 stubs (filled in later phases) -----
-inline void drawTabG  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("G tab — Phase 3 will populate"); }
-inline void drawTabO  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("O tab — Phase 6 will populate"); }
-inline void drawTabN  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("N tab — Phase 4 will populate"); }
+inline void drawTabG  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("G tab content is provided by main.cpp (drawGBody hook)."); }
+inline void drawTabO(RegUIState& s, RegUIActions& a) {
+    ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.3f, 1.0f),
+                       "O — Shift+O — HemiAuto / QuadAuto");
+    ImGui::TextWrapped(
+        "Settings consumed by the next Shift+O run. Sidebar Advanced > Voxel "
+        "slider mirrors the voxel value here (same global).");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Voxel size =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Voxel size (downsampling):");
+    {
+        float v = s.hemiVoxelSize;
+        if (ImGui::SliderFloat("##o_voxel", &v, 0.1f, 2.0f, "%.2f")) {
+            if (a.onHemiVoxelChanged) a.onHemiVoxelChanged(v);
+        }
+        ImGui::TextDisabled("  Recommended ratios:  1:1=%.2f  1:1.5=%.2f  1:2=%.2f",
+                            s.idealVoxel1to1, s.idealVoxel1to15, s.idealVoxel1to2);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Instrument Px threshold =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                       "Instrument-mask Px threshold:");
+    {
+        float v = s.instrumentPxThresh;
+        if (ImGui::SliderFloat("##o_instpx", &v, 0.0f, 50.0f, "%.0f px")) {
+            if (a.onInstrumentPxThreshChanged) a.onInstrumentPxThreshChanged(v);
+        }
+        ImGui::TextDisabled(
+            "  Affects next Shift+O run. Use B key to see rejection points.");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== AutoProbe iter cycles =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "AutoProbe iterations:");
+    ImGui::SliderInt("##o_iter", &s.iterCycles, 1, 25, "K = %d");
+    ImGui::Spacing();
+    if (ImGui::Button("Run AutoProbe x K##o_runiter", ImVec2(-1, 24.0f))) {
+        if (a.onIterativeAutoProbe) a.onIterativeAutoProbe(s.iterCycles);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Related viz shortcuts =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Related visualizations:");
+    ImGui::TextDisabled("  Cluster (green/blue/yellow) - see Viz tab (J key).");
+    ImGui::TextDisabled("  Boundary candidates / source viz - see Viz tab (B / N keys).");
+}
+inline void drawTabN  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("N tab content is provided by main.cpp (drawNBody hook)."); }
 inline void drawTabW(RegUIState& /*s*/, RegUIActions& /*a*/) {
     ImGui::TextColored(ImVec4(0.85f, 0.75f, 1.0f, 1.0f),
                        "W — Shift+W series — RIM 2D projection debug");
@@ -275,7 +333,64 @@ inline void drawTabW(RegUIState& /*s*/, RegUIActions& /*a*/) {
                             ? "(currently open)"
                             : "(currently closed)");
 }
-inline void drawTabU  (RegUIState&, RegUIActions&) { ImGui::TextDisabled("U tab — Phase 6 will populate"); }
+inline void drawTabU(RegUIState& s, RegUIActions& /*a*/) {
+    ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
+                       "U — Umeyama Manual diagnostics");
+    ImGui::TextWrapped(
+        "Read-only view of current Umeyama session and last result. "
+        "Operate via sidebar 'Umeyama Manual' button (manual mode opens "
+        "a 2-screen overlay).");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Current session point counts =====
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Current session:");
+    {
+        float boardFrac = (s.targetPtCount > 0)
+            ? (float)s.boardPtCount / (float)s.targetPtCount : 0.0f;
+        float objFrac   = (s.targetPtCount > 0)
+            ? (float)s.objPtCount   / (float)s.targetPtCount : 0.0f;
+        ImGui::Text("Board points:");
+        ImGui::SameLine(160);
+        ImGui::Text("%d / %d", s.boardPtCount, s.targetPtCount);
+        ImGui::ProgressBar(boardFrac, ImVec2(-1, 6), "");
+        ImGui::Spacing();
+        ImGui::Text("Object points:");
+        ImGui::SameLine(160);
+        ImGui::Text("%d / %d", s.objPtCount, s.targetPtCount);
+        ImGui::ProgressBar(objFrac, ImVec2(-1, 6), "");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ===== Last result =====
+    if (s.useRegistration) {
+        ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f), "Last registration result:");
+        const float diag = (s.modelBBoxDiag > 0.0f) ? s.modelBBoxDiag : 1.0f;
+        ImGui::Text("  Avg error:");   ImGui::SameLine(180);
+        ImGui::Text("%.4f  (%.2f%%)", s.avgError, s.avgError / diag * 100.0f);
+        ImGui::Text("  RMSE:");        ImGui::SameLine(180);
+        ImGui::Text("%.4f  (%.2f%%)", s.rmse, s.rmse / diag * 100.0f);
+        ImGui::Text("  Max error:");   ImGui::SameLine(180);
+        ImGui::Text("%.4f  (%.2f%%)", s.maxError, s.maxError / diag * 100.0f);
+        ImGui::Text("  Scale factor:"); ImGui::SameLine(180);
+        ImGui::Text("%.4f", s.scaleFactor);
+        ImGui::Text("  Model size:");  ImGui::SameLine(180);
+        ImGui::Text("%.4f", diag);
+    } else {
+        ImGui::TextDisabled("No registration applied yet.");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Related visualization:");
+    ImGui::TextDisabled("  CorresPoints (board+object spheres) - see Viz tab.");
+}
 inline void drawTabViz(RegUIState& s, RegUIActions& a) {
     ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
                        "Visualization toggles  (keyboard shortcuts in parens)");
