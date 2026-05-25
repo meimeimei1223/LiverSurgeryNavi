@@ -1366,7 +1366,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
     // [key-reorg Phase 5] isShiftV / isShiftF removed (Shift+V/F -> Alt+G/Alt+Shift+G).
-    const bool isShiftE   = (key == GLFW_KEY_E) && (mods & GLFW_MOD_SHIFT);
+    // [key-reorg Phase 9] isShiftE removed (Shift+E -> Alt+P; key==P already in needsScene).
     const bool isShiftG     = (key == GLFW_KEY_G) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);  // V3 BIPOP-CMA-ES (Good performance)
     const bool isCtrlShiftG = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);   // V3-RS BIPOP-CMA-ES (silhouette anchor)
     const bool isCtrlG      = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V3-R BIPOP-CMA-ES (Region-aware, 4-quadrant subset)
@@ -1379,7 +1379,6 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     const bool isCtrlShiftN = (key == GLFW_KEY_N) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);
     const bool needsScene = (key == GLFW_KEY_O      ||
                              key == GLFW_KEY_P      ||
-                             isShiftE               ||
                              isShiftG               ||
                              isCtrlG                ||
                              isCtrlShiftG           ||
@@ -2288,6 +2287,18 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseAutoSaveBeforeRegistration();
             runQuadCyclic();
             poseSaveToLibrary(SaveCriterion::RMSE);
+        } else if ((mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL)
+                                         && !(mods & GLFW_MOD_SHIFT)) {
+            // [key-reorg Phase 9] Alt+P : Silhouette Align (was Shift+E).
+            // byte-identical to the old GLFW_KEY_E Shift branch. Placed after
+            // the Ctrl* branches and before Shift+P / Plain P (mod precedence).
+            std::cout << "[Alt+P] dispatching Silhouette Align..." << std::endl;
+            g_stepStartTime = std::chrono::steady_clock::now();
+            poseAutoSaveBeforeRegistration();
+            runShiftE();
+            g_sessionSilhouetteN++;
+            gUI.state.regMethod = 5;
+            poseSaveToLibrary(SaveCriterion::IOU);
         } else if (mods & GLFW_MOD_SHIFT) {
             // Shift+P: Cyclic Boundary Registration
             //  Key P と同じ前処理 (source silhouette + target boundary) を使うが、
@@ -2314,18 +2325,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::RMSE);
         }
         break;
-    case GLFW_KEY_E:
-        if (mods & GLFW_MOD_SHIFT) {
-            // 元コード line 2854 (runShiftE 内冒頭) と line 3073-3075 の順序
-            // g_stepStartTime をリセットして各Shift+E呼出しごとの所要時間を記録
-            g_stepStartTime = std::chrono::steady_clock::now();
-            poseAutoSaveBeforeRegistration();
-            runShiftE();
-            g_sessionSilhouetteN++;
-            gUI.state.regMethod = 5;
-            poseSaveToLibrary(SaveCriterion::IOU);
-        }
-        break;
+    // [key-reorg Phase 9] GLFW_KEY_E removed: Shift+E (Silhouette Align) -> Alt+P.
     // [key-reorg Phase 4] GLFW_KEY_I removed: Shift+I (IoU debug dump) moved to
     //   Ctrl+D > Viz tab "Dump IoU debug PNG" button.
     case GLFW_KEY_Q:
