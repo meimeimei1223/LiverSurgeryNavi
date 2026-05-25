@@ -81,12 +81,20 @@ If Qt's cache was cleared, Run CMake to reconfigure.
 
 ---
 
+## Phase 5.5 — review fixes (commit after Phase 7)
+
+- **(1) rim/boundary populate:** the "Debug Source Rim Chain" / "Debug Target
+  Boundary" checkboxes were plain bool toggles — enabling them left the overlay
+  data empty so nothing drew. Fixed to mirror the old plain-W / Shift+W keys
+  (auto-recompute labels + `populateDebugSourceRimChain()` /
+  `populateDebugTargetBoundary()`, revert toggle on failure).
+- **(3) cluster dedup:** removed the duplicate "Cluster visualization (was V)"
+  checkbox; cluster is toggled only by `drawTabViz`'s "Cluster markers".
+
 ## Deferred / next time
 
 - **Phase 6 (optional, cosmetic):** group the now-long Viz tab with
-  CollapsingHeaders; also de-duplicate the cluster checkbox (it currently appears
-  twice — once via `drawTabViz`'s onToggleClusterVis callback and once via the
-  Phase-1 direct `g_showClusterVisualization` checkbox).
+  CollapsingHeaders.
 - **Camera/IO key grouping** (`R/K/J/S/L/M`, `Q/X/D/F2/A/U/C`) — user-flagged for
   later tidy.
 - **`Shift+E`** (Silhouette Align) is a standalone key; consider folding it into
