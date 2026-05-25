@@ -660,8 +660,8 @@ Current working directory: "/home/meidaikasai/Documents/MyGithubProject/AAA_Live
 [Path] REG_MODEL_PATH (auto): ../../../registration_model/
 [Path] INPUT_IMAGE_PATH (auto): ../../../input_image/
 [Path] DEPTH_OUTPUT_PATH (auto): ../../../depth_output/
-[Path] ONNX_MODELS_PATH (auto): ../../../medsam2_da3_lite/onnx_models/
-[Path] DEPTH_EXE_PATH (auto): ./medsam2_da3_lite
+[Path] ONNX_MODELS_PATH (auto): ../../../sam2_da3_lite/onnx_models/
+[Path] DEPTH_EXE_PATH (auto): ./sam2_da3_lite
 ========================================
 Final paths:
   MODEL_PATH:       model/
@@ -669,8 +669,8 @@ Final paths:
   REG_MODEL_PATH:   ../../../registration_model/
   INPUT_IMAGE_PATH: ../../../input_image/
   DEPTH_OUTPUT_PATH:../../../depth_output/
-  ONNX_MODELS_PATH: ../../../medsam2_da3_lite/onnx_models/
-  DEPTH_EXE_PATH:   ./medsam2_da3_lite
+  ONNX_MODELS_PATH: ../../../sam2_da3_lite/onnx_models/
+  DEPTH_EXE_PATH:   ./sam2_da3_lite
 ========================================
 
 [ImGui] Font loaded: /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf (18px)

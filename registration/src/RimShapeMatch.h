@@ -42,6 +42,7 @@
 #include <cmath>
 #include <limits>
 #include <queue>           // GN: BFS for unsigned boundary distance map
+#include <string>          // Phase 7b Step 3d: SilhouetteSweepState::fail_reason
 
 #include <Eigen/Dense>
 #include <glm/glm.hpp>
@@ -1902,6 +1903,1473 @@ inline bool runShapeMatchGN(
     }
     return true;
 }
+
+
+// =====================================================================
+//  Phase 7b Step 3c — Contour Sweep (Ctrl+Alt+W)
+// =====================================================================
+//
+//  User-proposed "Shift+P 風" algorithm: discretize both the target
+//  contour and the source rim into arc-length anchors, then sweep
+//  every (target_anchor, source_pivot, rotation) triple as discrete
+//  correspondence candidates. Replaces the gradient-driven GN with a
+//  combinatorial search whose every move is geometrically grounded
+//  (no depth-degeneracy because Z is locked by construction).
+//
+//  Math (one candidate (i, j, θ)):
+//    P_s   = src_pivots_3D[j]                          // current Z preserved
+//    P_t   = unproject(tgt_anchors_2D[i], depth=P_s.z) // lift at P_s's depth
+//    R     = world-Z rotation by θ (camera-forward axis in AR view)
+//    T(p)  = R · (p − P_s) + P_t                       // = R(p−P_s) + P_s + (P_t−P_s)
+//
+//  Because P_t.z = P_s.z and R is a Z-axis rotation, the translation
+//  (P_t − P_s) has Z=0 and R preserves Z. The world Z of every source
+//  point is invariant. Depth runaway is structurally impossible.
+//
+//  Cost-C (double chamfer over the 20-vs-20 pivot sets):
+//    src2D_i = π(T · src_pivots_3D[i])                  // i=0..N_src
+//    fwd  = (1/N_src) Σ_i  bdy_unsigned[src2D_i]        // src pulled to boundary
+//    bwd  = (1/N_tgt) Σ_j  min_i ||tgt_anchors[j] − src2D_i||
+//    cost = fwd + bwd
+//
+//  Phase 1 (broad): N_tgt × N_src × N_rot ≈ 20×20×36 = 14,400 candidates
+//  Phase 2 (fine):  same dims but re-anchored around Phase 1 best with
+//                   narrower arc-length / angle range (≈ ±1 phase-1 step)
+//
+//  Frame-by-frame ticking: caller chooses candidates_per_frame so that
+//  total / batch = target_frames (60fps × 2.5sec ≈ 150 frames / phase).
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// arclengthResampleRim3D
+//   Treat rim_chain (closed loop) as a 3D polyline; uniformly resample
+//   to N points by arc length. The chain is assumed sorted in geometric
+//   order (sortRimChainByAngle ensures this); closure between last and
+//   first index is included in the arc length.
+//
+//   --- Phase 7b Step 3c++ (label-based orientation lock) ----------------
+//   out_nearest_vert_idx (optional):
+//     For each output pivot k, the *mesh vertex index* of the closer
+//     rim_chain endpoint of the polyline segment it was interpolated
+//     within. Lets the caller look up per-pivot anatomical labels
+//     (LiverLeftRightLabel, LiverCranioCaudalLabel) without rebuilding
+//     the chain elsewhere. Pass nullptr to skip.
+// ---------------------------------------------------------------------
+inline void arclengthResampleRim3D(
+    const std::vector<int>& rim_chain,
+    const std::vector<float>& mesh_verts,   // flat x,y,z,x,y,z,...
+    int N,
+    std::vector<glm::vec3>& resampled_out,
+    std::vector<int>* out_nearest_vert_idx = nullptr)
+{
+    resampled_out.clear();
+    if (out_nearest_vert_idx) out_nearest_vert_idx->clear();
+    const int K = (int)rim_chain.size();
+    if (K < 2 || N < 1) return;
+    const int nV3 = (int)mesh_verts.size();
+
+    // Polyline points + parallel vertex-index array (so callers can
+    // look up labels without re-walking the chain).
+    std::vector<glm::vec3> pts;
+    std::vector<int>       pts_vidx;
+    pts.reserve(K + 1);
+    pts_vidx.reserve(K + 1);
+    for (int idx : rim_chain) {
+        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+        pts.emplace_back(mesh_verts[idx*3],
+                         mesh_verts[idx*3+1],
+                         mesh_verts[idx*3+2]);
+        pts_vidx.push_back(idx);
+    }
+    if (pts.size() < 2) return;
+    pts.push_back(pts.front());  // close the loop
+    pts_vidx.push_back(pts_vidx.front());
+
+    // Cumulative arc length
+    std::vector<float> cum(pts.size(), 0.0f);
+    for (size_t i = 1; i < pts.size(); i++) {
+        cum[i] = cum[i-1] + glm::length(pts[i] - pts[i-1]);
+    }
+    const float total_len = cum.back();
+    if (total_len < 1e-6f) return;
+
+    resampled_out.reserve(N);
+    if (out_nearest_vert_idx) out_nearest_vert_idx->reserve(N);
+    for (int k = 0; k < N; k++) {
+        const float t = (float(k) + 0.5f) * total_len / float(N);
+        auto it = std::upper_bound(cum.begin(), cum.end(), t);
+        if (it == cum.begin())   {
+            resampled_out.push_back(pts.front());
+            if (out_nearest_vert_idx) out_nearest_vert_idx->push_back(pts_vidx.front());
+            continue;
+        }
+        if (it == cum.end())     {
+            resampled_out.push_back(pts.back());
+            if (out_nearest_vert_idx) out_nearest_vert_idx->push_back(pts_vidx.back());
+            continue;
+        }
+        const size_t idx     = std::distance(cum.begin(), it);
+        const float  seg_len = cum[idx] - cum[idx-1];
+        const float  alpha   = (seg_len > 1e-6f)
+                                   ? (t - cum[idx-1]) / seg_len
+                                   : 0.0f;
+        resampled_out.push_back(glm::mix(pts[idx-1], pts[idx], alpha));
+        if (out_nearest_vert_idx) {
+            const size_t closer = (alpha < 0.5f) ? (idx - 1) : idx;
+            out_nearest_vert_idx->push_back(pts_vidx[closer]);
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// arclengthResampleContour2DSubrange
+//   Like resampleArcLength2D but only resamples the [t_center-t_radius,
+//   t_center+t_radius] subrange of the arc-length parameter (t ∈ [0,1]).
+//   Used by Phase 2 to refine around Phase 1's best target anchor.
+//   Boundary handling: clamp (no wrap) — target contour is an open
+//   polyline (the largest connected segment from traceContour2D).
+// ---------------------------------------------------------------------
+inline void arclengthResampleContour2DSubrange(
+    const std::vector<glm::vec2>& contour,
+    float t_center, float t_radius,
+    int N,
+    std::vector<glm::vec2>& resampled_out)
+{
+    resampled_out.clear();
+    if (contour.size() < 2 || N < 1) return;
+
+    std::vector<float> cum(contour.size(), 0.0f);
+    for (size_t i = 1; i < contour.size(); i++) {
+        cum[i] = cum[i-1] + glm::length(contour[i] - contour[i-1]);
+    }
+    const float total_len = cum.back();
+    if (total_len < 1e-6f) return;
+
+    const float t0 = std::max(0.0f, t_center - t_radius) * total_len;
+    const float t1 = std::min(1.0f, t_center + t_radius) * total_len;
+    const float range = t1 - t0;
+    if (range < 1e-6f) return;
+
+    resampled_out.reserve(N);
+    for (int k = 0; k < N; k++) {
+        const float t = t0 + (float(k) + 0.5f) * range / float(N);
+        auto it = std::upper_bound(cum.begin(), cum.end(), t);
+        if (it == cum.begin())   { resampled_out.push_back(contour.front()); continue; }
+        if (it == cum.end())     { resampled_out.push_back(contour.back());  continue; }
+        const size_t idx     = std::distance(cum.begin(), it);
+        const float  seg_len = cum[idx] - cum[idx-1];
+        const float  alpha   = (seg_len > 1e-6f)
+                                   ? (t - cum[idx-1]) / seg_len
+                                   : 0.0f;
+        resampled_out.push_back(glm::mix(contour[idx-1], contour[idx], alpha));
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// arclengthResampleRim3DSubrange
+//   Closed-loop subrange resample. t_center ± t_radius wraps modulo 1.
+//   If the wrap straddles index 0, the parameter range is split (the
+//   sampling is still uniform in arc length).
+//
+//   --- Phase 7b Step 3c++ ----------------------------------------------
+//   out_nearest_vert_idx (optional): mesh vertex idx of the closer
+//   chain endpoint for each output pivot, matching arclengthResampleRim3D.
+// ---------------------------------------------------------------------
+inline void arclengthResampleRim3DSubrange(
+    const std::vector<int>& rim_chain,
+    const std::vector<float>& mesh_verts,
+    float t_center, float t_radius,
+    int N,
+    std::vector<glm::vec3>& resampled_out,
+    std::vector<int>* out_nearest_vert_idx = nullptr)
+{
+    resampled_out.clear();
+    if (out_nearest_vert_idx) out_nearest_vert_idx->clear();
+    const int K = (int)rim_chain.size();
+    if (K < 2 || N < 1) return;
+    const int nV3 = (int)mesh_verts.size();
+
+    std::vector<glm::vec3> pts;
+    std::vector<int>       pts_vidx;
+    pts.reserve(K + 1);
+    pts_vidx.reserve(K + 1);
+    for (int idx : rim_chain) {
+        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+        pts.emplace_back(mesh_verts[idx*3],
+                         mesh_verts[idx*3+1],
+                         mesh_verts[idx*3+2]);
+        pts_vidx.push_back(idx);
+    }
+    if (pts.size() < 2) return;
+    pts.push_back(pts.front());
+    pts_vidx.push_back(pts_vidx.front());
+
+    std::vector<float> cum(pts.size(), 0.0f);
+    for (size_t i = 1; i < pts.size(); i++) {
+        cum[i] = cum[i-1] + glm::length(pts[i] - pts[i-1]);
+    }
+    const float total_len = cum.back();
+    if (total_len < 1e-6f) return;
+
+    auto sample = [&](float t, int* out_vidx) -> glm::vec3 {
+        // Wrap t to [0, total_len]
+        while (t < 0.0f)         t += total_len;
+        while (t > total_len)    t -= total_len;
+        auto it = std::upper_bound(cum.begin(), cum.end(), t);
+        if (it == cum.begin())   {
+            if (out_vidx) *out_vidx = pts_vidx.front();
+            return pts.front();
+        }
+        if (it == cum.end())     {
+            if (out_vidx) *out_vidx = pts_vidx.back();
+            return pts.back();
+        }
+        const size_t idx     = std::distance(cum.begin(), it);
+        const float  seg_len = cum[idx] - cum[idx-1];
+        const float  alpha   = (seg_len > 1e-6f)
+                                   ? (t - cum[idx-1]) / seg_len
+                                   : 0.0f;
+        if (out_vidx) {
+            const size_t closer = (alpha < 0.5f) ? (idx - 1) : idx;
+            *out_vidx = pts_vidx[closer];
+        }
+        return glm::mix(pts[idx-1], pts[idx], alpha);
+    };
+
+    const float t_lo = (t_center - t_radius) * total_len;
+    const float t_hi = (t_center + t_radius) * total_len;
+    const float range = t_hi - t_lo;
+    resampled_out.reserve(N);
+    if (out_nearest_vert_idx) out_nearest_vert_idx->reserve(N);
+    for (int k = 0; k < N; k++) {
+        const float t = t_lo + (float(k) + 0.5f) * range / float(N);
+        int vi = -1;
+        resampled_out.push_back(sample(t, out_nearest_vert_idx ? &vi : nullptr));
+        if (out_nearest_vert_idx) out_nearest_vert_idx->push_back(vi);
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// evaluateContourSweepCandidate
+//   Single (i_tgt, j_src, θ) evaluation. Builds the 4×4 transform that
+//   pins src_pivots[j_src] to tgt_anchors[i_tgt] at the source's current
+//   depth, rotates around world-Z (camera forward) by θ degrees, then
+//   computes the bidirectional chamfer between the transformed source
+//   pivots and target anchors.
+//
+//   Returns cost; writes T_out. Cost convention: lower is better.
+//   Out-of-frame source points contribute a large penalty (1000 px).
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// filterBoundaryByRim2DBbox
+//
+//   Anatomical / "stay near initial pose" filter. Computes the 2D
+//   bounding box of the projected source rim (in pixel space), expands
+//   it by margin_px on all sides, and keeps only the boundary 3D
+//   points whose 2D projection falls inside that box.
+//
+//   This is what makes the Contour Sweep respect the source's initial
+//   pose: by limiting target anchors to the source's vicinity, the
+//   "pin pivot to anchor" translation can no longer fling the source
+//   to anatomically nonsensical locations (e.g. caudal source pivot
+//   onto cranial target anchor).
+// ---------------------------------------------------------------------
+inline void filterBoundaryByRim2DBbox(
+    const std::vector<glm::vec3>& boundary_3D,
+    const std::vector<glm::vec3>& src_rim_3D,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    float margin_px,
+    std::vector<glm::vec3>& out_filtered)
+{
+    out_filtered.clear();
+    if (boundary_3D.empty() || src_rim_3D.empty() || margin_px < 0.0f) {
+        out_filtered = boundary_3D;
+        return;
+    }
+
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+
+    auto project_2D = [&](const glm::vec3& p, glm::vec2& out) -> bool {
+        const glm::vec4 clip = M * glm::vec4(p, 1.0f);
+        if (std::abs(clip.w) < 1e-9f) return false;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        out = glm::vec2(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+        return true;
+    };
+
+    // 1. Compute source rim 2D bbox
+    glm::vec2 src_min( 1e9f,  1e9f);
+    glm::vec2 src_max(-1e9f, -1e9f);
+    bool any_valid = false;
+    glm::vec2 p2d;
+    for (const auto& p : src_rim_3D) {
+        if (!project_2D(p, p2d)) continue;
+        src_min = glm::min(src_min, p2d);
+        src_max = glm::max(src_max, p2d);
+        any_valid = true;
+    }
+    if (!any_valid) {
+        out_filtered = boundary_3D;
+        return;
+    }
+    src_min -= glm::vec2(margin_px);
+    src_max += glm::vec2(margin_px);
+
+    // 2. Filter boundary points by inclusion in expanded bbox
+    out_filtered.reserve(boundary_3D.size() / 2);
+    for (const auto& p : boundary_3D) {
+        if (!project_2D(p, p2d)) continue;
+        if (p2d.x >= src_min.x && p2d.x <= src_max.x
+            && p2d.y >= src_min.y && p2d.y <= src_max.y)
+        {
+            out_filtered.push_back(p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Phase 7b Step 3c++: ScreenSide enums (label-based orientation lock)
+//
+//   After Apply Init Pose, the canonical viewing convention is:
+//     screen +x  ↔  patient's RIGHT  (anatomical)
+//     screen -y  ↔  patient's CRANIAL (top of image = head)
+//
+//   These enums classify each target anchor by which side of the
+//   locked-centroid neutral band it falls in. AMBIGUOUS means "inside
+//   the band" — used to relax the match constraint at the image
+//   midline where the source's BOUNDARY-labeled pivots also live.
+// ---------------------------------------------------------------------
+enum ScreenSideLR : uint8_t {
+    SS_LR_RIGHT     = 0,
+    SS_LR_LEFT      = 1,
+    SS_LR_AMBIGUOUS = 2
+};
+enum ScreenSideCC : uint8_t {
+    SS_CC_CRANIAL   = 0,
+    SS_CC_CAUDAL    = 1,
+    SS_CC_AMBIGUOUS = 2
+};
+
+// ---------------------------------------------------------------------
+// tagAnchorsInsideSourceBbox
+//
+//   Plan A (anchor-完全固定) helper. Given target anchors that were
+//   extracted from the FULL boundary (no pre-filter, so locations are
+//   invariant under source pose), tag each anchor true/false for
+//   inclusion in the source rim's 2D bbox (expanded by margin_px).
+//
+//   Use:
+//     - sweep can skip i_tgt with tag=false (anchors far from the
+//       current source) without ever moving the anchor itself
+//     - preview can render outside-bbox anchors in dim gray so the
+//       user can see the bbox boundary visually
+//
+//   When margin_px < 0 or src_rim is empty, all anchors are tagged true
+//   (filter effectively off — caller decides whether to skip).
+// ---------------------------------------------------------------------
+inline void tagAnchorsInsideSourceBbox(
+    const std::vector<glm::vec3>& anchors_3D,
+    const std::vector<glm::vec3>& src_rim_3D,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    float margin_px,
+    std::vector<uint8_t>& out_inside_mask)
+{
+    out_inside_mask.assign(anchors_3D.size(), (uint8_t)1);
+    if (anchors_3D.empty() || src_rim_3D.empty() || margin_px < 0.0f) {
+        return;
+    }
+
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+
+    auto project_2D = [&](const glm::vec3& p, glm::vec2& out) -> bool {
+        const glm::vec4 clip = M * glm::vec4(p, 1.0f);
+        if (std::abs(clip.w) < 1e-9f) return false;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        out = glm::vec2(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+        return true;
+    };
+
+    // Source rim 2D bbox
+    glm::vec2 src_min( 1e9f,  1e9f);
+    glm::vec2 src_max(-1e9f, -1e9f);
+    bool any_valid = false;
+    glm::vec2 p2d;
+    for (const auto& p : src_rim_3D) {
+        if (!project_2D(p, p2d)) continue;
+        src_min = glm::min(src_min, p2d);
+        src_max = glm::max(src_max, p2d);
+        any_valid = true;
+    }
+    if (!any_valid) return;   // leave everything as "inside" (1)
+    src_min -= glm::vec2(margin_px);
+    src_max += glm::vec2(margin_px);
+
+    for (size_t i = 0; i < anchors_3D.size(); i++) {
+        if (!project_2D(anchors_3D[i], p2d)) {
+            out_inside_mask[i] = 0;
+            continue;
+        }
+        const bool inside = (p2d.x >= src_min.x && p2d.x <= src_max.x
+                          && p2d.y >= src_min.y && p2d.y <= src_max.y);
+        out_inside_mask[i] = inside ? (uint8_t)1 : (uint8_t)0;
+    }
+}
+
+// ---------------------------------------------------------------------
+// extractSectorBasedTargetAnchors3D
+//
+//   Replacement for arc-length resampling of 2D contour traces. Takes
+//   the full set of 3D target boundary points (e.g. 55,000 from
+//   g_debugTargetBoundaryPoints), projects each to 2D using the AR
+//   camera, partitions them into N angular sectors around the 2D
+//   centroid, and returns the medoid (point closest to its sector's
+//   3D centroid) of each non-empty sector.
+//
+//   This MATCHES the approach used by Shift+P (Cyclic Boundary
+//   Registration) and is robust to:
+//     - Boundary fragmentation (SAM mask holes, instrument cuts)
+//     - Disconnected segments
+//     - Non-uniform point density along the boundary
+//
+//   Anchors are returned in CCW angular order. Empty sectors are
+//   skipped, so out_anchors_3D.size() may be less than n_sectors.
+//
+//   --- Phase 7b Step 3c bug fix (centroid lock) -----------------------
+//   full_boundary_3D_for_centroid (optional, default nullptr):
+//     When provided, the 2D centroid that anchors the sector partition
+//     is computed from THIS point set instead of `boundary_points_3D`.
+//
+//     Typical use: pass the *unfiltered* g_debugTargetBoundaryPoints
+//     here while `boundary_points_3D` carries the source-bbox-filtered
+//     subset. The result:
+//       - Centroid is locked to the target image (invariant to source
+//         pose changes — bbox filter no longer drags it around).
+//       - Sector boundary lines are therefore also locked in image space.
+//       - Only the subset of boundary points that get binned into each
+//         sector depends on the source bbox filter; medoid selection
+//         picks the locally most-representative point of each sector.
+//
+//     This is the fix for "source 移動で target anchor 位置が変わる"
+//     reported in HANDOVER_PHASE_7B_STEP3C.md §bug 1.
+// ---------------------------------------------------------------------
+inline void extractSectorBasedTargetAnchors3D(
+    const std::vector<glm::vec3>& boundary_points_3D,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    int n_sectors,
+    std::vector<glm::vec3>& out_anchors_3D,
+    std::vector<int>* out_sector_idx = nullptr,
+    glm::vec2* out_centroid_2D = nullptr,
+    const std::vector<glm::vec3>* full_boundary_3D_for_centroid = nullptr)
+{
+    out_anchors_3D.clear();
+    if (out_sector_idx) out_sector_idx->clear();
+    if (boundary_points_3D.empty() || n_sectors < 2) return;
+
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+
+    auto project_2D_inframe = [&](const glm::vec3& p,
+                                  glm::vec2& out2D) -> bool
+    {
+        const glm::vec4 clip = M * glm::vec4(p, 1.0f);
+        if (std::abs(clip.w) < 1e-9f) return false;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        if (ndcx < -1.5f || ndcx > 1.5f || ndcy < -1.5f || ndcy > 1.5f)
+            return false;
+        out2D = glm::vec2(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+        return true;
+    };
+
+    // --- Project + per-point validity for the bin-target points ------
+    std::vector<glm::vec2> pts_2D(boundary_points_3D.size());
+    std::vector<bool>      pts_valid(boundary_points_3D.size(), false);
+    for (size_t i = 0; i < boundary_points_3D.size(); i++) {
+        if (project_2D_inframe(boundary_points_3D[i], pts_2D[i])) {
+            pts_valid[i] = true;
+        }
+    }
+
+    // --- Centroid: from full_boundary (if provided) OR from binned set
+    //     This is the key "lock" that makes the partition source-pose-
+    //     invariant when the caller passes the unfiltered target set.
+    glm::vec2 centroid_2D(0.0f);
+    int n_valid_for_centroid = 0;
+    if (full_boundary_3D_for_centroid != nullptr
+        && !full_boundary_3D_for_centroid->empty())
+    {
+        glm::vec2 p2;
+        for (const auto& p : *full_boundary_3D_for_centroid) {
+            if (project_2D_inframe(p, p2)) {
+                centroid_2D += p2;
+                n_valid_for_centroid++;
+            }
+        }
+        if (n_valid_for_centroid == 0) {
+            // Full-boundary projection had no in-frame points;
+            // fall back to binned-set centroid for robustness.
+            for (size_t i = 0; i < pts_2D.size(); i++) {
+                if (!pts_valid[i]) continue;
+                centroid_2D += pts_2D[i];
+                n_valid_for_centroid++;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < pts_2D.size(); i++) {
+            if (!pts_valid[i]) continue;
+            centroid_2D += pts_2D[i];
+            n_valid_for_centroid++;
+        }
+    }
+    if (n_valid_for_centroid == 0) return;
+    centroid_2D /= float(n_valid_for_centroid);
+    if (out_centroid_2D) *out_centroid_2D = centroid_2D;
+
+    const float kTwoPi = 6.283185307179586f;
+    const float sector_size = kTwoPi / float(n_sectors);
+    std::vector<std::vector<size_t>> sectorIdx(n_sectors);
+    for (size_t i = 0; i < pts_2D.size(); i++) {
+        if (!pts_valid[i]) continue;
+        const glm::vec2 d = pts_2D[i] - centroid_2D;
+        if (glm::length(d) < 1e-6f) continue;
+        float theta = std::atan2(d.y, d.x);
+        if (theta < 0.0f) theta += kTwoPi;
+        int s = int(theta / sector_size);
+        if (s >= n_sectors) s = n_sectors - 1;
+        if (s < 0) s = 0;
+        sectorIdx[s].push_back(i);
+    }
+
+    out_anchors_3D.reserve(n_sectors);
+    if (out_sector_idx) out_sector_idx->reserve(n_sectors);
+    for (int s = 0; s < n_sectors; s++) {
+        if (sectorIdx[s].empty()) continue;
+        glm::vec3 sec_c(0.0f);
+        for (size_t idx : sectorIdx[s]) sec_c += boundary_points_3D[idx];
+        sec_c /= float(sectorIdx[s].size());
+        size_t best_idx = sectorIdx[s][0];
+        float best_d = glm::length(boundary_points_3D[best_idx] - sec_c);
+        for (size_t idx : sectorIdx[s]) {
+            const float d = glm::length(boundary_points_3D[idx] - sec_c);
+            if (d < best_d) { best_d = d; best_idx = idx; }
+        }
+        out_anchors_3D.push_back(boundary_points_3D[best_idx]);
+        if (out_sector_idx) out_sector_idx->push_back(s);
+    }
+}
+
+// ---------------------------------------------------------------------
+// extractSectorBasedTargetAnchors3DSubrange
+//
+//   Phase 2 variant: refine target anchors within a narrower angular
+//   window around the Phase 1 best sector.
+//
+//   --- Phase 7b Step 3c bug fix (centroid lock) -----------------------
+//   full_boundary_3D_for_centroid: see extractSectorBasedTargetAnchors3D
+//   docstring. Passing the unfiltered target boundary here keeps the
+//   subrange centered on the same locked centroid that Phase 1 used,
+//   so Phase 2's anchors don't slide as the source moves either.
+// ---------------------------------------------------------------------
+inline void extractSectorBasedTargetAnchors3DSubrange(
+    const std::vector<glm::vec3>& boundary_points_3D,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    float center_angle,
+    float half_range,
+    int n_subsectors,
+    std::vector<glm::vec3>& out_anchors_3D,
+    const std::vector<glm::vec3>* full_boundary_3D_for_centroid = nullptr)
+{
+    out_anchors_3D.clear();
+    if (boundary_points_3D.empty() || n_subsectors < 2) return;
+
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+    const float kTwoPi = 6.283185307179586f;
+
+    auto project_2D_inframe = [&](const glm::vec3& p,
+                                  glm::vec2& out2D) -> bool
+    {
+        const glm::vec4 clip = M * glm::vec4(p, 1.0f);
+        if (std::abs(clip.w) < 1e-9f) return false;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        if (ndcx < -1.5f || ndcx > 1.5f || ndcy < -1.5f || ndcy > 1.5f)
+            return false;
+        out2D = glm::vec2(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+        return true;
+    };
+
+    // --- Project + per-point validity for the bin-target points ------
+    std::vector<glm::vec2> pts_2D(boundary_points_3D.size());
+    std::vector<bool>      pts_valid(boundary_points_3D.size(), false);
+    for (size_t i = 0; i < boundary_points_3D.size(); i++) {
+        if (project_2D_inframe(boundary_points_3D[i], pts_2D[i])) {
+            pts_valid[i] = true;
+        }
+    }
+
+    // --- Centroid: from full_boundary if provided, else from binned set
+    glm::vec2 centroid_2D(0.0f);
+    int n_valid_for_centroid = 0;
+    if (full_boundary_3D_for_centroid != nullptr
+        && !full_boundary_3D_for_centroid->empty())
+    {
+        glm::vec2 p2;
+        for (const auto& p : *full_boundary_3D_for_centroid) {
+            if (project_2D_inframe(p, p2)) {
+                centroid_2D += p2;
+                n_valid_for_centroid++;
+            }
+        }
+        if (n_valid_for_centroid == 0) {
+            for (size_t i = 0; i < pts_2D.size(); i++) {
+                if (!pts_valid[i]) continue;
+                centroid_2D += pts_2D[i];
+                n_valid_for_centroid++;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < pts_2D.size(); i++) {
+            if (!pts_valid[i]) continue;
+            centroid_2D += pts_2D[i];
+            n_valid_for_centroid++;
+        }
+    }
+    if (n_valid_for_centroid == 0) return;
+    centroid_2D /= float(n_valid_for_centroid);
+
+    const float a_lo = center_angle - half_range;
+    const float subsec_size = (2.0f * half_range) / float(n_subsectors);
+    std::vector<std::vector<size_t>> binIdx(n_subsectors);
+
+    for (size_t i = 0; i < pts_2D.size(); i++) {
+        if (!pts_valid[i]) continue;
+        const glm::vec2 d = pts_2D[i] - centroid_2D;
+        if (glm::length(d) < 1e-6f) continue;
+        float theta = std::atan2(d.y, d.x);
+        if (theta < 0.0f) theta += kTwoPi;
+        float t = theta - a_lo;
+        while (t < 0.0f)    t += kTwoPi;
+        while (t >= kTwoPi) t -= kTwoPi;
+        if (t > 2.0f * half_range) continue;
+        int s = int(t / subsec_size);
+        if (s >= n_subsectors) s = n_subsectors - 1;
+        if (s < 0) s = 0;
+        binIdx[s].push_back(i);
+    }
+
+    out_anchors_3D.reserve(n_subsectors);
+    for (int s = 0; s < n_subsectors; s++) {
+        if (binIdx[s].empty()) continue;
+        glm::vec3 sec_c(0.0f);
+        for (size_t idx : binIdx[s]) sec_c += boundary_points_3D[idx];
+        sec_c /= float(binIdx[s].size());
+        size_t best_idx = binIdx[s][0];
+        float best_d = glm::length(boundary_points_3D[best_idx] - sec_c);
+        for (size_t idx : binIdx[s]) {
+            const float d = glm::length(boundary_points_3D[idx] - sec_c);
+            if (d < best_d) { best_d = d; best_idx = idx; }
+        }
+        out_anchors_3D.push_back(boundary_points_3D[best_idx]);
+    }
+}
+
+// ---------------------------------------------------------------------
+// project3DAnchorsTo2D
+// ---------------------------------------------------------------------
+inline void project3DAnchorsTo2D(
+    const std::vector<glm::vec3>& anchors_3D,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    std::vector<glm::vec2>& out_anchors_2D)
+{
+    out_anchors_2D.clear();
+    out_anchors_2D.reserve(anchors_3D.size());
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+    for (const auto& p : anchors_3D) {
+        const glm::vec4 clip = M * glm::vec4(p, 1.0f);
+        if (std::abs(clip.w) < 1e-9f) {
+            out_anchors_2D.emplace_back(-1e6f, -1e6f);
+            continue;
+        }
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        out_anchors_2D.emplace_back(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+    }
+}
+
+inline double evaluateContourSweepCandidate(
+    const std::vector<glm::vec2>& tgt_anchors_2D,
+    const std::vector<glm::vec3>& src_pivots_3D,
+    int   target_anchor_idx,
+    int   source_pivot_idx,
+    float rotation_deg,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    const std::vector<float>& bdy_unsigned,
+    int bdy_W, int bdy_H,
+    glm::mat4& T_out)
+{
+    const int N_tgt = (int)tgt_anchors_2D.size();
+    const int N_src = (int)src_pivots_3D.size();
+    if (N_tgt < 1 || N_src < 1 ||
+        target_anchor_idx < 0 || target_anchor_idx >= N_tgt ||
+        source_pivot_idx  < 0 || source_pivot_idx  >= N_src) {
+        T_out = glm::mat4(1.0f);
+        return 1e18;
+    }
+
+    const glm::vec3 P_s = src_pivots_3D[source_pivot_idx];
+    const glm::vec2 P_t_2D = tgt_anchors_2D[target_anchor_idx];
+    const glm::vec3 P_t_3D =
+        unprojectPixelAtWorldDepth(P_t_2D, P_s, view, proj, W, H);
+
+    // Build T = Translate(P_t_3D) · R_z(θ) · Translate(-P_s)
+    const float c = std::cos(glm::radians(rotation_deg));
+    const float s = std::sin(glm::radians(rotation_deg));
+    glm::mat4 R(1.0f);
+    R[0][0] =  c; R[0][1] =  s; R[0][2] = 0.0f;
+    R[1][0] = -s; R[1][1] =  c; R[1][2] = 0.0f;
+    R[2][0] = 0.0f; R[2][1] = 0.0f; R[2][2] = 1.0f;
+    const glm::mat4 T_to    = glm::translate(glm::mat4(1.0f),  P_t_3D);
+    const glm::mat4 T_from  = glm::translate(glm::mat4(1.0f), -P_s);
+    T_out = T_to * R * T_from;
+
+    // Project transformed source pivots to 2D
+    std::vector<glm::vec2> src2D(N_src);
+    int n_in_frame = 0;
+    const glm::mat4 M = proj * view;
+    for (int i = 0; i < N_src; i++) {
+        const glm::vec4 p4 = T_out * glm::vec4(src_pivots_3D[i], 1.0f);
+        const glm::vec4 clip = M * p4;
+        if (clip.w <= 1e-9f) { src2D[i] = glm::vec2(-1e6, -1e6); continue; }
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        if (ndcx < -1.0f || ndcx > 1.0f ||
+            ndcy < -1.0f || ndcy > 1.0f) {
+            src2D[i] = glm::vec2(-1e6, -1e6);
+            continue;
+        }
+        src2D[i] = glm::vec2((ndcx + 1.0f) * 0.5f * float(bdy_W),
+                             (1.0f - ndcy) * 0.5f * float(bdy_H));
+        n_in_frame++;
+    }
+    if (n_in_frame < N_src / 2) {
+        return 1e9 + double(N_src - n_in_frame);
+    }
+
+    // Forward chamfer: each src pivot → bdy distance
+    const float kOOFPenalty = 1000.0f;
+    double sum_fwd = 0.0;
+    for (int i = 0; i < N_src; i++) {
+        if (src2D[i].x < 0.0f) { sum_fwd += kOOFPenalty; continue; }
+        int px = int(src2D[i].x), py = int(src2D[i].y);
+        if (px < 0) px = 0; else if (px >= bdy_W) px = bdy_W - 1;
+        if (py < 0) py = 0; else if (py >= bdy_H) py = bdy_H - 1;
+        sum_fwd += double(bdy_unsigned[py * bdy_W + px]);
+    }
+    const double fwd = sum_fwd / double(N_src);
+
+    // Backward chamfer: each target anchor → nearest transformed src pivot
+    double sum_bwd = 0.0;
+    for (int j = 0; j < N_tgt; j++) {
+        float min_d2 = 1e18f;
+        for (int i = 0; i < N_src; i++) {
+            if (src2D[i].x < 0.0f) continue;
+            const float dx = tgt_anchors_2D[j].x - src2D[i].x;
+            const float dy = tgt_anchors_2D[j].y - src2D[i].y;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 < min_d2) min_d2 = d2;
+        }
+        sum_bwd += double(std::sqrt(std::max(0.0f, min_d2)));
+    }
+    const double bwd = sum_bwd / double(N_tgt);
+
+    return fwd + bwd;
+}
+
+
+// ---------------------------------------------------------------------
+// ContourSweepState
+//   State machine for the multi-frame Ctrl+Alt+W animation. Owned by
+//   the caller (RegistrationActions/main.cpp); RimShapeMatch provides
+//   only the per-candidate evaluator above. The state struct is here
+//   for type unity.
+// ---------------------------------------------------------------------
+struct ContourSweepState {
+    bool                       active = false;
+    int                        phase = 0;             // 0=idle, 1=broad, 2=fine, 3=done
+    int                        candidate_idx = 0;
+    int                        total_candidates = 0;
+    int                        candidates_per_frame = 100;
+    int                        current_frame = 0;
+    int                        total_frames_phase1 = 150;
+    int                        total_frames_phase2 = 150;
+    int                        n_target = 20;
+    int                        n_source = 20;
+    int                        n_rotation = 36;
+
+    // Discretization caches (rebuilt per phase)
+    std::vector<glm::vec2>     tgt_anchors_2D;
+    std::vector<glm::vec3>     src_pivots_3D;
+
+    // Best found this run
+    int                        best_i_tgt = -1;
+    int                        best_j_src = -1;
+    float                      best_theta_deg = 0.0f;
+    double                     best_cost = 1e18;
+    glm::mat4                  best_T = glm::mat4(1.0f);
+
+    // Phase 1 best (used to seed Phase 2 discretization)
+    int                        phase1_best_i_tgt = -1;
+    int                        phase1_best_j_src = -1;
+    float                      phase1_best_theta_deg = 0.0f;
+
+    // Endpoint-constraint state (Step 3c+): the source rim chain used
+    // for sweep may be reversed from g_debugSourceRimChain when the
+    // endpoint correspondence demands it, so Phase 2 must use this
+    // same (possibly reversed) chain for subrange resampling.
+    std::vector<int>           src_rim_chain_used;
+    bool                       dir_reversed = false;
+    bool                       endpoint_constraint_active = false;
+
+    // -----------------------------------------------------------------
+    // Phase 7b Step 3c++: Orientation lock + Plan A (anchor固定 + bbox tag)
+    //
+    //   This block replaces the earlier angle-based scheme. The two
+    //   problems addressed:
+    //
+    //   (1) "Source を動かすと target anchor も動いた"
+    //       Old design pre-filtered the boundary by source bbox then
+    //       extracted sectors → centroid + bin + medoid ALL depended on
+    //       the moving filter. Plan A passes the FULL boundary to the
+    //       extractor (so anchors are completely target-only and
+    //       invariant) and applies the bbox as a per-anchor TAG used
+    //       only to skip candidates during sweep / dim-render during
+    //       preview. Field: tgt_anchor_inside_bbox.
+    //
+    //   (2) "左右がひっくり返る (θ=210° best)"
+    //       The angle-based index check was synthetic. Plan B uses the
+    //       existing anatomical PCA labels:
+    //         - src_pivot_lr_label[j]: PURE_RIGHT / PURE_LEFT / BOUNDARY
+    //           inherited from LiverLeftRightLabel via the nearest
+    //           rim_chain vertex of pivot j.
+    //         - src_pivot_cc_label[j]: CRANIAL / CAUDAL from
+    //           LiverCranioCaudalLabel.
+    //         - tgt_anchor_screen_lr[i]: RIGHT / LEFT / AMBIGUOUS by
+    //           anchor_2D.x vs locked_centroid_2D.x ± neutral band.
+    //         - tgt_anchor_screen_cc[i]: CRANIAL / CAUDAL / AMBIGUOUS
+    //           by anchor_2D.y vs centroid.y ± band.
+    //       Mismatch (PURE_RIGHT ↔ SS_LR_LEFT etc.) → candidate skipped.
+    //       BOUNDARY / AMBIGUOUS values always pass (this is where the
+    //       "屈曲が強い垂直 rim" edge case is handled — those pivots
+    //       are BOUNDARY by design of LiverLeftRightLabel).
+    //
+    //   orientation_lock_active = true iff
+    //       g_shapeMatchSweepUseOrientationLock AND
+    //       both g_liverLR and g_liverCC are valid at sweep start.
+    //
+    //   The independent θ_rotation magnitude cap (Check B) is unchanged
+    //   and applies whenever orientation_lock_active.
+    // -----------------------------------------------------------------
+    std::vector<uint8_t>       src_pivot_lr_label;     // [N_source]  PURE_RIGHT/LEFT/BOUNDARY
+    std::vector<uint8_t>       src_pivot_cc_label;     // [N_source]  CRANIAL/CAUDAL
+    std::vector<uint8_t>       tgt_anchor_screen_lr;   // [N_target]  SS_LR_*
+    std::vector<uint8_t>       tgt_anchor_screen_cc;   // [N_target]  SS_CC_*
+    std::vector<uint8_t>       tgt_anchor_inside_bbox; // [N_target]  Plan A tag (1=inside)
+    glm::vec2                  locked_centroid_2D = glm::vec2(0.0f);
+    bool                       orientation_lock_active = false;
+
+    // Sector-based target anchors (Step 3c+, Shift+P-style approach).
+    // tgt_anchors_3D is the source of truth — derived from
+    // g_debugTargetBoundaryPoints by polar-sector medoid extraction.
+    // tgt_anchors_2D (already declared above) is the per-frame
+    // projection of tgt_anchors_3D for cost computation. This avoids
+    // re-projecting on every candidate evaluation while still using
+    // the AR-camera 2D distance as the cost metric.
+    std::vector<glm::vec3>     tgt_anchors_3D;
+    // Center angle of best Phase 1 sector (for Phase 2 subrange)
+    float                      phase1_best_center_angle = 0.0f;
+
+    // Phase 2 search radii (in arc-length t param ∈ [0,1])
+    float                      phase2_radius_target_t = 0.05f;   // 1/n_target
+    float                      phase2_radius_source_t = 0.05f;
+    float                      phase2_radius_rot_deg  = 10.0f;
+
+    // Progress history for plotting
+    std::vector<double>        cost_history;
+};
+
+
+// =====================================================================
+// Phase 7b Step 3d: Silhouette 2D Dense Sweep
+//   New, independent sweep path. Replaces the sector-based contour
+//   sweep with a pure 2D dense chamfer over:
+//     - source rim chain projected to image plane (~254 px curve)
+//     - target rim 2D lower-half (~150 px curve, from
+//       g_debugTargetContour2D filtered by centroid.y)
+//   Pivot/anchor index is fixed-correspondence (pivot[i] ↔ anchor[i]).
+//   Right-side start point for both curves is determined by:
+//     - Source: 2D centroid of PURE_RIGHT-labeled mesh vertices
+//     - Target: lower-half pixel with max x
+//   The two curves are then re-oriented clockwise (right → bottom →
+//   left → top) and arc-length resampled to 20 pivots/anchors.
+//
+//   No LR constraint, no bbox filter, no rot cap. The right-start
+//   convention is what locks the orientation.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// arclengthResample2D
+//   Arc-length resample of a 2D open polyline to N evenly-spaced
+//   points. Used to discretize both src_rim_2D (after re-orientation)
+//   and tgt_lower_2D into 20 pivots/anchors.
+//
+//   If close_loop=true, the closing segment (last → first) is included
+//   in the arc length; useful for the closed source rim. Default is
+//   open (target lower-half is a polyline segment).
+//
+//   out_nearest_src_idx (optional): for each output sample, the index
+//   in the INPUT curve of the polyline-segment endpoint closer to the
+//   sample. Lets the caller carry parallel arrays (3D positions,
+//   labels) without recomputing arc length.
+// ---------------------------------------------------------------------
+inline void arclengthResample2D(
+    const std::vector<glm::vec2>& curve,
+    int N,
+    std::vector<glm::vec2>& resampled_out,
+    bool close_loop = false,
+    std::vector<int>* out_nearest_src_idx = nullptr)
+{
+    resampled_out.clear();
+    if (out_nearest_src_idx) out_nearest_src_idx->clear();
+    const int K = (int)curve.size();
+    if (K < 2 || N < 1) return;
+
+    // Build extended polyline (with optional closure)
+    std::vector<glm::vec2> pts;
+    std::vector<int>       pts_orig_idx;
+    pts.reserve(K + (close_loop ? 1 : 0));
+    pts_orig_idx.reserve(K + (close_loop ? 1 : 0));
+    for (int i = 0; i < K; i++) {
+        pts.push_back(curve[i]);
+        pts_orig_idx.push_back(i);
+    }
+    if (close_loop) {
+        pts.push_back(curve[0]);
+        pts_orig_idx.push_back(0);
+    }
+
+    // Cumulative arc length
+    std::vector<float> cum(pts.size(), 0.0f);
+    for (size_t i = 1; i < pts.size(); i++) {
+        cum[i] = cum[i-1] + glm::length(pts[i] - pts[i-1]);
+    }
+    const float total_len = cum.back();
+    if (total_len < 1e-6f) return;
+
+    resampled_out.reserve(N);
+    if (out_nearest_src_idx) out_nearest_src_idx->reserve(N);
+    for (int k = 0; k < N; k++) {
+        const float t = (float(k) + 0.5f) * total_len / float(N);
+        auto it = std::upper_bound(cum.begin(), cum.end(), t);
+        if (it == cum.begin()) {
+            resampled_out.push_back(pts.front());
+            if (out_nearest_src_idx) out_nearest_src_idx->push_back(pts_orig_idx.front());
+            continue;
+        }
+        if (it == cum.end()) {
+            resampled_out.push_back(pts.back());
+            if (out_nearest_src_idx) out_nearest_src_idx->push_back(pts_orig_idx.back());
+            continue;
+        }
+        const size_t idx     = std::distance(cum.begin(), it);
+        const float  seg_len = cum[idx] - cum[idx-1];
+        const float  alpha   = (seg_len > 1e-6f)
+                                   ? (t - cum[idx-1]) / seg_len
+                                   : 0.0f;
+        resampled_out.push_back(glm::mix(pts[idx-1], pts[idx], alpha));
+        if (out_nearest_src_idx) {
+            const size_t closer = (alpha < 0.5f) ? (idx - 1) : idx;
+            out_nearest_src_idx->push_back(pts_orig_idx[closer]);
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// project_RimChainTo2D
+//   Project each mesh vertex referenced by rim_chain to image-plane
+//   pixel coords using (proj * view). Pixels with clip.w <= 0 are
+//   emitted as (-1e6, -1e6) sentinels; callers should filter these.
+//   Returns the same number of points as rim_chain.size().
+// ---------------------------------------------------------------------
+inline void project_RimChainTo2D(
+    const std::vector<int>& rim_chain,
+    const std::vector<float>& mesh_verts,      // flat x,y,z,...
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    std::vector<glm::vec2>& out_curve_2D)
+{
+    out_curve_2D.clear();
+    const int K  = (int)rim_chain.size();
+    const int nV3 = (int)mesh_verts.size();
+    if (K < 1) return;
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+    out_curve_2D.reserve(K);
+    for (int idx : rim_chain) {
+        if (idx < 0 || idx*3 + 2 >= nV3) {
+            out_curve_2D.emplace_back(-1e6f, -1e6f);
+            continue;
+        }
+        const glm::vec3 p3(mesh_verts[idx*3],
+                           mesh_verts[idx*3+1],
+                           mesh_verts[idx*3+2]);
+        const glm::vec4 clip = M * glm::vec4(p3, 1.0f);
+        if (clip.w <= 1e-9f) {
+            out_curve_2D.emplace_back(-1e6f, -1e6f);
+            continue;
+        }
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        out_curve_2D.emplace_back(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// findRightStartIndex
+//   For the source rim chain: compute the 3D centroid of all vertices
+//   labeled PURE_RIGHT (LiverLeftRightLabel), project that centroid
+//   to 2D, then return the chain index whose 2D position is closest.
+//
+//   Returns -1 if there are no PURE_RIGHT vertices, or if rim_chain
+//   is empty / all sentinels.
+// ---------------------------------------------------------------------
+inline int findRightStartIndex(
+    const std::vector<glm::vec2>& src_rim_2D,
+    const std::vector<int>& rim_chain,
+    const std::vector<uint8_t>& lr_labels,    // size = nV
+    const std::vector<float>& mesh_verts,     // flat x,y,z,...
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    glm::vec2* out_right_centroid_2D = nullptr)
+{
+    if (src_rim_2D.empty()) return -1;
+    if (src_rim_2D.size() != rim_chain.size()) return -1;
+    if (lr_labels.empty() || mesh_verts.empty()) return -1;
+
+    // Accumulate PURE_RIGHT 3D centroid (mesh-space). We use a 3D
+    // centroid then project once, to avoid sentinels biasing the mean.
+    const int nV  = (int)lr_labels.size();
+    const int nV3 = (int)mesh_verts.size();
+    glm::dvec3 sum3(0.0);
+    int        n_R = 0;
+    for (int i = 0; i < nV; i++) {
+        if (i*3 + 2 >= nV3) break;
+        if (lr_labels[i] != LiverLeftRightLabel::PURE_RIGHT) continue;
+        sum3 += glm::dvec3(mesh_verts[i*3],
+                           mesh_verts[i*3+1],
+                           mesh_verts[i*3+2]);
+        n_R++;
+    }
+    if (n_R == 0) return -1;
+    const glm::vec3 right_centroid_3D(sum3 / double(n_R));
+
+    // Project to 2D
+    const glm::mat4 M = proj * view;
+    const glm::vec4 clip = M * glm::vec4(right_centroid_3D, 1.0f);
+    if (clip.w <= 1e-9f) return -1;
+    const float ndcx = clip.x / clip.w;
+    const float ndcy = clip.y / clip.w;
+    const glm::vec2 c2D(
+        (ndcx + 1.0f) * 0.5f * float(W),
+        (1.0f - ndcy) * 0.5f * float(H));
+    if (out_right_centroid_2D) *out_right_centroid_2D = c2D;
+
+    // Find nearest chain index (skip sentinels)
+    int   best_idx = -1;
+    float best_d2  = std::numeric_limits<float>::infinity();
+    for (int i = 0; i < (int)src_rim_2D.size(); i++) {
+        if (src_rim_2D[i].x < -1e5f) continue;     // sentinel
+        const float dx = src_rim_2D[i].x - c2D.x;
+        const float dy = src_rim_2D[i].y - c2D.y;
+        const float d2 = dx*dx + dy*dy;
+        if (d2 < best_d2) { best_d2 = d2; best_idx = i; }
+    }
+    return best_idx;
+}
+
+
+// ---------------------------------------------------------------------
+// rotateAndOrientCurve
+//   Given a closed-loop 2D curve and a start index, return a re-ordered
+//   curve that begins at start_idx and proceeds in a chosen direction.
+//
+//   clockwise_on_screen:
+//     true → the next step from start_idx should move predominantly
+//            downward (+y on screen). If not, the chain is reversed
+//            (in-place, keeping start_idx at position 0).
+//
+//   Outputs (must be different vectors from `curve_2D`):
+//     out_curve              : re-ordered curve, size K
+//     parallel_index_array   : if non-null, parallel array where
+//                              element[i] = original index of out_curve[i]
+//                              in curve_2D (lets caller reorder parallel
+//                              data like rim chain vertex indices).
+// ---------------------------------------------------------------------
+inline void rotateAndOrientCurve(
+    const std::vector<glm::vec2>& curve_2D,
+    int start_idx,
+    bool clockwise_on_screen,
+    std::vector<glm::vec2>& out_curve,
+    std::vector<int>* parallel_index_array = nullptr)
+{
+    out_curve.clear();
+    if (parallel_index_array) parallel_index_array->clear();
+    const int K = (int)curve_2D.size();
+    if (K < 2 || start_idx < 0 || start_idx >= K) {
+        out_curve = curve_2D;
+        if (parallel_index_array) {
+            parallel_index_array->resize(K);
+            for (int i = 0; i < K; i++) (*parallel_index_array)[i] = i;
+        }
+        return;
+    }
+
+    // Step 1: rotate so start_idx becomes index 0
+    std::vector<glm::vec2> rot(K);
+    std::vector<int>       rot_orig(K);
+    for (int i = 0; i < K; i++) {
+        const int j = (start_idx + i) % K;
+        rot[i] = curve_2D[j];
+        rot_orig[i] = j;
+    }
+
+    // Step 2: decide direction (only if clockwise requested).
+    if (clockwise_on_screen) {
+        // Look at next ~10 points and pick a non-degenerate candidate
+        glm::vec2 p0 = rot[0];
+        glm::vec2 p1(0.0f);
+        bool found = false;
+        if (p0.x >= -1e5f) {
+            for (int s = 1; s < std::min(K, 10); s++) {
+                if (rot[s].x < -1e5f) continue;
+                const float dx = rot[s].x - p0.x;
+                const float dy = rot[s].y - p0.y;
+                if (dx*dx + dy*dy > 1.0f) {   // > 1 px movement
+                    p1 = rot[s];
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) {
+            // We start at the right-side of the silhouette. To proceed
+            // clockwise (right → bottom → left → top), the *next* step
+            // should move predominantly downward (+y on screen). If
+            // instead it moves upward (CCW), reverse.
+            if (p1.y < p0.y) {
+                // Reverse keeping index 0 fixed: 0, K-1, K-2, ..., 1
+                std::vector<glm::vec2> rev(K);
+                std::vector<int>       rev_orig(K);
+                rev[0]      = rot[0];
+                rev_orig[0] = rot_orig[0];
+                for (int i = 1; i < K; i++) {
+                    rev[i]      = rot[K - i];
+                    rev_orig[i] = rot_orig[K - i];
+                }
+                rot.swap(rev);
+                rot_orig.swap(rev_orig);
+            }
+        }
+    }
+
+    out_curve = std::move(rot);
+    if (parallel_index_array) *parallel_index_array = std::move(rot_orig);
+}
+
+
+// ---------------------------------------------------------------------
+// extractLowerHalfRimCurve
+//   From the (open) target contour 2D polyline, extract the longest
+//   maximal subsequence of consecutive points satisfying p.y >
+//   centroid_y. The target contour from traceContour2D is the longest
+//   connected boundary segment; on a 1920x1080 image, screen +y points
+//   downward, so "lower half" = pixel.y > centroid.y.
+//
+//   If multiple disjoint runs satisfy the predicate, the longest one
+//   (in point count) is returned.
+// ---------------------------------------------------------------------
+inline void extractLowerHalfRimCurve(
+    const std::vector<glm::vec2>& contour_2D,
+    float centroid_y,
+    std::vector<glm::vec2>& out_lower)
+{
+    out_lower.clear();
+    const int K = (int)contour_2D.size();
+    if (K < 2) return;
+
+    // Find maximal runs of consecutive indices where y > centroid_y.
+    int best_s = -1, best_e = -1;     // inclusive [s, e]
+    int cur_s = -1;
+    for (int i = 0; i < K; i++) {
+        const bool in_lower = (contour_2D[i].y > centroid_y);
+        if (in_lower) {
+            if (cur_s < 0) cur_s = i;
+            const int cur_e = i;
+            if ((cur_e - cur_s) > (best_e - best_s)) {
+                best_s = cur_s;
+                best_e = cur_e;
+            }
+        } else {
+            cur_s = -1;
+        }
+    }
+    if (best_s < 0) return;
+
+    out_lower.reserve(best_e - best_s + 1);
+    for (int i = best_s; i <= best_e; i++) out_lower.push_back(contour_2D[i]);
+}
+
+
+// ---------------------------------------------------------------------
+// orientTargetLowerByRightStart
+//   Given the target lower-half 2D curve (open polyline), pick the
+//   endpoint with greater x as the "right start" and reverse if
+//   needed so output[0] is the right end.
+// ---------------------------------------------------------------------
+inline void orientTargetLowerByRightStart(
+    const std::vector<glm::vec2>& lower_in,
+    std::vector<glm::vec2>& out_lower)
+{
+    out_lower.clear();
+    const int K = (int)lower_in.size();
+    if (K < 2) { out_lower = lower_in; return; }
+    if (lower_in.front().x >= lower_in.back().x) {
+        out_lower = lower_in;
+    } else {
+        out_lower.reserve(K);
+        for (int i = K - 1; i >= 0; i--) out_lower.push_back(lower_in[i]);
+    }
+}
+
+
+// ---------------------------------------------------------------------
+// denseChamfer2D
+//   Bidirectional dense chamfer distance between two 2D curves.
+//   Returns mean(A→B) + mean(B→A). Sentinels (x < -1e5) are skipped.
+//   Brute O(N*M). For N=254, M=150 that is ~38k distances; 720
+//   candidates total ~27M ops — typically well under 1 sec.
+// ---------------------------------------------------------------------
+inline double denseChamfer2D(
+    const std::vector<glm::vec2>& A,
+    const std::vector<glm::vec2>& B)
+{
+    if (A.empty() || B.empty()) return 1e18;
+
+    double sum_ab = 0.0;
+    int    n_a    = 0;
+    for (const auto& a : A) {
+        if (a.x < -1e5f) continue;
+        float dmin = std::numeric_limits<float>::infinity();
+        for (const auto& b : B) {
+            if (b.x < -1e5f) continue;
+            const float dx = a.x - b.x;
+            const float dy = a.y - b.y;
+            const float d2 = dx*dx + dy*dy;
+            if (d2 < dmin) dmin = d2;
+        }
+        if (std::isfinite(dmin)) { sum_ab += std::sqrt(dmin); n_a++; }
+    }
+    if (n_a == 0) return 1e18;
+
+    double sum_ba = 0.0;
+    int    n_b    = 0;
+    for (const auto& b : B) {
+        if (b.x < -1e5f) continue;
+        float dmin = std::numeric_limits<float>::infinity();
+        for (const auto& a : A) {
+            if (a.x < -1e5f) continue;
+            const float dx = a.x - b.x;
+            const float dy = a.y - b.y;
+            const float d2 = dx*dx + dy*dy;
+            if (d2 < dmin) dmin = d2;
+        }
+        if (std::isfinite(dmin)) { sum_ba += std::sqrt(dmin); n_b++; }
+    }
+    if (n_b == 0) return 1e18;
+
+    return (sum_ab / double(n_a)) + (sum_ba / double(n_b));
+}
+
+
+// ---------------------------------------------------------------------
+// evaluateSilhouetteSweepCandidate
+//   For one (i, θ) candidate:
+//     1. Pin src_pivots_3D[i] to tgt_anchors_2D[i] at the source's
+//        current depth (camera ray + unproject), giving translation.
+//     2. Rotate the source by θ around the camera axis through the
+//        pinned source pivot point.
+//     3. Project the entire transformed source rim curve (3D) to 2D.
+//     4. Return dense bidirectional 2D chamfer vs tgt_lower_2D.
+//
+//   The transform T is also written to T_out so the caller can adopt
+//   it on finish.
+// ---------------------------------------------------------------------
+inline double evaluateSilhouetteSweepCandidate(
+    const std::vector<glm::vec3>& src_rim_3D_dense,   // full chain in 3D (mesh-space)
+    const std::vector<glm::vec3>& src_pivots_3D,      // 20 pivots in 3D
+    const std::vector<glm::vec2>& tgt_anchors_2D,     // 20 anchors in 2D
+    const std::vector<glm::vec2>& tgt_lower_2D,       // dense target lower-half
+    int   pivot_idx,
+    float rotation_deg,
+    const glm::mat4& view, const glm::mat4& proj,
+    int W, int H,
+    glm::mat4& T_out)
+{
+    const int N_pivot = (int)src_pivots_3D.size();
+    if (pivot_idx < 0 || pivot_idx >= N_pivot ||
+        pivot_idx >= (int)tgt_anchors_2D.size() ||
+        src_rim_3D_dense.empty() || tgt_lower_2D.empty())
+    {
+        T_out = glm::mat4(1.0f);
+        return 1e18;
+    }
+
+    const glm::vec3 P_s    = src_pivots_3D[pivot_idx];
+    const glm::vec2 P_t_2D = tgt_anchors_2D[pivot_idx];
+    const glm::vec3 P_t_3D =
+        unprojectPixelAtWorldDepth(P_t_2D, P_s, view, proj, W, H);
+
+    // T = Translate(P_t_3D) · R_z(θ) · Translate(-P_s)
+    //   R_z = rotation around world-Z (camera axis in this AR setup).
+    //   Matches evaluateContourSweepCandidate exactly.
+    const float c = std::cos(glm::radians(rotation_deg));
+    const float s = std::sin(glm::radians(rotation_deg));
+    glm::mat4 R(1.0f);
+    R[0][0] =  c; R[0][1] =  s; R[0][2] = 0.0f;
+    R[1][0] = -s; R[1][1] =  c; R[1][2] = 0.0f;
+    R[2][0] = 0.0f; R[2][1] = 0.0f; R[2][2] = 1.0f;
+    const glm::mat4 T_to    = glm::translate(glm::mat4(1.0f),  P_t_3D);
+    const glm::mat4 T_from  = glm::translate(glm::mat4(1.0f), -P_s);
+    T_out = T_to * R * T_from;
+
+    // Project transformed dense src rim → 2D
+    const glm::mat4 M = proj * view;
+    const float W_f = float(W);
+    const float H_f = float(H);
+    std::vector<glm::vec2> src_2D;
+    src_2D.reserve(src_rim_3D_dense.size());
+    for (const auto& p : src_rim_3D_dense) {
+        const glm::vec4 p4 = T_out * glm::vec4(p, 1.0f);
+        const glm::vec4 cp = M * p4;
+        if (cp.w <= 1e-9f) { src_2D.emplace_back(-1e6f, -1e6f); continue; }
+        const float ndcx = cp.x / cp.w;
+        const float ndcy = cp.y / cp.w;
+        src_2D.emplace_back(
+            (ndcx + 1.0f) * 0.5f * W_f,
+            (1.0f - ndcy) * 0.5f * H_f);
+    }
+
+    return denseChamfer2D(src_2D, tgt_lower_2D);
+}
+
+
+// ---------------------------------------------------------------------
+// SilhouetteSweepState
+//   State machine for the multi-frame Ctrl+Alt+W Step 3d sweep.
+//   Independent from ContourSweepState (Step 3c) — the two coexist so
+//   the old method remains the default fallback when the new toggle
+//   is off.
+// ---------------------------------------------------------------------
+struct SilhouetteSweepState {
+    bool                       active = false;
+    int                        phase  = 0;   // 0=idle,1=broad,2=fine,3=done
+
+    // Frame-pacing controls (mirror ContourSweepState)
+    int                        candidate_idx        = 0;
+    int                        total_candidates     = 0;
+    int                        candidates_per_frame = 60;
+    int                        current_frame        = 0;
+    int                        total_frames_phase1  = 60;
+    int                        total_frames_phase2  = 30;
+
+    // Discretization sizes (fixed per spec)
+    int                        n_pivot     = 20;  // = n_anchor
+    int                        n_rotation  = 36;  // Phase 1: 0..350° step 10°
+
+    // ---- Phase 0 caches (set in startSilhouetteSweep) ----
+    //
+    // Source side (dense + sampled, indexed in the canonical
+    // right-start clockwise order):
+    std::vector<glm::vec2>     src_rim_2D;          // dense, projected (~254 pts)
+    std::vector<glm::vec3>     src_rim_3D_oriented; // dense, mesh-space, reordered
+    std::vector<int>           src_rim_orig_idx;    // parallel: index in original chain
+    std::vector<glm::vec2>     src_pivots_2D;       // 20 pivots in 2D (debug/draw)
+    std::vector<glm::vec3>     src_pivots_3D;       // 20 pivots in 3D (mesh-space)
+    std::vector<uint8_t>       src_pivots_lr_label; // 20 pivots LR label (debug)
+    glm::vec2                  src_right_centroid_2D = glm::vec2(0.0f);
+    int                        src_start_idx_in_chain = -1;   // index into original chain
+    bool                       src_dir_reversed = false;
+
+    // Target side:
+    std::vector<glm::vec2>     tgt_lower_2D;        // dense lower-half (~150 pts)
+    std::vector<glm::vec2>     tgt_anchors_2D;      // 20 anchors in 2D
+    glm::vec2                  tgt_centroid_2D = glm::vec2(0.0f);
+
+    // ---- Phase 1 / 2 results ----
+    int                        best_i_pivot   = -1;
+    float                      best_theta_deg = 0.0f;
+    double                     best_cost      = 1e18;
+    glm::mat4                  best_T         = glm::mat4(1.0f);
+
+    int                        phase1_best_i_pivot   = -1;
+    float                      phase1_best_theta_deg = 0.0f;
+
+    // Phase 2 search ranges
+    int                        phase2_pivot_radius = 2;     // ±2 around best
+    float                      phase2_theta_radius_deg = 10.0f;
+
+    // History (for ImGui PlotLines)
+    std::vector<double>        cost_history;
+
+    // Failure capture for UI
+    std::string                fail_reason;
+};
 
 
 } // namespace RimShape

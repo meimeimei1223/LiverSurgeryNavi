@@ -1,4 +1,4 @@
-# medsam2_da3_lite
+# sam2_da3_lite
 
 Lightweight Depth Anything V3 + SAM2 C++ ONNX inference engine.  
 No OpenCV dependency — uses stb_image only.
@@ -20,13 +20,13 @@ make -j$(nproc)
 
 ```bash
 # Basic usage
-./medsam2_da3_lite image.jpg --point 640,360
+./sam2_da3_lite image.jpg --point 640,360
 
 # Multiple points
-./medsam2_da3_lite image.jpg --point 640,360 --point 800,400 --bg-point 200,200
+./sam2_da3_lite image.jpg --point 640,360 --point 800,400 --bg-point 200,200
 
 # Full options
-./medsam2_da3_lite image.jpg \
+./sam2_da3_lite image.jpg \
     --depth-model models/depth_anything_v3_small.onnx \
     --sam-encoder models/sam2_hiera_tiny.encoder.onnx \
     --sam-decoder models/sam2_hiera_tiny.decoder.onnx \

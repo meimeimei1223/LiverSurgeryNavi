@@ -10,6 +10,7 @@
 #include <random>
 #include <algorithm>
 #include <cmath>
+#include <cstring>      // std::memcpy for Step 3d2 pose-hash cache
 #include <chrono>      // V3-2 timing diagnostics for runBipopCmaesV3
 #include <unordered_set>   // QuadAuto (Shift+O): filter_AR ∩ filter_Quad の hash set
 
@@ -252,7 +253,7 @@ inline int   g_shapeMatchContourN2D        = 200;
 inline float g_shapeMatchMinInFrameRate    = 0.30f;
 inline float g_shapeMatchOutOfFrameDistPx  = 100.0f;
 inline float g_shapeMatchMaxDistCapPx      = 100.0f;
-inline float g_shapeMatch2DInstThreshPx    = 20.0f;
+inline float g_shapeMatch2DInstThreshPx    = 40.0f;
 
 // Phase 7b Step 3a — 2D contour cache + last cost diagnostics.
 //   `g_debugTargetContour2D`         : the largest contour segment from
@@ -328,6 +329,364 @@ inline float  g_shapeMatchGNLambdaMin        = 1.0e-3f;
 inline float  g_shapeMatchGNStepMax          = 0.05f;
 inline bool   g_shapeMatchAltWSkipCoarse     = true;
 
+// =====================================================================
+// Phase 7b Step 3c — Contour Sweep (Ctrl+Alt+W)
+// =====================================================================
+//
+//   Live "Shift+P 風" sweep: arc-length partition both target contour
+//   and source rim, then iterate all (target_anchor, source_pivot,
+//   rotation) triples as discrete correspondences. Each candidate
+//   anchors a rigid transform that preserves Z by construction
+//   (rotation around camera-forward, translation in image plane).
+//
+//   Driven from main loop via tickContourSweep() — one batch of
+//   candidates per rendered frame so the convergence is visible.
+//
+//   Tunables:
+//     g_shapeMatchSweepNTarget   : target contour partition count
+//     g_shapeMatchSweepNSource   : source rim partition count
+//     g_shapeMatchSweepNRotation : rotation discretization (10° steps)
+//     g_shapeMatchSweepFrames1/2 : frame budget for Phase 1 / Phase 2
+//                                  (60fps × 2.5s = 150 frames default)
+//
+//   Returns to PoseLibrary via the standard refine-session flow,
+//   identical to Ctrl+W and Alt+W (Apply → undo snapshot → refine →
+//   poseSaveToLibrary).
+inline int    g_shapeMatchSweepNTarget       = 20;
+inline int    g_shapeMatchSweepNSource       = 20;
+inline int    g_shapeMatchSweepNRotation     = 36;
+inline int    g_shapeMatchSweepFrames1       = 300;   // ~5s @ 60fps
+inline int    g_shapeMatchSweepFrames2       = 300;   // total 10s default
+inline bool   g_shapeMatchSweepLog           = true;  // verbose per-batch log
+inline bool   g_shapeMatchSweepAnimate       = true;  // OFF = one-shot (no animation)
+
+// Endpoint constraint: RIM and target contour are typically OPEN chains
+// (caudal-only source + largest-segment target contour). Both have two
+// physical endpoints. Knowing which source endpoint maps to which target
+// endpoint collapses ~half the search space (no left↔right or anterior↔
+// posterior mismatches) and removes the 360° direction ambiguity.
+//
+//   g_shapeMatchSweepUseEndpointConstraint :
+//       ON  = determine endpoint correspondence at sweep start, reverse
+//             source chain if needed so that i_tgt=0 ↔ j_src=0 means
+//             "same end of curve". Then in the sweep, only allow
+//             candidates with |j_src - i_tgt| <= tolerance.
+//       OFF = legacy unconstrained sweep (good for closed-loop sources
+//             like full rim without caudal filter).
+//   g_shapeMatchSweepEndpointTolerance :
+//       Allowed misalignment in arc-length steps. 0 = strict diagonal
+//       (j_src must equal i_tgt). 3 default = ±3 step slack accommodates
+//       arc-length parameterization speed differences. Higher = wider
+//       search, but proportionally less benefit.
+inline bool   g_shapeMatchSweepUseEndpointConstraint = true;
+inline int    g_shapeMatchSweepEndpointTolerance     = 3;
+// Diagnostic readback (filled at sweep start)
+inline bool   g_shapeMatchSweepDirReversedDiag       = false;
+inline bool   g_shapeMatchSweepSrcIsOpenDiag         = true;
+
+// ---------------------------------------------------------------------
+// Phase 7b Step 3c++: Orientation lock — anatomical L/R + C/C label
+// based (Plan B, replaces the earlier angle-based scheme).
+//
+//   Premise: Apply Init Pose puts the source's anatomical RIGHT on
+//   the screen +x side and CRANIAL on the screen -y side (this is
+//   exactly what getPresetRotation does via the PCA-derived d_lr,
+//   d_cc unit vectors). The label-based lock just enforces that the
+//   sweep doesn't unwind that correspondence.
+//
+//   g_shapeMatchSweepUseOrientationLock:
+//     Master toggle (default ON). Drives BOTH:
+//       Check A (label) — each candidate (i_tgt, j_src) must satisfy
+//                         the LR/CC label compatibility table below.
+//       Check B (rot)   — |wrap_180(θ_rotation_deg)| ≤ RotationLockDeg.
+//     Auto-degraded to false at sweep start if g_liverLR or g_liverCC
+//     is not yet computed (with diagnostic log).
+//
+//   g_shapeMatchSweepNeutralBandPx:
+//     Half-width of the "AMBIGUOUS" band around the locked target
+//     centroid in pixel space. Anchors with |dx| ≤ band_px are
+//     SS_LR_AMBIGUOUS (pair with any source LR label). Similarly for
+//     dy and CC. Default 80 px ≈ 4% of a 1920-wide frame — comparable
+//     to the BOUNDARY-label band on the source side.
+//
+//   g_shapeMatchSweepRotationLockDeg:
+//     Check B cap on the candidate's θ in degrees. Default 90°. This
+//     is the absolute brake — even if the label check accidentally
+//     passes (LR-symmetric rim shapes can fool it), |θ| > cap is
+//     exactly the image-plane flip the user is complaining about.
+//
+//   Label compatibility table (skip iff mismatched):
+//     | src LR \ tgt LR      | RIGHT  | LEFT   | AMBIGUOUS |
+//     |-----------------------|--------|--------|-----------|
+//     | PURE_RIGHT            |  OK    |  skip  |   OK      |
+//     | PURE_LEFT             |  skip  |  OK    |   OK      |
+//     | BOUNDARY (rim 屈曲帯) |  OK    |  OK    |   OK      |
+//     CC same with CRANIAL/CAUDAL.
+//
+//   Diagnostic counters logged each batch:
+//     ep_skip   = endpoint constraint (OPEN-rim only)
+//     lbl_skip  = label compatibility (Check A)
+//     rot_skip  = θ_rotation magnitude (Check B)
+//     bbox_skip = source-bbox tag (Plan A active-mask)
+// ---------------------------------------------------------------------
+inline bool   g_shapeMatchSweepUseOrientationLock   = true;
+inline float  g_shapeMatchSweepNeutralBandPx        = 80.0f;
+inline float  g_shapeMatchSweepRotationLockDeg      = 90.0f;
+// Per-sweep diagnostic readbacks (filled at sweep start).
+inline bool   g_shapeMatchSweepLabelLockReadyDiag   = false;
+
+// Anatomical / "stay near initial pose" filter for target boundary.
+//   g_shapeMatchSweepFilterByRim:
+//     ON  = filter target boundary points to source rim's 2D bbox
+//           (expanded by margin) before sector extraction. This is
+//           THE essential anatomical constraint: it prevents the
+//           sweep from pinning source's caudal pivot onto target's
+//           cranial anchor (which would translate source far from
+//           its initial pose, violating the Apply Init Pose prior).
+//     OFF = use all boundary points (legacy / debugging only).
+//   g_shapeMatchSweepFilterMarginPx:
+//     Expansion of the bbox in pixels. 100-200 px is a reasonable
+//     range. Larger → more pose-correction freedom, but also more
+//     anatomically risky.
+inline bool  g_shapeMatchSweepFilterByRim    = true;
+inline float g_shapeMatchSweepFilterMarginPx = 150.0f;
+
+// Trial-pose visualization (rendered yellow during sweep). Distinct
+// from g_debugShapeMatchBestSrc (red = global best so far) so the user
+// can see both: red converges, yellow dances through current trials.
+inline std::vector<glm::vec3> g_contourSweepTrialSrc;
+inline bool                   g_contourSweepShowTrial = false;
+
+// ----- Anchor/pivot visualization (verifies sweep is indexing both sides) ----
+// Target anchors: 20 contour samples back-projected to 3D at the source
+// rim's centroid depth so they appear on the AR image plane in the scene.
+// Source pivots: 20 source rim samples transformed by the current
+// best-in-batch T so they sit on the yellow trial rim.
+// Highlighted dot (cyan) marks the i_tgt / j_src of the current best-in-
+// batch candidate — this is the pair the algorithm is currently
+// proposing as a correspondence. Watching the highlighted dots walk
+// through the 20-point discretization confirms the animation is exercising
+// both sides.
+inline bool                   g_shapeMatchSweepShowAnchors = true;
+inline std::vector<glm::vec3> g_contourSweepTgtAnchors3D;     // 20 pts, fixed
+inline std::vector<glm::vec3> g_contourSweepSrcPivotsTrial;   // 20 pts, animates
+inline int                    g_contourSweepCurrentITgt = -1;
+inline int                    g_contourSweepCurrentJSrc = -1;
+
+// Phase 7b Step 3c+ "preview anchors": independent toggle that
+// recomputes the 20 target anchors (rainbow-coloured) and the 20
+// source pivots (rainbow-coloured) from the current target contour /
+// source rim chain — works OUTSIDE of an active sweep, so the user
+// can verify the discretization placement BEFORE pressing Ctrl+Alt+W.
+//
+// Colour: HSV around the full hue circle so anchor 0 is red, anchor
+// 5 is yellow-green, anchor 10 is cyan, anchor 15 is magenta — making
+// the curve direction obvious at a glance and exposing any clustering
+// or maldistribution.
+inline bool g_shapeMatchSweepPreviewAnchors = false;
+
+// Defined inline (C++17) so the single instance lives in the header,
+// avoiding the include-order trap (main.cpp uses RimShape symbols
+// before RimShapeMatch.h is included if we define the global in main.cpp).
+inline RimShape::ContourSweepState g_contourSweepState;
+
+// =====================================================================
+// Phase 7b Step 3d: Silhouette 2D Dense Sweep — globals & UI toggles
+// =====================================================================
+// Master switch for new method. When ON, Ctrl+Alt+W runs the
+// silhouette dense sweep instead of the old sector-based contour
+// sweep. Both paths coexist; only one is active at a time.
+inline bool g_silhouetteSweepEnable = false;
+
+// ---------------------------------------------------------------------
+// CB1 / sweep source-rim discretization method (Step 3d Stage A).
+//   Selects WHICH algorithm populates g_silSwSrcRim2DPreview /
+//   g_silSwSrcPivots2DPreview / g_silSwSrcRim3DPreview etc.
+//   Both methods coexist; the popup CB1 + Ctrl+Alt+W sweep both
+//   consume whichever method is active.
+//
+//   ENVELOPE        = legacy angle-bin + max-radius envelope (closed
+//                     loop topology, wrong for the caudal-RIM arch but
+//                     kept as a fallback / comparison).
+//   MST_LONGEST_PATH = CB0.2 result (grid + KNN + MST + longest path,
+//                      open polyline topology — anatomically correct).
+//
+//   Default is MST_LONGEST_PATH because CB0/CB0.1/CB0.2 visualization
+//   confirmed the source RIM is an open arch; envelope is wrong by
+//   construction.
+// ---------------------------------------------------------------------
+enum SrcRimMethod : int {
+    SRC_RIM_METHOD_ENVELOPE         = 0,
+    SRC_RIM_METHOD_MST_LONGEST_PATH = 1,
+};
+inline int g_silSwSrcRimMethod = SRC_RIM_METHOD_MST_LONGEST_PATH;
+
+// Debug popup toggles (independent of sweep activation).
+//   CB0: raw RIM 2D projection (points only, no ordering / envelope)
+//   CB1: source 2D-projection popup window (envelope + pivots)
+//   CB2: target lower-half + anchors popup window
+// Useful before pressing Ctrl+Alt+W to verify discretization.
+//
+// CB0 rationale (Step 3d, 2026-05-23):
+//   CB1 applies an angle-bin + max-radius "envelope" step that forces
+//   a closed loop. If the actual anatomical RIM is open (an arch — the
+//   typical caudal-RIM case), the envelope will incorrectly close it
+//   across the top of the screen. CB0 bypasses ALL ordering /
+//   filtering / envelope logic — it simply projects every
+//   g_debugSourceRimChain vertex to 2D pixel space and dots them on a
+//   canvas — so the user can visually answer the question:
+//      "Is the anatomical source RIM, as the camera sees it, an open
+//       arch or a closed loop?"
+inline bool g_debugShow2DProjPopup_RawRim = false;   // [0] CB0 — points-only debug
+
+// CB0.1 (Stage 0.1): smoothed RIM 2D projection.
+//   Takes the same raw projection as CB0 and applies two cleanup steps:
+//     1. Grid-cell aggregation: bin points into G×G px cells, replace
+//        each cell's points with a single centroid (LR label = majority).
+//        This kills density-driven noise — clusters become one point.
+//     2. KNN smoothing: for each centroid, find K nearest neighbours
+//        in 2D and replace with their mean position. Iterate N times.
+//        This smooths the resulting curve without imposing topology.
+//   NEITHER step orders the points; the output is still an unordered
+//   point set (so it can be honestly compared against CB0). This is the
+//   stage between CB0 (raw) and CB1 (envelope-closed).
+inline bool  g_debugShow2DProjPopup_RawRimSmoothed = false;   // [0.1]
+inline float g_rawRimSmooth_GridPx       = 15.0f;             // bin cell size
+inline int   g_rawRimSmooth_KnnK         = 5;                 // KNN neighbours
+inline int   g_rawRimSmooth_KnnIters     = 2;                 // KNN passes
+inline bool  g_rawRimSmooth_ShowRawOverlay = true;            // overlay raw
+
+// CB0.2 (Stage 0.2): ordered RIM via MST + longest path.
+//   Takes the cleaned points from CB0.1 (same grid/KNN parameters)
+//   and orders them into an OPEN polyline:
+//     1. Build MST on the cleaned points (Prim, O(N²)).
+//        Edges longer than g_rawRimOrder_MaxEdgePx are filtered out;
+//        if this disconnects the graph, only the largest connected
+//        component is used.
+//     2. Find the longest path in the MST via two-pass BFS.
+//     3. Orient so the start endpoint is closer to PURE_RIGHT 3D
+//        centroid → 2D.
+//     4. Arc-length resample N pivots along the open path.
+//   This is the correct topology for the caudal RIM arch observed
+//   in CB0: no forced loop closure, no envelope artefact.
+inline bool  g_debugShow2DProjPopup_RawRimOrdered = false;    // [0.2]
+inline float g_rawRimOrder_MaxEdgePx   = 100.0f;              // MST edge cutoff
+inline int   g_rawRimOrder_NPivots     = 20;                  // pivots on path
+inline bool  g_rawRimOrder_ShowMST     = false;               // overlay MST
+inline bool  g_rawRimOrder_ShowCleaned = true;                // overlay cleaned
+
+// CB0.3 (Stage 0.3): Manual Sweep Probe — interactive sweep candidate viewer.
+//   Lets the user pick (PIVOT i, ANCHOR j, rotation step k) via sliders
+//   and see the resulting source-on-target overlay in real time. Reuses
+//   the exact same transform formula as evaluateSilhouetteSweepCandidate
+//   so the geometry matches the sweep byte-for-byte.
+//
+//   When `lock_j_eq_i` is ON, j follows i (matches the actual sweep
+//   convention where pivot[i] is paired with anchor[i]). When OFF, the
+//   user can freely explore i ≠ j combinations (which the sweep never
+//   tries, but is useful for debugging).
+//
+//   Rotation is exposed as a timestep (k = 0..n_rotation-1, with
+//   θ = k * (360/n_rotation)). An "animate" toggle steps k forward
+//   automatically so the user can watch the rotation sweep through.
+//
+//   Adds CC orientation indicator (arrow + head-up/FLIPPED text) using
+//   g_liverCC.d_cc to diagnose the cranio-caudal flip issue observed
+//   in Phase 1.
+inline bool  g_debugShow2DProjPopup_OverlayProbe = false;     // [0.3]
+inline int   g_overlayProbe_PivotI        = 0;       // source pivot 0..N-1
+inline int   g_overlayProbe_AnchorJ       = 0;       // target anchor 0..M-1
+inline int   g_overlayProbe_RotStep       = 0;       // rotation step 0..n_rot-1
+inline int   g_overlayProbe_NRotation     = 36;      // matches sweep default
+inline bool  g_overlayProbe_LockJI        = false;   // OFF by default →
+                                                     // independent i / j slider operation;
+                                                     // user can flip ON to match sweep convention
+inline bool  g_overlayProbe_ShowCCArrow   = true;    // CC direction arrow
+inline bool  g_overlayProbe_ShowSrcOverlay = true;   // transformed source
+inline bool  g_overlayProbe_ShowTgtOverlay = true;   // target lower + anchors
+inline bool  g_overlayProbe_AutoAnimate   = false;   // auto-advance k
+inline int   g_overlayProbe_AnimFramesPerStep = 5;   // throttle for animation
+inline int   g_overlayProbe_AnimFrameCounter  = 0;   // internal frame tally
+
+// ---- CB0.3 simulate flags: apply sweep本番's Check A / Check B in CB0.3 ----
+// When ON, CB0.3 shows "REJECTED BY A/B" + tints canvas red for the
+// candidates that sweep本番 would reject. Lets the user verify the
+// guard logic visually before trusting sweep本番.
+inline bool  g_overlayProbe_SimulateCheckA = true;
+inline bool  g_overlayProbe_SimulateCheckB = true;
+
+// =====================================================================
+// Step 3d sweep candidate guards (本番 Ctrl+Alt+W)
+// =====================================================================
+// Check A: rotation magnitude cap. Wraps θ to (-180°, +180°] and
+//   rejects any candidate whose |θ| exceeds g_silSwCheckA_RotCapDeg.
+//   Independent of CC labels — works whenever sweep runs.
+// Check B: CC orientation guard. Requires g_liverCC.valid(). Projects
+//   the CRANIAL→CAUDAL direction (g_liverCC.d_cc) under the candidate
+//   transform and rejects candidates where the on-screen CC vector
+//   deviates from "pointing down" (90° = 6 o'clock = +y_pixel) by
+//   more than g_silSwCheckB_CCToleranceDeg.
+//
+//   Both default ON. ±30° / ±15° per user spec (= "前後30°" and
+//   "5:55-7:05 ≈ ±5° but ±15° gives realistic working tolerance").
+// =====================================================================
+inline bool  g_silSwCheckA_Enable        = true;
+inline float g_silSwCheckA_RotCapDeg     = 30.0f;
+inline bool  g_silSwCheckB_Enable        = true;
+inline float g_silSwCheckB_CCToleranceDeg = 15.0f;
+
+inline bool g_debugShow2DProjPopup_Source = false;
+inline bool g_debugShow2DProjPopup_Target = false;
+
+// Sweep state machine. Same inline-singleton pattern as
+// g_contourSweepState.
+inline RimShape::SilhouetteSweepState g_silhouetteSweep;
+
+// Frame-pacing tuning (mirrors the Step 3c slider semantics).
+inline int  g_silhouetteSweepFrames1 = 60;     // Phase 1 frame budget
+inline int  g_silhouetteSweepFrames2 = 30;     // Phase 2 frame budget
+inline bool g_silhouetteSweepLog     = false;     // default OFF (was true);
+                                                  // turn ON only when debugging
+inline bool g_silhouetteSweepAnimate = true;
+
+// Preview cache: source 2D projection + 20 pivots (rebuilt every frame
+// the source-popup is visible, since the source mesh can move between
+// sweeps and the popup must reflect the current pose).
+// Target cache is rebuilt only when populateDebugTargetBoundary runs
+// (target is static during a session).
+inline std::vector<glm::vec2> g_silSwSrcRim2DPreview;
+inline std::vector<glm::vec2> g_silSwSrcPivots2DPreview;
+inline std::vector<uint8_t>   g_silSwSrcRim2DPreviewLR;   // per dense point
+inline std::vector<uint8_t>   g_silSwSrcPivotsLRPreview;  // per pivot
+inline int                    g_silSwSrcStartIdxPreview = -1;
+inline glm::vec2              g_silSwSrcRightCentroid2DPreview = glm::vec2(0.0f);
+
+// [Stage A] 3D pivot positions computed inline with the MST method.
+// When non-empty, startSilhouetteSweep uses this directly instead of
+// its own closed-loop resampling (which is wrong for an open polyline).
+// Always cleared on a cache miss; populated only by the MST dispatcher;
+// stays empty for the envelope path so the legacy resampling fires.
+inline std::vector<glm::vec3> g_silSwSrcPivots3DPreview;
+
+// [Step 3d revised] AR-silhouette source dense data, parallel to
+// g_silSwSrcRim2DPreview. Populated by silSwBuildSrcPreview, consumed
+// by startSilhouetteSweep to seed src_rim_3D_oriented + src_pivots_3D.
+// Replaces the old g_debugSourceRimChain-based dense source.
+inline std::vector<glm::vec3> g_silSwSrcRim3DPreview;     // dense 3D (mesh-space), oriented
+inline std::vector<int>       g_silSwSrcRimVIdxPreview;   // dense vertex idx, parallel
+
+// [Step 3d2] Source preview cache key. silSwBuildSrcPreview is called
+// every frame the popup is open, but recomputation is expensive
+// (BVH build + extractVisibleVerticesCustom prints ~50ms + log spam).
+// We hash a few mesh-vertex coordinates as a proxy for rigid-pose
+// change and skip the rebuild when the hash matches.
+inline uint64_t g_silSwSrcPreviewCacheHash = 0;
+inline bool     g_silSwSrcPreviewCacheValid = false;
+
+inline std::vector<glm::vec2> g_silSwTgtLower2DPreview;
+inline std::vector<glm::vec2> g_silSwTgtAnchors2DPreview;
+inline glm::vec2              g_silSwTgtCentroid2DPreview = glm::vec2(0.0f);
+
 extern std::vector<float> g_gnUnsignedBdy;
 extern int                g_gnUnsignedBdyW;
 extern int                g_gnUnsignedBdyH;
@@ -383,7 +742,7 @@ extern uint8_t g_activeQuadrantMask;
 //  [Boundary3D] rejected_by_instrument vs accepted). See B-key
 //  visualization for per-scene tuning.
 // =========================================================
-inline float g_instrumentPxThresh = 20.0f;
+inline float g_instrumentPxThresh = 40.0f;
 
 // =========================================================
 //  Source-side silhouette threshold (used by SilhouetteHemi / Key P).
@@ -422,9 +781,9 @@ inline float g_silhouetteSrcCosThresh = 0.40f;
 //       entry; persists until next session.
 // =========================================================
 inline bool  g_ctrlgUseArVisFilter   = false;
-inline float g_ctrlgBetaRimWeight    = 0.0f;
+inline float g_ctrlgBetaRimWeight    = 5.0f;
 inline float g_ctrlgRimTgtThreshPx   = 12.0f;   // matches Shift+P kBoundaryPxTh
-inline bool  g_ctrlgShowRimPairs     = false;
+inline bool  g_ctrlgShowRimPairs     = true;
 
 // [Phase D] Colored RIM pairs viewer (the K-representative variant).
 //   g_ctrlgShowColoredRimPairs : tick to overlay K colored sphere pairs
@@ -463,7 +822,7 @@ inline uint32_t g_ctrlgColoredRimSeed      = 1u;
 //                                When only one is ON, this is ignored.
 // Both default to a state that preserves V3R / V3 byte-identical behaviour:
 //   OFF + (default AND mode is irrelevant since the filter is off).
-inline bool    g_ctrlgUseCaudalOnly       = false;
+inline bool    g_ctrlgUseCaudalOnly       = true;
 inline uint8_t g_ctrlgArvisCaudalCombine  = 0;   // 0=AND (default), 1=OR
 
 // =========================================================
@@ -846,7 +1205,7 @@ inline bool g_cyclicAvailable = false;
 //  full chamfer 評価 → ICP 精錬。v1 はハードコードだが globals 経由
 //  にして将来 UI スライダで露出可能 (Cyclic Tuning panel 想定)。
 // =========================================================
-inline int   g_qcrSubsetK        = 3;     // K=3/4/5 (slider). 3=Fischler-Bolles min sample, 4-5=more stable
+inline int   g_qcrSubsetK        = 5;     // K=3/4/5 (slider). 3=Fischler-Bolles min sample, 4-5=more stable
 inline int   g_qcrMinSpreadSec   = 4;     // 採用 K sector の角度間隔下限 (=60°)
 inline int   g_qcrTopKCandidates = 20;    // Stage 1 → Stage 2 で残す候補数
 inline int   g_qcrMaxTrials      = 100000; // Stage 1 trial 数の上限 (超えたら等間隔サンプリング)
@@ -9606,6 +9965,2471 @@ inline bool runDebugShapeMatchGN()
               << "  in_frame=" << gn.n_in_frame << "/" << src_pts.size()
               << "  t=" << gn_ms << "ms"
               << std::endl;
+
+    return true;
+}
+
+
+// =====================================================================
+// Phase 7b Step 3c — Contour Sweep (Ctrl+Alt+W) driver
+// =====================================================================
+//
+// Three entry points:
+//   startContourSweep()  — initialize state, populate target/source,
+//                          enter Phase 1.
+//   tickContourSweep()   — called every main-loop frame; processes a
+//                          batch of candidates, advances state. Returns
+//                          true while sweep is ongoing.
+//   finishContourSweep() — adopt best T, apply to organ meshes, save
+//                          to PoseLibrary. Mirrors Ctrl+W / Alt+W tail.
+//
+// The mesh is NOT touched during ticks — only the visualization
+// (g_debugShapeMatchBestSrc) updates so the user sees the best-so-far
+// pose live. The mesh is moved exactly once, on finishContourSweep.
+// =====================================================================
+inline bool startContourSweep()
+{
+    auto& S = g_contourSweepState;
+    S = RimShape::ContourSweepState{};   // reset
+
+    if (!liverMesh3D) {
+        std::cout << "[Ctrl+Alt+W] no liverMesh3D — abort" << std::endl;
+        return false;
+    }
+    if (!g_boundaryDistMap.valid) {
+        std::cout << "[Ctrl+Alt+W] g_boundaryDistMap invalid — load depth first"
+                  << std::endl;
+        return false;
+    }
+
+    // Auto-populate source rim chain
+    if (g_debugSourceRimChain.empty()) {
+        std::cout << "[Ctrl+Alt+W] auto-running populateDebugSourceRimChain..."
+                  << std::endl;
+        if (!populateDebugSourceRimChain()) {
+            std::cout << "[Ctrl+Alt+W] failed to populate source rim" << std::endl;
+            return false;
+        }
+    }
+
+    // Auto-populate target contour (2D pixel polyline)
+    if (g_debugTargetContour2D.empty()) {
+        std::cout << "[Ctrl+Alt+W] auto-running populateDebugTargetBoundary..."
+                  << std::endl;
+        if (!populateDebugTargetBoundary()) {
+            std::cout << "[Ctrl+Alt+W] failed to populate target boundary"
+                      << std::endl;
+            return false;
+        }
+    }
+    if (g_debugTargetContour2D.size() < 3) {
+        std::cout << "[Ctrl+Alt+W] target contour too short ("
+                  << g_debugTargetContour2D.size() << " px) — abort"
+                  << std::endl;
+        return false;
+    }
+
+    // Build / cache unsigned boundary distance map (reuse Alt+W's cache)
+    if (!g_gnUnsignedBdyValid) {
+        if (!RimShape::buildUnsignedBoundaryMap(
+                g_boundaryDistMap,
+                g_gnUnsignedBdy, g_gnUnsignedBdyW, g_gnUnsignedBdyH,
+                &std::cout))
+        {
+            std::cout << "[Ctrl+Alt+W] unsigned bdy build failed — abort"
+                      << std::endl;
+            return false;
+        }
+        g_gnUnsignedBdyValid = true;
+    }
+
+    // Configure state
+    S.n_target            = std::max(4, g_shapeMatchSweepNTarget);
+    S.n_source            = std::max(4, g_shapeMatchSweepNSource);
+    S.n_rotation          = std::max(4, g_shapeMatchSweepNRotation);
+    S.total_frames_phase1 = std::max(1, g_shapeMatchSweepFrames1);
+    S.total_frames_phase2 = std::max(1, g_shapeMatchSweepFrames2);
+    S.total_candidates    = S.n_target * S.n_source * S.n_rotation;
+    S.candidates_per_frame =
+        std::max(1, (S.total_candidates + S.total_frames_phase1 - 1)
+                       / S.total_frames_phase1);
+
+    // Phase 1: full-range SECTOR-BASED target anchor extraction
+    //   Plan A (Step 3c++): ANCHOR-COMPLETELY-FIXED.
+    //     The full target boundary is passed to the extractor — centroid,
+    //     sector binning, and medoid selection ALL use target-only data.
+    //     Anchors are therefore invariant under source pose changes
+    //     ("source を動かしても anchor は動かない" guarantee).
+    //
+    //     The "stay near initial pose" filter (bbox by source rim) is
+    //     applied as a per-anchor TAG (tagAnchorsInsideSourceBbox) instead
+    //     of a pre-filter, so it still gates sweep candidates without
+    //     ever moving the anchor positions.
+    {
+        const glm::mat4 view_pre = buildSilhouetteView();
+        const glm::mat4 proj_pre = buildSilhouetteProj();
+        const int W_pre = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+        const int H_pre = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+
+        // 1. Extract anchors from the FULL boundary (no pre-filter).
+        RimShape::extractSectorBasedTargetAnchors3D(
+            g_debugTargetBoundaryPoints,
+            view_pre, proj_pre, W_pre, H_pre,
+            S.n_target,
+            S.tgt_anchors_3D,
+            /*out_sector_idx=*/        nullptr,
+            /*out_centroid_2D=*/       &S.locked_centroid_2D,
+            /*full_boundary_3D_for_centroid=*/ nullptr);
+        RimShape::project3DAnchorsTo2D(
+            S.tgt_anchors_3D, view_pre, proj_pre, W_pre, H_pre,
+            S.tgt_anchors_2D);
+
+        // 2. Tag each anchor inside / outside source bbox + margin.
+        //    Used by tick() to skip out-of-bbox candidates and by
+        //    preview() to render outside anchors in dim gray. Source
+        //    bbox is recomputed each sweep start from the CURRENT pose,
+        //    so the tag set responds to user pose adjustments while the
+        //    anchors themselves stay put.
+        if (g_shapeMatchSweepFilterByRim
+            && !g_debugSourceRimChain.empty() && liverMesh3D)
+        {
+            std::vector<glm::vec3> src_rim_3D;
+            src_rim_3D.reserve(g_debugSourceRimChain.size());
+            const auto& V = liverMesh3D->mVertices;
+            const int nV3 = (int)V.size();
+            for (int idx : g_debugSourceRimChain) {
+                if (idx * 3 + 2 < nV3)
+                    src_rim_3D.emplace_back(V[idx*3], V[idx*3+1], V[idx*3+2]);
+            }
+            RimShape::tagAnchorsInsideSourceBbox(
+                S.tgt_anchors_3D, src_rim_3D,
+                view_pre, proj_pre, W_pre, H_pre,
+                g_shapeMatchSweepFilterMarginPx,
+                S.tgt_anchor_inside_bbox);
+        } else {
+            S.tgt_anchor_inside_bbox.assign(S.tgt_anchors_3D.size(), (uint8_t)1);
+        }
+        int n_inside = 0;
+        for (uint8_t b : S.tgt_anchor_inside_bbox) if (b) n_inside++;
+        std::cout << "[Ctrl+Alt+W] sector-based target anchors: "
+                  << S.tgt_anchors_3D.size() << " / " << S.n_target
+                  << " sectors non-empty"
+                  << "  bbox_inside=" << n_inside << "/"
+                  << S.tgt_anchor_inside_bbox.size()
+                  << " (margin=" << g_shapeMatchSweepFilterMarginPx << "px)"
+                  << std::endl;
+    }
+
+    // -----------------------------------------------------------------
+    // Endpoint constraint setup:
+    //   1. Detect if source rim chain is OPEN (caudal-only) or CLOSED
+    //      (full rim). Closed loops have no meaningful "endpoint" so
+    //      the constraint is disabled in that case.
+    //   2. For open chains, project both source endpoints to 2D and
+    //      determine which target endpoint each maps closer to.
+    //   3. If reversed, build a reversed chain so that after resampling
+    //      src_pivots[0] is geometrically near tgt_anchors[0].
+    // -----------------------------------------------------------------
+    std::vector<int> src_chain_for_sweep = g_debugSourceRimChain;
+    {
+        const auto& V = liverMesh3D->mVertices;
+        const int K = (int)g_debugSourceRimChain.size();
+        bool src_open = true;     // default open
+        bool dir_reversed = false;
+
+        if (K >= 3) {
+            const int idx_A = g_debugSourceRimChain.front();
+            const int idx_B = g_debugSourceRimChain.back();
+            if (idx_A * 3 + 2 < (int)V.size() &&
+                idx_B * 3 + 2 < (int)V.size())
+            {
+                const glm::vec3 src_A_3D(V[idx_A*3],   V[idx_A*3+1], V[idx_A*3+2]);
+                const glm::vec3 src_B_3D(V[idx_B*3],   V[idx_B*3+1], V[idx_B*3+2]);
+                const float endpoint_dist = glm::length(src_A_3D - src_B_3D);
+
+                // Average adjacent-segment length over the chain
+                float sum_seg = 0.0f;
+                int   n_seg = 0;
+                for (int i = 1; i < K; i++) {
+                    const int ia = g_debugSourceRimChain[i-1];
+                    const int ib = g_debugSourceRimChain[i];
+                    if (ia*3+2 >= (int)V.size() || ib*3+2 >= (int)V.size()) continue;
+                    const glm::vec3 pa(V[ia*3], V[ia*3+1], V[ia*3+2]);
+                    const glm::vec3 pb(V[ib*3], V[ib*3+1], V[ib*3+2]);
+                    sum_seg += glm::length(pa - pb);
+                    n_seg++;
+                }
+                const float avg_seg = (n_seg > 0) ? (sum_seg / float(n_seg)) : 0.0f;
+                // Open if endpoint distance >> typical adjacent step
+                src_open = (avg_seg > 1e-6f && endpoint_dist > avg_seg * 5.0f);
+
+                if (g_shapeMatchSweepUseEndpointConstraint && src_open
+                    && S.tgt_anchors_2D.size() >= 2)
+                {
+                    // Project source endpoints to 2D using AR camera
+                    const glm::mat4 view_m = buildSilhouetteView();
+                    const glm::mat4 proj_m = buildSilhouetteProj();
+                    auto project_2d = [&](const glm::vec3& p) -> glm::vec2 {
+                        const glm::vec4 clip = (proj_m * view_m) * glm::vec4(p, 1.0f);
+                        if (std::abs(clip.w) < 1e-9f) return glm::vec2(-1e6f, -1e6f);
+                        const float ndcx = clip.x / clip.w;
+                        const float ndcy = clip.y / clip.w;
+                        return glm::vec2(
+                            (ndcx + 1.0f) * 0.5f * float(g_boundaryDistMap.width),
+                            (1.0f - ndcy) * 0.5f * float(g_boundaryDistMap.height));
+                    };
+                    const glm::vec2 src_A_2D = project_2d(src_A_3D);
+                    const glm::vec2 src_B_2D = project_2d(src_B_3D);
+                    // tgt_anchors_2D[0] and back() are the anchors closest
+                    // to the contour's two ends after arc-length resampling.
+                    const glm::vec2 tgt_A_2D = S.tgt_anchors_2D.front();
+                    const glm::vec2 tgt_B_2D = S.tgt_anchors_2D.back();
+
+                    const float d_fwd =
+                        glm::length(src_A_2D - tgt_A_2D)
+                        + glm::length(src_B_2D - tgt_B_2D);
+                    const float d_rev =
+                        glm::length(src_A_2D - tgt_B_2D)
+                        + glm::length(src_B_2D - tgt_A_2D);
+                    dir_reversed = (d_rev < d_fwd);
+
+                    if (dir_reversed) {
+                        std::reverse(src_chain_for_sweep.begin(),
+                                     src_chain_for_sweep.end());
+                    }
+
+                    std::cout << "[Ctrl+Alt+W] endpoint constraint:"
+                              << "  src_open=Y  dir="
+                              << (dir_reversed ? "REVERSED" : "forward")
+                              << "  d_fwd=" << d_fwd << "px"
+                              << "  d_rev=" << d_rev << "px"
+                              << "  tolerance=" << g_shapeMatchSweepEndpointTolerance
+                              << std::endl;
+                } else if (!src_open) {
+                    std::cout << "[Ctrl+Alt+W] endpoint constraint: src is CLOSED"
+                              << " (endpoint_dist=" << endpoint_dist
+                              << ", avg_seg=" << avg_seg
+                              << ") — constraint disabled"
+                              << std::endl;
+                }
+            }
+        }
+        g_shapeMatchSweepSrcIsOpenDiag   = src_open;
+        g_shapeMatchSweepDirReversedDiag = dir_reversed;
+        // Persist for Phase 2
+        S.src_rim_chain_used = src_chain_for_sweep;
+        S.dir_reversed = dir_reversed;
+        S.endpoint_constraint_active =
+            g_shapeMatchSweepUseEndpointConstraint && src_open;
+    }
+
+    // Resample source pivots and capture each pivot's nearest rim-chain
+    // mesh vertex index — that gives us the source LR/CC label per pivot
+    // for the Phase 7b Step 3c++ label-based orientation lock below.
+    std::vector<int> src_pivot_vert_idx;
+    RimShape::arclengthResampleRim3D(
+        src_chain_for_sweep, liverMesh3D->mVertices,
+        S.n_source, S.src_pivots_3D,
+        &src_pivot_vert_idx);
+
+    // -----------------------------------------------------------------
+    // Phase 7b Step 3c++: Label-based orientation lock setup.
+    //   Source side: inherit PURE_RIGHT / PURE_LEFT / BOUNDARY from
+    //                LiverLeftRightLabel and CRANIAL/CAUDAL from
+    //                LiverCranioCaudalLabel via src_pivot_vert_idx.
+    //   Target side: classify each anchor as SS_LR_RIGHT / LEFT /
+    //                AMBIGUOUS by 2D x vs locked_centroid_2D ± band,
+    //                and CC equivalent on y. AMBIGUOUS = inside the
+    //                neutral band — the image-midline counterpart to
+    //                source's BOUNDARY label.
+    //
+    // If either label set is missing, auto-degrade the lock to OFF
+    // with a diagnostic line — Check B (rot cap) still applies but
+    // Check A becomes a pass-through.
+    // -----------------------------------------------------------------
+    {
+        const bool lr_ready =
+            g_liverLR.valid()
+            && (int)g_liverLR.labels.size()
+                   == (int)(liverMesh3D->mVertices.size() / 3);
+        const bool cc_ready =
+            g_liverCC.valid()
+            && (int)g_liverCC.labels.size()
+                   == (int)(liverMesh3D->mVertices.size() / 3);
+        g_shapeMatchSweepLabelLockReadyDiag = (lr_ready && cc_ready);
+
+        S.src_pivot_lr_label.clear();
+        S.src_pivot_cc_label.clear();
+        S.src_pivot_lr_label.reserve(S.src_pivots_3D.size());
+        S.src_pivot_cc_label.reserve(S.src_pivots_3D.size());
+        if (lr_ready && cc_ready
+            && src_pivot_vert_idx.size() == S.src_pivots_3D.size())
+        {
+            for (int vi : src_pivot_vert_idx) {
+                if (vi < 0 || vi >= (int)g_liverLR.labels.size()
+                           || vi >= (int)g_liverCC.labels.size())
+                {
+                    // Defensive — treat unknown as BOUNDARY/CAUDAL so it
+                    // pairs with anything (passes Check A trivially).
+                    S.src_pivot_lr_label.push_back(
+                        (uint8_t)LiverLeftRightLabel::BOUNDARY);
+                    S.src_pivot_cc_label.push_back(
+                        (uint8_t)LiverCranioCaudalLabel::CAUDAL);
+                    continue;
+                }
+                S.src_pivot_lr_label.push_back(g_liverLR.labels[vi]);
+                S.src_pivot_cc_label.push_back(g_liverCC.labels[vi]);
+            }
+        } else {
+            // No valid labels — fill with BOUNDARY/CAUDAL so the
+            // skip-check is a no-op even if it accidentally fires.
+            S.src_pivot_lr_label.assign(
+                S.src_pivots_3D.size(),
+                (uint8_t)LiverLeftRightLabel::BOUNDARY);
+            S.src_pivot_cc_label.assign(
+                S.src_pivots_3D.size(),
+                (uint8_t)LiverCranioCaudalLabel::CAUDAL);
+        }
+
+        // Classify target anchors by their 2D screen position relative
+        // to the locked centroid. Screen +x → patient's RIGHT, screen
+        // -y (smaller y in pixel coords) → CRANIAL, by Apply-Init-Pose
+        // convention.
+        const float band = std::max(0.0f, g_shapeMatchSweepNeutralBandPx);
+        S.tgt_anchor_screen_lr.clear();
+        S.tgt_anchor_screen_cc.clear();
+        S.tgt_anchor_screen_lr.reserve(S.tgt_anchors_2D.size());
+        S.tgt_anchor_screen_cc.reserve(S.tgt_anchors_2D.size());
+        int n_R = 0, n_L = 0, n_Ax = 0, n_C = 0, n_K = 0, n_Ay = 0;
+        for (const auto& a2d : S.tgt_anchors_2D) {
+            const float dx = a2d.x - S.locked_centroid_2D.x;
+            const float dy = a2d.y - S.locked_centroid_2D.y;
+            uint8_t lr = RimShape::SS_LR_AMBIGUOUS;
+            if      (dx >  band) { lr = RimShape::SS_LR_RIGHT;   n_R++; }
+            else if (dx < -band) { lr = RimShape::SS_LR_LEFT;    n_L++; }
+            else                 {                                n_Ax++; }
+            uint8_t cc = RimShape::SS_CC_AMBIGUOUS;
+            if      (dy < -band) { cc = RimShape::SS_CC_CRANIAL; n_C++; }
+            else if (dy >  band) { cc = RimShape::SS_CC_CAUDAL;  n_K++; }
+            else                 {                                n_Ay++; }
+            S.tgt_anchor_screen_lr.push_back(lr);
+            S.tgt_anchor_screen_cc.push_back(cc);
+        }
+
+        S.orientation_lock_active =
+            g_shapeMatchSweepUseOrientationLock && lr_ready && cc_ready;
+        std::cout << "[Ctrl+Alt+W] orientation lock: "
+                  << (S.orientation_lock_active ? "ON (label)" : "OFF")
+                  << "  rot_cap=" << g_shapeMatchSweepRotationLockDeg << "°"
+                  << "  band=" << band << "px"
+                  << "  LR_ready=" << (lr_ready ? "Y" : "N")
+                  << "  CC_ready=" << (cc_ready ? "Y" : "N")
+                  << "  centroid_2D=(" << S.locked_centroid_2D.x
+                  << "," << S.locked_centroid_2D.y << ")"
+                  << "  tgt LR R/L/Amb=" << n_R << "/" << n_L << "/" << n_Ax
+                  << "  CC C/K/Amb="    << n_C << "/" << n_K << "/" << n_Ay
+                  << std::endl;
+    }
+
+    // -----------------------------------------------------------------
+    // Backproject target anchors (2D pixel coords) to world 3D on the
+    // plane z = source_rim_centroid.z so they can be drawn next to the
+    // source pivots in the AR scene. The exact depth doesn't matter
+    // for the visualization — only that target dots appear at the
+    // expected screen positions and roughly the right scene depth.
+    // -----------------------------------------------------------------
+
+    // ---- Target anchor visualization (sector-based) -----------------
+    // The new sector-based extraction already gives us 3D world points
+    // (medoids of 3D boundary points within each angular sector), so
+    // no back-projection is needed — just copy them out for rendering.
+    g_contourSweepTgtAnchors3D = S.tgt_anchors_3D;
+    g_contourSweepSrcPivotsTrial.clear();   // populated each tick
+    g_contourSweepCurrentITgt = -1;
+    g_contourSweepCurrentJSrc = -1;
+
+    if ((int)S.tgt_anchors_2D.size() < 3 ||
+        (int)S.src_pivots_3D.size()  < 3) {
+        std::cout << "[Ctrl+Alt+W] resample failed (tgt="
+                  << S.tgt_anchors_2D.size()
+                  << " src=" << S.src_pivots_3D.size() << ") — abort"
+                  << std::endl;
+        return false;
+    }
+
+    S.active = true;
+    S.phase  = 1;
+    S.candidate_idx = 0;
+    S.current_frame = 0;
+    S.best_cost = 1e18;
+    S.cost_history.clear();
+    S.cost_history.reserve(S.total_frames_phase1 + S.total_frames_phase2);
+
+    std::cout << "[Ctrl+Alt+W] sweep started.  Phase 1: "
+              << S.n_target << "×" << S.n_source << "×" << S.n_rotation
+              << " = " << S.total_candidates << " candidates,  "
+              << S.candidates_per_frame << " per frame,  ~"
+              << S.total_frames_phase1 << " frames"
+              << std::endl;
+    return true;
+}
+
+
+// ---------------------------------------------------------------------
+// initPhase2InternalContourSweep
+//   Refine discretization around Phase 1 best.
+// ---------------------------------------------------------------------
+inline void initPhase2InternalContourSweep()
+{
+    auto& S = g_contourSweepState;
+
+    // Phase 1 best position in t ∈ [0, 1]
+    const float t_tgt_best = (float(S.phase1_best_i_tgt) + 0.5f)
+                                 / float(S.n_target);
+    const float t_src_best = (float(S.phase1_best_j_src) + 0.5f)
+                                 / float(S.n_source);
+
+    // Phase 2: re-anchor with narrower range (±1 phase-1 step)
+    S.phase2_radius_target_t = 1.0f / float(S.n_target);
+    S.phase2_radius_source_t = 1.0f / float(S.n_source);
+    S.phase2_radius_rot_deg  =
+        std::max(2.0f, 360.0f / float(S.n_rotation));
+
+    // Sector-based Phase 2 target anchor refinement.
+    //   Use angular subrange centered on the Phase 1 best sector.
+    //   half_range = full sector size of Phase 1 → ±1 sector slack.
+    {
+        const glm::mat4 view_p2 = buildSilhouetteView();
+        const glm::mat4 proj_p2 = buildSilhouetteProj();
+        const int W_p2 = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+        const int H_p2 = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+        const float kTwoPi = 6.283185307179586f;
+        float center_angle = S.phase1_best_center_angle;
+        if (center_angle <= 0.0f && S.n_target > 0) {
+            center_angle = (float(S.phase1_best_i_tgt) + 0.5f)
+                              * (kTwoPi / float(S.n_target));
+        }
+        const float half_range = (kTwoPi / float(S.n_target));
+
+        // Plan A: pass FULL boundary subrange (no pre-filter); the
+        // bbox tag step further down handles the spatial gate.
+        RimShape::extractSectorBasedTargetAnchors3DSubrange(
+            g_debugTargetBoundaryPoints,
+            view_p2, proj_p2, W_p2, H_p2,
+            center_angle, half_range,
+            S.n_target,
+            S.tgt_anchors_3D,
+            /*full_boundary_3D_for_centroid=*/ nullptr);
+        RimShape::project3DAnchorsTo2D(
+            S.tgt_anchors_3D, view_p2, proj_p2, W_p2, H_p2,
+            S.tgt_anchors_2D);
+
+        // Re-tag bbox membership for the new anchor set.
+        if (g_shapeMatchSweepFilterByRim
+            && !g_debugSourceRimChain.empty() && liverMesh3D)
+        {
+            std::vector<glm::vec3> src_rim_3D;
+            src_rim_3D.reserve(g_debugSourceRimChain.size());
+            const auto& V = liverMesh3D->mVertices;
+            const int nV3 = (int)V.size();
+            for (int idx : g_debugSourceRimChain) {
+                if (idx * 3 + 2 < nV3)
+                    src_rim_3D.emplace_back(V[idx*3], V[idx*3+1], V[idx*3+2]);
+            }
+            RimShape::tagAnchorsInsideSourceBbox(
+                S.tgt_anchors_3D, src_rim_3D,
+                view_p2, proj_p2, W_p2, H_p2,
+                g_shapeMatchSweepFilterMarginPx,
+                S.tgt_anchor_inside_bbox);
+        } else {
+            S.tgt_anchor_inside_bbox.assign(S.tgt_anchors_3D.size(), (uint8_t)1);
+        }
+
+        std::cout << "[Ctrl+Alt+W] Phase 2 sector subrange: center="
+                  << center_angle * 57.29578f << "°  half_range="
+                  << half_range * 57.29578f << "°  anchors="
+                  << S.tgt_anchors_3D.size() << std::endl;
+    }
+    // Phase 2 must use the SAME (possibly reversed) chain that Phase 1
+    // used so t_src_best (a parameter in Phase 1's chain coordinate) is
+    // interpreted correctly.
+    const std::vector<int>& chain_for_phase2 =
+        S.src_rim_chain_used.empty() ? g_debugSourceRimChain
+                                     : S.src_rim_chain_used;
+    std::vector<int> phase2_src_vert_idx;
+    RimShape::arclengthResampleRim3DSubrange(
+        chain_for_phase2, liverMesh3D->mVertices,
+        t_src_best, S.phase2_radius_source_t,
+        S.n_source, S.src_pivots_3D,
+        &phase2_src_vert_idx);
+
+    // Refresh anchor visualization for Phase 2: sector-based extraction
+    // gave us 3D anchors directly; just copy them out for rendering.
+    g_contourSweepTgtAnchors3D = S.tgt_anchors_3D;
+
+    // -----------------------------------------------------------------
+    // Phase 7b Step 3c++: Recompute label arrays + screen-side for the
+    // narrower Phase-2 set. Source mesh has NOT moved (sweep applies
+    // best T only in finishContourSweep), so anatomical labels carry
+    // over via vertex index; target-anchor screen-side is recomputed
+    // since the anchors are different points.
+    // -----------------------------------------------------------------
+    if (S.orientation_lock_active)
+    {
+        const bool lr_ready =
+            g_liverLR.valid()
+            && (int)g_liverLR.labels.size()
+                   == (int)(liverMesh3D->mVertices.size() / 3);
+        const bool cc_ready =
+            g_liverCC.valid()
+            && (int)g_liverCC.labels.size()
+                   == (int)(liverMesh3D->mVertices.size() / 3);
+
+        S.src_pivot_lr_label.clear();
+        S.src_pivot_cc_label.clear();
+        S.src_pivot_lr_label.reserve(S.src_pivots_3D.size());
+        S.src_pivot_cc_label.reserve(S.src_pivots_3D.size());
+        if (lr_ready && cc_ready
+            && phase2_src_vert_idx.size() == S.src_pivots_3D.size())
+        {
+            for (int vi : phase2_src_vert_idx) {
+                if (vi < 0 || vi >= (int)g_liverLR.labels.size()
+                           || vi >= (int)g_liverCC.labels.size())
+                {
+                    S.src_pivot_lr_label.push_back(
+                        (uint8_t)LiverLeftRightLabel::BOUNDARY);
+                    S.src_pivot_cc_label.push_back(
+                        (uint8_t)LiverCranioCaudalLabel::CAUDAL);
+                    continue;
+                }
+                S.src_pivot_lr_label.push_back(g_liverLR.labels[vi]);
+                S.src_pivot_cc_label.push_back(g_liverCC.labels[vi]);
+            }
+        } else {
+            S.src_pivot_lr_label.assign(
+                S.src_pivots_3D.size(),
+                (uint8_t)LiverLeftRightLabel::BOUNDARY);
+            S.src_pivot_cc_label.assign(
+                S.src_pivots_3D.size(),
+                (uint8_t)LiverCranioCaudalLabel::CAUDAL);
+        }
+
+        const float band = std::max(0.0f, g_shapeMatchSweepNeutralBandPx);
+        S.tgt_anchor_screen_lr.clear();
+        S.tgt_anchor_screen_cc.clear();
+        S.tgt_anchor_screen_lr.reserve(S.tgt_anchors_2D.size());
+        S.tgt_anchor_screen_cc.reserve(S.tgt_anchors_2D.size());
+        for (const auto& a2d : S.tgt_anchors_2D) {
+            const float dx = a2d.x - S.locked_centroid_2D.x;
+            const float dy = a2d.y - S.locked_centroid_2D.y;
+            uint8_t lr = RimShape::SS_LR_AMBIGUOUS;
+            if      (dx >  band) lr = RimShape::SS_LR_RIGHT;
+            else if (dx < -band) lr = RimShape::SS_LR_LEFT;
+            uint8_t cc = RimShape::SS_CC_AMBIGUOUS;
+            if      (dy < -band) cc = RimShape::SS_CC_CRANIAL;
+            else if (dy >  band) cc = RimShape::SS_CC_CAUDAL;
+            S.tgt_anchor_screen_lr.push_back(lr);
+            S.tgt_anchor_screen_cc.push_back(cc);
+        }
+    }
+
+    S.phase = 2;
+    S.candidate_idx = 0;
+    S.current_frame = 0;
+    S.total_candidates = S.n_target * S.n_source * S.n_rotation;
+    S.candidates_per_frame =
+        std::max(1, (S.total_candidates + S.total_frames_phase2 - 1)
+                       / S.total_frames_phase2);
+
+    std::cout << "[Ctrl+Alt+W] Phase 2 start.  fine around"
+              << "  t_tgt=" << t_tgt_best
+              << "  t_src=" << t_src_best
+              << "  θ=" << S.phase1_best_theta_deg << "°"
+              << "  rot_radius=" << S.phase2_radius_rot_deg << "°"
+              << std::endl;
+}
+
+
+// ---------------------------------------------------------------------
+// tickContourSweep
+//   Process one frame's worth of candidates. Returns true if more
+//   work to do (caller should keep calling), false if done.
+// ---------------------------------------------------------------------
+inline bool tickContourSweep()
+{
+    auto& S = g_contourSweepState;
+    if (!S.active) return false;
+    if (S.phase < 1 || S.phase > 2) { S.active = false; return false; }
+
+    const glm::mat4 view = buildSilhouetteView();
+    const glm::mat4 proj = buildSilhouetteProj();
+    const int W = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+    const int H = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+
+    const int batch_start = S.candidate_idx;
+    // When animation is OFF, finish the phase in a single tick (no
+    // per-frame batching). Otherwise honor candidates_per_frame.
+    const int batch_end   = g_shapeMatchSweepAnimate
+        ? std::min(S.candidate_idx + S.candidates_per_frame, S.total_candidates)
+        : S.total_candidates;
+
+    int n_evaluated = 0;
+    int n_improved  = 0;
+    int n_skipped_endpoint = 0;
+    int n_skipped_label    = 0;   // Phase 7b Step 3c++: Check A label LR/CC
+    int n_skipped_rotation = 0;   // Phase 7b Step 3c++: Check B θ cap
+    int n_skipped_bbox     = 0;   // Phase 7b Step 3c++: Plan A bbox tag
+    // Pre-compute Check B threshold in radians once per batch.
+    const float kPi    = 3.141592653589793f;
+    const float kTwoPi = 6.283185307179586f;
+    const float rot_lock_rad =
+        g_shapeMatchSweepRotationLockDeg * (kPi / 180.0f);
+    // Track best-in-batch separately so we can show a trial pose
+    // (yellow) every frame even if no global improvement happened.
+    glm::mat4 best_in_batch_T = S.best_T;
+    double    best_in_batch_cost = 1e18;
+    int       best_in_batch_i_tgt = -1;
+    int       best_in_batch_j_src = -1;
+    for (int c = batch_start; c < batch_end; c++) {
+        // Decode (i_tgt outermost, j_src middle, k_rot innermost) so the
+        // animation sweeps rotations fastest, source pivots next, target
+        // anchors slowest — visually intuitive.
+        const int i_tgt = c / (S.n_source * S.n_rotation);
+        const int j_src = (c / S.n_rotation) % S.n_source;
+        const int k_rot = c % S.n_rotation;
+
+        // Endpoint constraint (Phase 1 only). After Phase 1's resample
+        // (possibly with reversed chain), i_tgt=0 and j_src=0 both
+        // correspond to "end A" of the curve. So |j_src - i_tgt|
+        // measures the arc-length offset of the implied correspondence.
+        // tolerance=0 means strict diagonal, tolerance=N means no
+        // constraint.
+        if (S.phase == 1 && S.endpoint_constraint_active) {
+            if (std::abs(j_src - i_tgt) > g_shapeMatchSweepEndpointTolerance) {
+                n_skipped_endpoint++;
+                continue;
+            }
+        }
+
+        // -------------------------------------------------------------
+        // Phase 7b Step 3c++ Plan A — Check C: bbox active-mask.
+        // Anchors are FIXED (target-only); the source-bbox filter is
+        // applied here as a per-anchor skip. Source movement updates
+        // S.tgt_anchor_inside_bbox at sweep start but leaves the anchor
+        // positions themselves alone.
+        // -------------------------------------------------------------
+        if (g_shapeMatchSweepFilterByRim
+            && i_tgt < (int)S.tgt_anchor_inside_bbox.size()
+            && !S.tgt_anchor_inside_bbox[i_tgt])
+        {
+            n_skipped_bbox++;
+            continue;
+        }
+
+        // -------------------------------------------------------------
+        // Phase 7b Step 3c++ — Check A: label-based LR/CC orientation
+        // lock. Source pivot's anatomical PCA label vs target anchor's
+        // screen-side classification. BOUNDARY (source LR) and
+        // AMBIGUOUS (target screen) always pass — those are the
+        // designed-in "neutral zones" that handle 屈曲帯 / midline.
+        // -------------------------------------------------------------
+        if (S.orientation_lock_active
+            && j_src < (int)S.src_pivot_lr_label.size()
+            && i_tgt < (int)S.tgt_anchor_screen_lr.size())
+        {
+            const uint8_t lr_s = S.src_pivot_lr_label[j_src];
+            const uint8_t lr_t = S.tgt_anchor_screen_lr[i_tgt];
+            const uint8_t cc_s = S.src_pivot_cc_label[j_src];
+            const uint8_t cc_t = S.tgt_anchor_screen_cc[i_tgt];
+
+            // LR mismatch (PURE_RIGHT ↔ SS_LR_LEFT or vice versa)
+            const bool lr_bad =
+                (lr_s == (uint8_t)LiverLeftRightLabel::PURE_RIGHT
+                    && lr_t == RimShape::SS_LR_LEFT)
+             || (lr_s == (uint8_t)LiverLeftRightLabel::PURE_LEFT
+                    && lr_t == RimShape::SS_LR_RIGHT);
+            // CC mismatch (CRANIAL ↔ SS_CC_CAUDAL or vice versa)
+            const bool cc_bad =
+                (cc_s == (uint8_t)LiverCranioCaudalLabel::CRANIAL
+                    && cc_t == RimShape::SS_CC_CAUDAL)
+             || (cc_s == (uint8_t)LiverCranioCaudalLabel::CAUDAL
+                    && cc_t == RimShape::SS_CC_CRANIAL);
+
+            if (lr_bad || cc_bad) {
+                n_skipped_label++;
+                continue;
+            }
+        }
+
+        float theta_deg = 0.0f;
+        if (S.phase == 1) {
+            theta_deg = float(k_rot) * 360.0f / float(S.n_rotation);
+        } else {
+            // Phase 2: ±radius_rot_deg around phase 1 best
+            const float t = (float(k_rot) + 0.5f) / float(S.n_rotation);
+            theta_deg = S.phase1_best_theta_deg
+                          + (2.0f * t - 1.0f) * S.phase2_radius_rot_deg;
+        }
+
+        // -------------------------------------------------------------
+        // Phase 7b Step 3c++ — Check B: θ_rotation magnitude cap.
+        // Independent secondary defense: even if Check A passes (LR-
+        // symmetric rim shapes can fool it), a θ magnitude above the
+        // cap is exactly the image-plane flip the user is complaining
+        // about. Applies in Phase 1 AND Phase 2.
+        // -------------------------------------------------------------
+        if (S.orientation_lock_active) {
+            float th_rad = theta_deg * (kPi / 180.0f);
+            while (th_rad >  kPi) th_rad -= kTwoPi;
+            while (th_rad < -kPi) th_rad += kTwoPi;
+            if (std::abs(th_rad) > rot_lock_rad) {
+                n_skipped_rotation++;
+                continue;
+            }
+        }
+
+        glm::mat4 T;
+        const double cost = RimShape::evaluateContourSweepCandidate(
+            S.tgt_anchors_2D, S.src_pivots_3D,
+            i_tgt, j_src, theta_deg,
+            view, proj, W, H,
+            g_gnUnsignedBdy, g_gnUnsignedBdyW, g_gnUnsignedBdyH,
+            T);
+        n_evaluated++;
+
+        if (cost < best_in_batch_cost) {
+            best_in_batch_cost  = cost;
+            best_in_batch_T     = T;
+            best_in_batch_i_tgt = i_tgt;
+            best_in_batch_j_src = j_src;
+        }
+
+        if (cost < S.best_cost) {
+            S.best_cost      = cost;
+            S.best_T         = T;
+            S.best_i_tgt     = i_tgt;
+            S.best_j_src     = j_src;
+            S.best_theta_deg = theta_deg;
+            n_improved++;
+        }
+    }
+    S.candidate_idx = batch_end;
+    S.cost_history.push_back(S.best_cost);
+    S.current_frame++;
+
+    // ---- Trial-pose visualization (yellow) ------------------------
+    // Updated EVERY frame regardless of global-best improvement so the
+    // mesh always shows motion during the sweep. Best-in-batch may be
+    // worse than the global best (since the global best from earlier
+    // batches isn't redone), but that's the point — the user sees what
+    // is currently being tried at this batch.
+    if (best_in_batch_cost < 1e17) {
+        g_contourSweepTrialSrc.clear();
+        g_contourSweepTrialSrc.reserve(g_debugSourceRimChain.size());
+        const auto& V = liverMesh3D->mVertices;
+        const int nV3 = (int)V.size();
+        for (int idx : g_debugSourceRimChain) {
+            if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+            const glm::vec4 p4 = best_in_batch_T *
+                glm::vec4(V[idx*3], V[idx*3+1], V[idx*3+2], 1.0f);
+            g_contourSweepTrialSrc.emplace_back(p4.x, p4.y, p4.z);
+        }
+        g_contourSweepShowTrial = true;
+
+        // Source pivot trial positions: 20 pivots transformed by
+        // best-in-batch T so they land on/around the yellow trial rim.
+        g_contourSweepSrcPivotsTrial.clear();
+        g_contourSweepSrcPivotsTrial.reserve(S.src_pivots_3D.size());
+        for (const auto& p : S.src_pivots_3D) {
+            const glm::vec4 p4 = best_in_batch_T * glm::vec4(p, 1.0f);
+            g_contourSweepSrcPivotsTrial.emplace_back(p4.x, p4.y, p4.z);
+        }
+        // Current correspondence indices for cyan highlight
+        g_contourSweepCurrentITgt = best_in_batch_i_tgt;
+        g_contourSweepCurrentJSrc = best_in_batch_j_src;
+    }
+
+    // ---- Global-best visualization (red) --------------------------
+    // Updated only when a new global best is found, so the user sees
+    // a stable "current converged answer" that snaps forward on
+    // improvements.
+    if (n_improved > 0) {
+        g_debugShapeMatchBestSrc.clear();
+        g_debugShapeMatchBestSrc.reserve(g_debugSourceRimChain.size());
+        const auto& V = liverMesh3D->mVertices;
+        const int nV3 = (int)V.size();
+        for (int idx : g_debugSourceRimChain) {
+            if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+            const glm::vec4 p4 = S.best_T *
+                glm::vec4(V[idx*3], V[idx*3+1], V[idx*3+2], 1.0f);
+            g_debugShapeMatchBestSrc.emplace_back(p4.x, p4.y, p4.z);
+        }
+        g_debugShapeMatchBestTransform = S.best_T;
+        g_debugShapeMatchBestCost      = S.best_cost;
+        g_showDebugShapeMatch          = true;  // ensure red dots visible
+    }
+
+    if (g_shapeMatchSweepLog) {
+        // Throttle to keep terminal readable on 600-frame sweeps:
+        //   - always log when improved (something interesting happened)
+        //   - always log on the last batch of the phase (sets up
+        //     "Phase X done." line nicely)
+        //   - otherwise every 30 frames so progress is still visible
+        const bool is_last_batch = (S.candidate_idx >= S.total_candidates);
+        const bool periodic      = (S.current_frame % 30 == 0);
+        const bool worth_logging = (n_improved > 0) || is_last_batch || periodic;
+        if (worth_logging) {
+            std::cout << "[Ctrl+Alt+W] phase=" << S.phase
+                      << "  frame=" << S.current_frame
+                      << "  c=" << batch_start << "-" << batch_end
+                      << "/" << S.total_candidates
+                      << "  best=" << S.best_cost << "px"
+                      << "  i=" << S.best_i_tgt
+                      << "  j=" << S.best_j_src
+                      << "  θ=" << S.best_theta_deg
+                      << "  improved+" << n_improved << "/" << n_evaluated
+                      << "  ep_skip=" << n_skipped_endpoint
+                      << "  lbl_skip=" << n_skipped_label
+                      << "  rot_skip=" << n_skipped_rotation
+                      << "  bbox_skip=" << n_skipped_bbox
+                      << std::endl;
+        }
+    }
+
+    // Phase transition
+    if (S.candidate_idx >= S.total_candidates) {
+        if (S.phase == 1) {
+            S.phase1_best_i_tgt     = S.best_i_tgt;
+            S.phase1_best_j_src     = S.best_j_src;
+            S.phase1_best_theta_deg = S.best_theta_deg;
+            // Recover the angular center of the best sector by
+            // re-projecting the best 3D anchor and computing its
+            // angle from the boundary centroid. This is what Phase 2
+            // re-sectors around.
+            //
+            // Plan A simplification: S.locked_centroid_2D already holds
+            // the full-boundary centroid (target-only, source-invariant)
+            // from Phase 1 setup. No re-extraction needed.
+            if (S.best_i_tgt >= 0
+                && S.best_i_tgt < (int)S.tgt_anchors_3D.size())
+            {
+                const glm::mat4 view_t = buildSilhouetteView();
+                const glm::mat4 proj_t = buildSilhouetteProj();
+                const int W_t = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+                const int H_t = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+                std::vector<glm::vec2> best_anchor_2D;
+                RimShape::project3DAnchorsTo2D(
+                    { S.tgt_anchors_3D[S.best_i_tgt] },
+                    view_t, proj_t, W_t, H_t, best_anchor_2D);
+                if (!best_anchor_2D.empty()) {
+                    const glm::vec2 d =
+                        best_anchor_2D[0] - S.locked_centroid_2D;
+                    float theta = std::atan2(d.y, d.x);
+                    const float kTwoPi = 6.283185307179586f;
+                    if (theta < 0.0f) theta += kTwoPi;
+                    S.phase1_best_center_angle = theta;
+                }
+            }
+            std::cout << "[Ctrl+Alt+W] Phase 1 done.  best cost=" << S.best_cost
+                      << " at (i=" << S.best_i_tgt
+                      << ", j=" << S.best_j_src
+                      << ", θ=" << S.best_theta_deg << "°)"
+                      << "  center_angle="
+                      << S.phase1_best_center_angle * 57.29578f << "°"
+                      << std::endl;
+            initPhase2InternalContourSweep();
+            return true;
+        } else {
+            std::cout << "[Ctrl+Alt+W] Phase 2 done.  final cost="
+                      << S.best_cost
+                      << " at (i=" << S.best_i_tgt
+                      << ", j=" << S.best_j_src
+                      << ", θ=" << S.best_theta_deg << "°)"
+                      << std::endl;
+            S.phase = 3;       // done flag
+            S.active = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// ---------------------------------------------------------------------
+// finishContourSweep
+//   Sweep completion lives in main.cpp because the post-apply pose-
+//   save flow uses gUI / g_stepStartTime / SaveCriterion / poseSave*
+//   which are defined in main.cpp / PoseLibrary.h (included AFTER this
+//   header). The actual logic mirrors Ctrl+W / Alt+W tail exactly;
+//   see the tickContourSweep path inside main.cpp's render loop.
+// ---------------------------------------------------------------------
+
+
+// =====================================================================
+// Phase 7b Step 3d: Silhouette 2D Dense Sweep — sweep functions
+//
+//   startSilhouetteSweep()  — Phase 0: project source rim, find right
+//                             start, re-orient clockwise, resample 20
+//                             pivots; build target lower-half, find
+//                             right end, resample 20 anchors.
+//   tickSilhouetteSweep()   — Phase 1 (720 cands) → Phase 2 (180 cands).
+//                             Returns true while sweep is ongoing.
+//   finishSilhouetteSweep() — adopt best T, apply to organ meshes,
+//                             save to PoseLibrary. Lives in main.cpp
+//                             (same reason as finishContourSweep).
+//
+//   The mesh is NOT touched during ticks — only g_debugShapeMatchBestSrc
+//   updates so the user sees the best-so-far pose. Mesh is moved exactly
+//   once, on finishSilhouetteSweep.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// silSwBuildDenseSrcRim3DOriented
+//   Helper: given a chain, an ordered list of original-chain indices
+//   (output of rotateAndOrientCurve's parallel_index_array), and the
+//   liver mesh, build a dense 3D point vector matching that order.
+// ---------------------------------------------------------------------
+inline void silSwBuildDenseSrcRim3DOriented(
+    const std::vector<int>& rim_chain,
+    const std::vector<int>& chain_order_into_rim_chain,
+    const std::vector<float>& mesh_verts,
+    std::vector<glm::vec3>& out_dense_3D)
+{
+    out_dense_3D.clear();
+    const int nV3 = (int)mesh_verts.size();
+    const int K   = (int)chain_order_into_rim_chain.size();
+    out_dense_3D.reserve(K);
+    for (int i = 0; i < K; i++) {
+        const int chain_pos = chain_order_into_rim_chain[i];
+        if (chain_pos < 0 || chain_pos >= (int)rim_chain.size()) {
+            out_dense_3D.emplace_back(0.0f);   // sentinel; should not happen
+            continue;
+        }
+        const int vidx = rim_chain[chain_pos];
+        if (vidx < 0 || vidx*3 + 2 >= nV3) {
+            out_dense_3D.emplace_back(0.0f);
+            continue;
+        }
+        out_dense_3D.emplace_back(mesh_verts[vidx*3],
+                                  mesh_verts[vidx*3+1],
+                                  mesh_verts[vidx*3+2]);
+    }
+}
+
+// ---------------------------------------------------------------------
+// =====================================================================
+// Phase 7b Step 3d Stage 0.1/0.2 — Shared smoothed RIM 2D builder
+// =====================================================================
+// buildSmoothedRim2D
+//   Helper used by CB0.2 popup (and intended for CB0.1 popup refactor).
+//   Pure function of:
+//     - liverMesh3D vertex coords (current source pose)
+//     - g_debugSourceRimChain      (W-key rim chain)
+//     - g_liverLR                  (per-vertex left/right label)
+//     - AR camera view + projection (buildSilhouetteView/Proj)
+//     - grid_px, knn_k, knn_iters  (smoothing parameters)
+//
+//   Pipeline:
+//     1. Auto-populate g_debugSourceRimChain if empty
+//     2. Project every chain vertex to 2D pixel coords (drop clip.w<=0)
+//     3. Bin into grid_px × grid_px cells; emit centroid + majority LR
+//     4. Optional KNN smoothing (k nearest + self, iterated)
+//     5. Compute 2D centroid + PURE_RIGHT 3D centroid → 2D
+//
+//   Returns SmoothedRim2DResult with .ok set; caller checks .ok and
+//   .fail_reason before consuming the point arrays.
+// ---------------------------------------------------------------------
+struct SmoothedRim2DResult {
+    bool        ok = false;
+    std::string fail_reason;
+
+    // Raw projected points (pre-smoothing), parallel arrays
+    std::vector<glm::vec2> raw_pts;
+    std::vector<uint8_t>   raw_lr;
+    std::vector<glm::vec3> raw_pts_3D;     // mesh-space, parallel to raw_pts
+    std::vector<int>       raw_vidx;       // vertex idx, parallel to raw_pts
+
+    // Cleaned (grid + KNN) points, parallel arrays + cell occupancy
+    std::vector<glm::vec2> smo_pts;
+    std::vector<uint8_t>   smo_lr;
+    std::vector<int>       smo_cnt;
+    std::vector<glm::vec3> smo_pts_3D;     // mesh-space centroid per cell
+                                           // (KNN-smoothed in lockstep with smo_pts)
+    std::vector<int>       smo_repr_vidx;  // representative vertex idx per cell
+                                           // (first vidx that fell in the bin)
+
+    int W_img = 1920;
+    int H_img = 1080;
+
+    glm::vec2 smoothed_centroid_2D = glm::vec2(0.0f);
+    glm::vec2 right_centroid_2D    = glm::vec2(-1e6f);
+    bool      right_centroid_valid = false;
+};
+
+inline SmoothedRim2DResult buildSmoothedRim2D(
+    float grid_px, int knn_k, int knn_iters)
+{
+    SmoothedRim2DResult R;
+
+    if (!liverMesh3D) {
+        R.fail_reason = "liverMesh3D is null";
+        return R;
+    }
+    if (g_debugSourceRimChain.empty()) {
+        if (!populateDebugSourceRimChain()) {
+            R.fail_reason = "populateDebugSourceRimChain failed (press W first)";
+            return R;
+        }
+    }
+    if (g_debugSourceRimChain.empty()) {
+        R.fail_reason = "g_debugSourceRimChain still empty";
+        return R;
+    }
+
+    const glm::mat4 view_m = buildSilhouetteView();
+    const glm::mat4 proj_m = buildSilhouetteProj();
+    R.W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+    R.H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+    const glm::mat4 M = proj_m * view_m;
+
+    const auto& Vmesh = liverMesh3D->mVertices;
+    const int nV3 = (int)Vmesh.size();
+    const bool lrValid = g_liverLR.valid();
+    const int  nLR     = lrValid ? (int)g_liverLR.labels.size() : 0;
+
+    // --- Step 1: project all rim chain to 2D ---
+    R.raw_pts.reserve(g_debugSourceRimChain.size());
+    R.raw_lr.reserve(g_debugSourceRimChain.size());
+    R.raw_pts_3D.reserve(g_debugSourceRimChain.size());
+    R.raw_vidx.reserve(g_debugSourceRimChain.size());
+    for (int idx : g_debugSourceRimChain) {
+        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+        const glm::vec3 p3(Vmesh[idx*3], Vmesh[idx*3+1], Vmesh[idx*3+2]);
+        const glm::vec4 clip = M * glm::vec4(p3, 1.0f);
+        if (clip.w < 1e-9f) continue;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        R.raw_pts.emplace_back(
+            (ndcx + 1.0f) * 0.5f * float(R.W_img),
+            (1.0f - ndcy) * 0.5f * float(R.H_img));
+        uint8_t lr = 255;
+        if (lrValid && idx < nLR) lr = g_liverLR.labels[idx];
+        R.raw_lr.push_back(lr);
+        R.raw_pts_3D.push_back(p3);
+        R.raw_vidx.push_back(idx);
+    }
+    const int N_raw = (int)R.raw_pts.size();
+    if (N_raw == 0) {
+        R.fail_reason = "no points projected on screen";
+        return R;
+    }
+
+    // --- Step 2: grid aggregation ---
+    const float grid = std::max(1.0f, grid_px);
+    struct Cell {
+        glm::dvec2 sum;
+        glm::dvec3 sum_3D;
+        int        cnt;
+        int        n_R, n_L, n_B, n_U;
+        int        first_vidx;
+    };
+    auto cellKey = [grid](float x, float y) -> long long {
+        const int cx = int(std::floor(x / grid));
+        const int cy = int(std::floor(y / grid));
+        const long long ux = (long long)(cx + (1 << 15));
+        const long long uy = (long long)(cy + (1 << 15));
+        return (uy << 20) | (ux & 0xFFFFFLL);
+    };
+    std::unordered_map<long long, Cell> bins;
+    bins.reserve(size_t(N_raw));
+    for (int i = 0; i < N_raw; i++) {
+        const long long k = cellKey(R.raw_pts[i].x, R.raw_pts[i].y);
+        auto& C = bins[k];
+        if (C.cnt == 0) {
+            C.sum = glm::dvec2(0.0);
+            C.sum_3D = glm::dvec3(0.0);
+            C.n_R = C.n_L = C.n_B = C.n_U = 0;
+            C.first_vidx = R.raw_vidx[i];
+        }
+        C.sum    += glm::dvec2(R.raw_pts[i]);
+        C.sum_3D += glm::dvec3(R.raw_pts_3D[i]);
+        C.cnt++;
+        switch (R.raw_lr[i]) {
+            case LiverLeftRightLabel::PURE_RIGHT: C.n_R++; break;
+            case LiverLeftRightLabel::PURE_LEFT:  C.n_L++; break;
+            case LiverLeftRightLabel::BOUNDARY:   C.n_B++; break;
+            default:                              C.n_U++; break;
+        }
+    }
+    R.smo_pts.reserve(bins.size());
+    R.smo_lr.reserve(bins.size());
+    R.smo_cnt.reserve(bins.size());
+    R.smo_pts_3D.reserve(bins.size());
+    R.smo_repr_vidx.reserve(bins.size());
+    for (auto& kv : bins) {
+        const Cell& C = kv.second;
+        R.smo_pts.emplace_back(C.sum / double(C.cnt));
+        R.smo_pts_3D.emplace_back(C.sum_3D / double(C.cnt));
+        R.smo_repr_vidx.push_back(C.first_vidx);
+        uint8_t maj = 255;
+        int best = -1;
+        if (C.n_R > best) { best = C.n_R; maj = LiverLeftRightLabel::PURE_RIGHT; }
+        if (C.n_L > best) { best = C.n_L; maj = LiverLeftRightLabel::PURE_LEFT;  }
+        if (C.n_B > best) { best = C.n_B; maj = LiverLeftRightLabel::BOUNDARY;   }
+        if (C.n_U > best) { best = C.n_U; maj = 255; }
+        R.smo_lr.push_back(maj);
+        R.smo_cnt.push_back(C.cnt);
+    }
+    const int N_cells = (int)R.smo_pts.size();
+
+    // --- Step 3: KNN smoothing ---
+    const int K     = std::max(0, knn_k);
+    const int iters = std::max(0, knn_iters);
+    if (K > 0 && iters > 0 && N_cells >= 2) {
+        const int Keff = std::min(K, N_cells - 1);
+        std::vector<glm::vec2> tmp(N_cells);
+        std::vector<glm::vec3> tmp3D(N_cells);
+        std::vector<std::pair<float, int>> dist_idx;
+        dist_idx.reserve(N_cells);
+        for (int it = 0; it < iters; it++) {
+            for (int i = 0; i < N_cells; i++) {
+                dist_idx.clear();
+                for (int j = 0; j < N_cells; j++) {
+                    if (j == i) continue;
+                    const float dx = R.smo_pts[j].x - R.smo_pts[i].x;
+                    const float dy = R.smo_pts[j].y - R.smo_pts[i].y;
+                    dist_idx.emplace_back(dx*dx + dy*dy, j);
+                }
+                std::nth_element(
+                    dist_idx.begin(),
+                    dist_idx.begin() + Keff,
+                    dist_idx.end(),
+                    [](const std::pair<float,int>& a,
+                       const std::pair<float,int>& b){
+                        return a.first < b.first;
+                    });
+                glm::dvec2 sum2(0.0);
+                glm::dvec3 sum3(0.0);
+                for (int n = 0; n < Keff; n++) {
+                    const int j = dist_idx[n].second;
+                    sum2 += glm::dvec2(R.smo_pts[j]);
+                    sum3 += glm::dvec3(R.smo_pts_3D[j]);
+                }
+                sum2 += glm::dvec2(R.smo_pts[i]);     // self prevents drift
+                sum3 += glm::dvec3(R.smo_pts_3D[i]);
+                tmp  [i] = glm::vec2(sum2 / double(Keff + 1));
+                tmp3D[i] = glm::vec3(sum3 / double(Keff + 1));
+            }
+            R.smo_pts   .swap(tmp);
+            R.smo_pts_3D.swap(tmp3D);
+        }
+    }
+
+    // --- Step 4: centroids ---
+    glm::dvec2 sum2d(0.0);
+    for (const auto& p : R.smo_pts) sum2d += glm::dvec2(p);
+    R.smoothed_centroid_2D = R.smo_pts.empty()
+        ? glm::vec2(float(R.W_img) * 0.5f, float(R.H_img) * 0.5f)
+        : glm::vec2(sum2d / double(R.smo_pts.size()));
+
+    if (lrValid) {
+        glm::dvec3 sumR(0.0);
+        int nR3 = 0;
+        for (int i = 0; i < nLR; i++) {
+            if (i * 3 + 2 >= nV3) break;
+            if (g_liverLR.labels[i] != LiverLeftRightLabel::PURE_RIGHT) continue;
+            sumR += glm::dvec3(Vmesh[i*3], Vmesh[i*3+1], Vmesh[i*3+2]);
+            nR3++;
+        }
+        if (nR3 > 0) {
+            const glm::vec3 rc3(sumR / double(nR3));
+            const glm::vec4 clip = M * glm::vec4(rc3, 1.0f);
+            if (clip.w > 1e-9f) {
+                const float ndcx = clip.x / clip.w;
+                const float ndcy = clip.y / clip.w;
+                R.right_centroid_2D = glm::vec2(
+                    (ndcx + 1.0f) * 0.5f * float(R.W_img),
+                    (1.0f - ndcy) * 0.5f * float(R.H_img));
+                R.right_centroid_valid = true;
+            }
+        }
+    }
+
+    R.ok = true;
+    return R;
+}
+
+// ---------------------------------------------------------------------
+// buildOrderedRim2D — Stage 0.2 ordering via MST + longest path
+// ---------------------------------------------------------------------
+//   Input:  cleaned 2D point set (from buildSmoothedRim2D) + start hint
+//           (PURE_RIGHT 3D centroid projected to 2D, optional)
+//   Output: oriented path + arc-length resampled pivots
+//
+//   Pipeline:
+//     1. Prim's MST O(N²) on full pairwise 2D distances
+//        Edges longer than max_edge_px are excluded (set to +inf)
+//        → may disconnect the graph; we keep the LARGEST CC only.
+//     2. Two-pass BFS on the chosen CC:
+//          a. BFS from arbitrary seed → farthest node = endpoint A
+//          b. BFS from endpoint A     → farthest node = endpoint B
+//          → path = endpoint B ← ... ← endpoint A (via parent[])
+//     3. Orient: if start hint valid, ensure path[0] is the endpoint
+//        closer (in 2D) to the start hint; else leave as-is.
+//     4. Arc-length resample n_pivots evenly along the oriented path.
+//
+//   Open-curve safe: the longest path in a tree is, by definition, an
+//   open chain — no forced loop closure. This is the correct topology
+//   for the caudal RIM arch we observed in CB0.
+// ---------------------------------------------------------------------
+struct OrderedRim2DResult {
+    bool        ok = false;
+    std::string fail_reason;
+
+    // MST adjacency (indexed into input cleaned_pts; nodes outside the
+    // largest CC still appear here but with edges only to their CC).
+    std::vector<std::vector<int>> mst_adj;
+    int   n_rejected_edges  = 0;
+    float mst_total_length_px = 0.0f;
+
+    // Indices in the largest connected component
+    std::vector<int> component;
+
+    // Oriented longest path (indices into input cleaned_pts)
+    std::vector<int> path;
+    int   endpoint_a = -1;
+    int   endpoint_b = -1;
+    float arc_length_px = 0.0f;
+    bool  start_oriented_to_right = false;
+
+    // Arc-length resampled pivots (size = n_pivots)
+    std::vector<glm::vec2> pivots;
+};
+
+inline OrderedRim2DResult buildOrderedRim2D(
+    const std::vector<glm::vec2>& cleaned_pts,
+    const glm::vec2& right_centroid_2D,
+    bool  right_centroid_valid,
+    float max_edge_px,
+    int   n_pivots)
+{
+    OrderedRim2DResult R;
+    const int N = (int)cleaned_pts.size();
+    if (N < 2) {
+        R.fail_reason = "need at least 2 cleaned points";
+        return R;
+    }
+
+    // --- 1. Prim's MST O(N²) with max_edge filter ---
+    const float kInf = std::numeric_limits<float>::infinity();
+    const float maxEdge2 = (max_edge_px > 0.0f)
+        ? max_edge_px * max_edge_px : kInf;
+    std::vector<float> minDist2(N, kInf);
+    std::vector<int>   parent  (N, -1);
+    std::vector<bool>  inTree  (N, false);
+
+    minDist2[0] = 0.0f;
+    for (int it = 0; it < N; it++) {
+        int u = -1;
+        float best = kInf;
+        for (int v = 0; v < N; v++) {
+            if (!inTree[v] && minDist2[v] < best) {
+                best = minDist2[v];
+                u = v;
+            }
+        }
+        if (u < 0) break;            // remaining nodes unreachable under filter
+        inTree[u] = true;
+        for (int v = 0; v < N; v++) {
+            if (inTree[v]) continue;
+            const float dx = cleaned_pts[v].x - cleaned_pts[u].x;
+            const float dy = cleaned_pts[v].y - cleaned_pts[u].y;
+            const float d2 = dx*dx + dy*dy;
+            if (d2 > maxEdge2) continue;
+            if (d2 < minDist2[v]) {
+                minDist2[v] = d2;
+                parent[v]   = u;
+            }
+        }
+    }
+
+    R.mst_adj.assign(N, {});
+    int n_edges_kept = 0;
+    for (int v = 0; v < N; v++) {
+        if (parent[v] < 0) continue;
+        R.mst_adj[v].push_back(parent[v]);
+        R.mst_adj[parent[v]].push_back(v);
+        const float dx = cleaned_pts[v].x - cleaned_pts[parent[v]].x;
+        const float dy = cleaned_pts[v].y - cleaned_pts[parent[v]].y;
+        R.mst_total_length_px += std::sqrt(dx*dx + dy*dy);
+        n_edges_kept++;
+    }
+    R.n_rejected_edges = (N - 1) - n_edges_kept;
+
+    // --- 2. Largest connected component ---
+    std::vector<int> comp_id(N, -1);
+    std::vector<int> comp_size;
+    for (int seed = 0; seed < N; seed++) {
+        if (comp_id[seed] >= 0) continue;
+        const int cid = (int)comp_size.size();
+        int sz = 0;
+        std::vector<int> stack = { seed };
+        comp_id[seed] = cid;
+        while (!stack.empty()) {
+            int u = stack.back(); stack.pop_back();
+            sz++;
+            for (int v : R.mst_adj[u]) {
+                if (comp_id[v] < 0) {
+                    comp_id[v] = cid;
+                    stack.push_back(v);
+                }
+            }
+        }
+        comp_size.push_back(sz);
+    }
+    int biggest_cid = 0;
+    for (size_t i = 1; i < comp_size.size(); i++) {
+        if (comp_size[i] > comp_size[biggest_cid]) biggest_cid = (int)i;
+    }
+    R.component.reserve(comp_size[biggest_cid]);
+    for (int i = 0; i < N; i++) {
+        if (comp_id[i] == biggest_cid) R.component.push_back(i);
+    }
+    if (R.component.size() < 2) {
+        R.fail_reason = "largest CC has <2 nodes (max_edge_px too small?)";
+        return R;
+    }
+
+    // --- 3. Two-pass BFS for longest path on the chosen CC ---
+    auto bfs_farthest = [&](int src,
+                            std::vector<int>& par_out,
+                            std::vector<float>& dist_out) -> int {
+        par_out.assign(N, -1);
+        dist_out.assign(N, kInf);
+        std::vector<int> q;
+        q.reserve(R.component.size());
+        dist_out[src] = 0.0f;
+        q.push_back(src);
+        size_t head = 0;
+        while (head < q.size()) {
+            int u = q[head++];
+            for (int v : R.mst_adj[u]) {
+                if (dist_out[v] != kInf) continue;
+                par_out[v] = u;
+                const float dx = cleaned_pts[v].x - cleaned_pts[u].x;
+                const float dy = cleaned_pts[v].y - cleaned_pts[u].y;
+                dist_out[v] = dist_out[u] + std::sqrt(dx*dx + dy*dy);
+                q.push_back(v);
+            }
+        }
+        int best = src;
+        float best_d = 0.0f;
+        for (int i : R.component) {
+            if (dist_out[i] != kInf && dist_out[i] > best_d) {
+                best_d  = dist_out[i];
+                best    = i;
+            }
+        }
+        return best;
+    };
+
+    std::vector<int>   par1, par2;
+    std::vector<float> d1, d2;
+    R.endpoint_a = bfs_farthest(R.component[0], par1, d1);
+    R.endpoint_b = bfs_farthest(R.endpoint_a,   par2, d2);
+    R.arc_length_px = d2[R.endpoint_b];
+
+    // Reconstruct path: endpoint_b → ... → endpoint_a (via par2)
+    std::vector<int> path;
+    {
+        int cur = R.endpoint_b;
+        int guard = 0;
+        while (cur != -1 && guard < N + 1) {
+            path.push_back(cur);
+            if (cur == R.endpoint_a) break;
+            cur = par2[cur];
+            guard++;
+        }
+        if (path.empty() || path.back() != R.endpoint_a) {
+            R.fail_reason = "path reconstruction failed";
+            return R;
+        }
+    }
+    R.path = std::move(path);
+
+    // --- 4. Orient by PURE_RIGHT proximity ---
+    if (right_centroid_valid) {
+        auto d2_from = [&](int idx) -> float {
+            const float dx = cleaned_pts[idx].x - right_centroid_2D.x;
+            const float dy = cleaned_pts[idx].y - right_centroid_2D.y;
+            return dx*dx + dy*dy;
+        };
+        const float dF = d2_from(R.path.front());
+        const float dB = d2_from(R.path.back());
+        if (dB < dF) std::reverse(R.path.begin(), R.path.end());
+        R.start_oriented_to_right = true;
+    }
+
+    // --- 5. Arc-length resample n_pivots ---
+    const int Np = std::max(2, n_pivots);
+    R.pivots.reserve(Np);
+    if (R.path.size() == 1) {
+        for (int i = 0; i < Np; i++)
+            R.pivots.push_back(cleaned_pts[R.path[0]]);
+    } else {
+        std::vector<float> cum(R.path.size(), 0.0f);
+        for (size_t i = 1; i < R.path.size(); i++) {
+            const float dx = cleaned_pts[R.path[i]].x   - cleaned_pts[R.path[i-1]].x;
+            const float dy = cleaned_pts[R.path[i]].y   - cleaned_pts[R.path[i-1]].y;
+            cum[i] = cum[i-1] + std::sqrt(dx*dx + dy*dy);
+        }
+        const float total = cum.back();
+        for (int p = 0; p < Np; p++) {
+            const float t = float(p) / float(Np - 1);
+            const float ss = t * total;
+            auto it = std::upper_bound(cum.begin(), cum.end(), ss);
+            int seg = (int)(it - cum.begin()) - 1;
+            if (seg < 0) seg = 0;
+            if (seg >= (int)R.path.size() - 1) {
+                R.pivots.push_back(cleaned_pts[R.path.back()]);
+                continue;
+            }
+            const float seg_len = cum[seg+1] - cum[seg];
+            const float u = (seg_len > 1e-6f)
+                          ? (ss - cum[seg]) / seg_len : 0.0f;
+            const glm::vec2 a = cleaned_pts[R.path[seg]];
+            const glm::vec2 b = cleaned_pts[R.path[seg+1]];
+            R.pivots.push_back(a + u * (b - a));
+        }
+    }
+
+    R.ok = true;
+    return R;
+}
+
+// ---------------------------------------------------------------------
+// silSwBuildSrcPreview
+//   Rebuilds the source-side cache vars used by the popup window
+//   (CB1) AND by Phase 0 of startSilhouetteSweep. Pure function of:
+// ---------------------------------------------------------------------
+// silSwBuildSrcPreview  [REVISED — Step 3d2]
+//   Build the source-side preview using the SAME silhouette extraction
+//   as Shift+E (runSilhouetteHemi):
+//     1. extractVisibleVerticesCustom (BVH-based AR visibility)
+//     2. |dot(normal, viewDir)| < g_silhouetteSrcCosThresh
+//        → silhouette-edge vertices
+//     3. Project to 2D using buildSilhouetteView/Proj
+//     4. Compute 2D centroid of silhouette
+//     5. atan2-sort around 2D centroid → smooth closed 2D contour
+//     6. Find PURE_RIGHT 3D centroid, project to 2D, locate the
+//        nearest silhouette point → start_idx
+//     7. Rotate to put start_idx at index 0, enforce clockwise (next
+//        step moves +y on screen)
+//     8. arc-length resample 20 pivots
+//
+//   This replaces the previous g_debugSourceRimChain-based path which
+//   yielded a jagged 2D curve (chain ordered by PCA-plane angle, not
+//   by AR screen angle). The new curve is by construction the visible
+//   silhouette as the AR camera actually sees it.
+//
+//   Caches populated:
+//     g_silSwSrcRim2DPreview         (dense, sorted+oriented)
+//     g_silSwSrcRim3DPreview         (dense, mesh-space, parallel)
+//     g_silSwSrcRimVIdxPreview       (dense, vertex idx, parallel)
+//     g_silSwSrcRim2DPreviewLR       (dense, LR label, parallel)
+//     g_silSwSrcPivots2DPreview      (20)
+//     g_silSwSrcPivotsLRPreview      (20)
+//     g_silSwSrcStartIdxPreview      (index in sorted-not-rotated array)
+//     g_silSwSrcRightCentroid2DPreview
+// ---------------------------------------------------------------------
+inline bool silSwBuildSrcPreview(std::string* out_fail_reason = nullptr)
+{
+    if (!liverMesh3D) {
+        if (out_fail_reason) *out_fail_reason = "liverMesh3D is null";
+        g_silSwSrcPreviewCacheValid = false;
+        return false;
+    }
+
+    // ---- Step 3d2: pose-hash short-circuit -------------------------
+    // BVH build + extractVisibleVerticesCustom is ~30-70ms and emits
+    // log spam ("Camera position: ...") every call. Skip the entire
+    // pipeline when the mesh hasn't moved since last build.
+    //
+    // Hash strategy: rigid transforms move ALL vertices by the same
+    // T, so checking a handful of vertex coords (cast as raw bits)
+    // is sufficient to detect any pose change. We sample 4 vertices
+    // spread across the mesh-vertex array.
+    {
+        const auto& V = liverMesh3D->mVertices;
+        const int nV3 = (int)V.size();
+        if (nV3 >= 12) {
+            uint64_t h = 1469598103934665603ULL;   // FNV-1a offset
+            const int sample_offsets[4] = {
+                0,
+                std::max(0, nV3 / 4 - (nV3 / 4 % 3)),
+                std::max(0, nV3 / 2 - (nV3 / 2 % 3)),
+                std::max(0, (nV3 * 3 / 4) - ((nV3 * 3 / 4) % 3))
+            };
+            for (int s = 0; s < 4; s++) {
+                const int o = sample_offsets[s];
+                for (int k = 0; k < 3; k++) {
+                    if (o + k >= nV3) continue;
+                    uint32_t bits;
+                    const float fv = V[o + k];
+                    std::memcpy(&bits, &fv, sizeof(bits));
+                    h ^= uint64_t(bits);
+                    h *= 1099511628211ULL;          // FNV-1a prime
+                }
+            }
+            // (No early return here — params get mixed in below and the
+            // combined check decides cache validity.)
+            g_silSwSrcPreviewCacheHash = h;
+        }
+    }
+
+    // [Stage A] Mix the source-rim method + CB0.1/CB0.2 tuning parameters
+    // into the cache key so that toggling the method or moving any slider
+    // forces a rebuild rather than returning stale results. Done AFTER
+    // the vertex hash above so the combined key reflects both pose and
+    // parameter state.
+    {
+        uint64_t hp = g_silSwSrcPreviewCacheHash;
+        auto mix32 = [&](uint32_t bits) {
+            hp ^= uint64_t(bits);
+            hp *= 1099511628211ULL;
+        };
+        auto mixF = [&](float v) {
+            uint32_t bits;
+            std::memcpy(&bits, &v, sizeof(bits));
+            mix32(bits);
+        };
+        mix32(uint32_t(g_silSwSrcRimMethod));
+        mixF (g_rawRimSmooth_GridPx);
+        mix32(uint32_t(g_rawRimSmooth_KnnK));
+        mix32(uint32_t(g_rawRimSmooth_KnnIters));
+        mixF (g_rawRimOrder_MaxEdgePx);
+        mix32(uint32_t(g_rawRimOrder_NPivots));
+        if (g_silSwSrcPreviewCacheValid &&
+            g_silSwSrcPreviewCacheHash == hp &&
+            !g_silSwSrcRim2DPreview.empty())
+        {
+            return true;       // both verts AND params unchanged
+        }
+        g_silSwSrcPreviewCacheHash = hp;
+    }
+
+    g_silSwSrcRim2DPreview.clear();
+    g_silSwSrcRim3DPreview.clear();
+    g_silSwSrcRimVIdxPreview.clear();
+    g_silSwSrcPivots2DPreview.clear();
+    g_silSwSrcRim2DPreviewLR.clear();
+    g_silSwSrcPivotsLRPreview.clear();
+    g_silSwSrcPivots3DPreview.clear();          // [Stage A] open-path safe
+    g_silSwSrcStartIdxPreview = -1;
+    g_silSwSrcPreviewCacheValid = false;
+
+    if (!g_liverLR.valid()) {
+        if (out_fail_reason) *out_fail_reason = "g_liverLR not computed (run HemiAuto/O first)";
+        return false;
+    }
+    if (!g_liverRegion.valid()) {
+        if (out_fail_reason) *out_fail_reason =
+            "g_liverRegion not computed (run HemiAuto/O first; need RIM label)";
+        return false;
+    }
+    int n_PR = 0;
+    for (uint8_t L : g_liverLR.labels) {
+        if (L == LiverLeftRightLabel::PURE_RIGHT) n_PR++;
+    }
+    if (n_PR == 0) {
+        if (out_fail_reason) *out_fail_reason = "no PURE_RIGHT vertices in g_liverLR";
+        return false;
+    }
+
+    // =================================================================
+    // METHOD DISPATCHER — Stage A integration of CB0.2 (MST + longest path).
+    //   The legacy path below (angle-bin envelope) is still reachable
+    //   when g_silSwSrcRimMethod == ENVELOPE, kept for comparison and
+    //   for fallback if MST_LONGEST_PATH ever has issues. Default is
+    //   MST_LONGEST_PATH because the CB0 visualization confirmed the
+    //   source RIM is an open arch, not a closed loop, and the envelope
+    //   step would close it incorrectly.
+    // =================================================================
+    if (g_silSwSrcRimMethod == SRC_RIM_METHOD_MST_LONGEST_PATH) {
+        // --- 1. Build cleaned points via CB0.1 pipeline ---
+        //   Uses the SAME parameters the user is tuning in the CB0.1
+        //   popup; results are byte-identical to what CB0.2 popup shows.
+        SmoothedRim2DResult S = buildSmoothedRim2D(
+            g_rawRimSmooth_GridPx,
+            g_rawRimSmooth_KnnK,
+            g_rawRimSmooth_KnnIters);
+        if (!S.ok) {
+            if (out_fail_reason) {
+                *out_fail_reason = std::string("[MST] smoothing failed: ")
+                                 + S.fail_reason;
+            }
+            return false;
+        }
+
+        // --- 2. Order via CB0.2 pipeline ---
+        OrderedRim2DResult O = buildOrderedRim2D(
+            S.smo_pts,
+            S.right_centroid_2D,
+            S.right_centroid_valid,
+            g_rawRimOrder_MaxEdgePx,
+            g_rawRimOrder_NPivots);
+        if (!O.ok) {
+            if (out_fail_reason) {
+                *out_fail_reason = std::string("[MST] ordering failed: ")
+                                 + O.fail_reason;
+            }
+            return false;
+        }
+
+        // --- 3. Populate dense arrays (cleaned points on the path) ---
+        //   These feed the sweep's cost calculation; ordering matters.
+        const int M = (int)O.path.size();
+        g_silSwSrcRim2DPreview.resize(M);
+        g_silSwSrcRim3DPreview.resize(M);
+        g_silSwSrcRimVIdxPreview.resize(M);
+        g_silSwSrcRim2DPreviewLR.resize(M);
+        for (int i = 0; i < M; i++) {
+            const int ci = O.path[i];
+            g_silSwSrcRim2DPreview[i]   = S.smo_pts   [ci];
+            g_silSwSrcRim3DPreview[i]   = S.smo_pts_3D[ci];
+            g_silSwSrcRimVIdxPreview[i] = S.smo_repr_vidx[ci];
+            g_silSwSrcRim2DPreviewLR[i] = S.smo_lr   [ci];
+        }
+
+        // --- 4. Populate 20 pivots (arc-length resampled on path) ---
+        //   Pivot LR is inherited from the nearest dense point. Index 0
+        //   is the PURE_RIGHT-oriented start by construction of O.path.
+        const int Np = (int)O.pivots.size();
+        g_silSwSrcPivots2DPreview.resize(Np);
+        g_silSwSrcPivotsLRPreview .resize(Np);
+        for (int i = 0; i < Np; i++) {
+            g_silSwSrcPivots2DPreview[i] = O.pivots[i];
+            float best_d2 = std::numeric_limits<float>::infinity();
+            int   best_j  = 0;
+            for (int j = 0; j < M; j++) {
+                const float dx = O.pivots[i].x - g_silSwSrcRim2DPreview[j].x;
+                const float dy = O.pivots[i].y - g_silSwSrcRim2DPreview[j].y;
+                const float d2 = dx*dx + dy*dy;
+                if (d2 < best_d2) { best_d2 = d2; best_j = j; }
+            }
+            g_silSwSrcPivotsLRPreview[i] = (M > 0)
+                ? g_silSwSrcRim2DPreviewLR[best_j]
+                : (uint8_t)255;
+        }
+
+        // --- 4b. Compute 3D pivots using SAME 2D arc-length parameterization
+        //   as O.pivots so g_silSwSrcPivots3DPreview[i] is the 3D point
+        //   whose perspective projection matches g_silSwSrcPivots2DPreview[i].
+        //   Open curve — NO loop closure (would mis-place pivots for the
+        //   anatomical arch topology).
+        g_silSwSrcPivots3DPreview.assign(Np, glm::vec3(0.0f));
+        if (M >= 2) {
+            std::vector<float> cum2D(M, 0.0f);
+            for (int i = 1; i < M; i++) {
+                const float dx = g_silSwSrcRim2DPreview[i].x
+                               - g_silSwSrcRim2DPreview[i-1].x;
+                const float dy = g_silSwSrcRim2DPreview[i].y
+                               - g_silSwSrcRim2DPreview[i-1].y;
+                cum2D[i] = cum2D[i-1] + std::sqrt(dx*dx + dy*dy);
+            }
+            const float total2D = cum2D[M - 1];
+            for (int p = 0; p < Np; p++) {
+                const float t  = float(p) / float(std::max(1, Np - 1));
+                const float ss = t * total2D;
+                auto it = std::upper_bound(cum2D.begin(), cum2D.end(), ss);
+                int seg = (int)(it - cum2D.begin()) - 1;
+                if (seg < 0) seg = 0;
+                if (seg >= M - 1) {
+                    g_silSwSrcPivots3DPreview[p] = g_silSwSrcRim3DPreview[M - 1];
+                    continue;
+                }
+                const float seg_len = cum2D[seg + 1] - cum2D[seg];
+                const float u = (seg_len > 1e-6f)
+                              ? (ss - cum2D[seg]) / seg_len : 0.0f;
+                g_silSwSrcPivots3DPreview[p] =
+                    g_silSwSrcRim3DPreview[seg] +
+                    u * (g_silSwSrcRim3DPreview[seg + 1] -
+                         g_silSwSrcRim3DPreview[seg]);
+            }
+        } else if (M == 1) {
+            for (int p = 0; p < Np; p++) {
+                g_silSwSrcPivots3DPreview[p] = g_silSwSrcRim3DPreview[0];
+            }
+        }
+
+        g_silSwSrcStartIdxPreview        = 0;     // path[0] is start by construction
+        g_silSwSrcRightCentroid2DPreview = S.right_centroid_2D;
+
+        if (g_silhouetteSweepLog) {
+            // Rate-limit to avoid log spam when this function is called
+            // every frame (e.g. CB1 popup open while Live ICP is running
+            // and constantly moving the mesh). Print at most once per
+            // ~60 calls (≈ once per second at 60 FPS).
+            static int s_mst_log_skip_counter = 0;
+            if ((s_mst_log_skip_counter++ % 60) == 0) {
+                std::cout << "[3d/SrcPreview/MST]"
+                          << " cleaned=" << (int)S.smo_pts.size()
+                          << " largest_CC=" << (int)O.component.size()
+                          << " path_nodes=" << M
+                          << " arc=" << O.arc_length_px << "px"
+                          << " pivots=" << Np
+                          << " start_to_R=" << (O.start_oriented_to_right ? "YES" : "no")
+                          << " rejected_edges=" << O.n_rejected_edges
+                          << "  (every 60th call shown)"
+                          << std::endl;
+            }
+        }
+
+        g_silSwSrcPreviewCacheValid = true;
+        return true;
+    }
+    // Otherwise: fall through to the legacy ENVELOPE method below.
+
+    // --- Step 1: Use g_debugSourceRimChain directly --------------
+    //   These are the GREEN dots the user sees with the W key —
+    //   anatomical RIM vertices that already passed the user's
+    //   active filter chain (quadrant / caudal / etc). Auto-populate
+    //   if missing.
+    //
+    //   No AR-visibility filter on top: the angle-bin + max-radius
+    //   envelope step below naturally selects on-screen outer
+    //   verts and rejects back-projected interior points (they sit
+    //   near the 2D centroid because perspective foreshortens
+    //   far-side rim verts toward the screen center).
+    if (g_debugSourceRimChain.empty()) {
+        if (!populateDebugSourceRimChain()) {
+            if (out_fail_reason) *out_fail_reason =
+                "populateDebugSourceRimChain failed";
+            return false;
+        }
+    }
+    if (g_debugSourceRimChain.size() < 20) {
+        if (out_fail_reason) *out_fail_reason =
+            "g_debugSourceRimChain too short (<20 verts) — adjust W filters";
+        return false;
+    }
+
+    const auto& Vmesh = liverMesh3D->mVertices;
+    const int nV3 = (int)Vmesh.size();
+
+    // Project every RIM-chain vertex to 2D pixel coordinates.
+    std::vector<glm::vec2> all_2D;
+    std::vector<glm::vec3> all_3D;
+    std::vector<int>       all_vidx;
+    all_2D.reserve(g_debugSourceRimChain.size());
+    all_3D.reserve(g_debugSourceRimChain.size());
+    all_vidx.reserve(g_debugSourceRimChain.size());
+    for (int idx : g_debugSourceRimChain) {
+        if (idx < 0 || idx*3 + 2 >= nV3) continue;
+        const glm::vec3 p3(Vmesh[idx*3], Vmesh[idx*3+1], Vmesh[idx*3+2]);
+        // Will project below (M is built earlier in this function but
+        // before this rewrite the order had to change). Project here.
+        // Note: glm::mat4 M is built later in original code; we move
+        // its construction up via the build below.
+        all_3D.push_back(p3);
+        all_vidx.push_back(idx);
+    }
+    // (2D projection happens after M is built below)
+
+    const glm::mat4 view_m = buildSilhouetteView();
+    const glm::mat4 proj_m = buildSilhouetteProj();
+    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+    const glm::mat4 M = proj_m * view_m;
+
+    // --- Step 2: project all_3D → 2D pixels (drop off-screen) -----
+    const int Nraw = (int)all_3D.size();
+    all_2D.reserve(Nraw);
+    {
+        std::vector<glm::vec3> kept3;
+        std::vector<int>       keptVI;
+        std::vector<glm::vec2> kept2;
+        kept3.reserve(Nraw);
+        keptVI.reserve(Nraw);
+        kept2.reserve(Nraw);
+        for (int i = 0; i < Nraw; i++) {
+            const glm::vec4 clip = M * glm::vec4(all_3D[i], 1.0f);
+            if (clip.w < 1e-9f) continue;
+            const float ndcx = clip.x / clip.w;
+            const float ndcy = clip.y / clip.w;
+            if (ndcx < -1.5f || ndcx > 1.5f ||
+                ndcy < -1.5f || ndcy > 1.5f) continue;
+            kept3.push_back(all_3D[i]);
+            keptVI.push_back(all_vidx[i]);
+            kept2.emplace_back(
+                (ndcx + 1.0f) * 0.5f * float(W_img),
+                (1.0f - ndcy) * 0.5f * float(H_img));
+        }
+        all_3D.swap(kept3);
+        all_vidx.swap(keptVI);
+        all_2D.swap(kept2);
+    }
+    const int Ns = (int)all_2D.size();
+    if (Ns < 20) {
+        if (out_fail_reason) *out_fail_reason =
+            "too few on-screen rim-chain points (<20)";
+        return false;
+    }
+
+    // --- Step 3: 2D centroid (used as ray origin) -------------------
+    glm::dvec2 sum2d(0.0);
+    for (const auto& p : all_2D) sum2d += glm::dvec2(p);
+    const glm::vec2 cen2D(sum2d / double(Ns));
+
+    // --- Step 4: PURE_RIGHT 2D centroid (for start anchor) ----------
+    glm::dvec3 sum3(0.0);
+    int n_R = 0;
+    for (int i = 0; i < (int)g_liverLR.labels.size(); i++) {
+        if (i*3 + 2 >= nV3) break;
+        if (g_liverLR.labels[i] != LiverLeftRightLabel::PURE_RIGHT) continue;
+        sum3 += glm::dvec3(Vmesh[i*3], Vmesh[i*3+1], Vmesh[i*3+2]);
+        n_R++;
+    }
+    const glm::vec3 right_centroid_3D(sum3 / double(n_R));
+    glm::vec2 right_centroid_2D(-1e6f);
+    {
+        const glm::vec4 clip = M * glm::vec4(right_centroid_3D, 1.0f);
+        if (clip.w > 1e-9f) {
+            const float ndcx = clip.x / clip.w;
+            const float ndcy = clip.y / clip.w;
+            right_centroid_2D = glm::vec2(
+                (ndcx + 1.0f) * 0.5f * float(W_img),
+                (1.0f - ndcy) * 0.5f * float(H_img));
+        }
+    }
+    if (right_centroid_2D.x < -1e5f) {
+        if (out_fail_reason) *out_fail_reason =
+            "PURE_RIGHT centroid projects behind camera";
+        return false;
+    }
+    g_silSwSrcRightCentroid2DPreview = right_centroid_2D;
+
+    // --- Step 5: angle-bin envelope (radial ray cast) ---------------
+    //   User's idea: cast rays from the 2D centroid outward in every
+    //   direction; the farthest projected point in each angular bin
+    //   IS that direction's outer rim envelope. This naturally rejects
+    //   back-side rim verts (which foreshorten toward the 2D center
+    //   under perspective) and produces a clean closed silhouette
+    //   contour in angle-sorted order.
+    //
+    //   N_BINS = 360 (1° per bin). Empty bins are skipped, so the
+    //   resulting envelope can have fewer than 360 points but is
+    //   always angle-monotonic = on-screen clockwise (atan2 ascending
+    //   under screen +y-down convention).
+    constexpr int   N_BINS = 360;
+    constexpr float kTwoPi = 6.2831853f;
+    constexpr float kPi    = 3.14159265f;
+    std::vector<float> bin_max_r2(N_BINS, -1.0f);
+    std::vector<int>   bin_winner(N_BINS, -1);
+    for (int i = 0; i < Ns; i++) {
+        const float dx = all_2D[i].x - cen2D.x;
+        const float dy = all_2D[i].y - cen2D.y;
+        const float r2 = dx*dx + dy*dy;
+        const float a  = std::atan2(dy, dx);    // [-π, π]
+        int b = int((a + kPi) / kTwoPi * float(N_BINS));
+        if (b < 0) b = 0;
+        if (b >= N_BINS) b = N_BINS - 1;
+        if (r2 > bin_max_r2[b]) {
+            bin_max_r2[b] = r2;
+            bin_winner[b] = i;
+        }
+    }
+
+    // Determine start bin from PURE_RIGHT centroid's angle.
+    const float right_angle = std::atan2(
+        right_centroid_2D.y - cen2D.y,
+        right_centroid_2D.x - cen2D.x);
+    const int right_bin = std::min(N_BINS - 1, std::max(0,
+        int((right_angle + kPi) / kTwoPi * float(N_BINS))));
+
+    // Find the filled bin nearest to right_bin (circular distance).
+    int start_bin = -1;
+    int min_dist = N_BINS;
+    for (int b = 0; b < N_BINS; b++) {
+        if (bin_winner[b] < 0) continue;
+        int d = std::abs(b - right_bin);
+        if (d > N_BINS / 2) d = N_BINS - d;
+        if (d < min_dist) { min_dist = d; start_bin = b; }
+    }
+    if (start_bin < 0) {
+        if (out_fail_reason) *out_fail_reason =
+            "all bins empty (impossible?)";
+        return false;
+    }
+
+    // Collect filled bins starting from start_bin, walking +b (CW).
+    std::vector<glm::vec2> rot2D;
+    std::vector<glm::vec3> rot3D;
+    std::vector<int>       rotVI;
+    rot2D.reserve(N_BINS);
+    rot3D.reserve(N_BINS);
+    rotVI.reserve(N_BINS);
+    int n_filled = 0;
+    float env_sum_step = 0.0f;
+    float env_max_step = 0.0f;
+    glm::vec2 prev_pt(0.0f);
+    bool prev_set = false;
+    for (int k = 0; k < N_BINS; k++) {
+        const int b = (start_bin + k) % N_BINS;
+        const int wi = bin_winner[b];
+        if (wi < 0) continue;
+        rot2D.push_back(all_2D[wi]);
+        rot3D.push_back(all_3D[wi]);
+        rotVI.push_back(all_vidx[wi]);
+        if (prev_set) {
+            const float dx = all_2D[wi].x - prev_pt.x;
+            const float dy = all_2D[wi].y - prev_pt.y;
+            const float d  = std::sqrt(dx*dx + dy*dy);
+            env_sum_step += d;
+            if (d > env_max_step) env_max_step = d;
+        }
+        prev_pt = all_2D[wi];
+        prev_set = true;
+        n_filled++;
+    }
+    const int Ks = (int)rot2D.size();
+    if (Ks < 20) {
+        if (out_fail_reason) {
+            *out_fail_reason = "envelope too sparse ("
+                             + std::to_string(Ks) + " filled bins)";
+        }
+        return false;
+    }
+    g_silSwSrcStartIdxPreview = 0;
+
+    const float env_avg_step = (Ks > 1)
+        ? env_sum_step / float(Ks - 1) : 0.0f;
+    if (g_silhouetteSweepLog) {
+        std::cout << "[3d/SrcPreview/AngleBin] rim_chain=" << Nraw
+                  << "  on_screen=" << Ns
+                  << "  filled_bins=" << Ks << "/" << N_BINS
+                  << "  start_bin=" << start_bin
+                  << "  (right_bin=" << right_bin << ")"
+                  << "  avg_step=" << env_avg_step << "px"
+                  << "  max_step=" << env_max_step << "px"
+                  << std::endl;
+    }
+
+    // Commit to globals
+    g_silSwSrcRim2DPreview   = rot2D;
+    g_silSwSrcRim3DPreview   = rot3D;
+    g_silSwSrcRimVIdxPreview = rotVI;
+
+    // Parallel LR label
+    g_silSwSrcRim2DPreviewLR.assign(Ks, LiverLeftRightLabel::BOUNDARY);
+    for (int i = 0; i < Ks; i++) {
+        const int vidx = rotVI[i];
+        if (vidx < 0 || vidx >= (int)g_liverLR.labels.size()) continue;
+        g_silSwSrcRim2DPreviewLR[i] = g_liverLR.labels[vidx];
+    }
+
+    // --- Step 6: arc-length resample 20 pivots (CLOSED loop) --------
+    //   The angle-bin envelope IS a closed contour around the 2D
+    //   centroid by construction, so close_loop=true gives evenly-
+    //   distributed pivots around the entire silhouette.
+    const int N_pivot = g_silhouetteSweep.n_pivot;
+    std::vector<int> pivot_nearest_idx;
+    RimShape::arclengthResample2D(
+        g_silSwSrcRim2DPreview, N_pivot,
+        g_silSwSrcPivots2DPreview,
+        /*close_loop=*/ true,
+        &pivot_nearest_idx);
+
+    g_silSwSrcPivotsLRPreview.assign(N_pivot, LiverLeftRightLabel::BOUNDARY);
+    for (int p = 0; p < N_pivot; p++) {
+        if (p < (int)pivot_nearest_idx.size()) {
+            const int ii = pivot_nearest_idx[p];
+            if (ii >= 0 && ii < (int)g_silSwSrcRim2DPreviewLR.size())
+                g_silSwSrcPivotsLRPreview[p] = g_silSwSrcRim2DPreviewLR[ii];
+        }
+    }
+
+    // [Step 3d2] mark cache valid for this pose-hash. Subsequent calls
+    // with the same liverMesh3D pose will short-circuit at the top.
+    g_silSwSrcPreviewCacheValid = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// silSwBuildTgtPreview  [REVISED — Step 3d2]
+//   Build target lower-half curve + 20 anchors from
+//   g_debugTargetBoundaryPoints (dense 3D point cloud filtered by
+//   boundaryDist<12px ∧ instDist>=instThresh, populated by Shift+W).
+//
+//   Why not g_debugTargetContour2D:
+//     traceContour2D often shatters the silhouette into hundreds of
+//     short segments (209 / longest 303px in current scene), giving
+//     a degenerate curve that doesn't span the liver. Direct use of
+//     the filtered 3D boundary point set yields ~50000 points densely
+//     covering the silhouette band — much more reliable.
+//
+//   Pipeline:
+//     1. Project all 3D boundary points to 2D pixels (drop sentinels)
+//     2. Compute 2D centroid
+//     3. Filter to lower half (p.y > centroid.y on screen)
+//     4. Bin by x into N_BINS=200 columns; for each filled bin keep
+//        the point with max y → smooth lower envelope
+//     5. Reverse (envelope is left-to-right by bin index; the desired
+//        order starts from right-end / max x)
+//     6. arc-length resample 20 anchors
+// ---------------------------------------------------------------------
+inline bool silSwBuildTgtPreview(std::string* out_fail_reason = nullptr)
+{
+    g_silSwTgtLower2DPreview.clear();
+    g_silSwTgtAnchors2DPreview.clear();
+
+    if (g_debugTargetBoundaryPoints.size() < 50) {
+        if (out_fail_reason) *out_fail_reason =
+            "g_debugTargetBoundaryPoints too short (<50 pts); run Shift+W first";
+        return false;
+    }
+
+    const glm::mat4 view_m = buildSilhouetteView();
+    const glm::mat4 proj_m = buildSilhouetteProj();
+    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+    const glm::mat4 M = proj_m * view_m;
+
+    // --- Step 1: project all boundary 3D points to 2D pixels ---
+    std::vector<glm::vec2> all_2D;
+    all_2D.reserve(g_debugTargetBoundaryPoints.size());
+    for (const auto& p : g_debugTargetBoundaryPoints) {
+        const glm::vec4 clip = M * glm::vec4(p, 1.0f);
+        if (clip.w < 1e-9f) continue;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        if (ndcx < -1.5f || ndcx > 1.5f ||
+            ndcy < -1.5f || ndcy > 1.5f) continue;
+        all_2D.emplace_back(
+            (ndcx + 1.0f) * 0.5f * float(W_img),
+            (1.0f - ndcy) * 0.5f * float(H_img));
+    }
+    if ((int)all_2D.size() < 50) {
+        if (out_fail_reason) *out_fail_reason =
+            "too few on-screen boundary points (<50)";
+        return false;
+    }
+
+    // --- Step 2: 2D centroid ---
+    glm::dvec2 sum2d(0.0);
+    for (const auto& p : all_2D) sum2d += glm::dvec2(p);
+    const glm::vec2 centroid(sum2d / double(all_2D.size()));
+    g_silSwTgtCentroid2DPreview = centroid;
+
+    // --- Step 3: lower half (screen +y = down) ---
+    std::vector<glm::vec2> lower_raw;
+    lower_raw.reserve(all_2D.size() / 2);
+    for (const auto& p : all_2D) {
+        if (p.y > centroid.y) lower_raw.push_back(p);
+    }
+    if ((int)lower_raw.size() < 30) {
+        if (out_fail_reason) *out_fail_reason =
+            "too few lower-half boundary points (<30)";
+        return false;
+    }
+
+    // --- Step 4: x-bin / max-y envelope ---
+    float xmin = lower_raw[0].x, xmax = lower_raw[0].x;
+    for (const auto& p : lower_raw) {
+        if (p.x < xmin) xmin = p.x;
+        if (p.x > xmax) xmax = p.x;
+    }
+    const float xrange = xmax - xmin;
+    if (xrange < 10.0f) {
+        if (out_fail_reason) *out_fail_reason =
+            "lower-half x extent too small (<10px)";
+        return false;
+    }
+    const int N_BINS = 200;
+    std::vector<float> bin_max_y (N_BINS, -1.0f);
+    std::vector<float> bin_at_x  (N_BINS,  0.0f);
+    for (const auto& p : lower_raw) {
+        int b = int((p.x - xmin) / xrange * float(N_BINS - 1));
+        if (b < 0) b = 0;
+        if (b >= N_BINS) b = N_BINS - 1;
+        if (p.y > bin_max_y[b]) {
+            bin_max_y[b] = p.y;
+            bin_at_x[b]  = p.x;
+        }
+    }
+    std::vector<glm::vec2> envelope;
+    envelope.reserve(N_BINS);
+    for (int b = 0; b < N_BINS; b++) {
+        if (bin_max_y[b] > 0.0f) {
+            envelope.emplace_back(bin_at_x[b], bin_max_y[b]);
+        }
+    }
+    if ((int)envelope.size() < 20) {
+        if (out_fail_reason) *out_fail_reason =
+            "envelope too short after x-bin (<20 bins filled)";
+        return false;
+    }
+
+    // --- Step 5: reverse to right-start (envelope is increasing x) ---
+    std::vector<glm::vec2> ordered;
+    ordered.reserve(envelope.size());
+    for (int i = (int)envelope.size() - 1; i >= 0; i--) {
+        ordered.push_back(envelope[i]);
+    }
+    g_silSwTgtLower2DPreview = ordered;
+
+    // --- Step 6: arc-length resample 20 anchors ---
+    const int N = g_silhouetteSweep.n_pivot;
+    RimShape::arclengthResample2D(
+        g_silSwTgtLower2DPreview, N,
+        g_silSwTgtAnchors2DPreview,
+        /*close_loop=*/ false);
+    if ((int)g_silSwTgtAnchors2DPreview.size() < N) {
+        if (out_fail_reason) *out_fail_reason =
+            "arclengthResample2D produced too few anchors";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// startSilhouetteSweep
+//   Phase 0 setup: build src/tgt caches, populate SilhouetteSweepState,
+//   transition to phase=1. Logs diagnostics. Returns false on any
+//   failure (sweep not started).
+// ---------------------------------------------------------------------
+inline bool startSilhouetteSweep()
+{
+    auto& S = g_silhouetteSweep;
+    S = RimShape::SilhouetteSweepState{};   // reset
+
+    // ---- Auto-trigger upstream populates (Step 3d2: still need
+    //      g_debugTargetBoundaryPoints from Shift+W) ----
+    if (g_debugTargetBoundaryPoints.empty()) {
+        std::cout << "[Ctrl+Alt+W/3d] auto-running populateDebugTargetBoundary..."
+                  << std::endl;
+        if (!populateDebugTargetBoundary()) {
+            S.fail_reason = "populateDebugTargetBoundary failed";
+            std::cout << "[Ctrl+Alt+W/3d] " << S.fail_reason << std::endl;
+            return false;
+        }
+    }
+
+    // ---- Build source + target previews ---
+    // (Step 3d2: src preview uses AR silhouette directly; tgt preview
+    //  uses g_debugTargetBoundaryPoints. No longer depends on
+    //  g_debugSourceRimChain or g_debugTargetContour2D.)
+    std::string srcFail;
+    if (!silSwBuildSrcPreview(&srcFail)) {
+        S.fail_reason = "src setup: " + srcFail;
+        std::cout << "[Ctrl+Alt+W/3d] failed — " << S.fail_reason << std::endl;
+        return false;
+    }
+    std::string tgtFail;
+    if (!silSwBuildTgtPreview(&tgtFail)) {
+        S.fail_reason = "tgt setup: " + tgtFail;
+        std::cout << "[Ctrl+Alt+W/3d] failed — " << S.fail_reason << std::endl;
+        return false;
+    }
+
+    // ---- Copy preview caches into state machine ----
+    S.src_rim_2D             = g_silSwSrcRim2DPreview;
+    S.src_rim_3D_oriented    = g_silSwSrcRim3DPreview;     // Step 3d2: from preview directly
+    S.src_pivots_2D          = g_silSwSrcPivots2DPreview;
+    S.src_pivots_lr_label    = g_silSwSrcPivotsLRPreview;
+    S.src_start_idx_in_chain = g_silSwSrcStartIdxPreview;
+    S.src_right_centroid_2D  = g_silSwSrcRightCentroid2DPreview;
+    S.tgt_lower_2D           = g_silSwTgtLower2DPreview;
+    S.tgt_anchors_2D         = g_silSwTgtAnchors2DPreview;
+    S.tgt_centroid_2D        = g_silSwTgtCentroid2DPreview;
+
+    // Build pivot 3D from dense 3D by re-resampling along the same arc
+    // length parameterisation. This ensures src_pivots_3D[i] is the
+    // exact 3D position whose 2D projection matches src_pivots_2D[i].
+    //
+    // [Stage A] If g_silSwSrcPivots3DPreview is populated (= MST source
+    // rim method is active), the dispatcher has ALREADY computed the
+    // 3D pivots using the open-curve arc-length parameterisation that
+    // matches src_pivots_2D. Use those directly and skip the legacy
+    // closed-loop resampling, which assumes a loop topology that the
+    // MST open polyline does not have.
+    if (!g_silSwSrcPivots3DPreview.empty() &&
+        (int)g_silSwSrcPivots3DPreview.size() == (int)S.src_pivots_2D.size())
+    {
+        S.src_pivots_3D = g_silSwSrcPivots3DPreview;
+    } else {
+        // Legacy closed-loop resampling — runs for ENVELOPE method.
+        const int N = S.n_pivot;
+        const int M = (int)S.src_rim_3D_oriented.size();
+        if (M >= 2 && N >= 1) {
+            std::vector<glm::vec3> pts3 = S.src_rim_3D_oriented;
+            pts3.push_back(pts3.front());     // close loop
+            std::vector<float> cum(pts3.size(), 0.0f);
+            for (size_t i = 1; i < pts3.size(); i++)
+                cum[i] = cum[i-1] + glm::length(pts3[i] - pts3[i-1]);
+            const float total = cum.back();
+            S.src_pivots_3D.clear();
+            S.src_pivots_3D.reserve(N);
+            if (total > 1e-6f) {
+                for (int k = 0; k < N; k++) {
+                    const float t = (float(k) + 0.5f) * total / float(N);
+                    auto it = std::upper_bound(cum.begin(), cum.end(), t);
+                    if (it == cum.begin()) { S.src_pivots_3D.push_back(pts3.front()); continue; }
+                    if (it == cum.end())   { S.src_pivots_3D.push_back(pts3.back());  continue; }
+                    const size_t idx = std::distance(cum.begin(), it);
+                    const float seg = cum[idx] - cum[idx-1];
+                    const float alpha = (seg > 1e-6f) ? (t - cum[idx-1]) / seg : 0.0f;
+                    S.src_pivots_3D.push_back(glm::mix(pts3[idx-1], pts3[idx], alpha));
+                }
+            }
+        }
+    }
+
+    // ---- Configure phase machine ----
+    S.n_pivot    = (int)S.tgt_anchors_2D.size();
+    S.n_rotation = 36;
+
+    // Total candidate counts
+    const int p1_cands = S.n_pivot * S.n_rotation;             // 20 * 36 = 720
+    const int p2_cands = (2 * S.phase2_pivot_radius + 1)
+                       * (2 * int(S.phase2_theta_radius_deg) + 1);
+    // Phase 2 will recompute exact total after Phase 1 done — initial
+    // value here is just for diagnostics.
+    (void)p2_cands;
+
+    S.total_frames_phase1 = g_silhouetteSweepAnimate
+                              ? std::max(1, g_silhouetteSweepFrames1)
+                              : 1;
+    S.total_frames_phase2 = g_silhouetteSweepAnimate
+                              ? std::max(1, g_silhouetteSweepFrames2)
+                              : 1;
+    S.candidates_per_frame = std::max(1,
+        (p1_cands + S.total_frames_phase1 - 1) / S.total_frames_phase1);
+
+    S.total_candidates = p1_cands;
+    S.candidate_idx    = 0;
+    S.current_frame    = 0;
+    S.phase            = 1;
+    S.active           = true;
+    S.best_cost        = 1e18;
+    S.best_i_pivot     = -1;
+    S.best_theta_deg   = 0.0f;
+    S.best_T           = glm::mat4(1.0f);
+    S.cost_history.clear();
+
+    std::cout << "[Ctrl+Alt+W/3d] sweep START\n"
+              << "  src_dense=" << S.src_rim_2D.size()
+              << "  src_pivots=" << S.src_pivots_3D.size()
+              << "  tgt_lower=" << S.tgt_lower_2D.size()
+              << "  tgt_anchors=" << S.tgt_anchors_2D.size()
+              << "  start_idx=" << S.src_start_idx_in_chain
+              << "  reversed=" << (S.src_dir_reversed ? "Y" : "N")
+              << "\n  Phase 1: " << p1_cands << " cands, "
+              << S.candidates_per_frame << "/frame, "
+              << S.total_frames_phase1 << " frames"
+              << std::endl;
+
+    return true;
+}
+
+
+// ---------------------------------------------------------------------
+// tickSilhouetteSweep
+//   Process one frame's batch of candidates. Returns true while sweep
+//   is ongoing; false when complete (caller then runs the apply/save
+//   tail in main.cpp).
+//
+//   Phase 1: 20 pivots * 36 rotations = 720 candidates
+//   Phase 2: (2*radius+1) pivots * (2*range_deg+1) rotations around best
+// ---------------------------------------------------------------------
+inline bool tickSilhouetteSweep()
+{
+    auto& S = g_silhouetteSweep;
+    if (!S.active) return false;
+
+    const glm::mat4 view_m = buildSilhouetteView();
+    const glm::mat4 proj_m = buildSilhouetteProj();
+    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+
+    int processed_this_frame = 0;
+    const int budget = std::max(1, S.candidates_per_frame);
+
+    int last_pivot_i = -1;
+    while (processed_this_frame < budget
+           && S.candidate_idx < S.total_candidates)
+    {
+        int pivot_i;
+        float theta_deg;
+
+        if (S.phase == 1) {
+            // candidate_idx → (i, k_rot)
+            const int i_p   = S.candidate_idx / S.n_rotation;
+            const int k_rot = S.candidate_idx % S.n_rotation;
+            pivot_i   = i_p;
+            theta_deg = 360.0f * float(k_rot) / float(S.n_rotation);
+        } else if (S.phase == 2) {
+            const int n_rot_p2 = 2 * int(S.phase2_theta_radius_deg) + 1;
+            const int i_p     = S.candidate_idx / n_rot_p2;
+            const int k_rot   = S.candidate_idx % n_rot_p2;
+            pivot_i = S.phase1_best_i_pivot - S.phase2_pivot_radius + i_p;
+            // Wrap pivot_i mod n_pivot (closed-loop indexing)
+            while (pivot_i < 0) pivot_i += S.n_pivot;
+            while (pivot_i >= S.n_pivot) pivot_i -= S.n_pivot;
+            theta_deg = S.phase1_best_theta_deg
+                      - S.phase2_theta_radius_deg
+                      + float(k_rot);
+        } else {
+            break;
+        }
+
+        glm::mat4 T_cand(1.0f);
+        double cost = RimShape::evaluateSilhouetteSweepCandidate(
+            S.src_rim_3D_oriented, S.src_pivots_3D,
+            S.tgt_anchors_2D, S.tgt_lower_2D,
+            pivot_i, theta_deg,
+            view_m, proj_m, W_img, H_img,
+            T_cand);
+
+        // === Check A: rotation magnitude cap (independent of CC) ===
+        //   Wrap θ to (-180°, +180°], reject if |θ| > cap.
+        if (g_silSwCheckA_Enable) {
+            float th = theta_deg;
+            while (th >  180.0f) th -= 360.0f;
+            while (th < -180.0f) th += 360.0f;
+            if (std::fabs(th) > g_silSwCheckA_RotCapDeg) {
+                cost = 1e18;
+            }
+        }
+
+        // === Check B: CC orientation guard (CRANIAL→CAUDAL must point
+        //     screen-down within ±tolerance, i.e. ~6 o'clock) ===
+        if (cost < 1e17 && g_silSwCheckB_Enable && g_liverCC.valid()) {
+            const glm::vec3 d_cc(
+                float(g_liverCC.d_cc.x),
+                float(g_liverCC.d_cc.y),
+                float(g_liverCC.d_cc.z));
+            const glm::vec3 P_s = S.src_pivots_3D[pivot_i];
+            const float step = 60.0f;     // mesh units (rough liver scale)
+            const glm::vec3 cranial_w = P_s + step * d_cc;
+            const glm::vec3 caudal_w  = P_s - step * d_cc;
+            const glm::mat4 VP = proj_m * view_m;
+            auto project = [&](const glm::vec3& p3) -> glm::vec2 {
+                const glm::vec4 cp = VP * (T_cand * glm::vec4(p3, 1.0f));
+                if (cp.w <= 1e-9f) return glm::vec2(-1e6f, -1e6f);
+                return glm::vec2(
+                    (cp.x / cp.w + 1.0f) * 0.5f * float(W_img),
+                    (1.0f - cp.y / cp.w) * 0.5f * float(H_img));
+            };
+            const glm::vec2 cranial_2D = project(cranial_w);
+            const glm::vec2 caudal_2D  = project(caudal_w);
+            if (cranial_2D.x > -1e5f && caudal_2D.x > -1e5f) {
+                const float dx = caudal_2D.x - cranial_2D.x;
+                const float dy = caudal_2D.y - cranial_2D.y;
+                const float angle_deg =
+                    std::atan2(dy, dx) * 180.0f / 3.14159265f;
+                // Target: 90° (= +y screen-down = 6 o'clock)
+                float delta = angle_deg - 90.0f;
+                while (delta >  180.0f) delta -= 360.0f;
+                while (delta < -180.0f) delta += 360.0f;
+                if (std::fabs(delta) > g_silSwCheckB_CCToleranceDeg) {
+                    cost = 1e18;
+                }
+            }
+            // If projection failed (NaN / behind camera), no reject —
+            // let the candidate through and rely on dense chamfer cost.
+        }
+
+        if (cost < S.best_cost) {
+            S.best_cost      = cost;
+            S.best_i_pivot   = pivot_i;
+            S.best_theta_deg = theta_deg;
+            S.best_T         = T_cand;
+        }
+
+        last_pivot_i = pivot_i;
+        S.candidate_idx++;
+        processed_this_frame++;
+    }
+
+    // ----- Trial visualization (Step 3d2: animate sweep on AR scene) -----
+    //   Mirrors the Step 3c trial-pose visualization. Yellow dots =
+    //   current best transformed source rim (whole curve). Pivots
+    //   shown in gray with the *last-tried* index in cyan so the user
+    //   can see the algorithm walking through the discretization.
+    //   Cleared by main.cpp's finish path.
+    {
+        g_contourSweepShowTrial = true;
+        g_contourSweepTrialSrc.clear();
+        g_contourSweepTrialSrc.reserve(S.src_rim_3D_oriented.size());
+        for (const auto& p : S.src_rim_3D_oriented) {
+            const glm::vec4 p4 = S.best_T * glm::vec4(p, 1.0f);
+            g_contourSweepTrialSrc.emplace_back(p4.x, p4.y, p4.z);
+        }
+        g_contourSweepSrcPivotsTrial.clear();
+        g_contourSweepSrcPivotsTrial.reserve(S.src_pivots_3D.size());
+        for (const auto& p : S.src_pivots_3D) {
+            const glm::vec4 p4 = S.best_T * glm::vec4(p, 1.0f);
+            g_contourSweepSrcPivotsTrial.emplace_back(p4.x, p4.y, p4.z);
+        }
+        // Use existing pivot-anchor highlight slots:
+        //   CurrentJSrc highlights the source pivot in cyan.
+        //   CurrentITgt would highlight the target anchor, but Step 3d
+        //   keeps target as a 2D-only curve (no 3D back-projection in
+        //   the scene), so we leave it -1.
+        g_contourSweepCurrentJSrc = last_pivot_i;
+        g_contourSweepCurrentITgt = -1;
+        // Note: g_contourSweepTgtAnchors3D is not populated by Step 3d
+        // (target is purely 2D), so the existing draw code will simply
+        // skip the target-anchor dots.
+        g_contourSweepTgtAnchors3D.clear();
+    }
+
+    // Push history once per frame for ImGui plot
+    S.cost_history.push_back(S.best_cost);
+    S.current_frame++;
+
+    // -------- Phase transition --------
+    if (S.candidate_idx >= S.total_candidates) {
+        if (S.phase == 1) {
+            // Lock Phase 1 best, set up Phase 2 sweep
+            S.phase1_best_i_pivot   = S.best_i_pivot;
+            S.phase1_best_theta_deg = S.best_theta_deg;
+
+            const int n_pivot_p2 = 2 * S.phase2_pivot_radius + 1;
+            const int n_rot_p2   = 2 * int(S.phase2_theta_radius_deg) + 1;
+            const int p2_cands   = n_pivot_p2 * n_rot_p2;
+
+            S.total_candidates    = p2_cands;
+            S.candidate_idx       = 0;
+            S.current_frame       = 0;
+            S.candidates_per_frame = std::max(1,
+                (p2_cands + S.total_frames_phase2 - 1) / S.total_frames_phase2);
+            S.phase = 2;
+
+            if (g_silhouetteSweepLog) {
+                std::cout << "[Ctrl+Alt+W/3d] Phase 1 done."
+                          << "  best i=" << S.best_i_pivot
+                          << "  θ=" << S.best_theta_deg << "°"
+                          << "  cost=" << S.best_cost << "px\n"
+                          << "  Phase 2: " << p2_cands << " cands, "
+                          << S.candidates_per_frame << "/frame"
+                          << std::endl;
+            }
+            return true;
+        } else if (S.phase == 2) {
+            S.phase  = 3;
+            S.active = false;
+            if (g_silhouetteSweepLog) {
+                std::cout << "[Ctrl+Alt+W/3d] Phase 2 done."
+                          << "  final best i=" << S.best_i_pivot
+                          << "  θ=" << S.best_theta_deg << "°"
+                          << "  cost=" << S.best_cost << "px"
+                          << std::endl;
+            }
+            return false;
+        }
+    }
 
     return true;
 }

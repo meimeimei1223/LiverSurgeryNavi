@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 500" font-family="system-ui, sans-serif">
+  <rect width="1000" height="500" fill="#1a1c22"/>
+  <text x="20" y="28" fill="#e8eaed" font-size="16" font-weight="600">Implementation phases &amp; dependencies</text>
+  <text x="20" y="48" fill="#9aa0a6" font-size="11">各 phase は独立 PR として merge 可能。番号順に進めるのが安全。</text>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7280"/>
+    </marker>
+  </defs>
+
+  <g transform="translate(40, 90)">
+    <rect width="160" height="80" fill="#1a221a" stroke="#3a5030" rx="6"/>
+    <text x="80" y="22" fill="#9fd07a" font-size="11" text-anchor="middle" font-weight="500">Phase 0</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">Clear CorresPoints</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">バグ修正 (孤立)</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~30 lines</text>
+  </g>
+
+  <g transform="translate(240, 90)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 1</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">DebugPanel 骨組み</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">Ctrl+D + 空 6 タブ</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~150 lines (new file)</text>
+  </g>
+
+  <g transform="translate(440, 90)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 2</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">Viz タブ</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">サイドバー viz 削除</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~200 lines</text>
+  </g>
+
+  <g transform="translate(640, 90)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 3</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">G タブ</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">Ctrl+G QSel 移植</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~250 lines</text>
+  </g>
+
+  <g transform="translate(40, 200)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 4</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">N タブ</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">Shift+N panel 移植</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~150 lines</text>
+  </g>
+
+  <g transform="translate(240, 200)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 5</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">W タブ</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">Shift+W popup スイッチ</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~120 lines</text>
+  </g>
+
+  <g transform="translate(440, 200)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 6</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">O タブ + U タブ</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">HemiAuto / Umeyama 設定</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~100 lines</text>
+  </g>
+
+  <g transform="translate(640, 200)">
+    <rect width="160" height="80" fill="#1a1f2a" stroke="#4a5070" rx="6"/>
+    <text x="80" y="22" fill="#9ab0e0" font-size="11" text-anchor="middle" font-weight="500">Phase 7</text>
+    <text x="80" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">ScreenMesh 統合</text>
+    <text x="80" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">Viz タブへ統合</text>
+    <text x="80" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~80 lines</text>
+  </g>
+
+  <g transform="translate(240, 310)">
+    <rect width="320" height="80" fill="#221a22" stroke="#603060" rx="6"/>
+    <text x="160" y="22" fill="#d090c0" font-size="11" text-anchor="middle" font-weight="500">Phase 8 — Main sidebar 最終整形</text>
+    <text x="160" y="40" fill="#cdd0d6" font-size="10" text-anchor="middle">Apply / Hemi+Probe / AutoQCR / Ctrl+G レイアウト確定</text>
+    <text x="160" y="54" fill="#cdd0d6" font-size="10" text-anchor="middle">Hemi → Shift+O 切替, 6-DoF を Tuning 側へ</text>
+    <text x="160" y="70" fill="#9aa0a6" font-size="9" text-anchor="middle">~200 lines change (整形のみ、機能変更なし)</text>
+  </g>
+
+  <line x1="200" y1="130" x2="240" y2="130" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="400" y1="130" x2="440" y2="130" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="600" y1="130" x2="640" y2="130" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 720 170 Q 720 185 120 185 L 120 200" fill="none" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="200" y1="240" x2="240" y2="240" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="400" y1="240" x2="440" y2="240" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="600" y1="240" x2="640" y2="240" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 720 280 Q 720 295 400 295 L 400 310" fill="none" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <g transform="translate(40, 420)">
+    <text x="0" y="0" fill="#9aa0a6" font-size="10">凡例:</text>
+    <rect x="0" y="6" width="14" height="10" fill="#1a221a" stroke="#3a5030"/>
+    <text x="20" y="15" fill="#cdd0d6" font-size="10">バグ修正 (独立して merge 可)</text>
+    <rect x="200" y="6" width="14" height="10" fill="#1a1f2a" stroke="#4a5070"/>
+    <text x="220" y="15" fill="#cdd0d6" font-size="10">機能追加 (DebugPanel タブ)</text>
+    <rect x="400" y="6" width="14" height="10" fill="#221a22" stroke="#603060"/>
+    <text x="420" y="15" fill="#cdd0d6" font-size="10">レイアウト整形のみ</text>
+  </g>
+
+  <g transform="translate(40, 460)">
+    <text x="0" y="0" fill="#9aa0a6" font-size="10">合計工数見積もり: ~1,300 lines change across ~5 files. 各 phase 独立。途中で止めても動く。</text>
+  </g>
+</svg>

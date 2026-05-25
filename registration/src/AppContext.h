@@ -95,7 +95,7 @@ struct AppContext {
     // Toggled by the "Use GPU" checkbox in the DEPTH GENERATION panel.
     // Default OFF for safety on machines without CUDA; flip ON to get
     // ~4-5x faster Run Depth when a CUDA GPU is available AND the
-    // medsam2_da3_lite binary was built with USE_CUDA=ON.
+    // sam2_da3_lite binary was built with USE_CUDA=ON.
     bool useCuda = false;
 
 };

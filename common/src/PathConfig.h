@@ -12,12 +12,12 @@ inline std::string SHADERS_PATH     = "../../../shaders/";
 inline std::string REG_MODEL_PATH   = "../../../registration_model/";
 inline std::string INPUT_IMAGE_PATH = "../../../input_image/";
 inline std::string DEPTH_OUTPUT_PATH = "../../../depth_output/";
-inline std::string ONNX_MODELS_PATH = "../../../medsam2_da3_lite/onnx_models/";
+inline std::string ONNX_MODELS_PATH = "../../../sam2_da3_lite/onnx_models/";
 
 #ifdef _WIN32
-inline std::string DEPTH_EXE_PATH   = "./medsam2_da3_lite.exe";
+inline std::string DEPTH_EXE_PATH   = "./sam2_da3_lite.exe";
 #else
-inline std::string DEPTH_EXE_PATH   = "./medsam2_da3_lite";
+inline std::string DEPTH_EXE_PATH   = "./sam2_da3_lite";
 #endif
 
 // --- Depth Model Selector ---
@@ -194,27 +194,27 @@ inline void initPaths() {
     ONNX_MODELS_PATH = findPath("ONNX_MODELS_PATH", "depth_anything_v3_small.onnx", {
                                                                                         "onnx_models/",
                                                                                         "../onnx_models/",
-                                                                                        "medsam2_da3_lite/onnx_models/",
-                                                                                        "../medsam2_da3_lite/onnx_models/",
-                                                                                        "../../medsam2_da3_lite/onnx_models/",
-                                                                                        "../../../medsam2_da3_lite/onnx_models/",
-                                                                                        "../../../../medsam2_da3_lite/onnx_models/"
+                                                                                        "sam2_da3_lite/onnx_models/",
+                                                                                        "../sam2_da3_lite/onnx_models/",
+                                                                                        "../../sam2_da3_lite/onnx_models/",
+                                                                                        "../../../sam2_da3_lite/onnx_models/",
+                                                                                        "../../../../sam2_da3_lite/onnx_models/"
                                                                                     });
 
     DEPTH_EXE_PATH = findExe("DEPTH_EXE_PATH", {
 #ifdef _WIN32
-                                                   "./medsam2_da3_lite.exe",
-                                                   "medsam2_da3_lite.exe",
-                                                   "../bin/medsam2_da3_lite.exe",
-                                                   "../../bin/medsam2_da3_lite.exe",
-                                                   "../../../bin/medsam2_da3_lite.exe",
+                                                   "./sam2_da3_lite.exe",
+                                                   "sam2_da3_lite.exe",
+                                                   "../bin/sam2_da3_lite.exe",
+                                                   "../../bin/sam2_da3_lite.exe",
+                                                   "../../../bin/sam2_da3_lite.exe",
 #else
-                                                   "./medsam2_da3_lite",
-                                                   "../../../medsam2_da3_lite/build/medsam2_da3_lite",
-                                                   "../../medsam2_da3_lite/build/medsam2_da3_lite",
-                                                   "../medsam2_da3_lite/build/medsam2_da3_lite",
-                                                   "../bin/medsam2_da3_lite",
-                                                   "medsam2_da3_lite",
+                                                   "./sam2_da3_lite",
+                                                   "../../../sam2_da3_lite/build/sam2_da3_lite",
+                                                   "../../sam2_da3_lite/build/sam2_da3_lite",
+                                                   "../sam2_da3_lite/build/sam2_da3_lite",
+                                                   "../bin/sam2_da3_lite",
+                                                   "sam2_da3_lite",
 #endif
                                                });
 

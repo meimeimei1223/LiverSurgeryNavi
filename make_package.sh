@@ -35,7 +35,7 @@ make -j$(nproc)
 
 # 実行ファイル検索
 AAA_EXE=$(find "${BUILD_DIR}" -name "AAA_Reg3D_ONNX" -type f -executable | head -1)
-DEPTH_EXE=$(find "${BUILD_DIR}" -name "medsam2_da3_lite" -type f -executable | head -1)
+DEPTH_EXE=$(find "${BUILD_DIR}" -name "sam2_da3_lite" -type f -executable | head -1)
 
 if [ -z "${AAA_EXE}" ]; then
     echo "ERROR: AAA_Reg3D_ONNX not found"
@@ -85,7 +85,7 @@ fi
 # Step 5: ONNXモデル
 # ---------------------------------------------------------
 echo "Copying ONNX models..."
-MODELS_SRC="${PROJ_ROOT}/medsam2_da3_lite/models"
+MODELS_SRC="${PROJ_ROOT}/sam2_da3_lite/models"
 if [ -d "${MODELS_SRC}" ]; then
     cp "${MODELS_SRC}"/*.onnx "${PACKAGE_DIR}/models/" 2>/dev/null || true
     echo "  OK ($(ls "${PACKAGE_DIR}/models/" | wc -l) files)"

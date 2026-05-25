@@ -36,6 +36,7 @@
 #include "CameraPreview.h"
 #include "mCutMesh.h"
 #include "MeshDrawing.h"
+#include "ScreenMeshPoints.h"   // ScreenMeshPointCache (shared GL_POINTS draw)
 #include "FullSphereCameraWithTarget.h"
 #include "DepthUtils.h"
 #include "IoUDebugDump.h"   // IoUDebug::dump (Shift+I)
@@ -138,6 +139,9 @@ std::vector<float> g_gnUnsignedBdy;
 int                g_gnUnsignedBdyW     = 0;
 int                g_gnUnsignedBdyH     = 0;
 bool               g_gnUnsignedBdyValid = false;
+
+// Phase 7b Step 3c (Ctrl+Alt+W) — Contour Sweep state lives in
+// RegistrationActions.h as an inline variable; no definition needed here.
 bool g_showClusterVisualization = false;
 bool g_showBoundaryCandidates   = false;
 bool g_showSourceVisualization  = false;
@@ -662,7 +666,7 @@ float g_meshAlpha[8] = {0.8f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f};
 // =========================================================
 bool  g_screenMeshAsPoints  = true;
 float g_screenMeshPointSize = 2.0f;
-float g_screenMeshDensity   = 100.0f;
+float g_screenMeshDensity   = 1.0f;
 static SphereMesh g_sphereMarker;  // クラスタ・対応点描画用スフィア
 static ARSave::State g_arSave;    // AR保存＋プレビュー状態
 static ShaderProgram* g_pShader     = nullptr;  // AR保存用シェーダ参照
@@ -690,7 +694,7 @@ bool g_showCorrespondencePoints = false;
 //  applyInitRotation() で post-transform AABB を g_dbgSourceBB に保存し、
 //  drawScene の最後で sphere を描く。
 // =========================================================
-bool      g_showDebugBB = true;          // 既定で ON。ImGui で toggle 可
+bool      g_showDebugBB = false;         // 既定で OFF。ImGui で toggle 可
 glm::vec3 g_dbgSourceBB_min(0.0f);
 glm::vec3 g_dbgSourceBB_max(0.0f);
 glm::vec3 g_dbgSourceBB_center(0.0f);
@@ -1245,76 +1249,8 @@ static glm::vec3 g_lastOrganOffset(0.0f);
 //  cachedVBO で mesh の VBO ID を覚え、setUp() で VBO が再生成された
 //  ときに自動的にリビルドする (ID の変化で検出)。
 // =========================================================
-struct ScreenMeshPointCache {
-    GLuint vao            = 0;
-    GLuint ebo            = 0;
-    size_t totalVerts     = 0;
-    GLuint cachedVBO      = 0;     // mesh->VBO id at last build (invalidation key)
-    bool   needsReshuffle = false; // user pressed Reshuffle button
-
-    bool ensure(mCutMesh* mesh) {
-        if (!mesh || mesh->VBO == 0 || mesh->mVertices.empty()) return false;
-        const size_t n = mesh->mVertices.size() / 3;
-
-        // already up-to-date?
-        if (vao != 0
-            && totalVerts == n
-            && cachedVBO == mesh->VBO
-            && !needsReshuffle) {
-            return true;
-        }
-
-        cleanup();
-
-        // shuffled indices [0..n-1]
-        std::vector<GLuint> idx(n);
-        std::iota(idx.begin(), idx.end(), 0u);
-        // 固定シードで再現性確保 (Reshuffle ボタン押下時のみ別シード)
-        static uint64_t seed = 0xC0FFEEULL;
-        if (needsReshuffle) seed += 1;
-        std::mt19937 rng(static_cast<unsigned>(seed));
-        std::shuffle(idx.begin(), idx.end(), rng);
-
-        glGenVertexArrays(1, &vao);
-        glGenBuffers(1, &ebo);
-        glBindVertexArray(vao);
-
-        // share mesh->VBO for positions (location=0)
-        glBindBuffer(GL_ARRAY_BUFFER, mesh->VBO);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
-        glEnableVertexAttribArray(0);
-
-        // share mesh->NBO for normals (location=1) so the basic shader's
-        // lighting calc still gets sensible values
-        if (mesh->NBO != 0) {
-            glBindBuffer(GL_ARRAY_BUFFER, mesh->NBO);
-            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
-            glEnableVertexAttribArray(1);
-        }
-
-        // upload shuffled index buffer
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     n * sizeof(GLuint), idx.data(), GL_STATIC_DRAW);
-
-        glBindVertexArray(0);
-
-        totalVerts     = n;
-        cachedVBO      = mesh->VBO;
-        needsReshuffle = false;
-        return true;
-    }
-
-    void requestReshuffle() { needsReshuffle = true; }
-
-    void cleanup() {
-        if (vao) { glDeleteVertexArrays(1, &vao); vao = 0; }
-        if (ebo) { glDeleteBuffers(1, &ebo);      ebo = 0; }
-        totalVerts = 0;
-        cachedVBO  = 0;
-    }
-};
-
+//  ScreenMeshPointCache の定義は common/src/ScreenMeshPoints.h に移動
+//  (REG と DEFORM で共有)。
 static ScreenMeshPointCache g_screenMeshPC;
 
 // =========================================================
@@ -1340,29 +1276,9 @@ void drawScreenMeshAsPoints(
     const glm::vec4& color,
     float pointSize)
 {
-    if (!mesh || mesh->VAO == 0 || mesh->mVertices.empty()) return;
-    if (!g_screenMeshPC.ensure(mesh)) return;
-
-    shader.use();
-    shader.setUniform("model",      model);
-    shader.setUniform("view",       view);
-    shader.setUniform("projection", projection);
-    shader.setUniform("vertColor",  color);
-    shader.setUniform("lightPos",   camPos);
-    shader.setUniform("viewPos",    camPos);
-    shader.setUniform("lightColor", glm::vec3(1.0f, 1.0f, 1.0f));
-    shader.setUniform("useTexture", false);
-
-    // density [%] -> draw count (シャッフル済み配列の先頭から K 個)
-    const float pct = std::clamp(g_screenMeshDensity, 0.1f, 100.0f);
-    const size_t total = g_screenMeshPC.totalVerts;
-    GLsizei drawCount = (GLsizei)std::max<size_t>(
-        1, (size_t)((double)total * (double)pct / 100.0));
-
-    glPointSize(pointSize);
-    glBindVertexArray(g_screenMeshPC.vao);
-    glDrawElements(GL_POINTS, drawCount, GL_UNSIGNED_INT, (void*)0);
-    glBindVertexArray(0);
+    // 共有の ScreenMeshPointCache に委譲。density は REG の UI 値を渡す。
+    g_screenMeshPC.draw(mesh, shader, model, view, projection, camPos,
+                        color, pointSize, g_screenMeshDensity);
 }
 
 static void rebuildOBJWithCurrentThreshold() {
@@ -1795,6 +1711,50 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         //                   ICP は skip、rim 絶対保持優先
         //   Alt+W         : Shape Match Coarse2D + Gauss-Newton refine
         //                   (Phase 7b Step 3b — PnP-style sub-pixel refine)
+        //   Ctrl+Alt+W    : Contour Sweep (Phase 7b Step 3c)
+        //                   discrete arc-length × rotation grid search,
+        //                   Z-axis-preserving by construction
+        if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_ALT)
+                                     && !(mods & GLFW_MOD_SHIFT)) {
+            // ==== Ctrl+Alt+W : Step 3c or 3d (toggle on g_silhouetteSweepEnable) ====
+            //   Starts a multi-frame live sweep. Per-frame batch is
+            //   processed in the main loop after rendering; mesh is
+            //   applied only on completion (no oscillation during sweep).
+            //
+            //   When g_silhouetteSweepEnable is OFF (default), runs the
+            //   Step 3c sector-based contour sweep (legacy).
+            //   When ON, runs the Step 3d silhouette 2D dense sweep
+            //   (no LR constraint, no bbox filter, no rot cap; the
+            //    right-start convention locks the orientation).
+            if (g_contourSweepState.active || g_silhouetteSweep.active) {
+                std::cout << "[Ctrl+Alt+W] sweep already running"
+                          << "  (3c.phase=" << g_contourSweepState.phase
+                          << "  3d.phase=" << g_silhouetteSweep.phase
+                          << ")  — ignored" << std::endl;
+                break;
+            }
+            if (gApp.mode != AppMode::kRegistration) {
+                std::cout << "[Ctrl+Alt+W] requires a loaded scene"
+                          << std::endl;
+                break;
+            }
+            // Auto-trigger labels (same as Ctrl+W).
+            // Step 3c++ label-based orientation lock needs BOTH LR and
+            // CC labels — unlike Ctrl+W which only needs CC when
+            // caudal-only is requested, here we always pull CC so the
+            // sweep can enforce screen-up ↔ patient-cranial alignment.
+            // Step 3d only needs LR (PURE_RIGHT centroid), but we
+            // pull both for parity / safety.
+            if (!g_liverRegion.valid()) recomputeLiverRegion();
+            if (!g_liverLR.valid())     recomputeLiverLR();
+            if (!g_liverCC.valid())     recomputeLiverCC();
+            if (g_silhouetteSweepEnable) {
+                startSilhouetteSweep();
+            } else {
+                startContourSweep();
+            }
+            break;
+        }
         if ((mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL)
                                   && !(mods & GLFW_MOD_SHIFT)) {
             // ==== Alt+W : Coarse2D + Gauss-Newton refine + apply + save ==
@@ -3210,31 +3170,57 @@ static bool setupObjScene() {
         return false;
     }
 
-    // 前回のオフセットをリセット（すべての臓器に対して）
-    if (liverMesh3D) {
-        std::vector<mCutMesh*> organs = { liverMesh3D, portalMesh3D, veinMesh3D,
-                                          tumorMesh3D, segmentMesh3D, gbMesh3D };
-        if (g_hasLastOrganTransform) {
-            // similarity transform undo
-            glm::mat4 invT = glm::inverse(g_lastOrganTransform);
-            Reg3DCustom::applyTransformToMeshes(organs, invT);
-            for (auto* m : organs) if (m) setUp(*m);
-            g_lastOrganTransform    = glm::mat4(1.0f);
-            g_hasLastOrganTransform = false;
-        } else if (glm::dot(g_lastOrganOffset, g_lastOrganOffset) > 0.0f) {
-            // legacy translation-only undo
-            for (auto* m : organs) {
-                if (m) {
-                    for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
-                        m->mVertices[i]   -= g_lastOrganOffset.x;
-                        m->mVertices[i+1] -= g_lastOrganOffset.y;
-                        m->mVertices[i+2] -= g_lastOrganOffset.z;
-                    }
-                    setUp(*m);
-                }
-            }
+    // ---------------------------------------------------------------------
+    //  Reload all organ meshes from the CT model (.obj) so we ALWAYS restart
+    //  from CT/model space. Previously this block only undid the last prealign
+    //  (g_lastOrganTransform), which left Apply-Init-Pose rotation / CMA-ES /
+    //  Umeyama / manual transforms baked into the vertices. Reloading discards
+    //  the entire transform chain, so the snapshotInitialPose() taken right
+    //  after the new prealign reflects the TRUE initial pose for the new depth
+    //  target (otherwise loading depth mid-session corrupts the initial pose
+    //  and every later Apply Init Pose / d_lr / d_cc derived from it).
+    // ---------------------------------------------------------------------
+    {
+        struct OrganSpec { mCutMesh** ptr; const char* file; glm::vec3 color; };
+        OrganSpec specs[] = {
+            { &liverMesh3D,   "liver.obj",  glm::vec3(0.8f, 0.2f, 0.2f) },
+            { &portalMesh3D,  "portal.obj", glm::vec3(0.2f, 0.2f, 0.8f) },
+            { &veinMesh3D,    "vein.obj",   glm::vec3(0.2f, 0.5f, 0.5f) },
+            { &tumorMesh3D,   "tumor.obj",  glm::vec3(0.8f, 0.5f, 0.5f) },
+            { &segmentMesh3D, "res.obj",    glm::vec3(0.2f, 0.8f, 0.5f) },
+            { &gbMesh3D,      "gb.obj",     glm::vec3(0.2f, 0.8f, 0.2f) },
+        };
+        for (auto& s : specs) {
+            // Preserve any runtime color tweak; fall back to the default color.
+            glm::vec3 keepColor = (*s.ptr) ? (*s.ptr)->mColor : s.color;
+            delete *s.ptr;
+            *s.ptr = new mCutMesh(mCutMesh().loadMeshFromFile((MODEL_PATH + s.file).c_str()));
+            (*s.ptr)->mColor = keepColor;
+            setUp(**s.ptr);
         }
-        g_lastOrganOffset = glm::vec3(0.0f);
+
+        // Re-point AppContext caches (otherwise getOrganList() is fine but
+        // gApp.liver / gApp.all hold dangling pointers to the freed meshes).
+        gApp.liver   = liverMesh3D;  gApp.portal  = portalMesh3D; gApp.vein = veinMesh3D;
+        gApp.tumor   = tumorMesh3D;  gApp.segment = segmentMesh3D; gApp.gb  = gbMesh3D;
+        allMeshes = { liverMesh3D, portalMesh3D, veinMesh3D,
+                      tumorMesh3D, segmentMesh3D, gbMesh3D };
+        gApp.all = allMeshes;
+
+        // No transform is applied to the freshly loaded vertices yet.
+        g_lastOrganTransform    = glm::mat4(1.0f);
+        g_hasLastOrganTransform = false;
+        g_lastOrganOffset       = glm::vec3(0.0f);
+
+        // Geometry-derived labels were computed on the old pose; invalidate so
+        // they auto-recompute (vertex indexing is identical after reload, so
+        // this is a safety reset rather than strictly required).
+        g_liverRegion = LiverRegionLabel::Result();
+        g_liverLR     = LiverLeftRightLabel::Result();
+        g_liverCC     = LiverCranioCaudalLabel::Result();
+
+        std::cout << "[setupObjScene] Reloaded all 6 organ meshes from " << MODEL_PATH
+                  << "  (CT space; all prior transforms discarded)" << std::endl;
     }
     Reg3DCustom::clearCachedTargetCloud();
 
@@ -3536,7 +3522,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
 
     // CUDA / GPU acceleration. When ON, the runner adds --cuda so the
     // external pipeline registers the CUDAExecutionProvider. Harmless
-    // when medsam2_da3_lite is a CPU-only build (silent CPU fallback).
+    // when sam2_da3_lite is a CPU-only build (silent CPU fallback).
     runner.config.useCuda = ctx.useCuda;
 
     // 出力ファイル名のサフィックスを決定。setupObjScene の intrinsics 候補
@@ -3551,7 +3537,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     else if (g_intrinsicsSource == 3) srcTag = "calib";
     runner.config.intrinsicsSourceName = srcTag;
 
-    // Custom intrinsics 選択時、外部 medsam2_da3_lite に --kinect-intrinsics
+    // Custom intrinsics 選択時、外部 sam2_da3_lite に --kinect-intrinsics
     // で K を渡す。これがないと外部側はデフォルト Azure Kinect 720p を使って
     // メッシュをアンプロジェクトしてしまい、AR で 3D メッシュと背景画像が
     // ずれる (C++ 側の射影行列は Custom K、メッシュは Kinect K で生成、で
@@ -3565,7 +3551,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
         // Brown-Conrady distortion: round-trip so the pipeline does NOT
         // truncate user-edited intrinsics_custom.txt on every Run Depth.
         // Zero coefficients pass through silently; only non-zero values
-        // emit --kinect-distortion on the medsam side.
+        // emit --kinect-distortion on the sam side.
         runner.config.k1 = g_intrinsics.k1;
         runner.config.k2 = g_intrinsics.k2;
         runner.config.k3 = g_intrinsics.k3;
@@ -3593,7 +3579,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
         runner.config.cx = (float)g_calibResult.cx;
         runner.config.cy = (float)g_calibResult.cy;
         // CalibResult only carries k1, k2 (the in-house Zhang tool fits only
-        // those). k3/k4/p1/p2 stay 0; the medsam pipeline will then either
+        // those). k3/k4/p1/p2 stay 0; the sam pipeline will then either
         // emit them (if non-zero) or skip the --kinect-distortion flag
         // entirely (when all zero).
         runner.config.k1 = (float)g_calibResult.k1;
@@ -3705,7 +3691,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
         std::cerr << "[RunDepth] expected OBJ missing: " << objPath << std::endl;
         // Backwards compat: fall back to legacy _k4a.obj if the source-tagged
         // file isn't there (e.g. older pipeline build that doesn't know about
-        // --intrinsics-source). Keeps things working until medsam2_da3_lite
+        // --intrinsics-source). Keeps things working until sam2_da3_lite
         // is rebuilt with the new flag.
         std::string fallback =
             DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
@@ -4306,6 +4292,150 @@ int main() {
             NormalRefineLive::pendingSave = false;
         }
 
+        // Phase 7b Step 3c — Contour Sweep tick.
+        //   While active, process one batch of candidates per frame.
+        //   The mesh stays put; only the visualization (best-so-far
+        //   transformed rim) updates so the user sees convergence
+        //   live. On the frame the sweep completes, the apply / save
+        //   tail runs here (same as Ctrl+W / Alt+W tail).
+        if (g_contourSweepState.active) {
+            const bool more = tickContourSweep();
+            if (!more) {
+                // ---- Finish: apply best T + save to PoseLibrary ----
+                auto& S = g_contourSweepState;
+                if (S.best_cost < 1e17) {
+                    std::cout << "[Ctrl+Alt+W] finishing sweep,"
+                              << " applying best T:  cost="
+                              << S.best_cost << "px" << std::endl;
+
+                    poseAutoSaveBeforeRegistration();
+                    {
+                        auto organs = getOrganList();
+                        int n_valid = 0;
+                        for (auto* m : organs) if (m) n_valid++;
+                        std::cout << "[Ctrl+Alt+W] applying best T to "
+                                  << n_valid << " organ meshes..."
+                                  << std::endl;
+                        NormalRefine::applyIncrementalTransform(
+                            glm::dmat4(S.best_T), organs);
+                    }
+
+                    g_showDebugShapeMatch = false;
+                    g_debugShapeMatchBestSrc.clear();
+                    g_debugShapeMatchBestTransform = S.best_T;
+                    g_debugShapeMatchBestCost      = S.best_cost;
+
+                    // Clear trial visualization (was yellow during sweep)
+                    g_contourSweepShowTrial = false;
+                    g_contourSweepTrialSrc.clear();
+                    g_contourSweepTgtAnchors3D.clear();
+                    g_contourSweepSrcPivotsTrial.clear();
+                    g_contourSweepCurrentITgt = -1;
+                    g_contourSweepCurrentJSrc = -1;
+
+                    std::cout << "[Ctrl+Alt+W] saving pose to PoseLibrary"
+                              << " (max_iter=0 pseudo-session)..."
+                              << std::endl;
+                    const int saved_max_iter = g_normRefineMaxIter;
+                    g_normRefineMaxIter = 0;
+                    g_stepStartTime = std::chrono::steady_clock::now();
+                    gUI.state.regMethod = 3;
+                    if (g_normRefineLiveMode) {
+                        startNormalCompatRefineLive(
+                            NormalRefine::NORMAL_COMPAT,
+                            g_activeQuadrantMask);
+                    } else {
+                        runNormalCompatRefineSession(
+                            NormalRefine::NORMAL_COMPAT,
+                            g_activeQuadrantMask);
+                        poseSaveToLibrary(SaveCriterion::EITHER,
+                                          g_activeQuadrantMask);
+                    }
+                    g_normRefineMaxIter = saved_max_iter;
+                } else {
+                    std::cout << "[Ctrl+Alt+W] sweep complete but no valid"
+                              << " best found — mesh unchanged"
+                              << std::endl;
+                }
+            }
+        }
+
+        // Phase 7b Step 3d — Silhouette 2D Sweep tick (new path).
+        //   Independent state from the Step 3c sweep above; both
+        //   functions are mutually exclusive (start dispatch picks
+        //   one based on g_silhouetteSweepEnable). On completion,
+        //   the apply / save tail mirrors the Step 3c tail exactly,
+        //   but reads from g_silhouetteSweep instead of g_contourSweepState.
+        if (g_silhouetteSweep.active) {
+            const bool more = tickSilhouetteSweep();
+            if (!more) {
+                auto& S = g_silhouetteSweep;
+                if (S.best_cost < 1e17) {
+                    std::cout << "[Ctrl+Alt+W/3d] finishing sweep,"
+                              << " applying best T:  cost="
+                              << S.best_cost << "px" << std::endl;
+
+                    poseAutoSaveBeforeRegistration();
+                    {
+                        auto organs = getOrganList();
+                        int n_valid = 0;
+                        for (auto* m : organs) if (m) n_valid++;
+                        std::cout << "[Ctrl+Alt+W/3d] applying best T to "
+                                  << n_valid << " organ meshes..."
+                                  << std::endl;
+                        NormalRefine::applyIncrementalTransform(
+                            glm::dmat4(S.best_T), organs);
+                    }
+
+                    g_showDebugShapeMatch = false;
+                    g_debugShapeMatchBestSrc.clear();
+                    g_debugShapeMatchBestTransform = S.best_T;
+                    g_debugShapeMatchBestCost      = S.best_cost;
+
+                    // Clear trial visualization (was yellow / cyan
+                    // during sweep). Mirrors the Step 3c finish path.
+                    g_contourSweepShowTrial = false;
+                    g_contourSweepTrialSrc.clear();
+                    g_contourSweepTgtAnchors3D.clear();
+                    g_contourSweepSrcPivotsTrial.clear();
+                    g_contourSweepCurrentITgt = -1;
+                    g_contourSweepCurrentJSrc = -1;
+
+                    std::cout << "[Ctrl+Alt+W/3d] saving pose to PoseLibrary"
+                              << " (max_iter=0 pseudo-session)..."
+                              << std::endl;
+                    const int saved_max_iter = g_normRefineMaxIter;
+                    g_normRefineMaxIter = 0;
+                    g_stepStartTime = std::chrono::steady_clock::now();
+                    gUI.state.regMethod = 3;
+                    if (g_normRefineLiveMode) {
+                        startNormalCompatRefineLive(
+                            NormalRefine::NORMAL_COMPAT,
+                            g_activeQuadrantMask);
+                    } else {
+                        runNormalCompatRefineSession(
+                            NormalRefine::NORMAL_COMPAT,
+                            g_activeQuadrantMask);
+                        poseSaveToLibrary(SaveCriterion::EITHER,
+                                          g_activeQuadrantMask);
+                    }
+                    g_normRefineMaxIter = saved_max_iter;
+                } else {
+                    std::cout << "[Ctrl+Alt+W/3d] sweep complete but no valid"
+                              << " best found — mesh unchanged"
+                              << " (reason: " << S.fail_reason << ")"
+                              << std::endl;
+                    // Even on failure, clean up trial visualization
+                    g_contourSweepShowTrial = false;
+                    g_contourSweepTrialSrc.clear();
+                    g_contourSweepTgtAnchors3D.clear();
+                    g_contourSweepSrcPivotsTrial.clear();
+                    g_contourSweepCurrentITgt = -1;
+                    g_contourSweepCurrentJSrc = -1;
+                }
+            }
+        }
+
         // マスク選択モードでは通常のUIを表示しない
         if (gApp.mode != AppMode::kMaskSelection) {
             gUI.draw(gWindowWidth, gWindowHeight);
@@ -4844,6 +4974,638 @@ int main() {
                             g_debugShapeMatchGNInFrame,
                             g_gnUnsignedBdyValid ? "valid" : "invalid");
             }
+
+            // Phase 7b Step 3c — Contour Sweep (Ctrl+Alt+W)
+            //   Live arc-length × rotation grid search. Z-axis is
+            //   preserved structurally; sweep runs over multiple
+            //   frames so user sees convergence visually.
+            ImGui::Separator();
+            ImGui::TextUnformatted("[Step 3c] Contour Sweep (Ctrl+Alt+W)");
+            ImGui::SliderInt("Sweep N target anchors",
+                             &g_shapeMatchSweepNTarget, 4, 80);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Number of arc-length divisions on the\n"
+                                  "target contour. 20 default. Each is a\n"
+                                  "candidate \"pin point\" for the source rim.");
+            }
+            ImGui::SliderInt("Sweep N source pivots",
+                             &g_shapeMatchSweepNSource, 4, 80);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Arc-length divisions on the source rim.\n"
+                                  "Each pivot tries to match every target\n"
+                                  "anchor. Total candidates = N_tgt × N_src × N_rot.");
+            }
+            ImGui::SliderInt("Sweep N rotations",
+                             &g_shapeMatchSweepNRotation, 4, 180);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Rotation discretization. 36 default =\n"
+                                  "10° steps. Rotates source rim around\n"
+                                  "world Z (camera-forward in AR view).");
+            }
+            ImGui::Checkbox("Sweep: show anchors / pivots",
+                            &g_shapeMatchSweepShowAnchors);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Show 20 target anchors (gray, fixed on\n"
+                                  "image plane) + 20 source pivots (gray,\n"
+                                  "transformed by trial pose every frame).\n"
+                                  "The current (i_tgt, j_src) pair is drawn\n"
+                                  "larger in cyan, walking along both curves\n"
+                                  "in lockstep so you can see the discrete\n"
+                                  "correspondence being evaluated.");
+            }
+            ImGui::Checkbox("Preview: 20 anchor/pivot dots (rainbow)",
+                            &g_shapeMatchSweepPreviewAnchors);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Show 20 target anchors AND 20 source pivots\n"
+                                  "as rainbow-coloured dots (red=0 ... violet=19)\n"
+                                  "regardless of whether a sweep is active.\n"
+                                  "Lets you verify, BEFORE pressing Ctrl+Alt+W,\n"
+                                  "that the 20 candidates are evenly distributed\n"
+                                  "along the entire target boundary / source rim.\n"
+                                  "Anchor 0 (red) and anchor 19 (violet) reveal\n"
+                                  "the endpoints. Clustering reveals problems.");
+            }
+            ImGui::Checkbox("Filter target by source bbox (anatomical)##sweepfilter",
+                            &g_shapeMatchSweepFilterByRim);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Restrict target boundary points to the 2D\n"
+                                  "bounding box of the projected source rim,\n"
+                                  "expanded by margin px on all sides.\n"
+                                  "PURPOSE: prevent the sweep from pinning\n"
+                                  "source's caudal pivot to target's cranial\n"
+                                  "anchor (which would translate source far\n"
+                                  "from its Apply-Init-Pose position).\n"
+                                  "Strongly recommended when source uses a\n"
+                                  "Caudal-only filter (or any partial rim).");
+            }
+            ImGui::SliderFloat("Filter margin (px)##sweepfiltermargin",
+                               &g_shapeMatchSweepFilterMarginPx,
+                               20.0f, 500.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Bbox expansion on each side, in pixels.\n"
+                                  "Smaller (50-100): stricter, stays closer to\n"
+                                  "initial pose. Default 150 = moderate slack.\n"
+                                  "Larger (300+): more pose-correction freedom\n"
+                                  "but allows anatomically loose matches.");
+            }
+            ImGui::Checkbox("Sweep: endpoint constraint (RIM direction)",
+                            &g_shapeMatchSweepUseEndpointConstraint);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("ON: detect which source RIM endpoint maps\n"
+                                  "to which target contour endpoint, possibly\n"
+                                  "reverse the source chain so j_src=0 ↔ i_tgt=0\n"
+                                  "means same physical end. Then only allow\n"
+                                  "sweep candidates with |j_src - i_tgt| <=\n"
+                                  "tolerance (eliminates left↔right and\n"
+                                  "forward↔reverse anatomical mismatches).\n"
+                                  "OFF for closed-loop sources (full rim,\n"
+                                  "no caudal filter).");
+            }
+            ImGui::SliderInt("Sweep endpoint tolerance",
+                             &g_shapeMatchSweepEndpointTolerance, 0, 19);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Allowed |j_src - i_tgt| arc-length steps.\n"
+                                  "0 = strict diagonal (j_src must equal i_tgt).\n"
+                                  "3 = ±3 step slack (default).\n"
+                                  "19 = effectively no constraint.");
+            }
+            if (g_shapeMatchSweepUseEndpointConstraint) {
+                ImGui::Text("  src_open=%s  dir=%s  (last sweep)",
+                            g_shapeMatchSweepSrcIsOpenDiag ? "Y" : "N (closed)",
+                            g_shapeMatchSweepDirReversedDiag ? "REVERSED" : "forward");
+            }
+
+            // ---- Phase 7b Step 3c++: Label-based orientation lock UI -
+            // The endpoint constraint only works on OPEN chains. For
+            // CLOSED rims we use the LiverLeftRightLabel / LiverCranio-
+            // CaudalLabel PCA labels directly: a PURE_RIGHT source pivot
+            // can only pair with a target anchor on screen +x side, etc.
+            // BOUNDARY-labeled pivots (rim 屈曲帯) pass through freely.
+            ImGui::Separator();
+            ImGui::TextDisabled("Orientation lock (label LR/CC + θ cap)");
+            ImGui::Checkbox("Sweep: orientation lock (anatomical L/R/CC)",
+                            &g_shapeMatchSweepUseOrientationLock);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON: enforce two checks during the sweep —\n"
+                    "  (A) anatomical label match —\n"
+                    "      source pivot j carries the LR/CC label of its\n"
+                    "      nearest rim-chain vertex (PCA-derived). Target\n"
+                    "      anchor i is classified by 2D position vs locked\n"
+                    "      centroid: screen +x → RIGHT, screen -y → CRANIAL.\n"
+                    "      Mismatch (PURE_RIGHT ↔ SS_LR_LEFT or CRANIAL ↔\n"
+                    "      SS_CC_CAUDAL) → candidate skipped. BOUNDARY (src)\n"
+                    "      and AMBIGUOUS (tgt, inside neutral band) always\n"
+                    "      pass — handles the 屈曲帯 / midline edge case.\n"
+                    "  (B) θ magnitude cap |wrap_180(θ)| ≤ rot_cap°.\n"
+                    "Auto-degrades to OFF if g_liverLR / g_liverCC missing\n"
+                    "(diagnostic line at sweep start).\n"
+                    "Default ON.");
+            }
+            ImGui::SliderFloat("orientation neutral band [px]",
+                               &g_shapeMatchSweepNeutralBandPx,
+                               0.0f, 400.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Check (A) target side AMBIGUOUS-band half-width in\n"
+                    "pixels around the locked centroid.\n"
+                    "Anchors with |dx| ≤ band or |dy| ≤ band are tagged\n"
+                    "AMBIGUOUS and pair with any source label — the image-\n"
+                    "midline analog of source BOUNDARY pivots.\n"
+                    "80 px ≈ 4% of 1920w (default).\n"
+                    "0 px = strictest (zero AMBIGUOUS zone).\n"
+                    "400 px = effectively disables Check (A); only B applies.");
+            }
+            ImGui::SliderFloat("orientation rot_cap [deg]",
+                               &g_shapeMatchSweepRotationLockDeg,
+                               15.0f, 180.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Check (B) cap on the candidate's image-plane θ\n"
+                    "rotation. |wrap_180(θ)| ≤ rot_cap.\n"
+                    "90° = ±90° from identity (default).\n"
+                    "45° = strict, only fine-tuning rotations.\n"
+                    "180° = no rotation cap (only check A applies).\n"
+                    "This directly blocks the 180°-class flips the user\n"
+                    "observes when running Ctrl+Alt+W on a CLOSED rim.");
+            }
+            // Diagnostic readback of the last sweep's label-lock status
+            if (g_shapeMatchSweepUseOrientationLock) {
+                ImGui::Text("  label_lock ready=%s  (LR & CC both valid)",
+                            g_shapeMatchSweepLabelLockReadyDiag ? "Y" : "N");
+            }
+
+            ImGui::Checkbox("Sweep: show anchor/pivot dots (cyan=current)",
+                            &g_shapeMatchSweepShowAnchors);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Visualize the 20 target anchors (back-projected\n"
+                                  "to AR image plane) and 20 source pivots\n"
+                                  "(transformed to trial pose). The current\n"
+                                  "(i_tgt, j_src) pair being tested is highlighted\n"
+                                  "as a large CYAN dot on each side — same color\n"
+                                  "means corresponding pair.\n"
+                                  "Use this to confirm that the sweep is actually\n"
+                                  "exercising the target-side indexing every frame.");
+            }
+            ImGui::Checkbox("Animate sweep##animatesweep",
+                            &g_shapeMatchSweepAnimate);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("ON  = sweep runs over multiple frames\n"
+                                  "       (visual animation, ~10 sec @ 300+300\n"
+                                  "       frames). Yellow dots = current trial,\n"
+                                  "       red dots = global best so far.\n"
+                                  "OFF = one-shot batch (~20 ms, no animation,\n"
+                                  "       result applied immediately).");
+            }
+            ImGui::SliderInt("Sweep frames Phase 1",
+                             &g_shapeMatchSweepFrames1, 30, 1200);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("How many frames to spend on Phase 1\n"
+                                  "(broad sweep over full ranges). 300 ≈\n"
+                                  "5 sec at 60 fps. Higher = slower\n"
+                                  "animation, smaller per-frame batches.\n"
+                                  "Ignored if Animate sweep = OFF.");
+            }
+            ImGui::SliderInt("Sweep frames Phase 2",
+                             &g_shapeMatchSweepFrames2, 30, 1200);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Frame budget for Phase 2 (fine refine\n"
+                                  "around Phase 1 best with narrower\n"
+                                  "arc-length / angle range).\n"
+                                  "Ignored if Animate sweep = OFF.");
+            }
+            ImGui::Checkbox("Sweep verbose log##sweeplog",
+                            &g_shapeMatchSweepLog);
+            // Diagnostic readback
+            if (g_contourSweepState.active ||
+                g_contourSweepState.phase == 3)
+            {
+                const auto& S = g_contourSweepState;
+                ImGui::Text("Sweep status: phase=%d  frame=%d  cands=%d/%d",
+                            S.phase, S.current_frame,
+                            S.candidate_idx, S.total_candidates);
+                ImGui::Text("  best cost=%.2f px  (i=%d, j=%d, θ=%.1f°)",
+                            S.best_cost, S.best_i_tgt, S.best_j_src,
+                            S.best_theta_deg);
+                if (!S.cost_history.empty()) {
+                    std::vector<float> hist_f(S.cost_history.size());
+                    for (size_t i = 0; i < S.cost_history.size(); i++)
+                        hist_f[i] = float(S.cost_history[i]);
+                    ImGui::PlotLines("##sweep_cost",
+                                     hist_f.data(), (int)hist_f.size(),
+                                     0, nullptr,
+                                     0.0f, FLT_MAX,
+                                     ImVec2(0.0f, 50.0f));
+                }
+            }
+
+            // -----------------------------------------------------------
+            // Phase 7b Step 3d — Silhouette 2D Sweep (NEW, separate path)
+            //   When [3] is ON, Ctrl+Alt+W routes to the new method:
+            //     - Source rim 2D projection + PURE_RIGHT centroid start
+            //     - Target contour lower-half + right-end start
+            //     - 20 pivots / 20 anchors (fixed index correspondence)
+            //     - Dense 2D chamfer cost
+            //   [1] / [2] are debug popups; they can be enabled before
+            //   sweep start to verify discretization is correct.
+            // -----------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextDisabled("[Step 3d] Silhouette 2D Sweep (NEW)");
+            ImGui::Checkbox("[0] Raw RIM 2D projection (points only, no ordering)",
+                            &g_debugShow2DProjPopup_RawRim);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "STAGE 0 — minimum-viable debug view.\n"
+                    "Projects every vertex of g_debugSourceRimChain\n"
+                    "(the GREEN dots from the W key) to 2D pixel space\n"
+                    "using the AR camera intrinsics + view matrix.\n"
+                    "\n"
+                    "Renders POINTS ONLY:\n"
+                    "  - no polyline (no ordering assumed)\n"
+                    "  - no angle-bin envelope\n"
+                    "  - no pivot resampling\n"
+                    "  - color = LR label\n"
+                    "      red   = PURE_RIGHT\n"
+                    "      blue  = PURE_LEFT\n"
+                    "      gray  = BOUNDARY\n"
+                    "  - yellow cross = 2D centroid of all rim points\n"
+                    "  - cyan  cross = PURE_RIGHT 3D centroid projected to 2D\n"
+                    "\n"
+                    "Purpose: visually answer 'Is the source anatomical\n"
+                    "RIM an open arch or a closed loop?' before CB1's\n"
+                    "envelope step forces it into a closed contour.\n"
+                    "Rebuilds every frame from the current source pose.");
+            }
+            ImGui::Checkbox("[0.1] Smoothed RIM 2D projection (grid + KNN)",
+                            &g_debugShow2DProjPopup_RawRimSmoothed);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "STAGE 0.1 — noise-removed point set.\n"
+                    "Same input as CB0, but applies:\n"
+                    "  1. GRID AGGREGATION: bin into G×G px cells,\n"
+                    "     replace each cell with the centroid of its\n"
+                    "     points (LR label = majority vote).\n"
+                    "  2. KNN SMOOTHING: for each centroid, find K\n"
+                    "     nearest neighbours in 2D and replace with\n"
+                    "     their mean; repeat N times.\n"
+                    "Output is STILL UNORDERED — no envelope, no\n"
+                    "polyline, no pivots. Just a cleaner point set\n"
+                    "you can compare against the CB0 raw scatter.\n"
+                    "\n"
+                    "Optional overlay: original raw dots in faint gray\n"
+                    "underneath the smoothed dots (toggle in popup).");
+            }
+            // [0.1] tuning sliders (shown inline so they're discoverable
+            // even when the popup isn't open; they live under the
+            // checkbox like the [3d] sweep sliders).
+            ImGui::SliderFloat("[0.1] grid cell px",
+                               &g_rawRimSmooth_GridPx, 3.0f, 80.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Side length of the 2D grid cell used to bin\n"
+                    "rim points. Larger = fewer / smoother output\n"
+                    "points. Typical 10-25 px for 1920x1080.");
+            }
+            ImGui::SliderInt("[0.1] KNN K",
+                             &g_rawRimSmooth_KnnK, 0, 30);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "K nearest neighbours used in the smoothing pass.\n"
+                    "0 = no KNN smoothing (grid-only result).\n"
+                    "Larger K = smoother but blurrier; small (3-7)\n"
+                    "preserves curvature.");
+            }
+            ImGui::SliderInt("[0.1] KNN iters",
+                             &g_rawRimSmooth_KnnIters, 0, 8);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Number of KNN smoothing passes. Each pass\n"
+                    "averages every point with its K neighbours.\n"
+                    "1-3 is usually enough.");
+            }
+            ImGui::Checkbox("[0.1] show raw overlay",
+                            &g_rawRimSmooth_ShowRawOverlay);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "When ON, draw the original raw points in faint\n"
+                    "gray underneath the smoothed dots — quick visual\n"
+                    "check that smoothing followed the data.");
+            }
+            ImGui::Checkbox("[0.2] Ordered RIM (MST + longest path)",
+                            &g_debugShow2DProjPopup_RawRimOrdered);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "STAGE 0.2 — ordered open polyline.\n"
+                    "Takes the cleaned CB0.1 points (uses the same\n"
+                    "grid / KNN parameters) and orders them via:\n"
+                    "  1. Prim MST on cleaned points (O(N²))\n"
+                    "  2. Two-pass BFS → longest path in tree\n"
+                    "  3. Orient so start endpoint is closer to the\n"
+                    "     PURE_RIGHT 3D centroid (projected to 2D)\n"
+                    "  4. Arc-length resample N pivots along the path\n"
+                    "Output is an OPEN polyline — correct topology\n"
+                    "for the caudal RIM arch (CB1's envelope forced\n"
+                    "a closed loop, which is wrong).");
+            }
+            ImGui::SliderFloat("[0.2] max edge px",
+                               &g_rawRimOrder_MaxEdgePx,
+                               10.0f, 500.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "MST edges longer than this are filtered out.\n"
+                    "Use this to prevent the MST from bridging\n"
+                    "unrelated point clusters (e.g. main rim arch\n"
+                    "vs. a stray BOUNDARY blob).\n"
+                    "If the filter disconnects the graph, the largest\n"
+                    "connected component is used.\n"
+                    "Set to 500 to effectively disable.");
+            }
+            ImGui::SliderInt("[0.2] N pivots",
+                             &g_rawRimOrder_NPivots, 5, 40);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Number of arc-length spaced pivots placed on\n"
+                    "the longest path. 20 matches the existing CB1\n"
+                    "convention so visual comparison is direct.");
+            }
+            ImGui::Checkbox("[0.2] show MST edges",
+                            &g_rawRimOrder_ShowMST);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Draw all MST edges (faint gray) under the\n"
+                    "longest path. Useful for diagnosing why a\n"
+                    "particular ordering was chosen.");
+            }
+            ImGui::Checkbox("[0.2] show cleaned overlay",
+                            &g_rawRimOrder_ShowCleaned);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Draw the cleaned (CB0.1) points faintly under\n"
+                    "the path so you can see which ones were skipped\n"
+                    "or bridged.");
+            }
+            // ---- CB0.3: Manual Sweep Probe -----------------------------
+            ImGui::Checkbox("[0.3] Overlay probe (manual sweep candidate)",
+                            &g_debugShow2DProjPopup_OverlayProbe);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "STAGE 0.3 — Manual sweep candidate viewer.\n"
+                    "Reproduces ONE silhouette-sweep candidate at a time:\n"
+                    "  - PIVOT i slider  : which source pivot to pin\n"
+                    "  - ANCHOR j slider : which target anchor to pin to\n"
+                    "  - rotation step k : θ = k * (360 / n_rotation)\n"
+                    "  - 'lock j=i'      : matches sweep (i:i pairing)\n"
+                    "  - animate         : auto-advance k as a timestep\n"
+                    "\n"
+                    "Uses evaluateSilhouetteSweepCandidate's exact formula,\n"
+                    "so the displayed geometry is byte-identical to what\n"
+                    "the sweep computes.\n"
+                    "\n"
+                    "Shows a CC direction arrow on the transformed source,\n"
+                    "with a head-up ✓ / FLIPPED ✗ indicator — exactly\n"
+                    "what's needed to diagnose Phase 1 flip behavior.");
+            }
+            ImGui::SliderInt("[0.3] PIVOT i",
+                             &g_overlayProbe_PivotI, 0, 39);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Source pivot index to pin to ANCHOR j.\n"
+                    "Range hard-capped at 39 for the slider; actual\n"
+                    "valid range is 0..N-1 where N = pivot count\n"
+                    "(typically 20). Out-of-range values are clamped\n"
+                    "automatically in the popup.");
+            }
+            // ANCHOR j slider is disabled (grayed out) when lock is ON,
+            // since j follows i in that mode. This avoids the confusing
+            // "I'm moving the slider but nothing changes" state.
+            if (g_overlayProbe_LockJI) ImGui::BeginDisabled();
+            ImGui::SliderInt("[0.3] ANCHOR j",
+                             &g_overlayProbe_AnchorJ, 0, 39);
+            if (g_overlayProbe_LockJI) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Target anchor index to receive the pinned source\n"
+                    "pivot. DISABLED when 'lock j=i' is ON (j follows i).\n"
+                    "Turn lock OFF to explore i≠j combinations that the\n"
+                    "actual sweep never tries (sweep uses i:i pairing only).");
+            }
+            ImGui::Checkbox("[0.3] lock j=i (match sweep convention)",
+                            &g_overlayProbe_LockJI);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "OFF (default) → i and j are independent.\n"
+                    "                Lets you probe what would happen\n"
+                    "                with cross combinations.\n"
+                    "ON             → j follows i. Mirrors the real\n"
+                    "                sweep (which uses i:i pairing only).\n"
+                    "                The ANCHOR j slider grays out.");
+            }
+            ImGui::SliderInt("[0.3] rotation step k",
+                             &g_overlayProbe_RotStep,
+                             0, std::max(1, g_overlayProbe_NRotation - 1));
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Rotation index. θ = k * (360 / n_rotation).\n"
+                    "Default n_rotation=36 → 10° per step → k=0..35.\n"
+                    "Treat this as the timestep slider — drag it or\n"
+                    "enable animate to watch the rotation sweep.");
+            }
+            ImGui::SliderInt("[0.3] n_rotation (sweep steps)",
+                             &g_overlayProbe_NRotation, 4, 360);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Number of discrete rotation steps. The actual\n"
+                    "sweep uses 36 (= 10° per step). Lowering this\n"
+                    "makes k coarser; raising it gives finer θ control\n"
+                    "for diagnosis.");
+            }
+            ImGui::Checkbox("[0.3] auto-animate k",
+                            &g_overlayProbe_AutoAnimate);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Auto-advances rotation step k every N frames.\n"
+                    "Watch how the source rotates through all candidate\n"
+                    "orientations for the chosen (i, j).");
+            }
+            ImGui::SliderInt("[0.3] frames per step",
+                             &g_overlayProbe_AnimFramesPerStep, 1, 60);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Animation speed control. Larger = slower.\n"
+                    "1 step/frame ≈ 60 steps per second at 60 FPS.");
+            }
+            ImGui::Checkbox("[0.3] show CC direction arrow",
+                            &g_overlayProbe_ShowCCArrow);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Draws an arrow on the transformed source pointing\n"
+                    "from CRANIAL (head) to CAUDAL (foot). Header text\n"
+                    "shows 'head-up ✓' if the arrow points downward on\n"
+                    "screen (normal anatomy), or 'FLIPPED ✗' otherwise.");
+            }
+            ImGui::Checkbox("[0.3] show source overlay",
+                            &g_overlayProbe_ShowSrcOverlay);
+            ImGui::Checkbox("[0.3] show target overlay",
+                            &g_overlayProbe_ShowTgtOverlay);
+            ImGui::Checkbox("[0.3] simulate Check A (rotation cap)",
+                            &g_overlayProbe_SimulateCheckA);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "When ON, CB0.3 paints the canvas reddish and shows\n"
+                    "'REJECTED BY A' if the current (i, j, k) would be\n"
+                    "rejected by sweep本番's Check A (rotation cap).\n"
+                    "Uses the same cap value as the sweep ([3d] slider).\n"
+                    "Turn OFF to see the raw candidate even if rejected.");
+            }
+            ImGui::Checkbox("[0.3] simulate Check B (CC guard)",
+                            &g_overlayProbe_SimulateCheckB);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "When ON, CB0.3 paints the canvas reddish and shows\n"
+                    "'REJECTED BY B' if the current (i, j, k) would be\n"
+                    "rejected by sweep本番's Check B (CC orientation).\n"
+                    "Uses the same tolerance as the sweep ([3d] slider).\n"
+                    "Requires g_liverCC valid (run Shift+H first).");
+            }
+            ImGui::Checkbox("[1] Source 2D projection popup",
+                            &g_debugShow2DProjPopup_Source);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Open a popup window showing the source rim chain\n"
+                    "projected to 2D, with:\n"
+                    "  - dense polyline tinted by LR label\n"
+                    "    (red=PURE_RIGHT, gray=BOUNDARY, blue=PURE_LEFT)\n"
+                    "  - 20 pivots in rainbow color (red=0 → violet=19)\n"
+                    "  - PURE_RIGHT centroid (yellow cross)\n"
+                    "  - right-start chain vertex (large yellow marker)\n"
+                    "Rebuilds every frame from current source pose.\n"
+                    "Use before pressing Ctrl+Alt+W to confirm orientation.");
+            }
+            ImGui::Checkbox("[2] Target rim lower-half popup",
+                            &g_debugShow2DProjPopup_Target);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Open a popup window showing target contour:\n"
+                    "  - upper half (gray, p.y <= centroid.y)\n"
+                    "  - lower half (purple, p.y >  centroid.y)\n"
+                    "  - centroid (yellow cross)\n"
+                    "  - 20 anchors in rainbow color (red=0 → violet=19)\n"
+                    "  - right-end (max x) start point (large yellow marker)\n"
+                    "Cached; rebuilt only on Shift+W.");
+            }
+            ImGui::Checkbox("[3] Enable silhouette sweep (Ctrl+Alt+W uses NEW method)",
+                            &g_silhouetteSweepEnable);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON  → Ctrl+Alt+W runs the Step 3d silhouette sweep.\n"
+                    "OFF → Ctrl+Alt+W runs the legacy Step 3c sector sweep.\n"
+                    "Independent state; the two paths never interfere.");
+            }
+            // ---- Source-rim discretization method (Step 3d Stage A) ----
+            //   Drives CB1 popup AND Ctrl+Alt+W sweep (when [3] is ON).
+            //   MST (default) = CB0.2 result (open polyline).
+            //   ENVELOPE      = legacy angle-bin closed loop (kept for
+            //                   comparison; anatomically wrong for the
+            //                   caudal RIM arch).
+            const char* srcRimMethodItems =
+                "ENVELOPE (legacy closed loop)\0"
+                "MST + longest path (CB0.2, open polyline)\0";
+            ImGui::Combo("Source rim method", &g_silSwSrcRimMethod,
+                         srcRimMethodItems);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Selects which algorithm populates the source rim\n"
+                    "pivots used by CB1 popup AND the silhouette sweep:\n"
+                    "  ENVELOPE: angle-bin + max-radius envelope.\n"
+                    "    Produces a CLOSED loop. Legacy method; wrong\n"
+                    "    for the caudal-RIM arch (CB0 confirmed this).\n"
+                    "    Kept available as a fallback / comparison.\n"
+                    "  MST + longest path:\n"
+                    "    Uses the cleaned CB0.1 points (same grid / KNN\n"
+                    "    parameters), builds an MST, takes the longest\n"
+                    "    path (open polyline), orients toward PURE_RIGHT,\n"
+                    "    arc-length resamples N pivots. Anatomically\n"
+                    "    correct for an open arch. This is the default.");
+            }
+            ImGui::SliderInt("3d frames Phase 1",
+                             &g_silhouetteSweepFrames1, 1, 600);
+            ImGui::SliderInt("3d frames Phase 2",
+                             &g_silhouetteSweepFrames2, 1, 300);
+            ImGui::Checkbox("3d animate##silswanim",
+                            &g_silhouetteSweepAnimate);
+            ImGui::Checkbox("3d verbose log##silswlog",
+                            &g_silhouetteSweepLog);
+
+            // ---- Step 3d candidate guards (本番 sweep) ----
+            ImGui::Separator();
+            ImGui::TextDisabled("[3d] Candidate guards (本番 sweep)");
+            ImGui::Checkbox("[3d] enable Check A (rotation cap)",
+                            &g_silSwCheckA_Enable);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Reject sweep candidates whose |θ| exceeds the cap.\n"
+                    "θ is wrapped into (-180°, +180°] first.\n"
+                    "Independent of CC labels; works whenever sweep runs.\n"
+                    "Default ON, cap = 30° (= sweep explores ±30° around 0).");
+            }
+            ImGui::SliderFloat("[3d] Check A: rotation cap ±deg",
+                               &g_silSwCheckA_RotCapDeg, 5.0f, 180.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Hard cap on rotation magnitude. Candidates with\n"
+                    "|θ| > this value get cost = +∞ (rejected).\n"
+                    "Smaller = stricter (faster to converge but may\n"
+                    "miss valid poses if initial alignment is off).");
+            }
+            ImGui::Checkbox("[3d] enable Check B (CC orientation guard)",
+                            &g_silSwCheckB_Enable);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Reject sweep candidates whose CRANIAL→CAUDAL axis\n"
+                    "(g_liverCC.d_cc, projected through candidate T)\n"
+                    "doesn't point screen-down (= 6 o'clock = +y_pixel)\n"
+                    "within tolerance.\n"
+                    "Requires g_liverCC valid (run Shift+H first).\n"
+                    "If not valid, this check is silently skipped.");
+            }
+            ImGui::SliderFloat("[3d] Check B: CC tolerance ±deg",
+                               &g_silSwCheckB_CCToleranceDeg, 5.0f, 90.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Allowed deviation from 6 o'clock for the on-screen\n"
+                    "CC direction. ±15° default = clock face 5:30..6:30.\n"
+                    "(User originally specified 5:55-7:05 = ±5° but ±15°\n"
+                    "gives realistic working tolerance.)");
+            }
+
+            if (g_silhouetteSweep.active || g_silhouetteSweep.phase == 3) {
+                const auto& S3d = g_silhouetteSweep;
+                ImGui::Text("3d status: phase=%d  frame=%d  cands=%d/%d",
+                            S3d.phase, S3d.current_frame,
+                            S3d.candidate_idx, S3d.total_candidates);
+                ImGui::Text("  best cost=%.2f px  (i=%d, θ=%.1f°)  rev=%s",
+                            S3d.best_cost, S3d.best_i_pivot,
+                            S3d.best_theta_deg,
+                            S3d.src_dir_reversed ? "Y" : "N");
+                if (!S3d.cost_history.empty()) {
+                    std::vector<float> hist_f(S3d.cost_history.size());
+                    for (size_t i = 0; i < S3d.cost_history.size(); i++)
+                        hist_f[i] = float(S3d.cost_history[i]);
+                    ImGui::PlotLines("##silsw_cost",
+                                     hist_f.data(), (int)hist_f.size(),
+                                     0, nullptr,
+                                     0.0f, FLT_MAX,
+                                     ImVec2(0.0f, 50.0f));
+                }
+            }
+            if (!g_silhouetteSweep.fail_reason.empty()
+                && !g_silhouetteSweep.active)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                                   "3d last failure: %s",
+                                   g_silhouetteSweep.fail_reason.c_str());
+            }
+
             } // close: if (CollapsingHeader("Shape Match..."))
             ImGui::Separator();
 
@@ -5976,6 +6738,192 @@ int main() {
                     }
                 }
 
+                // Phase 7b Step 3c (Ctrl+Alt+W): Contour Sweep trial pose
+                //   黄色点: 現在 sweep が試行中の "batch best" pose。
+                //   赤 (global best) と共存して描画され、sweep の進行中
+                //   毎フレーム位置が更新されるためアニメーションが見える。
+                //   sweep 終了時に clear される。
+                if (g_contourSweepShowTrial && !g_contourSweepTrialSrc.empty())
+                {
+                    const float rYel = RegRatios::markerCluster() * 0.95f;
+                    for (const auto& p : g_contourSweepTrialSrc) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(1.0f, 0.95f, 0.15f),  // yellow
+                                            rYel, view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // Phase 7b Step 3c: Anchor / pivot visualization
+                //   灰色小球: 20 target anchor (固定, AR 画面 plane 上に back-project)
+                //            + 20 source pivot (best-in-batch T 適用後、黄色 rim 上)
+                //   シアン大球: 現在 batch の i_tgt 番目 target anchor
+                //              + j_src 番目 source pivot
+                //   毎フレーム i_tgt/j_src が更新 → 動いている対応が確認できる。
+                //   同色 (シアン) なので「どの target がどの source とペアか」が判る。
+                if (g_shapeMatchSweepShowAnchors && g_contourSweepShowTrial)
+                {
+                    const float rSmall = RegRatios::markerCluster() * 0.80f;
+                    const float rLarge = RegRatios::markerCluster() * 2.20f;
+                    const glm::vec3 colGray(0.78f, 0.78f, 0.85f);
+                    const glm::vec3 colHi  (0.10f, 0.95f, 1.00f);   // cyan
+
+                    // Target anchors (back-projected on image plane)
+                    for (size_t i = 0; i < g_contourSweepTgtAnchors3D.size(); i++) {
+                        const bool hi = (int(i) == g_contourSweepCurrentITgt);
+                        g_sphereMarker.draw(shaderProgram,
+                            g_contourSweepTgtAnchors3D[i],
+                            hi ? colHi : colGray,
+                            hi ? rLarge : rSmall,
+                            view, projection, OrbitCam.cameraPos);
+                    }
+                    // Source pivots (transformed to trial pose)
+                    for (size_t j = 0; j < g_contourSweepSrcPivotsTrial.size(); j++) {
+                        const bool hi = (int(j) == g_contourSweepCurrentJSrc);
+                        g_sphereMarker.draw(shaderProgram,
+                            g_contourSweepSrcPivotsTrial[j],
+                            hi ? colHi : colGray,
+                            hi ? rLarge : rSmall,
+                            view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
+                // Phase 7b Step 3c++: Preview anchor/pivot dots.
+                //   Plan A (anchor固定) means anchors are always extracted
+                //   from the FULL target boundary — they don't move when
+                //   the user adjusts the source pose. The source bbox is
+                //   recomputed each frame and applied as a per-anchor
+                //   TAG: anchors INSIDE bbox render in rainbow (matches
+                //   what the sweep will see), OUTSIDE in dim gray with
+                //   a smaller radius so the user can visually confirm
+                //   the spatial gate. Source pivots get LR/CC label tint:
+                //     PURE_RIGHT → green-tinted
+                //     PURE_LEFT  → magenta-tinted
+                //     BOUNDARY   → gray (屈曲帯 = 反転防止 free pass)
+                //   So at a glance the user can spot reversed pairings.
+                if (g_shapeMatchSweepPreviewAnchors)
+                {
+                    const int Np = std::max(2, g_shapeMatchSweepNTarget);
+                    const int Ms = std::max(2, g_shapeMatchSweepNSource);
+                    const float rPrev = RegRatios::markerCluster() * 1.30f;
+                    const glm::vec3 colDim(0.55f, 0.55f, 0.55f);   // bbox-outside
+                    const glm::vec3 colBoundary(0.70f, 0.70f, 0.72f);
+
+                    const int W_img = (OrbitCam.calibWidth > 0)  ? OrbitCam.calibWidth
+                                    : (g_boundaryDistMap.width > 0) ? g_boundaryDistMap.width
+                                    : 1920;
+                    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight
+                                    : (g_boundaryDistMap.height > 0) ? g_boundaryDistMap.height
+                                    : 1080;
+
+                    // --- Target anchors (Plan A: always full boundary) -
+                    std::vector<glm::vec3> preview_tgt_3D;
+                    std::vector<uint8_t>   preview_tgt_inside;
+                    if (!g_debugTargetBoundaryPoints.empty()) {
+                        const glm::mat4 view_m = buildSilhouetteView();
+                        const glm::mat4 proj_m = buildSilhouetteProj();
+
+                        RimShape::extractSectorBasedTargetAnchors3D(
+                            g_debugTargetBoundaryPoints,
+                            view_m, proj_m, W_img, H_img,
+                            Np, preview_tgt_3D);
+
+                        if (g_shapeMatchSweepFilterByRim
+                            && !g_debugSourceRimChain.empty() && liverMesh3D)
+                        {
+                            std::vector<glm::vec3> src_rim_3D;
+                            src_rim_3D.reserve(g_debugSourceRimChain.size());
+                            const auto& V = liverMesh3D->mVertices;
+                            const int nV3 = (int)V.size();
+                            for (int idx : g_debugSourceRimChain) {
+                                if (idx * 3 + 2 < nV3)
+                                    src_rim_3D.emplace_back(V[idx*3], V[idx*3+1], V[idx*3+2]);
+                            }
+                            RimShape::tagAnchorsInsideSourceBbox(
+                                preview_tgt_3D, src_rim_3D,
+                                view_m, proj_m, W_img, H_img,
+                                g_shapeMatchSweepFilterMarginPx,
+                                preview_tgt_inside);
+                        } else {
+                            preview_tgt_inside.assign(
+                                preview_tgt_3D.size(), (uint8_t)1);
+                        }
+                    }
+
+                    // --- Source pivots (arc-length + LR label) ---------
+                    std::vector<glm::vec3> preview_src_3D;
+                    std::vector<int>       preview_src_vidx;
+                    if (!g_debugSourceRimChain.empty() && liverMesh3D) {
+                        RimShape::arclengthResampleRim3D(
+                            g_debugSourceRimChain,
+                            liverMesh3D->mVertices,
+                            Ms, preview_src_3D,
+                            &preview_src_vidx);
+                    }
+
+                    // Diagnostic (≤ once per ~2 sec)
+                    static int dbg_cnt = 0;
+                    if ((++dbg_cnt % 120) == 1) {
+                        int n_in = 0;
+                        for (uint8_t b : preview_tgt_inside) if (b) n_in++;
+                        std::cout << "[Preview] anchor-fixed"
+                                  << "  tgt_boundary_pts=" << g_debugTargetBoundaryPoints.size()
+                                  << "  tgt_anchors=" << preview_tgt_3D.size()
+                                  << " / " << Np
+                                  << "  bbox_in=" << n_in << "/" << preview_tgt_inside.size()
+                                  << "  src_pivots=" << preview_src_3D.size()
+                                  << "  img=" << W_img << "x" << H_img
+                                  << std::endl;
+                    }
+
+                    // Render target anchors: rainbow if inside bbox,
+                    // dim gray (smaller) if outside.
+                    for (size_t i = 0; i < preview_tgt_3D.size(); i++) {
+                        const bool inside = (i < preview_tgt_inside.size())
+                                            ? (bool)preview_tgt_inside[i]
+                                            : true;
+                        const float h_hue = float(i)
+                            / float(std::max((size_t)1, preview_tgt_3D.size()));
+                        const glm::vec3 col = inside
+                            ? cyclicHsv2rgb(h_hue, 0.90f, 1.0f)
+                            : colDim;
+                        const float r_use = inside ? rPrev : (rPrev * 0.55f);
+                        g_sphereMarker.draw(shaderProgram,
+                            preview_tgt_3D[i], col, r_use,
+                            view, projection, OrbitCam.cameraPos);
+                    }
+
+                    // Render source pivots with LR-label tint (rainbow
+                    // hue from i still, but saturation/value modulated
+                    // by label so reversal is visually obvious).
+                    const bool lr_ok =
+                        g_liverLR.valid()
+                        && liverMesh3D
+                        && (int)g_liverLR.labels.size()
+                               == (int)(liverMesh3D->mVertices.size() / 3)
+                        && preview_src_vidx.size() == preview_src_3D.size();
+                    for (size_t i = 0; i < preview_src_3D.size(); i++) {
+                        const float h_hue = float(i)
+                            / float(std::max((size_t)1, preview_src_3D.size()));
+                        glm::vec3 col = cyclicHsv2rgb(h_hue, 0.90f, 1.0f);
+                        if (lr_ok) {
+                            const int vi = preview_src_vidx[i];
+                            if (vi >= 0 && vi < (int)g_liverLR.labels.size()) {
+                                const uint8_t lbl = g_liverLR.labels[vi];
+                                if (lbl == (uint8_t)LiverLeftRightLabel::BOUNDARY) {
+                                    col = colBoundary;  // gray = 屈曲帯
+                                }
+                                // PURE_RIGHT / PURE_LEFT keep their
+                                // rainbow hue so the user can still
+                                // match anchor by index.
+                            }
+                        }
+                        const float r_use = rPrev;
+                        g_sphereMarker.draw(shaderProgram,
+                            preview_src_3D[i], col, r_use,
+                            view, projection, OrbitCam.cameraPos);
+                    }
+                }
+
                 // Cyclic correspondence visualization (Shift+B):
                 //   24 セクターを HSV で円環着色し、source (大球) と target
                 //   (中球) を同色で描画 → 同じ色のペアが対応関係を示す。
@@ -6402,6 +7350,1685 @@ int main() {
             } // else（通常1画面描画）
         } // kRegistration
 
+        // ================================================================
+        // Phase 7b Step 3d — 2D projection debug popups (CB0 / CB1 / CB2)
+        //   Three independent ImGui windows that visualize the source rim
+        //   2D projection (with pivots + LR tinting + right-start marker)
+        //   and the target contour lower-half (with anchors + right-end
+        //   marker). Each is a self-contained canvas using ImDrawList;
+        //   no GL state is touched, so they coexist with all 3D rendering.
+        //
+        //   CB0 = raw RIM 2D projection (points only)   ← STAGE 0 debug
+        //   CB1 = envelope + pivots + start marker
+        //   CB2 = target lower-half + anchors
+        // ================================================================
+        // --- CB0: Raw RIM 2D projection popup (points only, no ordering) ---
+        //   STAGE 0: project every g_debugSourceRimChain vertex to 2D pixel
+        //   space using the AR camera, and render as colored dots. No
+        //   ordering, no envelope, no pivots. Lets the user see the actual
+        //   point distribution and decide whether the anatomical source
+        //   RIM is an open arch or a closed loop, BEFORE any algorithm
+        //   tries to impose a topology on it.
+        if (g_debugShow2DProjPopup_RawRim && gApp.mode == AppMode::kRegistration) {
+            ImGui::SetNextWindowSize(ImVec2(820, 540), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Raw RIM 2D projection (Step 3d Stage 0)##silsw_rawrim_popup",
+                             &g_debugShow2DProjPopup_RawRim))
+            {
+                // ---- 1. Gather rim chain (auto-populate if empty) ----
+                bool can_render = true;
+                std::string fail_reason;
+
+                if (!liverMesh3D) {
+                    can_render = false;
+                    fail_reason = "liverMesh3D is null";
+                }
+                if (can_render && g_debugSourceRimChain.empty()) {
+                    if (!populateDebugSourceRimChain()) {
+                        can_render = false;
+                        fail_reason = "populateDebugSourceRimChain failed (press W first)";
+                    }
+                }
+                if (can_render && g_debugSourceRimChain.empty()) {
+                    can_render = false;
+                    fail_reason = "g_debugSourceRimChain still empty";
+                }
+
+                if (!can_render) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                                       "Cannot render: %s", fail_reason.c_str());
+                } else {
+                    // ---- 2. Build view/proj and project ----
+                    const glm::mat4 view_m = buildSilhouetteView();
+                    const glm::mat4 proj_m = buildSilhouetteProj();
+                    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+                    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+                    const glm::mat4 M = proj_m * view_m;
+
+                    const auto& Vmesh = liverMesh3D->mVertices;
+                    const int nV3 = (int)Vmesh.size();
+                    const bool lrValid = g_liverLR.valid();
+                    const int  nLR     = lrValid ? (int)g_liverLR.labels.size() : 0;
+
+                    struct Pt2 {
+                        glm::vec2 p;
+                        uint8_t   lr;     // 0=PURE_RIGHT, 1=PURE_LEFT, 2=BOUNDARY, 255=unknown
+                        bool      onscreen;
+                    };
+                    std::vector<Pt2> pts;
+                    pts.reserve(g_debugSourceRimChain.size());
+
+                    int n_input    = (int)g_debugSourceRimChain.size();
+                    int n_projected = 0;
+                    int n_onscreen  = 0;
+                    int n_R = 0, n_L = 0, n_B = 0, n_U = 0;
+
+                    for (int idx : g_debugSourceRimChain) {
+                        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+                        const glm::vec3 p3(Vmesh[idx*3],
+                                           Vmesh[idx*3+1],
+                                           Vmesh[idx*3+2]);
+                        const glm::vec4 clip = M * glm::vec4(p3, 1.0f);
+                        if (clip.w < 1e-9f) continue;
+                        n_projected++;
+                        const float ndcx = clip.x / clip.w;
+                        const float ndcy = clip.y / clip.w;
+                        const float px = (ndcx + 1.0f) * 0.5f * float(W_img);
+                        const float py = (1.0f - ndcy) * 0.5f * float(H_img);
+                        Pt2 q;
+                        q.p = glm::vec2(px, py);
+                        // On-screen test (allow a small margin so the
+                        // header count matches what the canvas can show)
+                        q.onscreen = (px >= 0.0f && px <= float(W_img) &&
+                                      py >= 0.0f && py <= float(H_img));
+                        if (q.onscreen) n_onscreen++;
+                        q.lr = 255;
+                        if (lrValid && idx < nLR) {
+                            q.lr = g_liverLR.labels[idx];
+                            switch (q.lr) {
+                                case LiverLeftRightLabel::PURE_RIGHT: n_R++; break;
+                                case LiverLeftRightLabel::PURE_LEFT:  n_L++; break;
+                                case LiverLeftRightLabel::BOUNDARY:   n_B++; break;
+                                default:                              n_U++; break;
+                            }
+                        } else {
+                            n_U++;
+                        }
+                        pts.push_back(q);
+                    }
+
+                    // ---- 3. 2D centroid of projected rim ----
+                    glm::dvec2 sum2d(0.0);
+                    for (const auto& q : pts) sum2d += glm::dvec2(q.p);
+                    const glm::vec2 cen2D = (pts.empty())
+                        ? glm::vec2(float(W_img) * 0.5f, float(H_img) * 0.5f)
+                        : glm::vec2(sum2d / double(pts.size()));
+
+                    // ---- 4. PURE_RIGHT 3D centroid → 2D ----
+                    glm::vec2 rightCen2D(-1e6f);
+                    bool      rightCen2DValid = false;
+                    if (lrValid) {
+                        glm::dvec3 sumR(0.0);
+                        int nR3 = 0;
+                        for (int i = 0; i < nLR; i++) {
+                            if (i * 3 + 2 >= nV3) break;
+                            if (g_liverLR.labels[i] !=
+                                LiverLeftRightLabel::PURE_RIGHT) continue;
+                            sumR += glm::dvec3(Vmesh[i*3],
+                                               Vmesh[i*3+1],
+                                               Vmesh[i*3+2]);
+                            nR3++;
+                        }
+                        if (nR3 > 0) {
+                            const glm::vec3 rc3(sumR / double(nR3));
+                            const glm::vec4 clip = M * glm::vec4(rc3, 1.0f);
+                            if (clip.w > 1e-9f) {
+                                const float ndcx = clip.x / clip.w;
+                                const float ndcy = clip.y / clip.w;
+                                rightCen2D = glm::vec2(
+                                    (ndcx + 1.0f) * 0.5f * float(W_img),
+                                    (1.0f - ndcy) * 0.5f * float(H_img));
+                                rightCen2DValid = true;
+                            }
+                        }
+                    }
+
+                    // ---- 5. 2D bbox of projected rim ----
+                    float bb_minx = 1e30f, bb_miny = 1e30f;
+                    float bb_maxx = -1e30f, bb_maxy = -1e30f;
+                    for (const auto& q : pts) {
+                        bb_minx = std::min(bb_minx, q.p.x);
+                        bb_miny = std::min(bb_miny, q.p.y);
+                        bb_maxx = std::max(bb_maxx, q.p.x);
+                        bb_maxy = std::max(bb_maxy, q.p.y);
+                    }
+                    if (pts.empty()) {
+                        bb_minx = bb_miny = bb_maxx = bb_maxy = 0.0f;
+                    }
+
+                    // ---- 6. Header info ----
+                    ImGui::Text("Raw AR-projection of g_debugSourceRimChain (no ordering)");
+                    ImGui::Text("  img=%dx%d   input=%d   projected=%d   on-screen=%d",
+                                W_img, H_img, n_input, n_projected, n_onscreen);
+                    if (lrValid) {
+                        ImGui::Text("  LR labels:  PURE_RIGHT=%d  PURE_LEFT=%d  "
+                                    "BOUNDARY=%d  unknown=%d",
+                                    n_R, n_L, n_B, n_U);
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                            "  [!] g_liverLR not valid — points drawn in neutral gray");
+                    }
+                    ImGui::Text("  2D bbox px:  x=[%.0f, %.0f]  y=[%.0f, %.0f]  "
+                                "(w=%.0f, h=%.0f)",
+                                bb_minx, bb_maxx, bb_miny, bb_maxy,
+                                bb_maxx - bb_minx, bb_maxy - bb_miny);
+                    ImGui::Text("  2D centroid: (%.0f, %.0f)",
+                                cen2D.x, cen2D.y);
+                    if (rightCen2DValid) {
+                        ImGui::Text("  PURE_RIGHT 3D centroid → 2D: (%.0f, %.0f)",
+                                    rightCen2D.x, rightCen2D.y);
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                            "  [!] PURE_RIGHT 3D centroid unavailable");
+                    }
+                    ImGui::Separator();
+
+                    // ---- 7. Canvas ----
+                    ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (avail.x < 100.0f) avail.x = 100.0f;
+                    if (avail.y < 100.0f) avail.y = 100.0f;
+                    const float canvas_w = avail.x;
+                    const float canvas_h = avail.y;
+                    ImVec2 canvas_p1(canvas_p0.x + canvas_w, canvas_p0.y + canvas_h);
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddRectFilled(canvas_p0, canvas_p1, IM_COL32(20, 20, 26, 255));
+                    dl->AddRect      (canvas_p0, canvas_p1, IM_COL32(120, 120, 130, 255));
+
+                    // Image → canvas scale (preserve aspect, fit)
+                    const float sx = canvas_w / float(W_img);
+                    const float sy = canvas_h / float(H_img);
+                    const float s  = (sx < sy) ? sx : sy;
+                    const float ox = canvas_p0.x + 0.5f * (canvas_w - s * float(W_img));
+                    const float oy = canvas_p0.y + 0.5f * (canvas_h - s * float(H_img));
+                    auto px2cv = [&](const glm::vec2& p) -> ImVec2 {
+                        return ImVec2(ox + p.x * s, oy + p.y * s);
+                    };
+
+                    // Image frame outline (= AR image extent)
+                    dl->AddRect(
+                        px2cv(glm::vec2(0.0f,        0.0f)),
+                        px2cv(glm::vec2(float(W_img), float(H_img))),
+                        IM_COL32(80, 80, 90, 255));
+
+                    // ---- 8. Draw points (NO lines) ----
+                    //   PURE_RIGHT = red, PURE_LEFT = blue,
+                    //   BOUNDARY = gray, unknown = neutral light gray.
+                    //   Filled circles 3 px radius; outline visible
+                    //   over both bg and image-frame area.
+                    for (const auto& q : pts) {
+                        ImU32 col = IM_COL32(200, 200, 200, 230);   // unknown
+                        switch (q.lr) {
+                            case LiverLeftRightLabel::PURE_RIGHT:
+                                col = IM_COL32(230,  70,  70, 240); break;
+                            case LiverLeftRightLabel::PURE_LEFT:
+                                col = IM_COL32( 80, 110, 240, 240); break;
+                            case LiverLeftRightLabel::BOUNDARY:
+                                col = IM_COL32(170, 170, 175, 220); break;
+                            default: break;
+                        }
+                        const ImVec2 c = px2cv(q.p);
+                        dl->AddCircleFilled(c, 3.0f, col);
+                    }
+
+                    // ---- 9. 2D centroid (yellow cross) ----
+                    {
+                        const ImVec2 c = px2cv(cen2D);
+                        const float d = 9.0f;
+                        const ImU32 yc = IM_COL32(255, 240, 80, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y), ImVec2(c.x + d, c.y), yc, 2.0f);
+                        dl->AddLine(ImVec2(c.x, c.y - d), ImVec2(c.x, c.y + d), yc, 2.0f);
+                        dl->AddText(ImVec2(c.x + 10, c.y - 18), yc, "2D centroid");
+                    }
+
+                    // ---- 10. PURE_RIGHT 3D centroid → 2D (cyan cross) ----
+                    if (rightCen2DValid) {
+                        const ImVec2 c = px2cv(rightCen2D);
+                        const float d = 9.0f;
+                        const ImU32 cy = IM_COL32(100, 230, 230, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y - d),
+                                    ImVec2(c.x + d, c.y + d), cy, 2.0f);
+                        dl->AddLine(ImVec2(c.x - d, c.y + d),
+                                    ImVec2(c.x + d, c.y - d), cy, 2.0f);
+                        dl->AddCircle(c, 7.0f, cy, 0, 1.5f);
+                        dl->AddText(ImVec2(c.x + 10, c.y + 8),
+                                    cy, "PURE_RIGHT 3D centroid → 2D");
+                    }
+
+                    // ---- 11. Legend (small, top-left of canvas) ----
+                    {
+                        const float lx = canvas_p0.x + 8.0f;
+                        float       ly = canvas_p0.y + 8.0f;
+                        auto legLine = [&](ImU32 col, const char* txt) {
+                            dl->AddCircleFilled(ImVec2(lx + 6.0f, ly + 7.0f),
+                                                3.0f, col);
+                            dl->AddText(ImVec2(lx + 16.0f, ly), col, txt);
+                            ly += 16.0f;
+                        };
+                        legLine(IM_COL32(230,  70,  70, 240), "PURE_RIGHT");
+                        legLine(IM_COL32( 80, 110, 240, 240), "PURE_LEFT");
+                        legLine(IM_COL32(170, 170, 175, 220), "BOUNDARY");
+                    }
+
+                    ImGui::Dummy(ImVec2(canvas_w, canvas_h));
+                }
+                ImGui::End();
+            }
+        }
+
+        // --- CB0.1: Smoothed RIM 2D projection (grid + KNN) ---
+        //   STAGE 0.1: same raw projection as CB0, but with two cleanup
+        //   passes. Output is still an unordered point set so the
+        //   comparison against CB0 is honest.
+        //
+        //   Pass 1 (grid aggregation):
+        //     bin all projected points into G×G px cells; emit one
+        //     centroid per non-empty cell, with LR label = majority
+        //     vote. Kills density-driven jaggedness and reduces the
+        //     point count from O(254) to typically O(30-80).
+        //   Pass 2 (KNN smoothing, optional):
+        //     for each centroid, replace its position with the mean of
+        //     its K nearest 2D neighbours; iterate N times. K=0 or
+        //     iters=0 skips this pass entirely.
+        if (g_debugShow2DProjPopup_RawRimSmoothed &&
+            gApp.mode == AppMode::kRegistration)
+        {
+            ImGui::SetNextWindowSize(ImVec2(820, 560), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin(
+                    "Smoothed RIM 2D projection (Step 3d Stage 0.1)"
+                    "##silsw_rawrim_smoothed_popup",
+                    &g_debugShow2DProjPopup_RawRimSmoothed))
+            {
+                bool can_render = true;
+                std::string fail_reason;
+
+                if (!liverMesh3D) {
+                    can_render = false;
+                    fail_reason = "liverMesh3D is null";
+                }
+                if (can_render && g_debugSourceRimChain.empty()) {
+                    if (!populateDebugSourceRimChain()) {
+                        can_render = false;
+                        fail_reason = "populateDebugSourceRimChain failed "
+                                      "(press W first)";
+                    }
+                }
+                if (can_render && g_debugSourceRimChain.empty()) {
+                    can_render = false;
+                    fail_reason = "g_debugSourceRimChain still empty";
+                }
+
+                if (!can_render) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                                       "Cannot render: %s", fail_reason.c_str());
+                } else {
+                    // ---- 1. Project all rim chain to 2D (same as CB0) ----
+                    const glm::mat4 view_m = buildSilhouetteView();
+                    const glm::mat4 proj_m = buildSilhouetteProj();
+                    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+                    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+                    const glm::mat4 M = proj_m * view_m;
+
+                    const auto& Vmesh = liverMesh3D->mVertices;
+                    const int nV3 = (int)Vmesh.size();
+                    const bool lrValid = g_liverLR.valid();
+                    const int  nLR     = lrValid ? (int)g_liverLR.labels.size() : 0;
+
+                    std::vector<glm::vec2> raw_pts;
+                    std::vector<uint8_t>   raw_lr;
+                    raw_pts.reserve(g_debugSourceRimChain.size());
+                    raw_lr.reserve(g_debugSourceRimChain.size());
+
+                    for (int idx : g_debugSourceRimChain) {
+                        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+                        const glm::vec3 p3(Vmesh[idx*3],
+                                           Vmesh[idx*3+1],
+                                           Vmesh[idx*3+2]);
+                        const glm::vec4 clip = M * glm::vec4(p3, 1.0f);
+                        if (clip.w < 1e-9f) continue;
+                        const float ndcx = clip.x / clip.w;
+                        const float ndcy = clip.y / clip.w;
+                        const float px = (ndcx + 1.0f) * 0.5f * float(W_img);
+                        const float py = (1.0f - ndcy) * 0.5f * float(H_img);
+                        raw_pts.emplace_back(px, py);
+                        uint8_t lr = 255;
+                        if (lrValid && idx < nLR) lr = g_liverLR.labels[idx];
+                        raw_lr.push_back(lr);
+                    }
+                    const int N_raw = (int)raw_pts.size();
+
+                    // ---- 2. Grid aggregation ----
+                    //   Hash bin = (cellX, cellY). Per bin: accumulate
+                    //   sum + count + LR-label tally; emit centroid.
+                    const float grid = std::max(1.0f,
+                                                g_rawRimSmooth_GridPx);
+                    struct Cell {
+                        glm::dvec2 sum;
+                        int        cnt;
+                        int        n_R;
+                        int        n_L;
+                        int        n_B;
+                        int        n_U;
+                    };
+                    // Use long long key (32-bit cellX in low, cellY in high)
+                    auto cellKey = [grid](float x, float y) -> long long {
+                        // Offset by +2^15 to keep both halves non-negative
+                        // for typical 1920x1080 with grid up to 80 px.
+                        const int cx = int(std::floor(x / grid));
+                        const int cy = int(std::floor(y / grid));
+                        const long long ux = (long long)(cx + (1 << 15));
+                        const long long uy = (long long)(cy + (1 << 15));
+                        return (uy << 20) | (ux & 0xFFFFFLL);
+                    };
+                    std::unordered_map<long long, Cell> bins;
+                    bins.reserve(size_t(N_raw));
+                    for (int i = 0; i < N_raw; i++) {
+                        const long long k = cellKey(raw_pts[i].x,
+                                                    raw_pts[i].y);
+                        auto& C = bins[k];
+                        if (C.cnt == 0) {
+                            C.sum = glm::dvec2(0.0);
+                            C.n_R = C.n_L = C.n_B = C.n_U = 0;
+                        }
+                        C.sum += glm::dvec2(raw_pts[i]);
+                        C.cnt++;
+                        switch (raw_lr[i]) {
+                            case LiverLeftRightLabel::PURE_RIGHT: C.n_R++; break;
+                            case LiverLeftRightLabel::PURE_LEFT:  C.n_L++; break;
+                            case LiverLeftRightLabel::BOUNDARY:   C.n_B++; break;
+                            default:                              C.n_U++; break;
+                        }
+                    }
+                    std::vector<glm::vec2> smo_pts;
+                    std::vector<uint8_t>   smo_lr;
+                    std::vector<int>       smo_cnt;
+                    smo_pts.reserve(bins.size());
+                    smo_lr.reserve(bins.size());
+                    smo_cnt.reserve(bins.size());
+                    for (auto& kv : bins) {
+                        const Cell& C = kv.second;
+                        smo_pts.emplace_back(C.sum / double(C.cnt));
+                        // Majority LR (ties broken: R > L > B > U)
+                        uint8_t maj = 255;
+                        int best = -1;
+                        if (C.n_R > best) { best = C.n_R; maj = LiverLeftRightLabel::PURE_RIGHT; }
+                        if (C.n_L > best) { best = C.n_L; maj = LiverLeftRightLabel::PURE_LEFT;  }
+                        if (C.n_B > best) { best = C.n_B; maj = LiverLeftRightLabel::BOUNDARY;   }
+                        if (C.n_U > best) { best = C.n_U; maj = 255; }
+                        smo_lr.push_back(maj);
+                        smo_cnt.push_back(C.cnt);
+                    }
+                    const int N_cells = (int)smo_pts.size();
+
+                    // ---- 3. KNN smoothing ----
+                    //   For each point, find K nearest in 2D (brute
+                    //   force; N is small after binning), replace with
+                    //   their mean position. Iterate.
+                    const int K     = std::max(0, g_rawRimSmooth_KnnK);
+                    const int iters = std::max(0, g_rawRimSmooth_KnnIters);
+                    if (K > 0 && iters > 0 && N_cells >= 2) {
+                        const int Keff = std::min(K, N_cells - 1);
+                        std::vector<glm::vec2> tmp(N_cells);
+                        for (int it = 0; it < iters; it++) {
+                            // For each i find Keff nearest js, average
+                            // their (current) positions.
+                            std::vector<std::pair<float, int>> dist_idx;
+                            dist_idx.reserve(N_cells);
+                            for (int i = 0; i < N_cells; i++) {
+                                dist_idx.clear();
+                                for (int j = 0; j < N_cells; j++) {
+                                    if (j == i) continue;
+                                    const float dx = smo_pts[j].x - smo_pts[i].x;
+                                    const float dy = smo_pts[j].y - smo_pts[i].y;
+                                    dist_idx.emplace_back(dx*dx + dy*dy, j);
+                                }
+                                // Partial nth_element for Keff smallest
+                                std::nth_element(
+                                    dist_idx.begin(),
+                                    dist_idx.begin() + Keff,
+                                    dist_idx.end(),
+                                    [](const std::pair<float,int>& a,
+                                       const std::pair<float,int>& b){
+                                        return a.first < b.first;
+                                    });
+                                glm::dvec2 sum(0.0);
+                                for (int n = 0; n < Keff; n++) {
+                                    sum += glm::dvec2(smo_pts[dist_idx[n].second]);
+                                }
+                                // Include self with weight 1 to avoid
+                                // run-away drift (1 + Keff weighting)
+                                sum += glm::dvec2(smo_pts[i]);
+                                tmp[i] = glm::vec2(sum / double(Keff + 1));
+                            }
+                            smo_pts.swap(tmp);
+                        }
+                    }
+
+                    // ---- 4. Stats on smoothed point set ----
+                    glm::dvec2 sum2d(0.0);
+                    for (const auto& p : smo_pts) sum2d += glm::dvec2(p);
+                    const glm::vec2 cen2D = (smo_pts.empty())
+                        ? glm::vec2(float(W_img) * 0.5f, float(H_img) * 0.5f)
+                        : glm::vec2(sum2d / double(smo_pts.size()));
+
+                    // PURE_RIGHT 3D centroid → 2D (same as CB0, for ref)
+                    glm::vec2 rightCen2D(-1e6f);
+                    bool      rightCen2DValid = false;
+                    if (lrValid) {
+                        glm::dvec3 sumR(0.0);
+                        int nR3 = 0;
+                        for (int i = 0; i < nLR; i++) {
+                            if (i * 3 + 2 >= nV3) break;
+                            if (g_liverLR.labels[i] !=
+                                LiverLeftRightLabel::PURE_RIGHT) continue;
+                            sumR += glm::dvec3(Vmesh[i*3],
+                                               Vmesh[i*3+1],
+                                               Vmesh[i*3+2]);
+                            nR3++;
+                        }
+                        if (nR3 > 0) {
+                            const glm::vec3 rc3(sumR / double(nR3));
+                            const glm::vec4 clip = M * glm::vec4(rc3, 1.0f);
+                            if (clip.w > 1e-9f) {
+                                const float ndcx = clip.x / clip.w;
+                                const float ndcy = clip.y / clip.w;
+                                rightCen2D = glm::vec2(
+                                    (ndcx + 1.0f) * 0.5f * float(W_img),
+                                    (1.0f - ndcy) * 0.5f * float(H_img));
+                                rightCen2DValid = true;
+                            }
+                        }
+                    }
+
+                    int n_R_out = 0, n_L_out = 0, n_B_out = 0, n_U_out = 0;
+                    int cnt_min = std::numeric_limits<int>::max();
+                    int cnt_max = 0, cnt_sum = 0;
+                    for (int i = 0; i < N_cells; i++) {
+                        switch (smo_lr[i]) {
+                            case LiverLeftRightLabel::PURE_RIGHT: n_R_out++; break;
+                            case LiverLeftRightLabel::PURE_LEFT:  n_L_out++; break;
+                            case LiverLeftRightLabel::BOUNDARY:   n_B_out++; break;
+                            default:                              n_U_out++; break;
+                        }
+                        cnt_min = std::min(cnt_min, smo_cnt[i]);
+                        cnt_max = std::max(cnt_max, smo_cnt[i]);
+                        cnt_sum += smo_cnt[i];
+                    }
+                    if (N_cells == 0) cnt_min = 0;
+
+                    // ---- 5. Header info ----
+                    ImGui::Text("Smoothed RIM 2D points (grid + KNN)");
+                    ImGui::Text("  img=%dx%d   raw=%d   "
+                                "cells=%d  (grid=%.1f px)   K=%d  iters=%d",
+                                W_img, H_img, N_raw, N_cells,
+                                g_rawRimSmooth_GridPx, K, iters);
+                    if (N_cells > 0) {
+                        ImGui::Text("  cell occupancy:  min=%d  max=%d  "
+                                    "avg=%.1f  total=%d",
+                                    cnt_min, cnt_max,
+                                    float(cnt_sum) / float(N_cells),
+                                    cnt_sum);
+                        ImGui::Text("  LR (majority):  PURE_RIGHT=%d  "
+                                    "PURE_LEFT=%d  BOUNDARY=%d  unknown=%d",
+                                    n_R_out, n_L_out, n_B_out, n_U_out);
+                    }
+                    ImGui::Text("  smoothed 2D centroid: (%.0f, %.0f)",
+                                cen2D.x, cen2D.y);
+                    if (rightCen2DValid) {
+                        ImGui::Text("  PURE_RIGHT 3D centroid → 2D: (%.0f, %.0f)",
+                                    rightCen2D.x, rightCen2D.y);
+                    }
+                    ImGui::Separator();
+
+                    // ---- 6. Canvas ----
+                    ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (avail.x < 100.0f) avail.x = 100.0f;
+                    if (avail.y < 100.0f) avail.y = 100.0f;
+                    const float canvas_w = avail.x;
+                    const float canvas_h = avail.y;
+                    ImVec2 canvas_p1(canvas_p0.x + canvas_w,
+                                     canvas_p0.y + canvas_h);
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddRectFilled(canvas_p0, canvas_p1,
+                                      IM_COL32(20, 20, 26, 255));
+                    dl->AddRect      (canvas_p0, canvas_p1,
+                                      IM_COL32(120, 120, 130, 255));
+
+                    const float sx = canvas_w / float(W_img);
+                    const float sy = canvas_h / float(H_img);
+                    const float s  = (sx < sy) ? sx : sy;
+                    const float ox = canvas_p0.x + 0.5f * (canvas_w - s * float(W_img));
+                    const float oy = canvas_p0.y + 0.5f * (canvas_h - s * float(H_img));
+                    auto px2cv = [&](const glm::vec2& p) -> ImVec2 {
+                        return ImVec2(ox + p.x * s, oy + p.y * s);
+                    };
+
+                    dl->AddRect(
+                        px2cv(glm::vec2(0.0f,        0.0f)),
+                        px2cv(glm::vec2(float(W_img), float(H_img))),
+                        IM_COL32(80, 80, 90, 255));
+
+                    // ---- 7. Raw overlay (optional, faint gray, small) ----
+                    if (g_rawRimSmooth_ShowRawOverlay) {
+                        const ImU32 rawCol = IM_COL32(140, 140, 145, 110);
+                        for (const auto& p : raw_pts) {
+                            dl->AddCircleFilled(px2cv(p), 1.8f, rawCol);
+                        }
+                    }
+
+                    // ---- 8. Smoothed points (colored by majority LR) ----
+                    //   Size scales gently with cell occupancy so dense
+                    //   regions are visually distinguishable.
+                    for (int i = 0; i < N_cells; i++) {
+                        ImU32 col = IM_COL32(200, 200, 200, 240);
+                        switch (smo_lr[i]) {
+                            case LiverLeftRightLabel::PURE_RIGHT:
+                                col = IM_COL32(230,  70,  70, 250); break;
+                            case LiverLeftRightLabel::PURE_LEFT:
+                                col = IM_COL32( 80, 110, 240, 250); break;
+                            case LiverLeftRightLabel::BOUNDARY:
+                                col = IM_COL32(170, 170, 175, 230); break;
+                            default: break;
+                        }
+                        // radius 3.5..5.5 px based on occupancy
+                        float r = 3.5f;
+                        if (cnt_max > 1) {
+                            r += 2.0f * float(smo_cnt[i] - 1)
+                                      / float(cnt_max - 1);
+                        }
+                        const ImVec2 c = px2cv(smo_pts[i]);
+                        dl->AddCircleFilled(c, r, col);
+                        dl->AddCircle(c, r + 0.8f,
+                                      IM_COL32(0, 0, 0, 200), 0, 1.0f);
+                    }
+
+                    // ---- 9. 2D centroid (yellow cross) ----
+                    {
+                        const ImVec2 c = px2cv(cen2D);
+                        const float d = 9.0f;
+                        const ImU32 yc = IM_COL32(255, 240, 80, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y),
+                                    ImVec2(c.x + d, c.y), yc, 2.0f);
+                        dl->AddLine(ImVec2(c.x, c.y - d),
+                                    ImVec2(c.x, c.y + d), yc, 2.0f);
+                        dl->AddText(ImVec2(c.x + 10, c.y - 18),
+                                    yc, "smoothed centroid");
+                    }
+
+                    // ---- 10. PURE_RIGHT 3D centroid → 2D (cyan ×) ----
+                    if (rightCen2DValid) {
+                        const ImVec2 c = px2cv(rightCen2D);
+                        const float d = 9.0f;
+                        const ImU32 cy = IM_COL32(100, 230, 230, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y - d),
+                                    ImVec2(c.x + d, c.y + d), cy, 2.0f);
+                        dl->AddLine(ImVec2(c.x - d, c.y + d),
+                                    ImVec2(c.x + d, c.y - d), cy, 2.0f);
+                        dl->AddCircle(c, 7.0f, cy, 0, 1.5f);
+                        dl->AddText(ImVec2(c.x + 10, c.y + 8),
+                                    cy, "PURE_RIGHT 3D centroid → 2D");
+                    }
+
+                    // ---- 11. Legend ----
+                    {
+                        const float lx = canvas_p0.x + 8.0f;
+                        float       ly = canvas_p0.y + 8.0f;
+                        auto legLine = [&](ImU32 col, const char* txt) {
+                            dl->AddCircleFilled(ImVec2(lx + 6.0f, ly + 7.0f),
+                                                3.5f, col);
+                            dl->AddText(ImVec2(lx + 16.0f, ly), col, txt);
+                            ly += 16.0f;
+                        };
+                        legLine(IM_COL32(230,  70,  70, 250), "PURE_RIGHT (smoothed)");
+                        legLine(IM_COL32( 80, 110, 240, 250), "PURE_LEFT  (smoothed)");
+                        legLine(IM_COL32(170, 170, 175, 230), "BOUNDARY   (smoothed)");
+                        if (g_rawRimSmooth_ShowRawOverlay) {
+                            legLine(IM_COL32(140, 140, 145, 180), "raw (overlay)");
+                        }
+                    }
+
+                    ImGui::Dummy(ImVec2(canvas_w, canvas_h));
+                }
+                ImGui::End();
+            }
+        }
+
+        // --- CB0.2: Ordered RIM (MST + longest path) popup ---
+        //   STAGE 0.2: same cleaned point set as CB0.1, but with an
+        //   explicit ORDERING via MST + longest path, then arc-length
+        //   resampled pivots. Output is an open polyline — the correct
+        //   topology for the caudal RIM arch we observed in CB0.
+        if (g_debugShow2DProjPopup_RawRimOrdered &&
+            gApp.mode == AppMode::kRegistration)
+        {
+            ImGui::SetNextWindowSize(ImVec2(820, 580), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin(
+                    "Ordered RIM (Step 3d Stage 0.2)##silsw_rawrim_ordered_popup",
+                    &g_debugShow2DProjPopup_RawRimOrdered))
+            {
+                // Reuse the same smoothing pipeline as CB0.1 so the
+                // two popups show the exact same cleaned input.
+                SmoothedRim2DResult S = buildSmoothedRim2D(
+                    g_rawRimSmooth_GridPx,
+                    g_rawRimSmooth_KnnK,
+                    g_rawRimSmooth_KnnIters);
+
+                if (!S.ok) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                                       "Cannot build cleaned points: %s",
+                                       S.fail_reason.c_str());
+                } else {
+                    OrderedRim2DResult O = buildOrderedRim2D(
+                        S.smo_pts,
+                        S.right_centroid_2D,
+                        S.right_centroid_valid,
+                        g_rawRimOrder_MaxEdgePx,
+                        g_rawRimOrder_NPivots);
+
+                    // ---- Header info ----
+                    ImGui::Text("Ordered RIM (MST + longest path)");
+                    ImGui::Text("  img=%dx%d   cleaned=%d  "
+                                "(grid=%.1fpx, K=%d, iters=%d)   "
+                                "max_edge=%.0fpx",
+                                S.W_img, S.H_img, (int)S.smo_pts.size(),
+                                g_rawRimSmooth_GridPx,
+                                g_rawRimSmooth_KnnK,
+                                g_rawRimSmooth_KnnIters,
+                                g_rawRimOrder_MaxEdgePx);
+                    if (!O.ok) {
+                        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                                           "  ordering failed: %s",
+                                           O.fail_reason.c_str());
+                    } else {
+                        ImGui::Text("  MST: total=%.0fpx   rejected_edges=%d"
+                                    "   largest_CC=%d/%d nodes",
+                                    O.mst_total_length_px,
+                                    O.n_rejected_edges,
+                                    (int)O.component.size(),
+                                    (int)S.smo_pts.size());
+                        const float path_step = (O.path.size() > 1)
+                            ? O.arc_length_px / float(O.path.size() - 1)
+                            : 0.0f;
+                        const float pivot_step = (O.pivots.size() > 1)
+                            ? O.arc_length_px / float(O.pivots.size() - 1)
+                            : 0.0f;
+                        ImGui::Text("  longest path: nodes=%d  arc=%.0fpx"
+                                    "  step≈%.1fpx",
+                                    (int)O.path.size(),
+                                    O.arc_length_px, path_step);
+                        ImGui::Text("  pivots: N=%d  step=%.1fpx  start_to_R=%s",
+                                    (int)O.pivots.size(),
+                                    pivot_step,
+                                    O.start_oriented_to_right ? "YES" : "no");
+                    }
+                    ImGui::Separator();
+
+                    // ---- Canvas ----
+                    ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (avail.x < 100.0f) avail.x = 100.0f;
+                    if (avail.y < 100.0f) avail.y = 100.0f;
+                    const float canvas_w = avail.x;
+                    const float canvas_h = avail.y;
+                    ImVec2 canvas_p1(canvas_p0.x + canvas_w,
+                                     canvas_p0.y + canvas_h);
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddRectFilled(canvas_p0, canvas_p1,
+                                      IM_COL32(20, 20, 26, 255));
+                    dl->AddRect      (canvas_p0, canvas_p1,
+                                      IM_COL32(120, 120, 130, 255));
+
+                    const float sx = canvas_w / float(S.W_img);
+                    const float sy = canvas_h / float(S.H_img);
+                    const float s  = (sx < sy) ? sx : sy;
+                    const float ox = canvas_p0.x + 0.5f * (canvas_w - s * float(S.W_img));
+                    const float oy = canvas_p0.y + 0.5f * (canvas_h - s * float(S.H_img));
+                    auto px2cv = [&](const glm::vec2& p) -> ImVec2 {
+                        return ImVec2(ox + p.x * s, oy + p.y * s);
+                    };
+
+                    dl->AddRect(
+                        px2cv(glm::vec2(0.0f,        0.0f)),
+                        px2cv(glm::vec2(float(S.W_img), float(S.H_img))),
+                        IM_COL32(80, 80, 90, 255));
+
+                    // ---- 1. Cleaned points overlay (LR-tinted, faint) ----
+                    if (g_rawRimOrder_ShowCleaned) {
+                        for (size_t i = 0; i < S.smo_pts.size(); i++) {
+                            ImU32 col = IM_COL32(120, 120, 130, 150);
+                            switch (S.smo_lr[i]) {
+                                case LiverLeftRightLabel::PURE_RIGHT:
+                                    col = IM_COL32(180,  80,  80, 160); break;
+                                case LiverLeftRightLabel::PURE_LEFT:
+                                    col = IM_COL32( 80,  90, 180, 160); break;
+                                case LiverLeftRightLabel::BOUNDARY:
+                                    col = IM_COL32(150, 150, 155, 140); break;
+                                default: break;
+                            }
+                            dl->AddCircleFilled(px2cv(S.smo_pts[i]), 2.8f, col);
+                        }
+                    }
+
+                    if (O.ok) {
+                        // ---- 2. MST edges (optional, thin gray) ----
+                        if (g_rawRimOrder_ShowMST) {
+                            const ImU32 mst_col = IM_COL32(110, 110, 130, 200);
+                            for (int u = 0; u < (int)O.mst_adj.size(); u++) {
+                                for (int v : O.mst_adj[u]) {
+                                    if (v <= u) continue;       // each edge once
+                                    dl->AddLine(px2cv(S.smo_pts[u]),
+                                                px2cv(S.smo_pts[v]),
+                                                mst_col, 1.0f);
+                                }
+                            }
+                        }
+
+                        // ---- 3. Longest path (thick orange polyline) ----
+                        const ImU32 path_col = IM_COL32(255, 180, 70, 230);
+                        for (size_t i = 1; i < O.path.size(); i++) {
+                            dl->AddLine(px2cv(S.smo_pts[O.path[i-1]]),
+                                        px2cv(S.smo_pts[O.path[i]]),
+                                        path_col, 2.5f);
+                        }
+
+                        // ---- 4. Pivots (rainbow, indexed) ----
+                        const int Np = (int)O.pivots.size();
+                        for (int p = 0; p < Np; p++) {
+                            const float hue = (Np > 1)
+                                ? (float(p) / float(Np)) * 0.83f : 0.0f;
+                            const glm::vec3 c3 = cyclicHsv2rgb(hue, 0.95f, 1.0f);
+                            const ImU32 col = IM_COL32(int(c3.r * 255),
+                                                       int(c3.g * 255),
+                                                       int(c3.b * 255), 255);
+                            const ImVec2 c = px2cv(O.pivots[p]);
+                            dl->AddCircleFilled(c, 5.0f, col);
+                            dl->AddCircle(c, 6.0f,
+                                          IM_COL32(255, 255, 255, 255), 0, 1.0f);
+                            char idbuf[8];
+                            std::snprintf(idbuf, sizeof(idbuf), "%d", p);
+                            dl->AddText(ImVec2(c.x + 7, c.y - 14), col, idbuf);
+                        }
+
+                        // ---- 5. Start marker (large yellow circle on pivot 0) ----
+                        if (!O.pivots.empty()) {
+                            const ImVec2 c = px2cv(O.pivots[0]);
+                            dl->AddCircle(c, 11.0f,
+                                          IM_COL32(255, 240, 80, 255), 0, 3.0f);
+                            dl->AddText(ImVec2(c.x + 12, c.y + 6),
+                                        IM_COL32(255, 240, 80, 255), "start");
+                        }
+
+                        // ---- 6. End marker (yellow X on last pivot) ----
+                        if (O.pivots.size() > 1) {
+                            const ImVec2 c = px2cv(O.pivots.back());
+                            const float d = 7.0f;
+                            const ImU32 yc = IM_COL32(255, 200, 80, 230);
+                            dl->AddLine(ImVec2(c.x - d, c.y - d),
+                                        ImVec2(c.x + d, c.y + d), yc, 2.0f);
+                            dl->AddLine(ImVec2(c.x - d, c.y + d),
+                                        ImVec2(c.x + d, c.y - d), yc, 2.0f);
+                            dl->AddText(ImVec2(c.x + 9, c.y - 16), yc, "end");
+                        }
+                    }
+
+                    // ---- 7. PURE_RIGHT 3D centroid → 2D (cyan ×) ----
+                    if (S.right_centroid_valid) {
+                        const ImVec2 c = px2cv(S.right_centroid_2D);
+                        const float d = 9.0f;
+                        const ImU32 cy = IM_COL32(100, 230, 230, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y - d),
+                                    ImVec2(c.x + d, c.y + d), cy, 2.0f);
+                        dl->AddLine(ImVec2(c.x - d, c.y + d),
+                                    ImVec2(c.x + d, c.y - d), cy, 2.0f);
+                        dl->AddCircle(c, 7.0f, cy, 0, 1.5f);
+                        dl->AddText(ImVec2(c.x + 10, c.y + 8),
+                                    cy, "PURE_RIGHT 3D centroid → 2D");
+                    }
+
+                    // ---- 8. Legend ----
+                    {
+                        const float lx = canvas_p0.x + 8.0f;
+                        float       ly = canvas_p0.y + 8.0f;
+                        if (g_rawRimOrder_ShowCleaned) {
+                            dl->AddCircleFilled(ImVec2(lx + 6.0f, ly + 7.0f),
+                                                3.0f,
+                                                IM_COL32(180, 80, 80, 220));
+                            dl->AddText(ImVec2(lx + 16.0f, ly),
+                                        IM_COL32(200, 200, 200, 255),
+                                        "cleaned (CB0.1, faint)");
+                            ly += 16.0f;
+                        }
+                        if (g_rawRimOrder_ShowMST) {
+                            dl->AddLine(ImVec2(lx, ly + 7),
+                                        ImVec2(lx + 14, ly + 7),
+                                        IM_COL32(110, 110, 130, 220), 1.5f);
+                            dl->AddText(ImVec2(lx + 16, ly),
+                                        IM_COL32(160, 160, 170, 255),
+                                        "MST edges");
+                            ly += 16.0f;
+                        }
+                        dl->AddLine(ImVec2(lx, ly + 7),
+                                    ImVec2(lx + 14, ly + 7),
+                                    IM_COL32(255, 180, 70, 230), 2.5f);
+                        dl->AddText(ImVec2(lx + 16, ly),
+                                    IM_COL32(255, 200, 100, 255),
+                                    "longest path");
+                        ly += 16.0f;
+                        dl->AddCircleFilled(ImVec2(lx + 6.0f, ly + 7.0f),
+                                            3.5f,
+                                            IM_COL32(230, 70, 70, 255));
+                        dl->AddText(ImVec2(lx + 16.0f, ly),
+                                    IM_COL32(220, 220, 220, 255),
+                                    "pivots 0..N (rainbow)");
+                    }
+
+                    ImGui::Dummy(ImVec2(canvas_w, canvas_h));
+                }
+                ImGui::End();
+            }
+        }
+
+        // --- CB0.3: Manual Sweep Probe popup ---
+        //   STAGE 0.3: interactive single-candidate viewer that uses the
+        //   SAME source/target globals as the actual sweep, so geometry
+        //   matches byte-for-byte. Reproduces ONE evaluateSilhouette-
+        //   SweepCandidate evaluation per frame.
+        if (g_debugShow2DProjPopup_OverlayProbe &&
+            gApp.mode == AppMode::kRegistration)
+        {
+            ImGui::SetNextWindowSize(ImVec2(900, 640), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin(
+                    "Overlay probe — manual sweep candidate"
+                    " (Step 3d Stage 0.3)##silsw_overlay_probe_popup",
+                    &g_debugShow2DProjPopup_OverlayProbe))
+            {
+                // ---- 1. Ensure source preview is up to date ----
+                //   Uses whichever method is active (ENVELOPE / MST) so
+                //   CB0.3 reflects what the actual sweep would see.
+                std::string srcFail;
+                const bool src_ok = silSwBuildSrcPreview(&srcFail);
+
+                // ---- 2. Ensure target preview is up to date ----
+                std::string tgtFail;
+                bool tgt_ok = true;
+                if (g_silSwTgtAnchors2DPreview.empty() ||
+                    g_silSwTgtLower2DPreview.empty())
+                {
+                    tgt_ok = silSwBuildTgtPreview(&tgtFail);
+                }
+
+                if (!src_ok) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                        "Cannot build source preview: %s\n"
+                        "(press W to populate g_debugSourceRimChain first)",
+                        srcFail.c_str());
+                }
+                if (!tgt_ok) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                        "Cannot build target preview: %s\n"
+                        "(press Shift+W to populate target boundary)",
+                        tgtFail.c_str());
+                }
+
+                if (src_ok && tgt_ok) {
+                    // ---- 3. Resolve i / j / k against actual sizes ----
+                    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+                    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+                    const glm::mat4 view_m = buildSilhouetteView();
+                    const glm::mat4 proj_m = buildSilhouetteProj();
+                    const glm::mat4 VP     = proj_m * view_m;
+
+                    const int N_pivot  = (int)g_silSwSrcPivots3DPreview.size();
+                    const int N_anchor = (int)g_silSwTgtAnchors2DPreview.size();
+                    const int N_rot    = std::max(2, g_overlayProbe_NRotation);
+
+                    if (N_pivot == 0 || N_anchor == 0) {
+                        ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1),
+                            "Pivots/anchors not populated yet "
+                            "(N_pivot=%d, N_anchor=%d)",
+                            N_pivot, N_anchor);
+                    } else {
+                        // ---- 4. Auto-animate k ----
+                        if (g_overlayProbe_AutoAnimate) {
+                            g_overlayProbe_AnimFrameCounter++;
+                            if (g_overlayProbe_AnimFrameCounter >=
+                                std::max(1, g_overlayProbe_AnimFramesPerStep))
+                            {
+                                g_overlayProbe_AnimFrameCounter = 0;
+                                g_overlayProbe_RotStep =
+                                    (g_overlayProbe_RotStep + 1) % N_rot;
+                            }
+                        }
+
+                        // ---- 5. Clamp and resolve indices ----
+                        const int i = std::max(0,
+                            std::min(g_overlayProbe_PivotI, N_pivot - 1));
+                        int j = g_overlayProbe_LockJI ? i
+                            : std::max(0,
+                                std::min(g_overlayProbe_AnchorJ, N_anchor - 1));
+                        if (g_overlayProbe_LockJI) {
+                            j = std::min(j, N_anchor - 1);
+                        }
+                        const int k = std::max(0,
+                            std::min(g_overlayProbe_RotStep, N_rot - 1));
+                        const float theta_deg = float(k) * 360.0f / float(N_rot);
+                        const float c_th = std::cos(glm::radians(theta_deg));
+                        const float s_th = std::sin(glm::radians(theta_deg));
+
+                        // ---- 6. Build T using evaluateSilhouetteSweepCandidate
+                        //   formula but with INDEPENDENT i / j (sweep uses
+                        //   i == j; CB0.3 allows i ≠ j for exploration).
+                        const glm::vec3 P_s    = g_silSwSrcPivots3DPreview[i];
+                        const glm::vec2 P_t_2D = g_silSwTgtAnchors2DPreview[j];
+                        const glm::vec3 P_t_3D = RimShape::unprojectPixelAtWorldDepth(
+                            P_t_2D, P_s, view_m, proj_m, W_img, H_img);
+
+                        glm::mat4 R(1.0f);
+                        R[0][0] =  c_th; R[0][1] =  s_th; R[0][2] = 0.0f;
+                        R[1][0] = -s_th; R[1][1] =  c_th; R[1][2] = 0.0f;
+                        R[2][0] = 0.0f;  R[2][1] = 0.0f;  R[2][2] = 1.0f;
+                        const glm::mat4 T_to   = glm::translate(glm::mat4(1.0f),  P_t_3D);
+                        const glm::mat4 T_from = glm::translate(glm::mat4(1.0f), -P_s);
+                        const glm::mat4 T      = T_to * R * T_from;
+
+                        // ---- 7. Transform source dense + pivots to 2D ----
+                        auto project = [&](const glm::vec3& p3) -> glm::vec2 {
+                            const glm::vec4 cp = VP * (T * glm::vec4(p3, 1.0f));
+                            if (cp.w <= 1e-9f) return glm::vec2(-1e6f, -1e6f);
+                            return glm::vec2(
+                                (cp.x/cp.w + 1.0f) * 0.5f * float(W_img),
+                                (1.0f - cp.y/cp.w) * 0.5f * float(H_img));
+                        };
+
+                        std::vector<glm::vec2> src_dense_2D;
+                        src_dense_2D.reserve(g_silSwSrcRim3DPreview.size());
+                        for (const auto& p : g_silSwSrcRim3DPreview)
+                            src_dense_2D.push_back(project(p));
+
+                        std::vector<glm::vec2> src_pivots_2D(N_pivot);
+                        for (int p = 0; p < N_pivot; p++)
+                            src_pivots_2D[p] = project(g_silSwSrcPivots3DPreview[p]);
+
+                        // ---- 8. Cost (chamfer to target lower) ----
+                        const double cost = RimShape::denseChamfer2D(
+                            src_dense_2D, g_silSwTgtLower2DPreview);
+
+                        // ---- 9. CC orientation diagnosis ----
+                        //   Transform g_liverCC.d_cc by R only (translation
+                        //   doesn't affect direction). Project the CRANIAL
+                        //   tip and CAUDAL tip from the pivot point.
+                        glm::vec2 cc_arrow_head(-1e6f);   // CAUDAL screen pt
+                        glm::vec2 cc_arrow_tail(-1e6f);   // CRANIAL screen pt
+                        bool      cc_valid    = false;
+                        bool      cc_head_up  = false;
+                        float     cc_angle_deg = 0.0f;    // on-screen CRANIAL→CAUDAL
+                        float     cc_delta_from_6oclock = 0.0f;
+                        if (g_liverCC.valid()) {
+                            // d_cc points toward CRANIAL by convention.
+                            const glm::vec3 d_cc_world(
+                                g_liverCC.d_cc.x,
+                                g_liverCC.d_cc.y,
+                                g_liverCC.d_cc.z);
+                            // Use a small step so both endpoints project
+                            // close to the pivot for a visible arrow.
+                            const float step = 60.0f;   // mesh units (rough liver scale)
+                            const glm::vec3 cranial_world = P_s + step * d_cc_world;
+                            const glm::vec3 caudal_world  = P_s - step * d_cc_world;
+                            const glm::vec2 cranial_2D = project(cranial_world);
+                            const glm::vec2 caudal_2D  = project(caudal_world);
+                            if (cranial_2D.x > -1e5f && caudal_2D.x > -1e5f) {
+                                cc_arrow_tail = cranial_2D;
+                                cc_arrow_head = caudal_2D;
+                                // "head-up" means: CRANIAL projects ABOVE
+                                // CAUDAL on screen (smaller pixel-y is up).
+                                cc_head_up = (cranial_2D.y < caudal_2D.y);
+                                cc_valid = true;
+                                // On-screen CC angle (CRANIAL→CAUDAL).
+                                // +y is screen-down → 90° = 6 o'clock.
+                                const float dx = caudal_2D.x - cranial_2D.x;
+                                const float dy = caudal_2D.y - cranial_2D.y;
+                                cc_angle_deg = std::atan2(dy, dx) * 180.0f / 3.14159265f;
+                                cc_delta_from_6oclock = cc_angle_deg - 90.0f;
+                                while (cc_delta_from_6oclock >  180.0f) cc_delta_from_6oclock -= 360.0f;
+                                while (cc_delta_from_6oclock < -180.0f) cc_delta_from_6oclock += 360.0f;
+                            }
+                        }
+
+                        // ---- 9b. Check A (rotation cap) — same logic as sweep本番 ----
+                        float th_wrapped = theta_deg;
+                        while (th_wrapped >  180.0f) th_wrapped -= 360.0f;
+                        while (th_wrapped < -180.0f) th_wrapped += 360.0f;
+                        const bool checkA_pass =
+                            std::fabs(th_wrapped) <= g_silSwCheckA_RotCapDeg;
+                        const bool checkA_reject =
+                            g_overlayProbe_SimulateCheckA && !checkA_pass;
+
+                        // ---- 9c. Check B (CC guard) — same logic as sweep本番 ----
+                        bool checkB_pass    = true;
+                        bool checkB_skipped = true;   // skipped when g_liverCC invalid
+                        if (cc_valid) {
+                            checkB_skipped = false;
+                            checkB_pass =
+                                std::fabs(cc_delta_from_6oclock) <=
+                                g_silSwCheckB_CCToleranceDeg;
+                        }
+                        const bool checkB_reject =
+                            g_overlayProbe_SimulateCheckB &&
+                            !checkB_skipped && !checkB_pass;
+
+                        // ---- 10. LR alignment check ----
+                        //   Source pivot[0] is by construction the
+                        //   PURE_RIGHT-oriented end. After T, where does
+                        //   it land relative to PURE_RIGHT centroid?
+                        bool lr_ok = true;
+                        if (g_silSwSrcRightCentroid2DPreview.x > -1e5f &&
+                            N_pivot > 0)
+                        {
+                            const glm::vec2 p0_after = src_pivots_2D[0];
+                            const glm::vec2 pN_after = src_pivots_2D[N_pivot - 1];
+                            const glm::vec2 R_ref    = g_silSwSrcRightCentroid2DPreview;
+                            // After T, pivot[0] should still be closer
+                            // to the source's PURE_RIGHT centroid than
+                            // pivot[N-1] is. (LR is internal to source.)
+                            const float d0 = glm::length(p0_after - R_ref);
+                            const float dN = glm::length(pN_after - R_ref);
+                            lr_ok = (d0 <= dN);
+                        }
+
+                        // ==== Header ====
+                        ImGui::Text("Manual sweep candidate viewer");
+                        ImGui::Text("  i=%d  j=%d  k=%d (θ=%.1f°)   "
+                                    "lock=%s   cost=%.1f px",
+                                    i, j, k, theta_deg,
+                                    g_overlayProbe_LockJI ? "ON" : "OFF",
+                                    cost);
+                        ImGui::Text("  N_pivot=%d   N_anchor=%d   N_rot=%d",
+                                    N_pivot, N_anchor, N_rot);
+                        if (cc_valid) {
+                            if (cc_head_up) {
+                                ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.4f, 1),
+                                    "  CC: head-up ✓  (angle from 6h = %.1f°)",
+                                    cc_delta_from_6oclock);
+                            } else {
+                                ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1),
+                                    "  CC: FLIPPED ✗  (angle from 6h = %.1f°)",
+                                    cc_delta_from_6oclock);
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(0.95f, 0.7f, 0.3f, 1),
+                                "  CC: unavailable (g_liverCC not valid — run Shift+H)");
+                        }
+                        ImGui::Text("  LR (pivot 0 vs N-1 to PURE_RIGHT centroid): %s",
+                                    lr_ok ? "aligned ✓" : "mirrored ✗");
+
+                        // ---- Check A / Check B status (sweep本番 guard simulation) ----
+                        if (checkA_pass) {
+                            ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.4f, 1),
+                                "  Check A (rot cap ±%.0f°): pass ✓  (|θ wrap|=%.1f°)",
+                                g_silSwCheckA_RotCapDeg, std::fabs(th_wrapped));
+                        } else {
+                            const ImVec4 col = g_overlayProbe_SimulateCheckA
+                                ? ImVec4(0.95f, 0.4f, 0.4f, 1)
+                                : ImVec4(0.95f, 0.7f, 0.3f, 1);
+                            ImGui::TextColored(col,
+                                "  Check A (rot cap ±%.0f°): %s  (|θ wrap|=%.1f°)",
+                                g_silSwCheckA_RotCapDeg,
+                                g_overlayProbe_SimulateCheckA ? "REJECT ✗" : "would reject (sim OFF)",
+                                std::fabs(th_wrapped));
+                        }
+                        if (checkB_skipped) {
+                            ImGui::TextColored(ImVec4(0.95f, 0.7f, 0.3f, 1),
+                                "  Check B (CC ±%.0f°): skipped (no CC data)",
+                                g_silSwCheckB_CCToleranceDeg);
+                        } else if (checkB_pass) {
+                            ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.4f, 1),
+                                "  Check B (CC ±%.0f°): pass ✓  (|Δ from 6h|=%.1f°)",
+                                g_silSwCheckB_CCToleranceDeg,
+                                std::fabs(cc_delta_from_6oclock));
+                        } else {
+                            const ImVec4 col = g_overlayProbe_SimulateCheckB
+                                ? ImVec4(0.95f, 0.4f, 0.4f, 1)
+                                : ImVec4(0.95f, 0.7f, 0.3f, 1);
+                            ImGui::TextColored(col,
+                                "  Check B (CC ±%.0f°): %s  (|Δ from 6h|=%.1f°)",
+                                g_silSwCheckB_CCToleranceDeg,
+                                g_overlayProbe_SimulateCheckB ? "REJECT ✗" : "would reject (sim OFF)",
+                                std::fabs(cc_delta_from_6oclock));
+                        }
+
+                        const bool any_reject = checkA_reject || checkB_reject;
+                        if (any_reject) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1),
+                                "  >>> REJECTED — sweep本番 would set cost = +∞ <<<");
+                        }
+                        ImGui::Separator();
+
+                        // ==== Canvas ====
+                        ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+                        ImVec2 avail = ImGui::GetContentRegionAvail();
+                        if (avail.x < 100.0f) avail.x = 100.0f;
+                        if (avail.y < 100.0f) avail.y = 100.0f;
+                        const float canvas_w = avail.x;
+                        const float canvas_h = avail.y;
+                        ImVec2 canvas_p1(canvas_p0.x + canvas_w,
+                                         canvas_p0.y + canvas_h);
+
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        // Reddish tint when any simulated check rejects;
+                        // normal dark background otherwise.
+                        const ImU32 bg_col = any_reject
+                            ? IM_COL32(60, 18, 18, 255)
+                            : IM_COL32(20, 20, 26, 255);
+                        dl->AddRectFilled(canvas_p0, canvas_p1, bg_col);
+                        dl->AddRect      (canvas_p0, canvas_p1,
+                                          any_reject
+                                            ? IM_COL32(200, 80, 80, 255)
+                                            : IM_COL32(120, 120, 130, 255));
+
+                        const float sx = canvas_w / float(W_img);
+                        const float sy = canvas_h / float(H_img);
+                        const float s  = (sx < sy) ? sx : sy;
+                        const float ox = canvas_p0.x + 0.5f * (canvas_w - s * float(W_img));
+                        const float oy = canvas_p0.y + 0.5f * (canvas_h - s * float(H_img));
+                        auto px2cv = [&](const glm::vec2& p) -> ImVec2 {
+                            return ImVec2(ox + p.x * s, oy + p.y * s);
+                        };
+
+                        dl->AddRect(
+                            px2cv(glm::vec2(0.0f,        0.0f)),
+                            px2cv(glm::vec2(float(W_img), float(H_img))),
+                            IM_COL32(80, 80, 90, 255));
+
+                        // ---- 11a. Target overlay (purple dense + rainbow anchors) ----
+                        if (g_overlayProbe_ShowTgtOverlay) {
+                            // Dense target lower-half (purple dots)
+                            const ImU32 tcol = IM_COL32(180, 120, 200, 180);
+                            for (const auto& p : g_silSwTgtLower2DPreview) {
+                                dl->AddCircleFilled(px2cv(p), 1.4f, tcol);
+                            }
+                            // 20 target anchors (rainbow ×)
+                            for (int a = 0; a < N_anchor; a++) {
+                                const float hue = (N_anchor > 1)
+                                    ? (float(a) / float(N_anchor)) * 0.83f : 0.0f;
+                                const glm::vec3 c3 = cyclicHsv2rgb(hue, 0.95f, 1.0f);
+                                const ImU32 col = IM_COL32(int(c3.r * 255),
+                                                           int(c3.g * 255),
+                                                           int(c3.b * 255), 255);
+                                const ImVec2 cp = px2cv(g_silSwTgtAnchors2DPreview[a]);
+                                const float d = 5.0f;
+                                dl->AddLine(ImVec2(cp.x-d, cp.y-d),
+                                            ImVec2(cp.x+d, cp.y+d), col, 1.5f);
+                                dl->AddLine(ImVec2(cp.x-d, cp.y+d),
+                                            ImVec2(cp.x+d, cp.y-d), col, 1.5f);
+                                char idbuf[8];
+                                std::snprintf(idbuf, sizeof(idbuf), "%d", a);
+                                dl->AddText(ImVec2(cp.x + 7, cp.y + 4), col, idbuf);
+                            }
+                        }
+
+                        // ---- 11b. Source overlay (transformed dense path + pivots) ----
+                        if (g_overlayProbe_ShowSrcOverlay) {
+                            // Dense path as connected polyline
+                            const int M = (int)src_dense_2D.size();
+                            for (int p = 1; p < M; p++) {
+                                if (src_dense_2D[p-1].x < -1e5f) continue;
+                                if (src_dense_2D[p].x   < -1e5f) continue;
+                                ImU32 col = IM_COL32(220, 180, 180, 200);
+                                if (p - 1 < (int)g_silSwSrcRim2DPreviewLR.size()) {
+                                    switch (g_silSwSrcRim2DPreviewLR[p - 1]) {
+                                        case LiverLeftRightLabel::PURE_RIGHT:
+                                            col = IM_COL32(230, 80, 80, 230); break;
+                                        case LiverLeftRightLabel::PURE_LEFT:
+                                            col = IM_COL32(80, 110, 240, 230); break;
+                                        case LiverLeftRightLabel::BOUNDARY:
+                                            col = IM_COL32(180, 180, 185, 200); break;
+                                        default: break;
+                                    }
+                                }
+                                dl->AddLine(px2cv(src_dense_2D[p-1]),
+                                            px2cv(src_dense_2D[p]), col, 2.0f);
+                            }
+                            // Source pivots (rainbow ●)
+                            for (int p = 0; p < N_pivot; p++) {
+                                if (src_pivots_2D[p].x < -1e5f) continue;
+                                const float hue = (N_pivot > 1)
+                                    ? (float(p) / float(N_pivot)) * 0.83f : 0.0f;
+                                const glm::vec3 c3 = cyclicHsv2rgb(hue, 0.95f, 1.0f);
+                                const ImU32 col = IM_COL32(int(c3.r * 255),
+                                                           int(c3.g * 255),
+                                                           int(c3.b * 255), 255);
+                                const ImVec2 cp = px2cv(src_pivots_2D[p]);
+                                dl->AddCircleFilled(cp, 4.5f, col);
+                                dl->AddCircle(cp, 5.5f,
+                                              IM_COL32(0, 0, 0, 220), 0, 1.0f);
+                                char idbuf[8];
+                                std::snprintf(idbuf, sizeof(idbuf), "%d", p);
+                                dl->AddText(ImVec2(cp.x + 6, cp.y - 14), col, idbuf);
+                            }
+                        }
+
+                        // ---- 12. Highlight selected pivot[i] and anchor[j] ----
+                        if (i >= 0 && i < (int)src_pivots_2D.size() &&
+                            src_pivots_2D[i].x > -1e5f)
+                        {
+                            const ImVec2 cp = px2cv(src_pivots_2D[i]);
+                            dl->AddCircle(cp, 11.0f,
+                                          IM_COL32(255, 240, 80, 255), 0, 3.0f);
+                            dl->AddText(ImVec2(cp.x + 13, cp.y + 7),
+                                        IM_COL32(255, 240, 80, 255), "pivot[i]");
+                        }
+                        if (j >= 0 && j < (int)g_silSwTgtAnchors2DPreview.size()) {
+                            const ImVec2 cp = px2cv(g_silSwTgtAnchors2DPreview[j]);
+                            const float d = 10.0f;
+                            const ImU32 yc = IM_COL32(255, 220, 100, 255);
+                            dl->AddLine(ImVec2(cp.x-d, cp.y-d),
+                                        ImVec2(cp.x+d, cp.y+d), yc, 3.0f);
+                            dl->AddLine(ImVec2(cp.x-d, cp.y+d),
+                                        ImVec2(cp.x+d, cp.y-d), yc, 3.0f);
+                            dl->AddText(ImVec2(cp.x + 12, cp.y + 7), yc, "anchor[j]");
+                        }
+
+                        // ---- 13. CC direction arrow ----
+                        if (g_overlayProbe_ShowCCArrow && cc_valid) {
+                            const ImVec2 tail = px2cv(cc_arrow_tail);  // CRANIAL
+                            const ImVec2 head = px2cv(cc_arrow_head);  // CAUDAL
+                            const ImU32 col = cc_head_up
+                                ? IM_COL32(120, 240, 120, 255)
+                                : IM_COL32(240, 100, 100, 255);
+                            dl->AddLine(tail, head, col, 3.0f);
+                            // Arrowhead (perpendicular triangle at head)
+                            const float dx = head.x - tail.x;
+                            const float dy = head.y - tail.y;
+                            const float len = std::sqrt(dx*dx + dy*dy);
+                            if (len > 1.0f) {
+                                const float ux = dx / len, uy = dy / len;
+                                const float px = -uy, py = ux;
+                                const float a = 10.0f, b = 6.0f;
+                                const ImVec2 p1(head.x - a*ux + b*px,
+                                                head.y - a*uy + b*py);
+                                const ImVec2 p2(head.x - a*ux - b*px,
+                                                head.y - a*uy - b*py);
+                                dl->AddTriangleFilled(head, p1, p2, col);
+                            }
+                            dl->AddText(tail,
+                                        IM_COL32(180, 240, 180, 230), "CRANIAL");
+                            dl->AddText(head,
+                                        IM_COL32(240, 180, 180, 230), "CAUDAL");
+                        }
+
+                        // ---- 14. Legend (top-left) ----
+                        {
+                            const float lx = canvas_p0.x + 8.0f;
+                            float       ly = canvas_p0.y + 8.0f;
+                            auto legCircle = [&](ImU32 col, const char* txt) {
+                                dl->AddCircleFilled(ImVec2(lx + 6.0f, ly + 7.0f),
+                                                    3.5f, col);
+                                dl->AddText(ImVec2(lx + 16.0f, ly), col, txt);
+                                ly += 16.0f;
+                            };
+                            auto legLine = [&](ImU32 col, const char* txt) {
+                                dl->AddLine(ImVec2(lx, ly + 7),
+                                            ImVec2(lx + 14, ly + 7), col, 2.0f);
+                                dl->AddText(ImVec2(lx + 16, ly), col, txt);
+                                ly += 16.0f;
+                            };
+                            if (g_overlayProbe_ShowTgtOverlay) {
+                                legCircle(IM_COL32(180, 120, 200, 220),
+                                          "target lower-half (purple)");
+                                legCircle(IM_COL32(255, 100, 100, 230),
+                                          "target anchors (rainbow ×)");
+                            }
+                            if (g_overlayProbe_ShowSrcOverlay) {
+                                legLine(IM_COL32(230, 80, 80, 230),
+                                        "source dense (LR-tinted)");
+                                legCircle(IM_COL32(255, 220, 100, 230),
+                                          "source pivots (rainbow ●)");
+                            }
+                            if (g_overlayProbe_ShowCCArrow && cc_valid) {
+                                legLine(cc_head_up
+                                    ? IM_COL32(120, 240, 120, 255)
+                                    : IM_COL32(240, 100, 100, 255),
+                                    cc_head_up ? "CC head-up ✓"
+                                               : "CC FLIPPED ✗");
+                            }
+                        }
+
+                        // ---- 15. REJECTED banner (top center, large) ----
+                        if (any_reject) {
+                            const char* msg =
+                                (checkA_reject && checkB_reject) ? "REJECTED BY A + B" :
+                                checkA_reject                    ? "REJECTED BY A (rotation cap)" :
+                                                                   "REJECTED BY B (CC guard)";
+                            const ImU32 col = IM_COL32(255, 80, 80, 255);
+                            // Position near top, horizontally centered over canvas.
+                            const ImVec2 tsize = ImGui::CalcTextSize(msg);
+                            const ImVec2 pos(
+                                canvas_p0.x + 0.5f * (canvas_w - tsize.x),
+                                canvas_p0.y + 24.0f);
+                            // Soft dark backing for readability
+                            dl->AddRectFilled(
+                                ImVec2(pos.x - 6, pos.y - 3),
+                                ImVec2(pos.x + tsize.x + 6, pos.y + tsize.y + 3),
+                                IM_COL32(20, 0, 0, 200), 4.0f);
+                            dl->AddText(pos, col, msg);
+                        }
+
+                        ImGui::Dummy(ImVec2(canvas_w, canvas_h));
+                    }
+                }
+                ImGui::End();
+            }
+        }
+
+        // --- CB1: Source 2D projection popup ---
+        if (g_debugShow2DProjPopup_Source && gApp.mode == AppMode::kRegistration) {
+            // Rebuild source cache every frame so the popup reflects
+            // the current source pose. silSwBuildSrcPreview is cheap.
+            std::string srcFail;
+            const bool ok = silSwBuildSrcPreview(&srcFail);
+
+            ImGui::SetNextWindowSize(ImVec2(820, 540), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Source rim 2D projection (Step 3d)##silsw_src_popup",
+                             &g_debugShow2DProjPopup_Source))
+            {
+                if (!ok) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                                       "Cannot build preview: %s",
+                                       srcFail.c_str());
+                } else {
+                    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+                    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+                    ImGui::Text("AR-image-plane projection of source rim chain");
+                    ImGui::Text("  dense=%d pts   pivots=%d   start_idx=%d   img=%dx%d",
+                                (int)g_silSwSrcRim2DPreview.size(),
+                                (int)g_silSwSrcPivots2DPreview.size(),
+                                g_silSwSrcStartIdxPreview, W_img, H_img);
+
+                    // [Step 3d2] angle-bin envelope diagnostic: step stats
+                    {
+                        const auto& curveD = g_silSwSrcRim2DPreview;
+                        const int Kd = (int)curveD.size();
+                        if (Kd >= 2) {
+                            float dsum = 0.0f, dmax = 0.0f, dmin = 1e30f;
+                            int   n_jump = 0;
+                            std::vector<float> ds;
+                            ds.reserve(Kd);
+                            for (int i = 0; i < Kd; i++) {
+                                const int j = (i + 1) % Kd;
+                                const float dx = curveD[j].x - curveD[i].x;
+                                const float dy = curveD[j].y - curveD[i].y;
+                                const float d = std::sqrt(dx*dx + dy*dy);
+                                ds.push_back(d);
+                                dsum += d;
+                                if (d > dmax) dmax = d;
+                                if (d < dmin) dmin = d;
+                            }
+                            std::sort(ds.begin(), ds.end());
+                            const float dmed = ds[ds.size() / 2];
+                            for (float d : ds) if (d > 4.0f * dmed) n_jump++;
+                            const float davg = dsum / float(Kd);
+                            ImGui::Text("  step px: avg=%.1f  med=%.1f  min=%.1f  max=%.1f"
+                                        "   jumps(>4×med)=%d",
+                                        davg, dmed, dmin, dmax, n_jump);
+                            if (n_jump > 0) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                                    "  [!] %d step(s) longer than 4× median — "
+                                    "shown in orange below",
+                                    n_jump);
+                            }
+                        }
+                    }
+                    ImGui::Separator();
+
+                    // Reserve canvas region
+                    ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (avail.x < 100.0f) avail.x = 100.0f;
+                    if (avail.y < 100.0f) avail.y = 100.0f;
+                    const float canvas_w = avail.x;
+                    const float canvas_h = avail.y;
+                    ImVec2 canvas_p1(canvas_p0.x + canvas_w, canvas_p0.y + canvas_h);
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddRectFilled(canvas_p0, canvas_p1, IM_COL32(20, 20, 26, 255));
+                    dl->AddRect      (canvas_p0, canvas_p1, IM_COL32(120, 120, 130, 255));
+
+                    // Image → canvas scale (preserve aspect, fit)
+                    const float sx = canvas_w / float(W_img);
+                    const float sy = canvas_h / float(H_img);
+                    const float s  = (sx < sy) ? sx : sy;
+                    // Centered offset
+                    const float ox = canvas_p0.x + 0.5f * (canvas_w - s * float(W_img));
+                    const float oy = canvas_p0.y + 0.5f * (canvas_h - s * float(H_img));
+                    auto px2cv = [&](const glm::vec2& p) -> ImVec2 {
+                        return ImVec2(ox + p.x * s, oy + p.y * s);
+                    };
+
+                    // Draw image frame outline
+                    dl->AddRect(
+                        px2cv(glm::vec2(0.0f,        0.0f)),
+                        px2cv(glm::vec2(float(W_img), float(H_img))),
+                        IM_COL32(80, 80, 90, 255));
+
+                    // Dense rim drawn as CLOSED polyline (last→first
+                    // segment included). The angle-bin envelope is a
+                    // closed contour by construction. Color by LR
+                    // label. Segments more than 4× median length are
+                    // drawn in orange to expose any anomaly (typically
+                    // there will be none for the envelope method).
+                    const auto& curve = g_silSwSrcRim2DPreview;
+                    const auto& labels = g_silSwSrcRim2DPreviewLR;
+                    const int Kc = (int)curve.size();
+                    float jump_thr = 1e9f;
+                    if (Kc >= 2) {
+                        std::vector<float> ds;
+                        ds.reserve(Kc);
+                        for (int i = 0; i < Kc; i++) {
+                            const int j = (i + 1) % Kc;
+                            const float dx = curve[j].x - curve[i].x;
+                            const float dy = curve[j].y - curve[i].y;
+                            ds.push_back(std::sqrt(dx*dx + dy*dy));
+                        }
+                        std::sort(ds.begin(), ds.end());
+                        jump_thr = 4.0f * ds[ds.size() / 2];
+                    }
+                    for (int i = 0; i < Kc; i++) {
+                        if (curve[i].x < -1e5f) continue;
+                        const int j = (i + 1) % Kc;     // closed loop
+                        if (curve[j].x < -1e5f) continue;
+                        const float dx = curve[j].x - curve[i].x;
+                        const float dy = curve[j].y - curve[i].y;
+                        const float dseg = std::sqrt(dx*dx + dy*dy);
+
+                        ImU32 col = IM_COL32(180, 180, 180, 255);
+                        if (i < (int)labels.size()) {
+                            switch (labels[i]) {
+                                case LiverLeftRightLabel::PURE_RIGHT:
+                                    col = IM_COL32(230, 70, 70, 255);   break;
+                                case LiverLeftRightLabel::PURE_LEFT:
+                                    col = IM_COL32(80, 110, 240, 255);  break;
+                                case LiverLeftRightLabel::BOUNDARY:
+                                    col = IM_COL32(170, 170, 175, 255); break;
+                            }
+                        }
+                        if (dseg > jump_thr) {
+                            col = IM_COL32(255, 150, 50, 200);   // orange = jump
+                        }
+                        dl->AddLine(px2cv(curve[i]), px2cv(curve[j]), col, 1.5f);
+                    }
+
+                    // PURE_RIGHT centroid (yellow cross)
+                    {
+                        const ImVec2 c = px2cv(g_silSwSrcRightCentroid2DPreview);
+                        const float d = 8.0f;
+                        const ImU32 yc = IM_COL32(255, 240, 80, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y), ImVec2(c.x + d, c.y), yc, 2.0f);
+                        dl->AddLine(ImVec2(c.x, c.y - d), ImVec2(c.x, c.y + d), yc, 2.0f);
+                        dl->AddText(ImVec2(c.x + 10, c.y - 18), yc, "PURE_RIGHT centroid");
+                    }
+
+                    // Right-start chain vertex (large yellow marker)
+                    if (!curve.empty() && curve[0].x > -1e5f) {
+                        const ImVec2 c = px2cv(curve[0]);
+                        dl->AddCircle(c, 10.0f, IM_COL32(255, 240, 80, 255), 0, 3.0f);
+                        dl->AddText(ImVec2(c.x + 12, c.y + 6),
+                                    IM_COL32(255, 240, 80, 255), "start");
+                    }
+
+                    // 20 pivots (rainbow)
+                    const auto& pv = g_silSwSrcPivots2DPreview;
+                    const int Np = (int)pv.size();
+                    for (int p = 0; p < Np; p++) {
+                        if (pv[p].x < -1e5f) continue;
+                        // Cyclic HSV rainbow over [0, 5/6] (matches the
+                        // existing Preview anchors so visual matching by
+                        // index works between popup and 3D scene).
+                        const float hue = (Np > 1) ? (float(p) / float(Np)) * 0.83f : 0.0f;
+                        const glm::vec3 c3 = cyclicHsv2rgb(hue, 0.95f, 1.0f);
+                        const ImU32 col = IM_COL32(int(c3.r * 255),
+                                                   int(c3.g * 255),
+                                                   int(c3.b * 255), 255);
+                        const ImVec2 c = px2cv(pv[p]);
+                        dl->AddCircleFilled(c, 5.0f, col);
+                        dl->AddCircle(c, 6.0f, IM_COL32(255, 255, 255, 255), 0, 1.0f);
+                        char idbuf[8];
+                        std::snprintf(idbuf, sizeof(idbuf), "%d", p);
+                        dl->AddText(ImVec2(c.x + 7, c.y - 14), col, idbuf);
+                    }
+
+                    ImGui::Dummy(ImVec2(canvas_w, canvas_h));
+                }
+                ImGui::End();
+            }
+        }
+
+        // --- CB2: Target rim lower-half + anchors popup ---
+        if (g_debugShow2DProjPopup_Target && gApp.mode == AppMode::kRegistration) {
+            // Target is static once Shift+W ran; cache survives. Rebuild
+            // is also cheap (~150 pts max).
+            std::string tgtFail;
+            const bool ok = silSwBuildTgtPreview(&tgtFail);
+
+            ImGui::SetNextWindowSize(ImVec2(820, 540), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Target rim lower-half + anchors (Step 3d)##silsw_tgt_popup",
+                             &g_debugShow2DProjPopup_Target))
+            {
+                if (!ok) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                                       "Cannot build preview: %s",
+                                       tgtFail.c_str());
+                } else {
+                    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+                    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+                    ImGui::Text("AR-image-plane target contour (largest segment)");
+                    ImGui::Text("  total=%d  lower=%d  anchors=%d  img=%dx%d",
+                                (int)g_debugTargetContour2D.size(),
+                                (int)g_silSwTgtLower2DPreview.size(),
+                                (int)g_silSwTgtAnchors2DPreview.size(),
+                                W_img, H_img);
+                    ImGui::Text("  centroid.y=%.1f  (pixels with y > this = lower)",
+                                g_silSwTgtCentroid2DPreview.y);
+                    ImGui::Separator();
+
+                    ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (avail.x < 100.0f) avail.x = 100.0f;
+                    if (avail.y < 100.0f) avail.y = 100.0f;
+                    const float canvas_w = avail.x;
+                    const float canvas_h = avail.y;
+                    ImVec2 canvas_p1(canvas_p0.x + canvas_w, canvas_p0.y + canvas_h);
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddRectFilled(canvas_p0, canvas_p1, IM_COL32(20, 20, 26, 255));
+                    dl->AddRect      (canvas_p0, canvas_p1, IM_COL32(120, 120, 130, 255));
+
+                    const float sx = canvas_w / float(W_img);
+                    const float sy = canvas_h / float(H_img);
+                    const float s  = (sx < sy) ? sx : sy;
+                    const float ox = canvas_p0.x + 0.5f * (canvas_w - s * float(W_img));
+                    const float oy = canvas_p0.y + 0.5f * (canvas_h - s * float(H_img));
+                    auto px2cv = [&](const glm::vec2& p) -> ImVec2 {
+                        return ImVec2(ox + p.x * s, oy + p.y * s);
+                    };
+
+                    // Image frame
+                    dl->AddRect(
+                        px2cv(glm::vec2(0.0f,        0.0f)),
+                        px2cv(glm::vec2(float(W_img), float(H_img))),
+                        IM_COL32(80, 80, 90, 255));
+
+                    // Full target contour: above-centroid gray, below purple.
+                    // (g_debugTargetContour2D is an open polyline; multiple
+                    //  segments are possible but traceContour2D returns the
+                    //  longest, so a single polyline draw is fine.)
+                    const float cy = g_silSwTgtCentroid2DPreview.y;
+                    const auto& full = g_debugTargetContour2D;
+                    const int Kt = (int)full.size();
+                    for (int i = 0; i + 1 < Kt; i++) {
+                        const bool lower = (full[i].y > cy);
+                        const ImU32 col = lower
+                            ? IM_COL32(170, 100, 220, 255)   // purple
+                            : IM_COL32(110, 110, 115, 255);  // gray
+                        dl->AddLine(px2cv(full[i]), px2cv(full[i + 1]), col, 1.5f);
+                    }
+
+                    // Centroid line + cross
+                    {
+                        const ImVec2 a = px2cv(glm::vec2(0.0f, cy));
+                        const ImVec2 b = px2cv(glm::vec2(float(W_img), cy));
+                        dl->AddLine(a, b, IM_COL32(90, 90, 100, 160), 1.0f);
+                        const ImVec2 c = px2cv(g_silSwTgtCentroid2DPreview);
+                        const float d = 8.0f;
+                        const ImU32 yc = IM_COL32(255, 240, 80, 255);
+                        dl->AddLine(ImVec2(c.x - d, c.y), ImVec2(c.x + d, c.y), yc, 2.0f);
+                        dl->AddLine(ImVec2(c.x, c.y - d), ImVec2(c.x, c.y + d), yc, 2.0f);
+                        dl->AddText(ImVec2(c.x + 10, c.y - 18), yc, "centroid");
+                    }
+
+                    // Right-end (max x) start marker
+                    if (!g_silSwTgtLower2DPreview.empty()) {
+                        const ImVec2 c = px2cv(g_silSwTgtLower2DPreview.front());
+                        dl->AddCircle(c, 10.0f, IM_COL32(255, 240, 80, 255), 0, 3.0f);
+                        dl->AddText(ImVec2(c.x + 12, c.y + 6),
+                                    IM_COL32(255, 240, 80, 255), "start");
+                    }
+
+                    // 20 anchors (rainbow), same coloring as source pivots
+                    const auto& an = g_silSwTgtAnchors2DPreview;
+                    const int Na = (int)an.size();
+                    for (int p = 0; p < Na; p++) {
+                        const float hue = (Na > 1) ? (float(p) / float(Na)) * 0.83f : 0.0f;
+                        const glm::vec3 c3 = cyclicHsv2rgb(hue, 0.95f, 1.0f);
+                        const ImU32 col = IM_COL32(int(c3.r * 255),
+                                                   int(c3.g * 255),
+                                                   int(c3.b * 255), 255);
+                        const ImVec2 c = px2cv(an[p]);
+                        dl->AddCircleFilled(c, 5.0f, col);
+                        dl->AddCircle(c, 6.0f, IM_COL32(255, 255, 255, 255), 0, 1.0f);
+                        char idbuf[8];
+                        std::snprintf(idbuf, sizeof(idbuf), "%d", p);
+                        dl->AddText(ImVec2(c.x + 7, c.y - 14), col, idbuf);
+                    }
+
+                    ImGui::Dummy(ImVec2(canvas_w, canvas_h));
+                }
+                ImGui::End();
+            }
+        }
+
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -6691,6 +9318,21 @@ static void setupUICallbacks() {
     // preview is also flipped; we restore the original click coords after
     // the runner returns so the user's edits aren't disturbed.
     auto runSegmentForCamera = [](AppContext& ctx, MaskKind kind) {
+        // The external SAM2 tool loads the image from disk via fopen(), but in
+        // camera mode ctx.image.path is a placeholder ("[Camera Captured]" /
+        // "[Camera Live]"), which can't be opened. Save the current frame to a
+        // real file first (same as Run Depth via runCameraDepthEstimation),
+        // then restore the placeholder afterwards so other code paths are
+        // unaffected.
+        std::string savedPath = gCamera.saveForDepthEstimation();
+        if (savedPath.empty()) {
+            std::cerr << "[Segment] failed to save camera frame for preview"
+                      << std::endl;
+            return;
+        }
+        std::string origPath = ctx.image.path;
+        ctx.image.path = savedPath;
+
         // Pick which list to flip based on the kind being previewed.
         std::vector<MaskPoint>& target =
             (kind == MaskKind::Instrument) ? ctx.instrumentMaskPoints
@@ -6699,6 +9341,8 @@ static void setupUICallbacks() {
         for (auto& p : target) p.u = ctx.image.width - p.u;
         runSegmentOnly(ctx, kind);
         target = backup;
+
+        ctx.image.path = origPath;  // restore camera placeholder
     };
 
     a.onSegment1 = [runSegmentForCamera]() {
@@ -6936,7 +9580,7 @@ static void setupUICallbacks() {
     a.onRunCalibration = []() {
         std::cout << "[Calib] Running calibration_tool..." << std::endl;
 
-        // Find calibration_tool executable (same dir as medsam2_da3_lite)
+        // Find calibration_tool executable (same dir as sam2_da3_lite)
         std::string exeDir = std::filesystem::path(DEPTH_EXE_PATH).parent_path().string();
         std::string exe;
         const std::vector<std::string> candidates = {
@@ -7123,7 +9767,7 @@ static void setupUICallbacks() {
         // Run-Depth invocation passes this through to
         // DepthRunnerConfig::useCuda which adds --cuda to the CLI so the
         // external pipeline registers the CUDAExecutionProvider.
-        // The flag is harmless when medsam2_da3_lite was built with
+        // The flag is harmless when sam2_da3_lite was built with
         // USE_CUDA=OFF -- the pipeline prints a "CUDA not available"
         // warning and falls back to CPU.
         gApp.useCuda = useGpu;

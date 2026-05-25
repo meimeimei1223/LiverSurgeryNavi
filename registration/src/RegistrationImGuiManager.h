@@ -101,7 +101,7 @@ struct RegUIActions {
     std::function<void(bool)> onDetectVignetteChanged;
     // CUDA / GPU toggle. main.cpp 側で gApp.useCuda を更新し、次回の
     // Run Depth / Instrument preview の CLI に --cuda を付与する。
-    // medsam2_da3_lite が USE_CUDA=OFF でビルドされている場合は CPU
+    // sam2_da3_lite が USE_CUDA=OFF でビルドされている場合は CPU
     // fallback されるため、ON でも害はない。
     std::function<void(bool)> onUseCudaChanged;
     // ---- チャット 9: 4-quadrant 連動 (Initial Orientation = Ctrl+G mask) ----
@@ -2416,7 +2416,7 @@ public:  // drawDepthOverlayをpublicに変更（マスク選択モードから�
 
                     // CUDA / GPU toggle. main.cpp 側で gApp.useCuda を更新し、
                     // 次回の Run Depth / Instrument preview の CLI に --cuda
-                    // を付与する。medsam2_da3_lite が USE_CUDA=OFF でビルド
+                    // を付与する。sam2_da3_lite が USE_CUDA=OFF でビルド
                     // されている場合は CPU fallback されるため害はない。
                     {
                         bool useGpu = state.useCuda;

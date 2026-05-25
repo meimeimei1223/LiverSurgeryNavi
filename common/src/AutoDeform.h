@@ -121,6 +121,12 @@ struct State {
     std::vector<Handle> moveHandles;
     float fieldBboxDiag = 0.0f;
 
+    // Step 1 (classifySrcVisibility) で計測される source liver の AABB 対角線。
+    // scale=1/scale=10 どちらでも全 draw 関数のスフィア半径をこれに比例させる
+    // ことで「bbox の 0.5-1% の点」という相対サイズを保つ。
+    // 0 のときは旧来の絶対半径(scale=10 想定値)を使う。
+    float srcBboxDiag = 0.0f;
+
     std::vector<int>       seqMoveQueue;
     std::vector<bool>      seqMoveUsed;
     std::vector<int>       seqVisIdxOf;
@@ -149,6 +155,9 @@ struct State {
     int   rmseLastMatched  = 0;
     int   rmseLastTotal    = 0;
 
+    // SHIFT+Key1/2/3 で 1個だけ描くデバッグモード (0=通常)
+    int   debugMaxPoints   = 0;
+
     void clear() {
         correspondences.clear();
         statsAll = statsSilhouette = statsInterior = Stats{};
@@ -169,6 +178,7 @@ struct State {
         fixHandles.clear();
         moveHandles.clear();
         fieldBboxDiag = 0.0f;
+        srcBboxDiag   = 0.0f;
         seqMoveQueue.clear();
         seqMoveUsed.clear();
         seqVisIdxOf.clear();
@@ -232,6 +242,7 @@ inline void classifySrcVisibility(
         mn = glm::min(mn, p); mx = glm::max(mx, p);
     }
     float diag = glm::length(mx - mn);
+    st.srcBboxDiag = diag;   // ★ 全 draw 関数のスフィア半径正規化に使う ★
     st.visTolerance = 0.0f;
 
     Reg3D::BVHTree bvh;
@@ -348,7 +359,8 @@ inline void drawSrcVisibility(
     float srcRadius = 0.04f,
     float tgtRadius = 0.05f,
     bool  drawHidden = false,
-    bool  drawOutscreen = false)
+    bool  drawOutscreen = false,
+    int   maxPoints = 0)
 {
     if (st.srcPosCache.empty()) return;
 
@@ -358,6 +370,7 @@ inline void drawSrcVisibility(
     static const glm::vec3 colOutscr  (0.4f, 0.4f, 0.4f);
     static const glm::vec3 colTarget  (0.2f, 0.4f, 1.0f);
 
+    int drawn = 0;
     for (size_t i = 0; i < st.srcPosCache.size(); i++) {
         int v = st.srcVisibility[i];
         if (v == VIS_HIDDEN && !drawHidden) continue;
@@ -370,10 +383,17 @@ inline void drawSrcVisibility(
         default:            c = colOutscr;  break;
         }
         sphere.draw(shader, st.srcPosCache[i], c, srcRadius, view, proj, camPos);
+        drawn++;
+        if (maxPoints > 0 && drawn >= maxPoints) break;
     }
 
-    for (const auto& p : st.tgtPosCache) {
-        sphere.draw(shader, p, colTarget, tgtRadius, view, proj, camPos);
+    if (maxPoints <= 0 || drawn < maxPoints) {
+        int tgtDrawn = 0;
+        for (const auto& p : st.tgtPosCache) {
+            sphere.draw(shader, p, colTarget, tgtRadius, view, proj, camPos);
+            tgtDrawn++;
+            if (maxPoints > 0 && (drawn + tgtDrawn) >= maxPoints) break;
+        }
     }
 }
 
@@ -396,6 +416,7 @@ inline void extractCorrespondences(
     int  savedNVisHidden   = st.nVisHidden;
     int  savedNVisOutscr   = st.nVisOutscreen;
     float savedVisToler    = st.visTolerance;
+    float savedSrcBboxDiag = st.srcBboxDiag;   // ★ Key1で計測した値を draw() スフィア半径正規化用に保持 ★
 
     st.clear();
 
@@ -407,6 +428,7 @@ inline void extractCorrespondences(
     st.nVisHidden      = savedNVisHidden;
     st.nVisOutscreen   = savedNVisOutscr;
     st.visTolerance    = savedVisToler;
+    st.srcBboxDiag     = savedSrcBboxDiag;     // ★ 復元(Key1→Key2 で 0 に落ちる問題の修正)★
 
     st.silhouetteThreshold = silhouetteThreshold;
     if (!liverMesh || !screenMesh) return;
@@ -732,14 +754,20 @@ inline void drawStep1(
     const glm::mat4& proj,
     const glm::vec3& camPos,
     float srcRadius = 0.04f,
-    float tgtRadius = 0.04f)
+    float tgtRadius = 0.04f,
+    int   maxPoints = 2000)
 {
     if (st.stage != 2 || st.correspondences.empty()) return;
     float vmin = st.statsAll.minV;
     float vmax = st.statsAll.median + 3.0f * st.statsAll.mad;
     if (vmax <= vmin) vmax = st.statsAll.maxV;
 
-    for (const auto& c : st.correspondences) {
+    // maxPoints<=0 のときは間引き無し(全対応点を描画)
+    size_t N = st.correspondences.size();
+    int step = (maxPoints > 0) ? std::max<int>(1, static_cast<int>(N) / maxPoints) : 1;
+
+    for (size_t i = 0; i < N; i += step) {
+        const auto& c = st.correspondences[i];
         glm::vec3 col = distanceToColor(c.distProjected, vmin, vmax);
         float rSrc = c.isSilhouette ? srcRadius * 1.3f : srcRadius;
         float rTgt = c.isSilhouette ? tgtRadius * 1.3f : tgtRadius;
@@ -757,11 +785,17 @@ inline void drawStep2(
     const glm::vec3& camPos,
     float srcRadius = 0.05f,
     float tgtRadius = 0.04f,
-    bool  drawOutlier = true)
+    bool  drawOutlier = true,
+    int   maxPoints = 2000)
 {
     if (st.stage != 3 || st.correspondences.empty()) return;
 
-    for (const auto& c : st.correspondences) {
+    // maxPoints<=0 のときは間引き無し(全対応点を描画)
+    size_t N = st.correspondences.size();
+    int step = (maxPoints > 0) ? std::max<int>(1, static_cast<int>(N) / maxPoints) : 1;
+
+    for (size_t i = 0; i < N; i += step) {
+        const auto& c = st.correspondences[i];
         if (!drawOutlier && c.category == CAT_OUTLIER) continue;
         glm::vec3 col = categoryColor(c.category, c.isSilhouette);
         float rSrc = c.isSilhouette ? srcRadius * 1.3f : srcRadius;
@@ -1178,6 +1212,22 @@ inline int applyHandlesToSoftBody(
     return nAdded;
 }
 
+// ============================================================================
+// 描画ディスパッチャ — スフィア半径を bbox 比例に正規化
+// ----------------------------------------------------------------------------
+// scale=10 時代のハードコード半径(0.04, 0.05, 0.03 等)は bbox≈6.3 の世界で
+// 「bbox の 0.5-0.8% 程度」という想定だった。scale=1 になって bbox が 0.63
+// になると同じ絶対値では 6-8% で太すぎる。
+//
+// st.srcBboxDiag(Step1 で計測)が有効なら、kRefBbox = 6.33 を基準とした
+// 比率で各サブ関数のデフォルト半径をスケールする。bbox 未計測の場合は
+// 旧来の絶対値で動く(後方互換)。
+//
+// さらに視覚バランスのため:
+//  - Stage 2/3 は対応点が 87,000+ あって全部描くと塗りつぶされるので
+//    maxPoints=2000 で間引き(Step 5 と同じ思想)
+//  - 全体の半径も控えめ(kVizShrink)に絞ってある
+// ============================================================================
 inline void draw(
     const State& st,
     SphereMesh& sphere,
@@ -1186,12 +1236,78 @@ inline void draw(
     const glm::mat4& proj,
     const glm::vec3& camPos)
 {
-    if (st.stage == 1)      drawSrcVisibility(st, sphere, shader, view, proj, camPos);
-    else if (st.stage == 2) drawStep1(st, sphere, shader, view, proj, camPos);
-    else if (st.stage == 3) drawStep2(st, sphere, shader, view, proj, camPos);
-    else if (st.stage == 4) drawFieldPoints(st, sphere, shader, view, proj, camPos);
-    else if (st.stage == 5) {
-        drawFieldPoints(st, sphere, shader, view, proj, camPos, 0.02f, 300);
+    constexpr float kRefBbox    = 6.33f;   // scale=10 時代の典型的な liver bbox diag
+    constexpr float kVizShrink  = 0.5f;    // 旧基準の半分にして「点」感を出す
+    constexpr float kDotRadius  = 0.04f;   // 全 stage 統一の基本半径(旧 scale=10)
+
+    const float r = (st.srcBboxDiag > 1e-6f) ? (st.srcBboxDiag / kRefBbox) : 1.0f;
+    const float dot = kDotRadius * r * kVizShrink;
+
+    // SHIFT+Key1/2/3 で debugMaxPoints=1 → 1個だけ描画(サイズ比較デバッグ)
+    const bool single = (st.debugMaxPoints > 0);
+    const int mp1 = single ? 1 : 0;       // stage 1: 0=全部
+    const int mp2 = single ? 1 : 0;       // stage 2/3: 0=全部 (間引き廃止)
+    const int mp4 = single ? 1 : 500;     // stage 4
+    const int mp5 = single ? 1 : 300;     // stage 5
+
+    // ================================================================
+    // SHIFT+Key デバッグ: 黄色の1個だけ描画してサイズ比較する
+    // ================================================================
+    if (st.debugMaxPoints > 0) {
+        glm::vec3 pos(0);
+        bool found = false;
+        const char* label = "?";
+
+        if (st.stage == 1 && !st.srcPosCache.empty()) {
+            for (size_t i = 0; i < st.srcPosCache.size(); i++) {
+                if (st.srcVisibility[i] == VIS_VISIBLE)
+                    { pos = st.srcPosCache[i]; found = true; break; }
+            }
+            label = "Stage1(srcVis)";
+        } else if ((st.stage == 2 || st.stage == 3) && !st.correspondences.empty()) {
+            pos = st.correspondences[0].srcPos; found = true;
+            label = (st.stage == 2) ? "Stage2(corr)" : "Stage3(class)";
+        }
+
+        if (found) {
+            sphere.draw(shader, pos, glm::vec3(1.0f, 1.0f, 0.0f), dot,
+                        view, proj, camPos);
+            static int dbgLastStage = -1;
+            if (dbgLastStage != st.stage) {
+                std::cout << "[debug] " << label
+                          << "  dot=" << dot
+                          << "  bbox=" << st.srcBboxDiag
+                          << "  r=" << r
+                          << "  pos=(" << pos.x << "," << pos.y << "," << pos.z << ")"
+                          << std::endl;
+                dbgLastStage = st.stage;
+            }
+        }
+        return;
+    }
+
+    // ================================================================
+    // 通常描画 — 全 stage 統一 dot サイズ
+    // debugMaxPoints>0 時は上のブロックで return 済み
+    // ================================================================
+    if (st.stage == 1) {
+        drawSrcVisibility(st, sphere, shader, view, proj, camPos,
+                          /*srcRadius=*/dot, /*tgtRadius=*/dot,
+                          /*drawHidden=*/false, /*drawOutscreen=*/false,
+                          /*maxPoints=*/mp1);
+    } else if (st.stage == 2) {
+        drawStep1(st, sphere, shader, view, proj, camPos,
+                  /*srcRadius=*/dot, /*tgtRadius=*/dot, /*maxPoints=*/mp2);
+    } else if (st.stage == 3) {
+        drawStep2(st, sphere, shader, view, proj, camPos,
+                  /*srcRadius=*/dot, /*tgtRadius=*/dot,
+                  /*drawOutlier=*/true, /*maxPoints=*/mp2);
+    } else if (st.stage == 4) {
+        drawFieldPoints(st, sphere, shader, view, proj, camPos,
+                        /*radius=*/dot * 0.75f, mp4);
+    } else if (st.stage == 5) {
+        drawFieldPoints(st, sphere, shader, view, proj, camPos,
+                        /*radius=*/dot * 0.5f, /*maxPoints=*/mp5);
         drawHandles(st, sphere, shader, view, proj, camPos);
     }
 }
