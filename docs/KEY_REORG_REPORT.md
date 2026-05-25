@@ -102,3 +102,32 @@ If Qt's cache was cleared, Run CMake to reconfigure.
 - **Phase 8:** full GUI acceptance test.
 
 Branch `key-reorg` is local only (not merged to `main`, not pushed).
+
+---
+
+## Summary of work done (final)
+
+Commits on `key-reorg` (in order):
+
+| Commit | Phase | What |
+|---|---|---|
+| `3c8cc07` | 1 | viz/recompute/debug controls added to Ctrl+D > Viz tab |
+| `1528486` | 2 | `Alt+G` (V1) / `Alt+Shift+G` (V2) BIPOP shortcuts; legacy Shift+V/F kept w/ deprecation log |
+| `e766b09` | 4+5 | removed migrated viz/debug keys (V/F/B/T/Y/H/I full; N/W/R partial) + isShiftV/F |
+| `0f3bfc2` | 7 | `docs/KEY_REFERENCE.md` + DebugPanel header comment |
+| `feb4e1d` | — | this report |
+| (5.5) | 5.5 | review fixes: rim/boundary populate on enable + cluster checkbox dedup |
+| (report) | — | report updated with Phase 5.5 |
+
+Decisions:
+- Phase 3 (deprecation-warning soak) **skipped** — went straight to removal.
+- Shift+V/Shift+F removal migration print message **not added** (single-dev, local).
+
+Status:
+- All phases build clean (`lsn_registration`, 0 errors); 0 removed-key cases remain.
+- Review items (1) rim/boundary populate and (3) cluster dedup: **fixed** (Phase 5.5).
+- (2) GUI acceptance test: **pending on real hardware** (Qt Creator) — verify the
+  Viz-tab toggles render/work (esp. rim chain / target boundary now populate),
+  Alt+G/Alt+Shift+G reproduce old Shift+V/F results, and label checkboxes
+  auto-recompute on first enable.
+- Branch `key-reorg`: local only, not merged, not pushed.
