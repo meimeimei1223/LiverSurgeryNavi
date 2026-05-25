@@ -51,8 +51,9 @@ struct State {
     // content depends on many main.cpp-local symbols (e.g. the migrated Ctrl+G
     // Quadrant Selector panel — Phase 3) and is therefore registered as a
     // lambda capturing frame-loop locals by reference.
-    std::function<void()> drawGBody;   // Phase 3: full Ctrl+G panel body
-    std::function<void()> drawNBody;   // Phase 4: Normal-Compatible Refine panel
+    std::function<void()> drawGBody;    // Phase 3: full Ctrl+G panel body
+    std::function<void()> drawNBody;    // Phase 4: Normal-Compatible Refine panel
+    std::function<void()> drawVizExtra; // Phase 7: ScreenMesh Display + B/N viz
 };
 
 // Internal tab draw functions (later phases populate these).
@@ -103,7 +104,8 @@ inline void draw(State& st, RegistrationImGuiManager& gUI) {
             }
             if (ImGui::BeginTabItem("Viz")) {
                 st.activeTab = TAB_VIZ;
-                drawTabViz(gUI.state, gUI.actions);
+                drawTabViz(gUI.state, gUI.actions);   // Phase 2: Cluster / CorresPoints
+                if (st.drawVizExtra) st.drawVizExtra(); // Phase 7: ScreenMesh + B/N viz
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();

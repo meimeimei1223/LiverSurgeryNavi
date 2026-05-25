@@ -6437,11 +6437,24 @@ int main() {
 
         };  // end g_debugPanel.drawNBody (migrated Normal-Compatible Refine)
 
-        if (gApp.mode == AppMode::kRegistration && !gUmeyama.active) {
-            ImGui::SetNextWindowBgAlpha(0.7f);
-            ImGui::Begin("ScreenMesh Display",
-                         nullptr,
-                         ImGuiWindowFlags_AlwaysAutoResize);
+        // [PHASE-7] ScreenMesh Display content relocated into Debug Panel > Viz
+        // tab (rendered after the Phase-2 Cluster/CorresPoints section).
+        // Registered as a hook; also surfaces the B/N-key visualization toggles.
+        // Standalone floating window removed.
+        g_debugPanel.drawVizExtra = [&]() {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Other markers:");
+            ImGui::Checkbox("Boundary candidates (B key)##viz_b",
+                            &g_showBoundaryCandidates);
+            ImGui::Checkbox("Source visualization (N key)##viz_n",
+                            &g_showSourceVisualization);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Screen mesh rendering:");
             ImGui::Checkbox("Draw as points (lightweight)", &g_screenMeshAsPoints);
             if (g_screenMeshAsPoints) {
                 ImGui::SliderFloat("Point size [px]",
@@ -6474,8 +6487,7 @@ int main() {
                     ImGui::Text("|err| = %.4f m  (%.1f mm)", d, d * 1000.0f);
                 }
             }
-            ImGui::End();
-        }
+        };  // end g_debugPanel.drawVizExtra (migrated ScreenMesh Display + B/N viz)
 
         // Consolidated Debug Panel (Ctrl+D). Same registration / non-Umeyama
         // guard as the legacy floating panels above.
