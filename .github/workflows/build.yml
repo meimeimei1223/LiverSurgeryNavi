@@ -52,7 +52,7 @@ jobs:
         run: |
           mkdir -p package/LiverSurgeryNavi/onnx_models
           cp build/bin/LiverSurgeryNavi package/LiverSurgeryNavi/
-          cp build/bin/medsam2_da3_lite package/LiverSurgeryNavi/
+          cp build/bin/sam2_da3_lite package/LiverSurgeryNavi/
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime.so* package/LiverSurgeryNavi/
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_cuda.so* package/LiverSurgeryNavi/ 2>/dev/null || true
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_shared.so* package/LiverSurgeryNavi/ 2>/dev/null || true
@@ -117,7 +117,7 @@ jobs:
         run: |
           mkdir -p package/LiverSurgeryNavi/onnx_models
           cp build/bin/Release/LiverSurgeryNavi.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/LiverSurgeryNavi.exe package/LiverSurgeryNavi/
-          cp build/bin/Release/medsam2_da3_lite.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/medsam2_da3_lite.exe package/LiverSurgeryNavi/
+          cp build/bin/Release/sam2_da3_lite.exe package/LiverSurgeryNavi/ 2>/dev/null || cp build/bin/sam2_da3_lite.exe package/LiverSurgeryNavi/
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime.dll package/LiverSurgeryNavi/
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_cuda.dll package/LiverSurgeryNavi/ 2>/dev/null || true
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_shared.dll package/LiverSurgeryNavi/ 2>/dev/null || true

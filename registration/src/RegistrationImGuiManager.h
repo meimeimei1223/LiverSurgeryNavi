@@ -101,7 +101,7 @@ struct RegUIActions {
     std::function<void(bool)> onDetectVignetteChanged;
     // CUDA / GPU toggle. main.cpp 側で gApp.useCuda を更新し、次回の
     // Run Depth / Instrument preview の CLI に --cuda を付与する。
-    // medsam2_da3_lite が USE_CUDA=OFF でビルドされている場合は CPU
+    // sam2_da3_lite が USE_CUDA=OFF でビルドされている場合は CPU
     // fallback されるため、ON でも害はない。
     std::function<void(bool)> onUseCudaChanged;
     // ---- チャット 9: 4-quadrant 連動 (Initial Orientation = Ctrl+G mask) ----
@@ -302,6 +302,9 @@ private:
     bool infoExpanded_ = false;
     bool showRestartConfirm_ = false;
     bool regPhaseActive_ = false;
+    bool initOrientShouldCollapse_ = false;   // [Phase 9c] One-shot: set by the
+                                              // Apply Init Pose button, consumed
+                                              // next frame to fold INITIAL ORIENT.
     float sidebarWidth_ = 400.0f;
 
     // ---- INITIAL ORIENTATION panel: CollapsingHeader open states ----
@@ -1144,7 +1147,7 @@ private:
         childH += 6.0f                                 // section separator
                   + fontH + 2.0f                         // POSITION sub-header
                   + fontH                                // anatomy hint
-                  + 64.0f                                // 2x2 grid
+                  + 32.0f                                // 1x4 grid (Phase 9a, was 64 for 2x2)
                   + fontH + 4.0f                         // mask text
                   + (22.0f + 4.0f)                       // quick presets
                   + 6.0f                                 // spacing before ORIENTATION
@@ -1152,9 +1155,8 @@ private:
         if (orientExpanded_) {
             childH += 3.0f * (22.0f + 4.0f);           // orientation 3 行
         }
-        childH += 6.0f                                 // spacing before Apply
-                  + (24.0f + 6.0f)                       // apply button
-                  + 8.0f;                                // tail padding
+        childH += 8.0f;                                // tail padding only
+                                                       // (Phase 9d: Apply moved out)
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.06f, 0.10f, 0.5f));
         ImGui::BeginChild("##initOrient", ImVec2(-1, childH), false);
@@ -1262,14 +1264,15 @@ private:
         };
 
         ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.70f, 0.85f), "  POSITION");
-        ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 0.85f),
-                           "  Top=anterior, Left=patient's right");
+        // [Phase 9a] Removed "Top=anterior, Left=patient's right" hint — the
+        // 2x2 spatial mapping it described no longer applies in the 1x4
+        // horizontal layout (just reading order: ant_R, ant_L, pos_R, pos_L).
 
-        // ---- 2x2 grid (Ctrl+G と同じレイアウト) ----
+        // ---- 1x4 grid (horizontal, Phase 9a; was 2x2) ----
         {
             const ImGuiTableFlags tableFlags =
                 ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchSame;
-            if (ImGui::BeginTable("##initorient_quad_grid", 2, tableFlags)) {
+            if (ImGui::BeginTable("##initorient_quad_grid", 4, tableFlags)) {
                 auto checkbox_cell = [&](const char* shortName,
                                          int nv,
                                          uint8_t bit)
@@ -1293,15 +1296,12 @@ private:
                     ImGui::PopID();
                 };
 
-                // Row 1: anterior
+                // [Phase 9a] Single row, 4 columns. Same callbacks as 2x2.
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 checkbox_cell("ant_R", state.quadNAR, kMaskAR);
                 ImGui::TableNextColumn();
                 checkbox_cell("ant_L", state.quadNAL, kMaskAL);
-
-                // Row 2: posterior
-                ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 checkbox_cell("pos_R", state.quadNPR, kMaskPR);
                 ImGui::TableNextColumn();
@@ -1473,31 +1473,10 @@ private:
         }
 
         // ============================================================
-        //  [§D] Apply Init Pose (主動線、常時表示、最下部)
+        //  [§D] Apply Init Pose moved to drawRegistrationSection (Phase 9d):
+        //  it now lives OUTSIDE this CollapsingHeader so it stays visible even
+        //  when INITIAL ORIENTATION is folded.
         // ============================================================
-        //  POSITION / ORIENTATION を確定したあとにこのボタンで applyInitRotation
-        //  を実行する。ORIENTATION が折りたたみのとき、現在値は ORIENTATION ヘッダ
-        //  の "[Base]" 等で確認できる。
-        ImGui::Spacing();
-        {
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImVec4(0.10f, 0.30f, 0.55f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                  ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                  ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.95f, 0.97f, 1.00f, 1.0f));
-            bool empty = (state.activeQuadrantMask == kMaskNone);
-            if (empty) ImGui::BeginDisabled();
-            if (ImGui::Button("Apply Init Pose", ImVec2(-1, 24.0f))) {
-                if (actions.onApplyInitPose) actions.onApplyInitPose();
-            }
-            if (empty) ImGui::EndDisabled();
-            ImGui::PopStyleColor(4);
-            ImGui::PopStyleVar();
-        }
 
         ImGui::Spacing();
         ImGui::EndChild();
@@ -1552,30 +1531,87 @@ private:
 
         bool anyP = (state.regState > 0 && state.regState < 4);
 
-        drawInitOrientationPanel();
+        // [Phase 8] INITIAL ORIENTATION as a collapsing header. Label shows
+        // current Q-mask + Orient preset so it stays readable when collapsed.
+        {
+            constexpr uint8_t kMaskNone = 0x00;
+            constexpr uint8_t kMaskAll  = 0x0F;
+            char qstr[24];
+            if (state.activeQuadrantMask == kMaskNone)      std::snprintf(qstr, sizeof(qstr), "NONE");
+            else if (state.activeQuadrantMask == kMaskAll)  std::snprintf(qstr, sizeof(qstr), "ALL");
+            else std::snprintf(qstr, sizeof(qstr), "0x%02X", (unsigned)state.activeQuadrantMask);
 
-        // --- STAGE 1: Hemi Auto (2/3 width) + AutoProbe (1/3 width) ---
+            char hdrLabel[96];
+            std::snprintf(hdrLabel, sizeof(hdrLabel),
+                          "INITIAL ORIENTATION  [Q:%s | %s]###initorient_hdr",
+                          qstr, presetLabel(state.initRotPreset));
+
+            // [Phase 9c] One-shot fold from Apply Init Pose. Cleared on consume
+            // so the user can manually re-open the header any time afterwards.
+            if (initOrientShouldCollapse_) {
+                ImGui::SetNextItemOpen(false, ImGuiCond_Always);
+                initOrientShouldCollapse_ = false;
+            }
+            // Auto-open before any registration / labels exist; fold up after.
+            else if (!state.useRegistration && !state.quadLabelsReady) {
+                ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.10f, 0.12f, 0.16f, 0.7f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.15f, 0.18f, 0.24f, 0.8f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.20f, 0.24f, 0.32f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.55f, 0.70f, 0.90f, 1.0f));
+            bool ioOpen = ImGui::CollapsingHeader(hdrLabel);
+            ImGui::PopStyleColor(4);
+
+            if (ioOpen) {
+                drawInitOrientationPanel();  // contents only (Apply moved out, Phase 9d)
+            }
+        }
+
+        // [Phase 9d] Apply Init Pose — main-line button, ALWAYS visible (outside
+        // the CollapsingHeader). Disabled if no quadrant selected. Pressing it
+        // also triggers the Phase 9c one-shot auto-fold on the next frame.
+        {
+            constexpr uint8_t kMaskNone_apply = 0x00;
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.10f, 0.30f, 0.55f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.95f, 0.97f, 1.00f, 1.0f));
+            bool empty = (state.activeQuadrantMask == kMaskNone_apply);
+            if (empty) ImGui::BeginDisabled();
+            if (ImGui::Button("Apply Init Pose", ImVec2(-1, 28.0f))) {
+                if (actions.onApplyInitPose) actions.onApplyInitPose();
+                initOrientShouldCollapse_ = true;   // [Phase 9c]
+            }
+            if (empty) ImGui::EndDisabled();
+            ImGui::PopStyleColor(4);
+            ImGui::PopStyleVar();
+        }
+        ImGui::Spacing();
+
+        // --- STAGE 1: Hemi Quad (Shift+O, 2/3 width) + Probe (1/3 width) ---
+        // [Phase 8 rename] Hemi Auto -> Hemi Quad (Shift+O): calls onQuadAuto
+        // (AR-fixed-view ∩ quadrant intersection, the improved method) instead
+        // of onHemiAuto. onHemiAuto is preserved in RegUIActions for keyboard
+        // and other code paths; only this sidebar button is rerouted. The
+        // v:0.50 voxel readout is dropped (same value lives in Debug Panel O
+        // tab and sidebar Advanced).
         {
             const float gap     = 4.0f;
             const float availW  = ImGui::GetContentRegionAvail().x;
             const float hemiW   = (availW - gap) * 0.66f;
 
-            if(glowButton("Hemi Auto", colReg(), anyP && state.regMethod!=1, hemiW, 52, state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
-                state.regMethod = 1; if(actions.onHemiAuto) actions.onHemiAuto();
-            }
-            {
-                ImVec2 p = ImGui::GetItemRectMin();
-                ImVec2 sz = ImGui::GetItemRectSize();
-                char buf[16]; snprintf(buf, sizeof(buf), "v:%.2f", state.hemiVoxelSize);
-                ImVec2 ts = ImGui::CalcTextSize(buf);
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(p.x + sz.x - ts.x - 6, p.y + (sz.y - ts.y) * 0.5f),
-                    IM_COL32(120,220,160,180), buf);
+            if(glowButton("Hemi Quad (Shift+O)", colReg(),
+                          anyP && state.regMethod!=1, hemiW, 52,
+                          state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
+                state.regMethod = 1;
+                if(actions.onQuadAuto) actions.onQuadAuto();
             }
 
-            // AutoProbe: HemiAuto の右隣 (残り 1/3)
             ImGui::SameLine(0.0f, gap);
-            if(glowButton("AutoProbe", colReg(), anyP, -1, 52, 0)) {
+            if(glowButton("Probe", colReg(), anyP, -1, 52, 0)) {
                 if(actions.onAutoProbe) actions.onAutoProbe();
             }
         }
@@ -1588,88 +1624,20 @@ private:
         //  AutoQCR ボタン、右 1/3 が 6-DoF lock チェックボックス。
         //  チェック ON (default) = rigid (DICOM mm + metric depth)、
         //  チェック OFF = 7-DoF T+R+Scale (Shift+Ctrl+P 互換)。
+        // [Phase 8] AutoQCR is now a full-width button. The 6-DoF/7-DoF lock
+        // checkbox moved into the QCR Tuning collapsing header below (keeps the
+        // main button clean). `anyP` disables it only while another
+        // registration is running; prerequisites are guarded inside
+        // runAutoQuadCyclicRansac.
         {
-            float totalW = ImGui::GetContentRegionAvail().x;
-            float gap2 = ImGui::GetStyle().ItemSpacing.x;
-            float wAutoQcr = totalW * (2.0f / 3.0f) - gap2;
-            const char* label = state.autoQcrLockScale
-                                    ? "AutoQCR  6-DoF"
-                                    : "AutoQCR  7-DoF";
-            // [BUGFIX] 旧コード:
-            //   bool anyP2 = (state.cameraState == 2 || state.hasLocalImage);
-            //   if(glowButton(label, colReg(), anyP2, ...)) {
-            // anyP2 は「画像ソースが用意済み」を表す true 値だったが、
-            // それを `disabled` に渡していたため、画像をロードした直後に
-            // ボタンが灰色になる polarity bug が発生していた (= 主要動線で
-            // ボタンが押せなくなる)。AutoProbe と同じ `anyP` (= 他登録が
-            // 実行中) に統一。前提 (Apply Init Pose 済み等) は
-            // runAutoQuadCyclicRansac 内のガードで早期 return される。
-            if(glowButton(label, colReg(), anyP, wAutoQcr, 52, 0)) {
+            if(glowButton("AutoQCR", colReg(), anyP, -1, 52, 0)) {
                 if(actions.onAutoQCR) actions.onAutoQCR(state.autoQcrLockScale);
             }
-
-            ImGui::SameLine(0.0f, gap2);
-            // 6-DoF checkbox (右側 1/3)
-            bool lockScale = state.autoQcrLockScale;
-            if (ImGui::Checkbox("6-DoF", &lockScale)) {
-                // RegUIState は const 参照では渡らないため、
-                // const_cast せずトグルだけしておく(次フレームの sync で
-                // 反映される設計でも OK だが、即時反映が欲しいので直接書く)。
-                const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
-            }
         }
         ImGui::Spacing();
 
-        // ----------------------------------------------------------------
-        //  QCR Tuning  (Shift+Ctrl+P / AutoQCR 共通、折りたたみ既定 OFF)
-        // ----------------------------------------------------------------
-        //  g_qcrSubsetK と g_qcrMaxTrials は RegistrationActions.h で
-        //  inline 定義されており、runQuadCyclicRansac() の中で読まれる。
-        //  AutoQCR (= runAutoQuadCyclicRansac) は 9 個の ORIENT preset
-        //  それぞれに対して runQuadCyclicRansac を呼ぶので、ここで設定
-        //  した K / Max trials は AutoQCR の各 trial にも自動的に効く。
-        //
-        //  位置: 旧 "Shift+Ctrl+P Tuning" として下方に置いていたが、
-        //  AutoQCR との関係が見えにくかったため AutoQCR ボタン直下に移動。
-        if (ImGui::CollapsingHeader("QCR Tuning  (Shift+Ctrl+P / AutoQCR)")) {
-            ImGui::Indent(8);
-            // K subset size: 3 (Fischler-Bolles min), 4-5 (more stable, over-determined)
-            ImGui::TextColored(colMuted(), "Subset size K:");
-            if (ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d")) {
-                // value clamped inside runQuadCyclicRansac if out of range
-            }
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  K=3: %d-pt exact fit (max variety)\n"
-                               "  K=4: over-det. (balanced)\n"
-                               "  K=5: over-det. (most stable)",
-                               g_qcrSubsetK);
-            // Trial count cap (K=4/5 expensive: stride sample to stay under cap)
-            ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max trials (Stage 1 cap):");
-            ImGui::SliderInt("##qcrCap", &g_qcrMaxTrials, 10000, 500000, "%d");
-            // -------------------------------------------------------
-            //  Rotation hard limits (post-Umeyama)
-            //  -----------------------------------------------------
-            //   per-axis : 各軸 (X/Y/Z) Euler 角の |angle| max
-            //   total    : axis-angle 表現の総回転量 (arccos((tr(R)-1)/2))
-            //  AutoQCR の 15 preset は最大 ±40° (FAR) なので、
-            //  Umeyama drift を 30° 以下に絞ると「枠を大きく超えない」。
-            // -------------------------------------------------------
-            ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max axis rotation (per-axis):");
-            ImGui::SliderFloat("##qcrMaxAxis", &g_qcrMaxAxisRotDeg,
-                               5.0f, 90.0f, "%.1f deg");
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  X/Y/Z 単軸ごとの上限 (30° 推奨)");
-            ImGui::Spacing();
-            ImGui::TextColored(colMuted(), "Max total rotation (axis-angle):");
-            ImGui::SliderFloat("##qcrMaxTotal", &g_qcrMaxTotalRotDeg,
-                               5.0f, 90.0f, "%.1f deg");
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
-                               "  off-axis 大回転も含む総量 (30° 推奨)");
-            ImGui::Unindent(8);
-        }
-        ImGui::Spacing();
+        // [Phase 9b] QCR Tuning block merged into the "Tuning & Advanced"
+        // collapsing header near the bottom of this section.
 
         // ----------------------------------------------------------------
         //  [Ctrl+G] V3-R BIPOP-CMA-ES (主動線、メイン Refinement)
@@ -1694,51 +1662,18 @@ private:
 
             // AutoQCR と同じ 2/3 + 1/3 レイアウト: ボタン本体 (左) +
             // 6-DoF チェックボックス (右)。
-            float totalW = ImGui::GetContentRegionAvail().x;
-            float gap2 = ImGui::GetStyle().ItemSpacing.x;
-            float wCtrlg = totalW * (2.0f / 3.0f) - gap2;
-
-            if (glowButton("Ctrl+G  V3-R  [Refine]", colReg(),
-                           ctrlgDisabled, wCtrlg, 56))
+            // [Phase 8] Ctrl+G full-width button (shorter label). The 6-DoF
+            // lock checkbox moved into the Advanced collapsing header below
+            // (the Debug Panel G tab covers the 4-DoF / search-dimension radio).
+            if (glowButton("Ctrl+G", colReg(), ctrlgDisabled, -1, 56))
             {
                 state.regMethod = 3;   // BIPOP method (Shift+V/F/G と同じ slot)
                 if (actions.onCtrlG) actions.onCtrlG();
             }
-
-            ImGui::SameLine(0.0f, gap2);
-            // 6-DoF checkbox (右側 1/3)
-            //   ON  = SIX_DOF_RIGID (scale=1 固定)
-            //   OFF = SEVEN_DOF     (scale 推定 ON)
-            //   左 floating パネルで 4-DoF (FOUR_DOF_XYRXRY) を選んでいる
-            //   場合は false 扱いで表示される (4-DoF != 6-DoF)。
-            bool lockScale = state.ctrlgLockScale;
-            if (ImGui::Checkbox("6-DoF##ctrlg", &lockScale)) {
-                const_cast<RegUIState&>(state).ctrlgLockScale = lockScale;
-                if (actions.onCtrlgLockScaleChanged)
-                    actions.onCtrlgLockScaleChanged(lockScale);
-            }
         }
 
-        // --- Instrument Px Threshold ---
-        // 器具マスクが有効な時だけ表示。スライダー値が変わったら次の HemiAuto
-        // (Key O) で再分類されるので、Bキーで赤点を見ながら調整できる。
-        if (state.regMethod == 1 && state.instrumentMaskActive) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.04f, 0.04f, 0.4f));
-            ImGui::BeginChild("##instinfo", ImVec2(-1, 42), false);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
-            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.0f), "  Inst Px");
-            ImGui::SameLine();
-            float v = state.instrumentPxThresh;
-            ImGui::SetNextItemWidth(-8);
-            if (ImGui::SliderFloat("##instpx", &v, 0.0f, 50.0f, "%.0f px")) {
-                if (actions.onInstrumentPxThreshChanged) {
-                    actions.onInstrumentPxThreshChanged(v);
-                }
-            }
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-        }
+        // [Phase 8] Instrument Px Threshold slider relocated to Debug Panel
+        // O tab (always accessible there, not conditional). Sidebar stays clean.
 
         // --- Iter Probe (K回 AutoProbe を連続呼び出し) ---
         //   [UI整理 - 削除済] AutoQCR で 9 preset 自動 sweep ができるため、
@@ -1782,45 +1717,36 @@ private:
         }
 
         ImGui::Spacing();
+        // [Phase 8] Pose Library label includes entry count when > 0.
         {
             float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
-            if(colorButton(state.poseLibraryOpen ? "Pose Library ON" : "Pose Library",
-                            state.poseLibraryOpen ? colGreen() : colReg(), false, false, bw2)) {
+            char libLabel[48];
+            if (state.poseEntryCount > 0) {
+                std::snprintf(libLabel, sizeof(libLabel),
+                              state.poseLibraryOpen ? "Pose Library (%d) ON"
+                                                    : "Pose Library (%d)",
+                              state.poseEntryCount);
+            } else {
+                std::snprintf(libLabel, sizeof(libLabel),
+                              state.poseLibraryOpen ? "Pose Library ON"
+                                                    : "Pose Library");
+            }
+            if(colorButton(libLabel,
+                           state.poseLibraryOpen ? colGreen() : colReg(), false, false, bw2)) {
                 if(actions.onPoseLibraryToggle) actions.onPoseLibraryToggle();
             }
             ImGui::SameLine();
-            if(colorButton("Undo", state.poseUndoAvailable ? colRed() : colDim(),
+            if(colorButton("Pose Undo", state.poseUndoAvailable ? colRed() : colDim(),
                             false, !state.poseUndoAvailable, bw2)) {
                 if(actions.onPoseUndo) actions.onPoseUndo();
             }
         }
 
-        ImGui::Spacing();
-        {
-            float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
-            if(colorButton("Reset Reg", colRed(), false, false, bw2)) {
-                if(actions.onResetRegistration) actions.onResetRegistration();
-                if(state.clusterVis && actions.onToggleClusterVis) actions.onToggleClusterVis();
-            }
-            ImGui::SameLine();
-            bool hasPoints = (state.boardPtCount + state.objPtCount) > 0;
-            if(colorButton("Clear CorresPoints", hasPoints ? colRed() : colDim(), false, !hasPoints, bw2)) {
-                if(actions.onClearPoints) actions.onClearPoints();
-            }
-        }
-        ImGui::Spacing();
-        {
-            float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
-            if(colorButton(state.correspondenceVis ? "CorresPoints ON" : "CorresPoints OFF",
-                            state.correspondenceVis ? colGreen() : colDim(), false, false, bw2)) {
-                if(actions.onToggleCorrespondenceVis) actions.onToggleCorrespondenceVis();
-            }
-            ImGui::SameLine();
-            if(colorButton(state.clusterVis ? "Cluster ON" : "Cluster OFF",
-                            state.clusterVis ? colGreen() : colDim(), false, false, bw2)) {
-                if(actions.onToggleClusterVis) actions.onToggleClusterVis();
-            }
-        }
+        // [Phase 8] Reset is now part of the 3-column footer at the bottom of
+        // this section (Deform / Depth / Reset). Reset no longer auto-toggles
+        // cluster viz off — that belongs to the user (Debug Panel Viz tab).
+        // [PHASE-2] Cluster / CorresPoints viz toggles relocated to
+        // Debug Panel > Viz tab (Ctrl+D).
 
         // ---- QCR Tuning は AutoQCR の直下に移動済み (上部参照) ----
         ImGui::Spacing();
@@ -1842,16 +1768,53 @@ private:
         //    - Voxel UI も regMethod==1 (Hemi Auto 選択時) 限定だった旧表示を
         //      ここに常時表示として移動済み。
         // ====================================================================
-        if (ImGui::CollapsingHeader("Advanced")) {
+        // [Phase 9b] Merged "QCR Tuning" + "Advanced" into a single end-of-
+        // section header so the two debug/expert headers no longer occupy two
+        // separate rows. Layout: AutoQCR section -> separator -> Ctrl+G section.
+        if (ImGui::CollapsingHeader("Tuning & Advanced")) {
             ImGui::Indent(8);
 
-            // ---- Voxel slider (旧 regMethod==1 限定表示 → ここに常時) ----
-            drawVoxelInfo();
+            // ===== AutoQCR section =====
+            ImGui::TextColored(colMuted(), "AutoQCR (Alt+Ctrl+P / Shift+Ctrl+P):");
+            {
+                bool lockScale = state.autoQcrLockScale;
+                if (ImGui::Checkbox("AutoQCR 6-DoF lock (scale=1)##qcr_lock", &lockScale)) {
+                    const_cast<RegUIState&>(state).autoQcrLockScale = lockScale;
+                }
+            }
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Subset size K:");
+            ImGui::SliderInt("##qcrK", &g_qcrSubsetK, 3, 5, "K = %d");
+            ImGui::TextColored(ImVec4(0.45f,0.45f,0.5f,1),
+                               "  K=3: exact fit  K=4: balanced  K=5: stable");
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max trials (Stage 1 cap):");
+            ImGui::SliderInt("##qcrCap", &g_qcrMaxTrials, 10000, 500000, "%d");
+            ImGui::Spacing();
+            ImGui::TextColored(colMuted(), "Max axis rotation (per-axis):");
+            ImGui::SliderFloat("##qcrMaxAxis", &g_qcrMaxAxisRotDeg,
+                               5.0f, 90.0f, "%.1f deg");
+            ImGui::TextColored(colMuted(), "Max total rotation (axis-angle):");
+            ImGui::SliderFloat("##qcrMaxTotal", &g_qcrMaxTotalRotDeg,
+                               5.0f, 90.0f, "%.1f deg");
+
+            ImGui::Spacing();
+            ImGui::Separator();
             ImGui::Spacing();
 
-            // ---- Ctrl+G / Ctrl+Shift+G RIM/raycast 関連コントロール ----
-            //   main.cpp 側 drawCtrlGRimRaycastControls() がここに描画。
-            //   未配線の場合 (テスト環境等) は何も出ない。
+            // ===== Ctrl+G section =====
+            ImGui::TextColored(colMuted(), "Ctrl+G / Ctrl+Shift+G (V3-R):");
+            {
+                bool lockScale = state.ctrlgLockScale;
+                if (ImGui::Checkbox("Ctrl+G 6-DoF lock (scale=1)##ctrlg_lock_adv", &lockScale)) {
+                    const_cast<RegUIState&>(state).ctrlgLockScale = lockScale;
+                    if (actions.onCtrlgLockScaleChanged)
+                        actions.onCtrlgLockScaleChanged(lockScale);
+                }
+            }
+            ImGui::Spacing();
+            drawVoxelInfo();
+            ImGui::Spacing();
             if (actions.onDrawAdvancedCtrlG) {
                 ImGui::PushID("##adv_ctrlg");
                 actions.onDrawAdvancedCtrlG();
@@ -1862,20 +1825,28 @@ private:
         }
         ImGui::Spacing();
 
+        // [Phase 8] Footer: 3-column nav (Deform / Depth / Reset). All three
+        // are "leave this section" actions; grouping them communicates that.
+        // Reset stays red as a warning.
         ImGui::Spacing(); ImGui::Spacing();
         {
-            float bw2 = (ImGui::GetContentRegionAvail().x - 4) / 2.0f;
+            float bw3 = (ImGui::GetContentRegionAvail().x - 8) / 3.0f;
             bool canDeform = (state.regState == 4 && state.mainMode == 0);
+
             if(canDeform) {
-                if(glowButton("Proceed Deform >>", colDeform(), false, bw2, 36)) {
+                if(glowButton("Deform >>", colDeform(), false, bw3, 36)) {
                     if (actions.onSwitchToDeformMode) actions.onSwitchToDeformMode();
                 }
             } else {
-                colorButton("Proceed Deform >>", colDim(), false, true, bw2, 36);
+                colorButton("Deform >>", colDim(), false, true, bw3, 36);
             }
             ImGui::SameLine();
-            if(colorButton("<< Back Depth", colDepth(), false, false, bw2, 36)) {
+            if(colorButton("<< Depth", colDepth(), false, false, bw3, 36)) {
                 regPhaseActive_ = false;
+                if (actions.onResetRegistration) actions.onResetRegistration();
+            }
+            ImGui::SameLine();
+            if(colorButton("Reset", colRed(), false, false, bw3, 36)) {
                 if (actions.onResetRegistration) actions.onResetRegistration();
             }
         }
@@ -2416,7 +2387,7 @@ public:  // drawDepthOverlayをpublicに変更（マスク選択モードから�
 
                     // CUDA / GPU toggle. main.cpp 側で gApp.useCuda を更新し、
                     // 次回の Run Depth / Instrument preview の CLI に --cuda
-                    // を付与する。medsam2_da3_lite が USE_CUDA=OFF でビルド
+                    // を付与する。sam2_da3_lite が USE_CUDA=OFF でビルド
                     // されている場合は CPU fallback されるため害はない。
                     {
                         bool useGpu = state.useCuda;

@@ -138,7 +138,7 @@ struct CameraIntrinsics {
 //  Y-axis sign convention for the OBJ source
 // ------------------------------------------------------------
 //  OPENCV  (+1):  +Y points DOWN  (raw depth-map unprojection)
-//  OPENGL  (-1):  +Y points UP    (DepthAnything / medsam2_da3)
+//  OPENGL  (-1):  +Y points UP    (DepthAnything / sam2_da3)
 //  Applied only when projecting to image pixels for mask lookup.
 //  3D coordinates in the returned PointCloud are NEVER flipped.
 // ============================================================

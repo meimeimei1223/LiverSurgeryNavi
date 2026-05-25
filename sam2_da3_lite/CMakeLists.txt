@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(medsam2_da3_lite LANGUAGES CXX)
+project(sam2_da3_lite LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -64,7 +64,7 @@ foreach(STB_FILE stb_image.h stb_image_write.h stb_image_resize2.h)
     endif()
 endforeach()
 
-add_library(medsam2_da3_lite_lib STATIC
+add_library(sam2_da3_lite_lib STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/image_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/depth_anything_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sam2_segmentor.cpp
@@ -74,38 +74,38 @@ add_library(medsam2_da3_lite_lib STATIC
 
 )
 
-target_include_directories(medsam2_da3_lite_lib PUBLIC
+target_include_directories(sam2_da3_lite_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${ONNXRUNTIME_INCLUDE_DIR}
 )
 
-target_link_directories(medsam2_da3_lite_lib PUBLIC ${ONNXRUNTIME_LIB_DIR})
-target_link_libraries(medsam2_da3_lite_lib PUBLIC onnxruntime)
+target_link_directories(sam2_da3_lite_lib PUBLIC ${ONNXRUNTIME_LIB_DIR})
+target_link_libraries(sam2_da3_lite_lib PUBLIC onnxruntime)
 
 if(USE_CUDA)
-    target_compile_definitions(medsam2_da3_lite_lib PRIVATE USE_CUDA)
+    target_compile_definitions(sam2_da3_lite_lib PRIVATE USE_CUDA)
 endif()
 
-add_executable(medsam2_da3_lite ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp)
-target_link_libraries(medsam2_da3_lite PRIVATE medsam2_da3_lite_lib)
+add_executable(sam2_da3_lite ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp)
+target_link_libraries(sam2_da3_lite PRIVATE sam2_da3_lite_lib)
 
 if(WIN32)
-    add_custom_command(TARGET medsam2_da3_lite POST_BUILD
+    add_custom_command(TARGET sam2_da3_lite POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${ONNXRUNTIME_LIB_DIR}/onnxruntime.dll"
-            "$<TARGET_FILE_DIR:medsam2_da3_lite>"
+            "$<TARGET_FILE_DIR:sam2_da3_lite>"
     )
 else()
-    set_target_properties(medsam2_da3_lite PROPERTIES
+    set_target_properties(sam2_da3_lite PROPERTIES
         BUILD_RPATH  ${ONNXRUNTIME_LIB_DIR}
         INSTALL_RPATH ${ONNXRUNTIME_LIB_DIR}
     )
 endif()
 
-install(TARGETS medsam2_da3_lite DESTINATION bin)
+install(TARGETS sam2_da3_lite DESTINATION bin)
 
 message(STATUS "")
-message(STATUS "=== medsam2_da3_lite Build Configuration ===")
+message(STATUS "=== sam2_da3_lite Build Configuration ===")
 message(STATUS "ONNX Runtime: ${ONNXRUNTIME_ROOT}")
 message(STATUS "ORT variant:  ${ORT_NAME}")
 message(STATUS "CUDA Support: ${USE_CUDA}")

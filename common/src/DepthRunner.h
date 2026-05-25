@@ -14,7 +14,7 @@
 #include <functional>
 #include "PlatformCompat.h"
 
-// Pipeline stage selector for the external medsam2_da3_lite executable.
+// Pipeline stage selector for the external sam2_da3_lite executable.
 //   All     : SAM2 + DA3 in one shot (default, legacy behaviour).
 //   Segment : SAM2 only -- writes segmentation_mask.png and exits.
 //             Lets the UI show the mask to the user before paying the
@@ -30,7 +30,7 @@ struct DepthRunnerConfig {
     std::string samDecoder;
     std::string outputDir;
     // CUDA / GPU acceleration toggle. Appended as --cuda to the CLI.
-    // Requires medsam2_da3_lite built with USE_CUDA=ON (CMakeLists picks
+    // Requires sam2_da3_lite built with USE_CUDA=ON (CMakeLists picks
     // the GPU ORT variant in that case). When OFF, the pipeline runs on
     // CPU. When ON but the binary is CPU-only, the in-pipeline fallback
     // logs "CUDA not available, using CPU" and continues without crashing.
@@ -189,7 +189,7 @@ public:
 
         if (!isAvailable()) {
             std::cerr << "[DepthRunner] Executable not found: " << config.exePath << std::endl;
-            std::cerr << "[DepthRunner] Build: cd medsam2_da3_lite && mkdir build && cd build && cmake .. && make" << std::endl;
+            std::cerr << "[DepthRunner] Build: cd sam2_da3_lite && mkdir build && cd build && cmake .. && make" << std::endl;
             return result;
         }
 

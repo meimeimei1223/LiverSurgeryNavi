@@ -8,14 +8,14 @@ if(MSVC)
     add_compile_options(/wd4819 /wd4267 /wd4244 /wd4996 /MP /utf-8)
 endif()
 
-# stb_image — try parent's third_party/stb first, then medsam2's include/
+# stb_image — try parent's third_party/stb first, then sam2's include/
 set(STB_DIR "")
 if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/stb/stb_image.h")
     set(STB_DIR "${CMAKE_SOURCE_DIR}/third_party/stb")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb/stb_image.h")
     set(STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/stb")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../medsam2_da3_lite/include/stb_image.h")
-    set(STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../medsam2_da3_lite/include")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../sam2_da3_lite/include/stb_image.h")
+    set(STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../sam2_da3_lite/include")
 else()
     message(FATAL_ERROR "stb_image.h not found")
 endif()

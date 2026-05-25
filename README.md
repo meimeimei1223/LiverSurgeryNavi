@@ -16,7 +16,7 @@ Download pre-built packages from [GitHub Actions](https://github.com/meimeimei12
 ```bash
 # Linux (GPU-enabled)
 cd LiverSurgeryNavi-Linux
-chmod +x LiverSurgeryNavi medsam2_da3_lite
+chmod +x LiverSurgeryNavi sam2_da3_lite
 export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
 ./LiverSurgeryNavi
 ```
