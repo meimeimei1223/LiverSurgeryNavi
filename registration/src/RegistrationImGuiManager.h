@@ -56,6 +56,8 @@ struct RegUIActions {
     std::function<void(int)> onToggleOrgan;
     std::function<void()> onSwitchToDeformMode;
     std::function<void()> onResetCamera;
+    std::function<void()> onExportStl;         // [key-reorg P12] was M (export registered OBJs)
+    std::function<void()> onExportStlFlipped;  // [key-reorg P12] was Shift+M (cam-mm STL + snapshot)
     std::function<void()> onRefine;
     std::function<void()> onSilhouetteAlign;
     // ---- Ctrl+G : V3-R BIPOP-CMA-ES (Region-aware, main refinement) ----
@@ -638,6 +640,7 @@ public:
             drawDepthSection();
             drawRegistrationSection();
             drawDeformSection();
+            drawExport();
             drawSaveAR();
             drawVisibility();
             drawInfoPanel();
@@ -2040,6 +2043,23 @@ private:
             ImGui::PopStyleColor();
         }
         ImGui::Spacing();
+    }
+
+    // [key-reorg Phase 12] Export section — replaces the removed M / Shift+M
+    // keys. "Export Reg OBJs" = registered organ OBJs to registration_model/.
+    // "Export cam-mm STL" = cam-mm tumor/liver STL (X+Z flip) + input snapshot.
+    void drawExport() {
+        if (!ImGui::CollapsingHeader("Export")) return;
+        ImGui::Indent(16); ImGui::Spacing();
+        float halfW = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
+        if (colorButton("Export Reg OBJs", colReg(), false, false, halfW)) {
+            if (actions.onExportStl) actions.onExportStl();
+        }
+        ImGui::SameLine();
+        if (colorButton("Export cam-mm STL", colYellow(), false, false, halfW)) {
+            if (actions.onExportStlFlipped) actions.onExportStlFlipped();
+        }
+        ImGui::Spacing(); ImGui::Unindent(16); ImGui::Separator();
     }
 
     void drawSaveAR() {

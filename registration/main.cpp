@@ -69,6 +69,7 @@
 #include "imgui_impl_opengl3.h"
 #include "RegistrationImGuiManager.h"
 #include "DebugPanel.h"
+#include "StlExport.h"
 #include "UmeyamaController.h"
 // PoseLibrary.h は RegistrationActions.h の後で include する
 // (RegistrationActions.h 内の inline computeUnifiedMetrics 定義を見えてからで
@@ -1362,6 +1363,178 @@ static void rebuildOBJWithCurrentThreshold() {
     std::cout << "=== Rebuild done ===" << std::endl;
 }
 
+// [key-reorg Phase 12] STL/OBJ export, moved verbatim out of the old
+// GLFW_KEY_M switch case. Declared in StlExport.h; called by the sidebar
+// Export buttons (onExportStl / onExportStlFlipped).
+void StlExport::exportRegisteredObjs() {
+    if (gApp.mode != AppMode::kRegistration) {
+        std::cout << "[ExportObj] only valid in Registration mode" << std::endl;
+        return;
+    }
+    std::filesystem::create_directories(REG_MODEL_PATH);
+    if (liverMesh3D)   liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
+    if (portalMesh3D)  portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
+    if (veinMesh3D)    veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
+    if (tumorMesh3D)   tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
+    if (segmentMesh3D) segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
+    if (gbMesh3D)      gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
+    std::cout << "[ExportObj] Registered OBJs exported to " << REG_MODEL_PATH << std::endl;
+}
+
+void StlExport::exportCamMmStlWithSnapshot() {
+    if (gApp.mode != AppMode::kRegistration) {
+        std::cout << "[ExportSTL] only valid in Registration mode" << std::endl;
+        return;
+    }
+    std::filesystem::create_directories(REG_MODEL_PATH);
+
+    auto bboxDiag = [](const mCutMesh* m) -> float {
+        if (!m || m->mVertices.size() < 3) return 0.0f;
+        glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
+        for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+            glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
+            mn = glm::min(mn, v);
+            mx = glm::max(mx, v);
+        }
+        return glm::length(mx - mn);
+    };
+
+    float SCALE_RESTORE = 1.0f;
+    if (g_hasOriginalDiags && liverMesh3D) {
+        float current_liver_diag = bboxDiag(liverMesh3D);
+        if (current_liver_diag < 1e-9f) {
+            std::cerr << "[Shift+M] current liver diag near zero -- using 1.0 fallback"
+                      << std::endl;
+        } else {
+            SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag;
+        }
+    } else {
+        std::cerr << "[Shift+M] WARNING: original CT diagonals not captured at startup; "
+                     "using 1.0 (output will likely be in wrong scale)" << std::endl;
+    }
+    std::cout << "[Shift+M] g_originalLiverDiagMm=" << g_originalLiverDiagMm
+              << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
+              << "  SCALE_RESTORE=" << SCALE_RESTORE
+              << "  (CT-truth based, X+Z flip)" << std::endl;
+
+    auto exportCamMmStl =
+        [&](const mCutMesh* src, const std::string& outPath, const char* label) {
+            if (!src || src->mVertices.empty()) {
+                std::cout << "[Shift+M] Skip " << label << " (mesh empty)" << std::endl;
+                return;
+            }
+            mCutMesh out = *src;
+            for (size_t i = 0; i + 2 < out.mVertices.size(); i += 3) {
+                out.mVertices[i  ] = -out.mVertices[i  ] * SCALE_RESTORE;  // X flip
+                out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;  // Y keep
+                out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;  // Z flip
+            }
+            out.exportStlFile(outPath);
+            Reg3DCustom::printMeshBBox(out, label);
+        };
+
+    exportCamMmStl(tumorMesh3D, REG_MODEL_PATH + "tumor_cam_mm.stl",
+                   "tumor_cam_mm (Adagolodjo-format)");
+    exportCamMmStl(liverMesh3D, REG_MODEL_PATH + "liver_cam_mm.stl",
+                   "liver_cam_mm (Adagolodjo-format)");
+
+    std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm (Adagolodjo format)"
+              << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
+
+    try {
+        std::string srcTag = "k4a";
+        if      (g_intrinsicsSource == 2) srcTag = "custom";
+        else if (g_intrinsicsSource == 3) srcTag = "calib";
+
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tmLocal{};
+#ifdef _WIN32
+        localtime_s(&tmLocal, &t);
+#else
+        localtime_r(&t, &tmLocal);
+#endif
+        char tsBuf[32];
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmLocal);
+
+        std::string snapDir = REG_MODEL_PATH + "snapshot_" + tsBuf + "/";
+        std::filesystem::create_directories(snapDir);
+
+        const std::vector<std::string> srcFiles = {
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
+            DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
+            DEPTH_OUTPUT_PATH + "original_rectified.jpg",
+            DEPTH_OUTPUT_PATH + "segmentation_mask.png",
+            DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
+            DEPTH_OUTPUT_PATH + "texture.png",
+            REG_MODEL_PATH + "tumor_cam_mm.stl",
+            REG_MODEL_PATH + "liver_cam_mm.stl",
+        };
+
+        int copiedCount = 0;
+        int missingCount = 0;
+        std::vector<std::string> missing;
+        for (const auto& src : srcFiles) {
+            std::filesystem::path srcPath(src);
+            if (!std::filesystem::exists(srcPath)) {
+                ++missingCount;
+                missing.push_back(srcPath.filename().string());
+                continue;
+            }
+            std::filesystem::path dstPath =
+                std::filesystem::path(snapDir) / srcPath.filename();
+            try {
+                std::filesystem::copy_file(
+                    srcPath, dstPath,
+                    std::filesystem::copy_options::overwrite_existing);
+                ++copiedCount;
+            } catch (const std::exception& e) {
+                std::cerr << "[Shift+M] copy failed: " << src
+                          << " -> " << dstPath
+                          << " : " << e.what() << std::endl;
+            }
+        }
+
+        {
+            std::ofstream readme(snapDir + "README.txt");
+            if (readme.is_open()) {
+                readme << "Snapshot created: " << tsBuf << "\n"
+                       << "Intrinsics tag (g_intrinsicsSource="
+                       << g_intrinsicsSource << "): " << srcTag << "\n"
+                       << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
+                       << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
+                       << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
+                       << "\n"
+                       << "Source paths at capture time:\n"
+                       << "  DEPTH_OUTPUT_PATH = " << DEPTH_OUTPUT_PATH << "\n"
+                       << "  REG_MODEL_PATH    = " << REG_MODEL_PATH << "\n";
+                readme.close();
+                ++copiedCount;
+            }
+        }
+
+        std::cout << "[Shift+M] Snapshot saved: " << snapDir
+                  << "  (" << copiedCount << " files copied, "
+                  << missingCount << " missing)" << std::endl;
+        if (missingCount > 0) {
+            std::cout << "[Shift+M] Missing in snapshot (skipped):";
+            for (const auto& m : missing) std::cout << "\n  - " << m;
+            std::cout << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Shift+M] Snapshot creation failed: " << e.what()
+                  << "  (STL export was successful, only snapshot failed)"
+                  << std::endl;
+    }
+}
+
 static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
@@ -2408,269 +2581,13 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         break;
     // [key-reorg Phase 10] GLFW_KEY_K removed: camera depth via sidebar
     //   "Run Depth" button (camera mode uses the same button).
-    case GLFW_KEY_J: {
-        // カメラフレームをJPEGファイルとして保存
-        if (!gCamera.active) {
-            std::cerr << "[J] Camera is not active" << std::endl;
-            break;
-        }
-
-        std::string filename = gCamera.saveForDepthEstimation();
-        if (!filename.empty()) {
-            std::cout << "[J] Saved camera frame to: " << filename << std::endl;
-        } else {
-            std::cerr << "[J] Failed to save camera frame" << std::endl;
-        }
-        break;
-    }
+    // [key-reorg Phase 12] GLFW_KEY_J removed: camera_frame_temp.jpg is written
+    //   automatically by "Run Depth" (camera mode); standalone save not needed.
     // [key-reorg Phase 10] GLFW_KEY_S / GLFW_KEY_L removed: snapshot / live-view
     //   handled by the sidebar camera toggle ("Capture" / "Re-Capture").
-    case GLFW_KEY_M: {
-        if (gApp.mode != AppMode::kRegistration) {
-            std::cout << "[M] only valid in Registration mode" << std::endl;
-            break;
-        }
-        std::filesystem::create_directories(REG_MODEL_PATH);
-
-        if (mods & GLFW_MOD_SHIFT) {
-            // -----------------------------------------------------------------
-            //  Shift+M (v4): cam-mm + (X flip + Z flip) STL export
-            //                (EchoLiver dataset 評価用、TRE 13.03 mm 達成版)
-            //
-            //  目的: registered organ mesh (cam frame, scene 単位) を
-            //        Adagolodjo の出力フォーマット (cam-mm OpenGL 規約) に
-            //        変換して出力する。
-            //
-            //  スケール復元方針 (CT 真値基準):
-            //    SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag
-            //
-            //  これは prealign + registration + 手合わせのどの段階で scale が
-            //  どう変わっても、最終 mesh の extent が CT 真値と一致するよう
-            //  正規化する。CT mm スケールは absolute 不変量なので、scale chain
-            //  を track する必要がなくなる (堅牢性が大きく上がる)。
-            //
-            //  liver を基準にしているのは tumor よりも 10 倍大きく
-            //  numerically stable なため。同じ scale 係数を全 organ に適用する
-            //  (uniform similarity transform 前提なので、全 organ で本来同じ値)。
-            //
-            //  3 つの変換 (v4 = X flip + Z flip + scale restore):
-            //    v_out.x = -SCALE_RESTORE * v_internal.x   ← X flip (mirrorMeshAndCloudX 戻し)
-            //    v_out.y = +SCALE_RESTORE * v_internal.y
-            //    v_out.z = -SCALE_RESTORE * v_internal.z   ← Z flip (OpenGL +Z back 規約)
-            //
-            //  X flip は mirrorMeshAndCloudX で screenMesh / targetCloud にだけ
-            //  入った内部 X 反転を最終出力で「戻す」目的 (organ はその反転を
-            //  受けていないが、処理空間が X 反転している状態で配置されている)。
-            //  これを入れないと TRE が ~60 mm 級まで悪化する (v3 の症状)。
-            //
-            //  X+Z 二重反射の合成は det (+1)(-1)(-1) = +1 で Y 軸まわり 180° 回転と
-            //  等価。triangle winding は保存されるので index swap は不要。
-            //  (v3 の Z-only 反転 det=-1 では winding 補正のため index swap が
-            //  必要だったが、v4 では除去)
-            //
-            //  Evaluation.m が読込時に y,z 反転 → cam OpenCV (LUS GT 比較フレーム)。
-            //
-            //  no-registration 状態で実行しても extent は CT 真値と一致する
-            //  (round-trip identity 維持)。
-            // -----------------------------------------------------------------
-            auto bboxDiag = [](const mCutMesh* m) -> float {
-                if (!m || m->mVertices.size() < 3) return 0.0f;
-                glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
-                for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
-                    glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
-                    mn = glm::min(mn, v);
-                    mx = glm::max(mx, v);
-                }
-                return glm::length(mx - mn);
-            };
-
-            float SCALE_RESTORE = 1.0f;
-            if (g_hasOriginalDiags && liverMesh3D) {
-                float current_liver_diag = bboxDiag(liverMesh3D);
-                if (current_liver_diag < 1e-9f) {
-                    std::cerr << "[Shift+M] current liver diag near zero -- using 1.0 fallback"
-                              << std::endl;
-                } else {
-                    SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag;
-                }
-            } else {
-                std::cerr << "[Shift+M] WARNING: original CT diagonals not captured at startup; "
-                             "using 1.0 (output will likely be in wrong scale)" << std::endl;
-            }
-            std::cout << "[Shift+M] g_originalLiverDiagMm=" << g_originalLiverDiagMm
-                      << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
-                      << "  SCALE_RESTORE=" << SCALE_RESTORE
-                      << "  (CT-truth based, X+Z flip)" << std::endl;
-
-            auto exportCamMmStl =
-                [&](const mCutMesh* src, const std::string& outPath, const char* label) {
-                    if (!src || src->mVertices.empty()) {
-                        std::cout << "[Shift+M] Skip " << label << " (mesh empty)" << std::endl;
-                        return;
-                    }
-                    mCutMesh out = *src;
-                    for (size_t i = 0; i + 2 < out.mVertices.size(); i += 3) {
-                        out.mVertices[i  ] = -out.mVertices[i  ] * SCALE_RESTORE;  // X flip (mirrorMeshAndCloudX 戻し)
-                        out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;  // Y keep
-                        out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;  // Z flip (OpenGL +Z back)
-                    }
-                    // X+Z 二重反射: det = (-1)*(+1)*(-1) = +1 → Y 軸まわり 180° 回転と等価。
-                    // triangle winding は保存されるので index swap 不要。
-                    out.exportStlFile(outPath);
-                    Reg3DCustom::printMeshBBox(out, label);
-                };
-
-            exportCamMmStl(tumorMesh3D, REG_MODEL_PATH + "tumor_cam_mm.stl",
-                           "tumor_cam_mm (Adagolodjo-format)");
-            exportCamMmStl(liverMesh3D, REG_MODEL_PATH + "liver_cam_mm.stl",
-                           "liver_cam_mm (Adagolodjo-format)");
-
-            std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm (Adagolodjo format)"
-                      << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
-
-            // -----------------------------------------------------------------
-            //  Snapshot: 再現性のため Run Depth 入力一式 + 出力 STL を
-            //            REG_MODEL_PATH/snapshot_YYYYMMDD_HHMMSS/ にコピー
-            //
-            //  動機: depth_output/ は次の Run Depth で上書きされるため、
-            //        この時点で評価につながる入力 (OBJ/intrinsics/mask 等) を
-            //        まとめて保管しておかないと再現できない。
-            //
-            //  方針: STL 出力に成功してもしなくても可能な範囲で保存し、
-            //        snapshot 作成自体が失敗しても STL は既に保存済みなので
-            //        ログのみ出して継続する (best-effort)。
-            // -----------------------------------------------------------------
-            try {
-                // intrinsics タグの自動判別 (Run Depth と同じロジック)
-                std::string srcTag = "k4a";
-                if      (g_intrinsicsSource == 2) srcTag = "custom";
-                else if (g_intrinsicsSource == 3) srcTag = "calib";
-
-                // timestamp YYYYMMDD_HHMMSS
-                auto now = std::chrono::system_clock::now();
-                std::time_t t = std::chrono::system_clock::to_time_t(now);
-                std::tm tmLocal{};
-#ifdef _WIN32
-                localtime_s(&tmLocal, &t);
-#else
-                localtime_r(&t, &tmLocal);
-#endif
-                char tsBuf[32];
-                std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmLocal);
-
-                std::string snapDir = REG_MODEL_PATH + "snapshot_" + tsBuf + "/";
-                std::filesystem::create_directories(snapDir);
-
-                // コピー候補一覧 (存在しないものはスキップ、害なし)
-                const std::vector<std::string> srcFiles = {
-                    // registration target cloud (主役)
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
-                    // full cloud (board display 用)
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
-                    // camera K と入力画像/マスク
-                    DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
-                    DEPTH_OUTPUT_PATH + "original_rectified.jpg",
-                    DEPTH_OUTPUT_PATH + "segmentation_mask.png",
-                    DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
-                    DEPTH_OUTPUT_PATH + "texture.png",
-                    // 直前に出した STL も同梱
-                    REG_MODEL_PATH + "tumor_cam_mm.stl",
-                    REG_MODEL_PATH + "liver_cam_mm.stl",
-                };
-
-                int copiedCount = 0;
-                int missingCount = 0;
-                std::vector<std::string> missing;
-                for (const auto& src : srcFiles) {
-                    std::filesystem::path srcPath(src);
-                    if (!std::filesystem::exists(srcPath)) {
-                        ++missingCount;
-                        missing.push_back(srcPath.filename().string());
-                        continue;
-                    }
-                    std::filesystem::path dstPath =
-                        std::filesystem::path(snapDir) / srcPath.filename();
-                    try {
-                        std::filesystem::copy_file(
-                            srcPath, dstPath,
-                            std::filesystem::copy_options::overwrite_existing);
-                        ++copiedCount;
-                    } catch (const std::exception& e) {
-                        std::cerr << "[Shift+M] copy failed: " << src
-                                  << " -> " << dstPath
-                                  << " : " << e.what() << std::endl;
-                    }
-                }
-
-                // README.txt (メタ情報 + 復元手順)
-                {
-                    std::ofstream readme(snapDir + "README.txt");
-                    if (readme.is_open()) {
-                        readme << "Snapshot created: " << tsBuf << "\n"
-                               << "Intrinsics tag (g_intrinsicsSource="
-                               << g_intrinsicsSource << "): " << srcTag << "\n"
-                               << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
-                               << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
-                               << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
-                               << "\n"
-                               << "Source paths at capture time:\n"
-                               << "  DEPTH_OUTPUT_PATH = " << DEPTH_OUTPUT_PATH << "\n"
-                               << "  REG_MODEL_PATH    = " << REG_MODEL_PATH << "\n"
-                               << "\n"
-                               << "Restore example (bash):\n"
-                               << "  SNAP=\"" << snapDir << "\"\n"
-                               << "  DEST=\"" << DEPTH_OUTPUT_PATH << "\"\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_masked_" << srcTag << ".obj        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_masked_" << srcTag << ".mtl        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_full_"   << srcTag << "_light.obj  \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_full_"   << srcTag << "_light.mtl  \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/intrinsics_"               << srcTag << ".txt        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/original_rectified.jpg                  \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/segmentation_mask.png                   \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/instrument_segmentation_mask.png        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/texture.png                             \"$DEST\"/\n"
-                               << "  # GUI 起動 -> 自動的に最新 OBJ を再ロード\n"
-                               << "\n"
-                               << "STL outputs (already saved directly to REG_MODEL_PATH):\n"
-                               << "  tumor_cam_mm.stl\n"
-                               << "  liver_cam_mm.stl\n";
-                        readme.close();
-                        ++copiedCount;
-                    }
-                }
-
-                std::cout << "[Shift+M] Snapshot saved: " << snapDir
-                          << "  (" << copiedCount << " files copied, "
-                          << missingCount << " missing)" << std::endl;
-                if (missingCount > 0) {
-                    std::cout << "[Shift+M] Missing in snapshot (skipped):";
-                    for (const auto& m : missing) {
-                        std::cout << "\n  - " << m;
-                    }
-                    std::cout << std::endl;
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "[Shift+M] Snapshot creation failed: " << e.what()
-                          << "  (STL export was successful, only snapshot failed)"
-                          << std::endl;
-            }
-        } else {
-            if (liverMesh3D)   liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
-            if (portalMesh3D)  portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
-            if (veinMesh3D)    veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
-            if (tumorMesh3D)   tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
-            if (segmentMesh3D) segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
-            if (gbMesh3D)      gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
-            std::cout << "[M] Registered OBJs exported to " << REG_MODEL_PATH << std::endl;
-        }
-        break;
-    }
+    // [key-reorg Phase 12] GLFW_KEY_M removed: OBJ/STL export moved to the
+    //   sidebar Export buttons (StlExport::exportRegisteredObjs /
+    //   exportCamMmStlWithSnapshot, wired via onExportStl / onExportStlFlipped).
     }
 }
 
@@ -9367,6 +9284,10 @@ static void setupUICallbacks() {
             OrbitCam.currentTarget = TARGET_TEXTURE;
         }
     };
+
+    // [key-reorg Phase 12] Export buttons (were M / Shift+M keys).
+    a.onExportStl        = []() { StlExport::exportRegisteredObjs(); };
+    a.onExportStlFlipped = []() { StlExport::exportCamMmStlWithSnapshot(); };
 
     a.onToggleClusterVis = []() {
         g_showClusterVisualization = !g_showClusterVisualization;
