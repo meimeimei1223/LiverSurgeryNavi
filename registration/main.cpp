@@ -677,10 +677,11 @@ static ARSave::State g_arSave;    // AR保存＋プレビュー状態
 static ShaderProgram* g_pShader     = nullptr;  // AR保存用シェーダ参照
 static ShaderProgram* g_pShaderCube = nullptr;
 // Intrinsics source selector (enum in common/src/IntrinsicsSource.h).
-// Default Preset = the azure_kinect_720p preset (= old default "Kinect").
-// Step 4 (autoSelect) overrides this at startup based on available files.
+// Default Preset = the only factory preset currently in the registry
+// (Azure Kinect 1080p). Step 4 (autoSelect) overrides this at startup based on
+// available files.
 static IntrinsicsSource g_intrinsicsSource = IntrinsicsSource::Preset;
-static std::string      g_currentPresetKey = "azure_kinect_720p";
+static std::string      g_currentPresetKey = "azure_kinect_1080p";
 static CalibResult    g_calibResult;             // キャリブレーション結果
 // Step 7: Settings タブの Calibration パラメータ (UI から編集される)
 static std::string      g_chessboardFolder   = "../../../chessboard/";
@@ -9099,7 +9100,7 @@ static void syncUIState() {
     for (auto& p : Reg3DCustom::presetRegistry()) {
         RegUIState::PresetEntry e;
         e.key = p.key; e.displayName = p.displayName;
-        e.available = p.K.valid(); e.dynamic = p.isDynamic;
+        e.available = p.K.valid(); e.dynamic = false;  // no dynamic presets anymore
         s.presetList.push_back(std::move(e));
     }
 
@@ -9470,10 +9471,10 @@ static void setupUICallbacks() {
 
     a.onIntrinsicsSourceChanged = [](int i) {
         // i is the legacy 4-button index (0=DA3,1=Kinect,2=Custom,3=Calib);
-        // bridge to the enum. Kinect maps to the azure_kinect_720p preset.
+        // bridge to the enum. Kinect maps to the (sole) Azure Kinect preset.
         g_intrinsicsSource = intrinsicsSourceFromLegacyInt(i);
         if (g_intrinsicsSource == IntrinsicsSource::Preset)
-            g_currentPresetKey = "azure_kinect_720p";
+            g_currentPresetKey = "azure_kinect_1080p";
         const char* names[] = {"DA3", "Kinect", "Custom", "Calibrated"};
         std::cout << "[Intrinsics] Source: " << names[std::clamp(i,0,3)] << std::endl;
 

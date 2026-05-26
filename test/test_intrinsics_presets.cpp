@@ -1,4 +1,4 @@
-// test_intrinsics_presets.cpp — Step 5 (IntrinsicsPresets.h) unit check.
+// test_intrinsics_presets.cpp — IntrinsicsPresets.h unit check.
 // Built/run by test/test_intrinsics_presets.sh. No GUI; pure CPU.
 #include "IntrinsicsPresets.h"
 #include <cstdio>
@@ -8,11 +8,12 @@ using namespace Reg3DCustom;
 int main() {
     int fails = 0;
 
-    // A. lookupPreset("azure_kinect_720p", K) -> K.fx == 918.234f
+    // A. lookupPreset("azure_kinect_1080p", K) -> K.fx == 1377.35f
     CameraIntrinsics K;
-    bool ok = lookupPreset("azure_kinect_720p", K);
-    printf("[A] lookup(azure_kinect_720p)=%d fx=%.3f\n", ok, K.fx);
-    if (!ok || std::fabs(K.fx - 918.234f) > 1e-3f) { printf("  FAIL A\n"); fails++; }
+    bool ok = lookupPreset("azure_kinect_1080p", K);
+    printf("[A] lookup(azure_kinect_1080p)=%d fx=%.3f res=%dx%d\n",
+           ok, K.fx, K.width, K.height);
+    if (!ok || std::fabs(K.fx - 1377.35f) > 1e-2f) { printf("  FAIL A\n"); fails++; }
 
     // B. lookupPreset("nonexistent", K) -> false
     CameraIntrinsics K2;
@@ -20,15 +21,17 @@ int main() {
     printf("[B] lookup(nonexistent)=%d\n", ok2);
     if (ok2) { printf("  FAIL B\n"); fails++; }
 
-    // C. da3_last is invalid before update, valid (and rewritten) after.
+    // C. da3_last is no longer a preset (now file-driven). Must NOT resolve.
     CameraIntrinsics K3;
-    bool before = lookupPreset("da3_last", K3);
-    updateDynamicPreset("da3_last", CameraIntrinsics::k4a_color_1080p());
-    bool after = lookupPreset("da3_last", K3);
-    printf("[C] da3_last before=%d after=%d fx=%.2f\n", before, after, K3.fx);
-    if (before || !after || std::fabs(K3.fx - 1377.35f) > 1e-2f) { printf("  FAIL C\n"); fails++; }
+    bool ok3 = lookupPreset("da3_last", K3);
+    printf("[C] lookup(da3_last)=%d (expect 0: DA3 is file-driven, not a preset)\n", ok3);
+    if (ok3) { printf("  FAIL C\n"); fails++; }
 
-    printf("[info] preset count=%zu\n", presetRegistry().size());
+    // D. Registry is minimal: exactly 1 factory preset.
+    size_t n = presetRegistry().size();
+    printf("[D] preset count=%zu (expect 1)\n", n);
+    if (n != 1) { printf("  FAIL D\n"); fails++; }
+
     printf(fails == 0 ? "All preset tests passed\n" : "Preset tests FAILED\n");
     return fails == 0 ? 0 : 1;
 }

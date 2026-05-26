@@ -6,9 +6,10 @@
 #  GUI なし。test_intrinsics_presets.cpp をビルドして実行する。
 #
 #  検証内容:
-#    A. lookupPreset("azure_kinect_720p", K) -> K.fx == 918.234f
-#    B. lookupPreset("nonexistent", K)       -> false
-#    C. updateDynamicPreset("da3_last", ...)  で da3_last が書き換わる
+#    A. lookupPreset("azure_kinect_1080p", K) -> K.fx == 1377.35f
+#    B. lookupPreset("nonexistent", K)        -> false
+#    C. lookupPreset("da3_last", K)           -> false (DA3 は file 駆動、preset でない)
+#    D. preset 数 = 1 (最小化済み)
 #
 #  GL リンクについて: IntrinsicsPresets.h -> OBJTargetExtraction.h -> mCutMesh.h
 #  が GL シンボルを引き込むため -lGLEW -lGL でリンクする (プリセットコード自体は
