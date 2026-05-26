@@ -682,6 +682,11 @@ static ShaderProgram* g_pShaderCube = nullptr;
 static IntrinsicsSource g_intrinsicsSource = IntrinsicsSource::Preset;
 static std::string      g_currentPresetKey = "azure_kinect_720p";
 static CalibResult    g_calibResult;             // キャリブレーション結果
+// Step 7: Settings タブの Calibration パラメータ (UI から編集される)
+static std::string      g_chessboardFolder   = "../../../chessboard/";
+static int              g_chessboardCols     = 9;
+static int              g_chessboardRows     = 6;
+static float            g_chessboardSquareMm = 22.0f;
 
 // カメラ開始前の状態を保存
 static struct {
@@ -9057,10 +9062,54 @@ static void syncUIState() {
     s.boardAlpha  = g_meshAlpha[6];
     s.targetAlpha = g_meshAlpha[7];
 
-    // Calibration state.
-    // RegUIState::intrinsicsSource is still a legacy int in Step 3 (UI unchanged),
-    // so bridge the enum back through the legacy numbering.
-    s.intrinsicsSource = intrinsicsSourceToLegacyInt(g_intrinsicsSource);
+    // ---- Step 7: intrinsics source dropdown + Active card ----
+    s.intrinsicsSource  = g_intrinsicsSource;          // enum, direct
+    s.currentPresetKey  = g_currentPresetKey;
+    s.currentFx = g_intrinsics.fx; s.currentFy = g_intrinsics.fy;
+    s.currentCx = g_intrinsics.cx; s.currentCy = g_intrinsics.cy;
+    s.currentWidth = g_intrinsics.width; s.currentHeight = g_intrinsics.height;
+
+    // Availability of file-backed sources.
+    {
+        namespace fs = std::filesystem;
+        const std::string base = DEPTH_OUTPUT_PATH;
+        s.customAvailable    = fs::exists(base + "intrinsics_custom.txt");
+        s.calibLastAvailable = fs::exists(base + "intrinsics_calib_last.txt")
+                            || fs::exists(base + "intrinsics_calib.txt");
+    }
+
+    // Human-readable Active card label.
+    switch (g_intrinsicsSource) {
+        case IntrinsicsSource::Custom:
+            s.currentDisplayName = "Custom (intrinsics_custom.txt)"; break;
+        case IntrinsicsSource::Calib:
+            s.currentDisplayName = "Calib (last)"; break;
+        case IntrinsicsSource::Preset: {
+            s.currentDisplayName = g_currentPresetKey;
+            for (auto& p : Reg3DCustom::presetRegistry())
+                if (g_currentPresetKey == p.key) { s.currentDisplayName = p.displayName; break; }
+            break;
+        }
+        case IntrinsicsSource::Auto:
+            s.currentDisplayName = "Auto (delegate to DA3)"; break;
+    }
+
+    // Preset list for the dropdown (rebuilt each frame; small + cheap).
+    s.presetList.clear();
+    for (auto& p : Reg3DCustom::presetRegistry()) {
+        RegUIState::PresetEntry e;
+        e.key = p.key; e.displayName = p.displayName;
+        e.available = p.K.valid(); e.dynamic = p.isDynamic;
+        s.presetList.push_back(std::move(e));
+    }
+
+    // Settings tab — calibration parameters.
+    s.chessboardFolder    = g_chessboardFolder;
+    s.chessboardBoardCols = g_chessboardCols;
+    s.chessboardBoardRows = g_chessboardRows;
+    s.chessboardSquareMm  = g_chessboardSquareMm;
+
+    // Calibration result state.
     s.calibDone     = g_calibResult.valid;
     s.calibMessage  = g_calibResult.message;
     s.calibFx       = (float)g_calibResult.fx;
@@ -9476,6 +9525,37 @@ static void setupUICallbacks() {
         }
     };
 
+    // ---- Step 7: new intrinsics source dropdown callbacks (案 Y) ----
+    a.onSourceChanged = [](IntrinsicsSource s) {
+        g_intrinsicsSource = s;
+        const char* nm[] = {"Custom", "Calib", "Preset", "Auto"};
+        std::cout << "[Intrinsics] Source -> " << nm[std::clamp((int)s, 0, 3)] << std::endl;
+        loadIntrinsicsFromCurrentSource();
+    };
+    a.onPresetChanged = [](const std::string& key) {
+        g_currentPresetKey = key;
+        g_intrinsicsSource = IntrinsicsSource::Preset;
+        std::cout << "[Intrinsics] Preset -> " << key << std::endl;
+        loadIntrinsicsFromCurrentSource();
+    };
+    a.onSaveAsCustom = []() {
+        if (!g_intrinsics.valid()) {
+            std::cerr << "[Intrinsics] Save as Custom: current K invalid; ignored" << std::endl;
+            return;
+        }
+        Reg3DCustom::CameraIntrinsics K = g_intrinsics;
+        K.name = "custom";
+        const std::string path = DEPTH_OUTPUT_PATH + "intrinsics_custom.txt";
+        if (Reg3DCustom::saveCameraIntrinsics(path, K)) {
+            g_intrinsicsSource = IntrinsicsSource::Custom;
+            loadIntrinsicsFromCurrentSource();
+            std::cout << "[Intrinsics] Saved current K as Custom -> " << path << std::endl;
+        }
+    };
+    a.onChessboardFolderChanged = [](const std::string& f) { g_chessboardFolder = f; };
+    a.onBoardSizeChanged = [](int c, int r) { g_chessboardCols = c; g_chessboardRows = r; };
+    a.onSquareSizeChanged = [](float mm) { g_chessboardSquareMm = mm; };
+
     a.onRunCalibration = []() {
         std::cout << "[Calib] Running calibration_tool..." << std::endl;
 
@@ -9506,11 +9586,15 @@ static void setupUICallbacks() {
         try { exe = std::filesystem::absolute(exe).string(); } catch (...) {}
         std::cout << "[Calib] exe: " << exe << std::endl;
 
-        std::string folder  = "../../../chessboard/";
+        // Step 7: Calibration パラメータは Settings タブから編集可能な globals を使う。
+        std::string folder  = g_chessboardFolder;
         std::string outFile = DEPTH_OUTPUT_PATH + "intrinsics_calib.txt";
+        std::string board   = std::to_string(g_chessboardCols) + ","
+                            + std::to_string(g_chessboardRows);
+        std::ostringstream sq; sq << g_chessboardSquareMm;
 
         std::string cmd = "\"" + exe + "\" \"" + folder + "\""
-                          + " --board 9,6 --square 22"
+                          + " --board " + board + " --square " + sq.str()
                           + " --output \"" + outFile + "\""
                           + " 2>&1";
 

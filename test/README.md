@@ -1,5 +1,24 @@
 # test/ — 自動検証スクリプト
 
+| スクリプト | 対象 | 概要 |
+|---|---|---|
+| `test_intrinsics_step1.sh` | Step 1 | `lsn_deform --dry-run` で DeformPipeline の K 読込/UV を検証 |
+| `test_intrinsics_presets.sh` | Step 5 | `IntrinsicsPresets.h` の lookupPreset / updateDynamicPreset |
+| `test_intrinsics_step4.sh` | Step 4 | `lsn_registration --check-intrinsics` で autoSelect 優先順位を検証 |
+
+実行はいずれも `bash test/<script>` 。全テスト pass で exit 0、失敗で exit 1。
+intrinsics 系ファイル（`intrinsics_k4a.txt` / `intrinsics_custom.txt` /
+`intrinsics_calib_last.txt` / `intrinsics_calib.txt`）は各スクリプトが
+バックアップ→復元するので破壊しない。
+
+## 検証用 CLI フラグ
+
+- `lsn_deform --dry-run` … GUI なしで Step 1 のロジックのみ実行しログ出力（下記）。
+- `lsn_registration --check-intrinsics` … GUI なしで Step 4 の
+  `autoSelectIntrinsicsSource()` + `loadIntrinsicsFromCurrentSource()` を実行し、
+  選択された source（legacy int 0=Auto/1=Preset/2=Custom/3=Calib）と
+  ロードされた K を出力して即 exit 0。
+
 ## test_intrinsics_step1.sh
 
 INTRINSICS **Step 1**（`deform/src/DeformPipeline.h` から K4A 720p ハードコードを除去し、
