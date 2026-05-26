@@ -194,9 +194,19 @@ static bool initOpenGL() {
 // ============================================================================
 // main
 // ============================================================================
-int main() {
+int main(int argc, char** argv) {
     initPaths();
     initFilePaths();
+
+    // [intrinsics-step-1-test] --dry-run: CPU-only verification of the Step-1
+    // intrinsics path (load K from intrinsics_k4a.txt + board UV). No GL window,
+    // no reg_*.obj required. Logs deformK + board UV range, then exits.
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--dry-run") {
+            DeformPipeline::dryRunStep1();
+            return 0;
+        }
+    }
 
     if (!initOpenGL()) {
         std::cerr << "OpenGL init failed" << std::endl;
