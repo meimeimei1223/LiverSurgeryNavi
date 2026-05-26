@@ -414,7 +414,7 @@ private:
 
         RayCast::Ray ray = RayCast::screenToRay(
             sx, sy, v, p, glm::vec4(0, 0, vpW, vpH));
-        RayCast::RayHitTri hit = RayCast::intersectMesh(
+        RayCast::RayHit hit = RayCast::intersectMesh(
             ray, mesh->mVertices, mesh->mIndices);
 
         return hit.hit ? hit.position : MISS;

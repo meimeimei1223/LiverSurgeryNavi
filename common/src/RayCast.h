@@ -10,7 +10,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#include "SoftBody.h"
+// [deform-sep Step 1] SoftBody dependency removed — RayCast is now mesh-generic.
 #include "mCutMesh.h"
 #include "FullSphereCameraWithTarget.h"
 
@@ -39,13 +39,8 @@ public:
         bool hit;
         float distance;
         glm::vec3 position;
-        SoftBody* hitObject;
-    };
-
-    struct RayHitTri {
-        bool hit;
-        float distance;
-        glm::vec3 position;
+        // [deform-sep Step 1] removed SoftBody* hitObject (was unused by callers);
+        // RayHit merged into this struct.
     };
 
     static Ray screenToRay(float screenX, float screenY,
@@ -74,43 +69,12 @@ public:
         return ray;
     }
 
-    static RayHit intersectMesh(const Ray& ray, SoftBody& mesh) {
-        RayHit result = { false, std::numeric_limits<float>::max(), glm::vec3(0), nullptr };
-
-        const auto& positions = mesh.getPositions();
-        const auto& surfaceTriIds = mesh.getMeshData().tetSurfaceTriIds;
-
-        std::cout << "Ray origin: " << ray.origin.x << ", " << ray.origin.y << ", " << ray.origin.z << std::endl;
-        std::cout << "Ray direction: " << ray.direction.x << ", " << ray.direction.y << ", " << ray.direction.z << std::endl;
-
-        float t, u, v;
-        for (size_t i = 0; i < surfaceTriIds.size(); i += 3) {
-            int idx1 = surfaceTriIds[i];
-            int idx2 = surfaceTriIds[i + 1];
-            int idx3 = surfaceTriIds[i + 2];
-
-            glm::vec3 v1(positions[idx1 * 3], positions[idx1 * 3 + 1], positions[idx1 * 3 + 2]);
-            glm::vec3 v2(positions[idx2 * 3], positions[idx2 * 3 + 1], positions[idx2 * 3 + 2]);
-            glm::vec3 v3(positions[idx3 * 3], positions[idx3 * 3 + 1], positions[idx3 * 3 + 2]);
-
-            if (rayTriangleIntersect(ray.origin, ray.direction, v1, v2, v3, t, u, v)) {
-                if (t < result.distance) {
-                    result.hit = true;
-                    result.distance = t;
-                    result.position = ray.origin + ray.direction * t;
-                    result.hitObject = &mesh;
-                    std::cout << "Hit at triangle " << i/3 << std::endl;
-                    std::cout << "Hit position: " << result.position.x << ", "
-                              << result.position.y << ", " << result.position.z << std::endl;
-                }
-            }
-        }
-
-        return result;
-    }
-
-    static RayHitTri intersectMesh(const Ray& ray, std::vector<GLfloat> vertices, std::vector<GLuint> indices) {
-        RayHitTri result = { false, std::numeric_limits<float>::max(), glm::vec3(0)};
+    // [deform-sep Step 1] The SoftBody& overload was deleted; SoftBody callers
+    // (Grabber) now extract positions/indices and call this generic overload.
+    static RayHit intersectMesh(const Ray& ray,
+                                const std::vector<GLfloat>& vertices,
+                                const std::vector<GLuint>& indices) {
+        RayHit result = { false, std::numeric_limits<float>::max(), glm::vec3(0)};
 
         const auto& positions = vertices;
         const auto& surfaceTriIds = indices;
@@ -219,7 +183,7 @@ inline void FindHit(float screenX, float screenY,
 
     glm::mat4 modelMatrix = glm::mat4(1.0f);
 
-    RayCast::RayHitTri hit = RayCast::intersectMesh(worldRay, vertices, indices);
+    RayCast::RayHit hit = RayCast::intersectMesh(worldRay, vertices, indices);
 
     std::cout << "Hit test with ray: origin=("
               << worldRay.origin.x << "," << worldRay.origin.y << "," << worldRay.origin.z
@@ -260,7 +224,7 @@ inline void FindHitWithCamera(float screenX, float screenY,
 
     RayCast::Ray worldRay = RayCast::screenToRay(screenX, screenY, view, projection, viewport);
 
-    RayCast::RayHitTri hit = RayCast::intersectMesh(worldRay, vertices, indices);
+    RayCast::RayHit hit = RayCast::intersectMesh(worldRay, vertices, indices);
 
     if (hit.hit) {
         glm::vec3 hitPos = hit.position;
@@ -320,7 +284,7 @@ inline void FindHitWithCameraMultipleMeshes(
     for (size_t meshIdx = 0; meshIdx < meshes.size(); meshIdx++) {
         if (!meshes[meshIdx] || meshes[meshIdx]->mVertices.empty()) continue;
 
-        RayCast::RayHitTri hit = RayCast::intersectMesh(
+        RayCast::RayHit hit = RayCast::intersectMesh(
             worldRay,
             meshes[meshIdx]->mVertices,
             meshes[meshIdx]->mIndices);
