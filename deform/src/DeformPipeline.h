@@ -18,6 +18,7 @@
 #include "PathConfig.h"
 #include "ShaderProgram.h"
 #include "MeshDrawing.h"
+#include "MeshDrawingSoftBody.h"   // [deform-sep Step 2] SoftBody draw helper
 #include "Sphere.h"
 #include "SoftBody.h"
 #include "TetoMeshData.h"
