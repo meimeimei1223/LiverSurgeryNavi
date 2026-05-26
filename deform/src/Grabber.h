@@ -50,7 +50,7 @@ public:
         localRay.direction = glm::normalize(
             glm::vec3(invModelMatrix * glm::vec4(worldRay.direction, 0.0f)));
 
-        RayCast::RayHit hit = RayCast::intersectMesh(localRay, *physicsObject);
+        RayCast::RayHit hit = raycastAgainstMesh(localRay);
         if (hit.hit) {
             physicsObject->createHandleGroup(hit.position, groupRadius);
 
@@ -81,7 +81,7 @@ public:
         localRay.direction = glm::normalize(
             glm::vec3(invModelMatrix * glm::vec4(worldRay.direction, 0.0f)));
 
-        return RayCast::intersectMesh(localRay, *physicsObject).hit;
+        return raycastAgainstMesh(localRay).hit;
     }
 
     void startGrab(float screenX, float screenY) {
@@ -99,7 +99,7 @@ public:
         localRay.direction = glm::normalize(
             glm::vec3(invModelMatrix * glm::vec4(worldRay.direction, 0.0f)));
 
-        RayCast::RayHit hit = RayCast::intersectMesh(localRay, *physicsObject);
+        RayCast::RayHit hit = raycastAgainstMesh(localRay);
         if (hit.hit) {
             glm::vec4 worldHitPos = modelMatrix * glm::vec4(hit.position, 1.0f);
             hit_position = glm::vec3(worldHitPos);
@@ -157,6 +157,17 @@ public:
     }
 
 private:
+    // [deform-sep Step 1] RayCast lost its SoftBody& overload. Pull the surface
+    // positions/indices out of the SoftBody and forward to the generic
+    // intersectMesh. getPositions() is vector<float> (== vector<GLfloat>) so it
+    // passes directly; tetSurfaceTriIds is vector<int> so convert to GLuint.
+    RayCast::RayHit raycastAgainstMesh(const RayCast::Ray& localRay) const {
+        const std::vector<float>& posF = physicsObject->getPositions();
+        const std::vector<int>&   triI = physicsObject->getMeshData().tetSurfaceTriIds;
+        std::vector<GLuint> triU(triI.begin(), triI.end());
+        return RayCast::intersectMesh(localRay, posF, triU);
+    }
+
     SoftBody* physicsObject;
     float     grabDistance;
     glm::vec3 prevPosition;
