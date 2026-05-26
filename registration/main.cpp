@@ -44,6 +44,7 @@
 #include "NoOpen3DRegistration.h"
 
 #include "OBJTargetExtraction.h"
+#include "IntrinsicsSource.h"
 #include "MeshCleanup.h"
 #include "AR.h"
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
@@ -674,7 +675,11 @@ static SphereMesh g_sphereMarker;  // クラスタ・対応点描画用スフィ
 static ARSave::State g_arSave;    // AR保存＋プレビュー状態
 static ShaderProgram* g_pShader     = nullptr;  // AR保存用シェーダ参照
 static ShaderProgram* g_pShaderCube = nullptr;
-static int            g_intrinsicsSource = 1;   // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
+// Intrinsics source selector (enum in common/src/IntrinsicsSource.h).
+// Default Preset = the azure_kinect_720p preset (= old default "Kinect").
+// Step 4 (autoSelect) overrides this at startup based on available files.
+static IntrinsicsSource g_intrinsicsSource = IntrinsicsSource::Preset;
+static std::string      g_currentPresetKey = "azure_kinect_720p";
 static CalibResult    g_calibResult;             // キャリブレーション結果
 
 // カメラ開始前の状態を保存
@@ -1443,8 +1448,8 @@ void StlExport::exportCamMmStlWithSnapshot() {
 
     try {
         std::string srcTag = "k4a";
-        if      (g_intrinsicsSource == 2) srcTag = "custom";
-        else if (g_intrinsicsSource == 3) srcTag = "calib";
+        if      (g_intrinsicsSource == IntrinsicsSource::Custom) srcTag = "custom";
+        else if (g_intrinsicsSource == IntrinsicsSource::Calib)  srcTag = "calib";
 
         auto now = std::chrono::system_clock::now();
         std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -1507,7 +1512,7 @@ void StlExport::exportCamMmStlWithSnapshot() {
             if (readme.is_open()) {
                 readme << "Snapshot created: " << tsBuf << "\n"
                        << "Intrinsics tag (g_intrinsicsSource="
-                       << g_intrinsicsSource << "): " << srcTag << "\n"
+                       << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << "): " << srcTag << "\n"
                        << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
                        << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
                        << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
@@ -2879,17 +2884,17 @@ static bool setupObjScene() {
     // intrinsicsSource (UI 状態) に応じて候補リストを切り替える。
     // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
     std::vector<std::string> intrinsicsCandidates;
-    if (g_intrinsicsSource == 2) {
+    if (g_intrinsicsSource == IntrinsicsSource::Custom) {
         // Custom: depth pipeline が intrinsics_custom.txt を出すのでそれを読む
         intrinsicsCandidates = {
             DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
         };
-    } else if (g_intrinsicsSource == 3) {
+    } else if (g_intrinsicsSource == IntrinsicsSource::Calib) {
         // Calib: depth pipeline が intrinsics_calib.txt を出すのでそれを読む
         intrinsicsCandidates = {
             DEPTH_OUTPUT_PATH + "intrinsics_calib.txt",
         };
-    } else if (g_intrinsicsSource == 1) {
+    } else if (g_intrinsicsSource == IntrinsicsSource::Preset) {
         intrinsicsCandidates = {
             DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
         };
@@ -2906,7 +2911,7 @@ static bool setupObjScene() {
     if (!Reg3DCustom::loadCameraIntrinsicsAny(intrinsicsCandidates, K)) {
         const char* labels[] = {"DA3", "Kinect", "Custom", "Calib"};
         std::cerr << "[Intrinsics] "
-                  << labels[std::clamp(g_intrinsicsSource, 0, 3)]
+                  << labels[std::clamp(intrinsicsSourceToLegacyInt(g_intrinsicsSource), 0, 3)]
                   << " selected but no matching file under " << DEPTH_OUTPUT_PATH
                   << "; falling back to k4a 720p" << std::endl;
         K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
@@ -3178,8 +3183,8 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     //   2 (Custom) : "custom" -> intrinsics_custom.txt, pc_*_custom*.obj
     //   3 (Calib)  : "calib"  -> intrinsics_calib.txt, pc_*_calib*.obj
     std::string srcTag = "k4a";  // 既定 (Kinect / DA3)
-    if      (g_intrinsicsSource == 2) srcTag = "custom";
-    else if (g_intrinsicsSource == 3) srcTag = "calib";
+    if      (g_intrinsicsSource == IntrinsicsSource::Custom) srcTag = "custom";
+    else if (g_intrinsicsSource == IntrinsicsSource::Calib)  srcTag = "calib";
     runner.config.intrinsicsSourceName = srcTag;
 
     // Custom intrinsics 選択時、外部 sam2_da3_lite に --kinect-intrinsics
@@ -3187,7 +3192,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     // メッシュをアンプロジェクトしてしまい、AR で 3D メッシュと背景画像が
     // ずれる (C++ 側の射影行列は Custom K、メッシュは Kinect K で生成、で
     // 食い違うのが原因)。
-    if (g_intrinsicsSource == 2 && g_intrinsics.valid()) {
+    if (g_intrinsicsSource == IntrinsicsSource::Custom && g_intrinsics.valid()) {
         runner.config.useCustomIntrinsics = true;
         runner.config.fx = g_intrinsics.fx;
         runner.config.fy = g_intrinsics.fy;
@@ -3216,7 +3221,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
                       << " p1=" << g_intrinsics.p1 << " p2=" << g_intrinsics.p2
                       << std::endl;
         }
-    } else if (g_intrinsicsSource == 3 && g_calibResult.valid) {
+    } else if (g_intrinsicsSource == IntrinsicsSource::Calib && g_calibResult.valid) {
         // Calibrated source: same idea
         runner.config.useCustomIntrinsics = true;
         runner.config.fx = (float)g_calibResult.fx;
@@ -3482,11 +3487,11 @@ static bool runSegmentOnly(AppContext& ctx, MaskKind kind) {
 
     // ---- Same intrinsics tag dispatch as runDepthAndUpdateScene ----
     std::string srcTag = "k4a";
-    if      (g_intrinsicsSource == 2) srcTag = "custom";
-    else if (g_intrinsicsSource == 3) srcTag = "calib";
+    if      (g_intrinsicsSource == IntrinsicsSource::Custom) srcTag = "custom";
+    else if (g_intrinsicsSource == IntrinsicsSource::Calib)  srcTag = "calib";
     runner.config.intrinsicsSourceName = srcTag;
 
-    if (g_intrinsicsSource == 2 && g_intrinsics.valid()) {
+    if (g_intrinsicsSource == IntrinsicsSource::Custom && g_intrinsics.valid()) {
         runner.config.useCustomIntrinsics = true;
         runner.config.fx = g_intrinsics.fx;
         runner.config.fy = g_intrinsics.fy;
@@ -3503,7 +3508,7 @@ static bool runSegmentOnly(AppContext& ctx, MaskKind kind) {
         runner.config.k4 = g_intrinsics.k4;
         runner.config.p1 = g_intrinsics.p1;
         runner.config.p2 = g_intrinsics.p2;
-    } else if (g_intrinsicsSource == 3 && g_calibResult.valid) {
+    } else if (g_intrinsicsSource == IntrinsicsSource::Calib && g_calibResult.valid) {
         runner.config.useCustomIntrinsics = true;
         runner.config.fx = (float)g_calibResult.fx;
         runner.config.fy = (float)g_calibResult.fy;
@@ -3861,11 +3866,12 @@ int main() {
             // 起動時の g_intrinsicsSource をその OBJ のソースに合わせる。
             // これがないと OBJ は custom メッシュなのに intrinsicsSource=Kinect、
             // という不整合が起きて intrinsics_k4a.txt の方を読みに行ってしまう。
-            if      (chosen.tag == "custom") g_intrinsicsSource = 2;
-            else if (chosen.tag == "calib")  g_intrinsicsSource = 3;
-            else                             g_intrinsicsSource = 1;  // k4a
+            if      (chosen.tag == "custom") g_intrinsicsSource = IntrinsicsSource::Custom;
+            else if (chosen.tag == "calib")  g_intrinsicsSource = IntrinsicsSource::Calib;
+            else                             g_intrinsicsSource = IntrinsicsSource::Preset;  // k4a
             std::cout << "[main] Intrinsics source aligned to OBJ tag: "
-                      << chosen.tag << " (g_intrinsicsSource=" << g_intrinsicsSource << ")"
+                      << chosen.tag << " (g_intrinsicsSource="
+                      << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << ")"
                       << std::endl;
         }
     }
@@ -8942,8 +8948,10 @@ static void syncUIState() {
     s.boardAlpha  = g_meshAlpha[6];
     s.targetAlpha = g_meshAlpha[7];
 
-    // Calibration state
-    s.intrinsicsSource = g_intrinsicsSource;
+    // Calibration state.
+    // RegUIState::intrinsicsSource is still a legacy int in Step 3 (UI unchanged),
+    // so bridge the enum back through the legacy numbering.
+    s.intrinsicsSource = intrinsicsSourceToLegacyInt(g_intrinsicsSource);
     s.calibDone     = g_calibResult.valid;
     s.calibMessage  = g_calibResult.message;
     s.calibFx       = (float)g_calibResult.fx;
@@ -9303,7 +9311,11 @@ static void setupUICallbacks() {
     };
 
     a.onIntrinsicsSourceChanged = [](int i) {
-        g_intrinsicsSource = i;
+        // i is the legacy 4-button index (0=DA3,1=Kinect,2=Custom,3=Calib);
+        // bridge to the enum. Kinect maps to the azure_kinect_720p preset.
+        g_intrinsicsSource = intrinsicsSourceFromLegacyInt(i);
+        if (g_intrinsicsSource == IntrinsicsSource::Preset)
+            g_currentPresetKey = "azure_kinect_720p";
         const char* names[] = {"DA3", "Kinect", "Custom", "Calibrated"};
         std::cout << "[Intrinsics] Source: " << names[std::clamp(i,0,3)] << std::endl;
 
@@ -9430,7 +9442,7 @@ static void setupUICallbacks() {
         }
         g_calibResult.valid = (g_calibResult.fx > 0 && g_calibResult.fy > 0);
         g_calibResult.message = g_calibResult.valid ? "OK" : "Invalid result";
-        if (g_calibResult.valid) g_intrinsicsSource = 3;
+        if (g_calibResult.valid) g_intrinsicsSource = IntrinsicsSource::Calib;
 
         std::cout << "[Calib] Result: fx=" << g_calibResult.fx
                   << " fy=" << g_calibResult.fy
