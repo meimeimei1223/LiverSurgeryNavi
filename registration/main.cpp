@@ -45,6 +45,7 @@
 
 #include "OBJTargetExtraction.h"
 #include "IntrinsicsSource.h"
+#include "IntrinsicsPresets.h"
 #include "MeshCleanup.h"
 #include "AR.h"
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
@@ -3699,9 +3700,113 @@ static bool initOpenGL() {
     return true;
 }
 
-int main() {
+// =============================================================================
+//  Intrinsics startup auto-selection (Step 4)
+//  Priority (high -> low): Custom > Calib > Preset > Auto.
+//    Custom : intrinsics_custom.txt valid
+//    Calib  : intrinsics_calib_last.txt valid (legacy intrinsics_calib.txt also
+//             accepted until the Step 6 rename lands)
+//    Preset : g_currentPresetKey resolves to a valid preset (default
+//             azure_kinect_720p -> reproduces the old hardcoded K4A 720p default)
+//    Auto   : nothing usable -> delegate to SAM2/DA3, OrbitCam left unset
+// =============================================================================
+static IntrinsicsSource autoSelectIntrinsicsSource() {
+    namespace fs = std::filesystem;
+    const std::string base = DEPTH_OUTPUT_PATH;
+    Reg3DCustom::CameraIntrinsics K;
+
+    // 1. Custom — highest priority
+    if (fs::exists(base + "intrinsics_custom.txt")
+        && Reg3DCustom::loadCameraIntrinsics(base + "intrinsics_custom.txt", K)
+        && K.valid()) {
+        return IntrinsicsSource::Custom;
+    }
+    // 2. Calib (prefer _last; tolerate legacy name until Step 6)
+    for (const char* f : { "intrinsics_calib_last.txt", "intrinsics_calib.txt" }) {
+        Reg3DCustom::CameraIntrinsics Kc;
+        if (fs::exists(base + f)
+            && Reg3DCustom::loadCameraIntrinsics(base + f, Kc)
+            && Kc.valid()) {
+            return IntrinsicsSource::Calib;
+        }
+    }
+    // 3. Preset history (default key set at startup -> K4A 720p)
+    Reg3DCustom::CameraIntrinsics Kp;
+    if (!g_currentPresetKey.empty() && Reg3DCustom::lookupPreset(g_currentPresetKey, Kp)) {
+        return IntrinsicsSource::Preset;
+    }
+    // 4. Last resort
+    return IntrinsicsSource::Auto;
+}
+
+// Load K for the currently-selected source into g_intrinsics / gApp.intrinsics /
+// OrbitCam. Auto leaves them untouched (SAM2/DA3 任せ; no intrinsics-dependent
+// processing is reached on the Auto path, so nothing crashes).
+static void loadIntrinsicsFromCurrentSource() {
+    Reg3DCustom::CameraIntrinsics K;
+    bool ok = false;
+    switch (g_intrinsicsSource) {
+        case IntrinsicsSource::Custom:
+            ok = Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_custom.txt", K);
+            break;
+        case IntrinsicsSource::Calib:
+            ok = Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_calib_last.txt", K)
+              || Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_calib.txt", K);
+            break;
+        case IntrinsicsSource::Preset:
+            ok = Reg3DCustom::lookupPreset(g_currentPresetKey, K);
+            break;
+        case IntrinsicsSource::Auto:
+            std::cout << "[Intrinsics] startup source=Auto "
+                         "(delegate to SAM2/DA3); OrbitCam intrinsics left unset"
+                      << std::endl;
+            return;
+    }
+    if (ok && K.valid()) {
+        g_intrinsics    = K;
+        gApp.intrinsics = K;
+        OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
+        std::cout << "[Intrinsics] startup source="
+                  << intrinsicsSourceToLegacyInt(g_intrinsicsSource)
+                  << " key=" << g_currentPresetKey
+                  << "  K " << K.width << "x" << K.height
+                  << " fx=" << K.fx << " fy=" << K.fy
+                  << " cx=" << K.cx << " cy=" << K.cy << std::endl;
+    } else {
+        std::cerr << "[Intrinsics] startup: failed to load K for selected source "
+                  << intrinsicsSourceToLegacyInt(g_intrinsicsSource)
+                  << "; leaving OrbitCam unset (Auto-like)" << std::endl;
+    }
+}
+
+int main(int argc, char** argv) {
     initPaths();
     initFilePaths();
+
+    // Headless self-check for Step 4 autoSelect (no GUI/OpenGL). Runs the real
+    // autoSelectIntrinsicsSource() + loadIntrinsicsFromCurrentSource() against
+    // whatever intrinsics_*.txt files exist under DEPTH_OUTPUT_PATH, prints the
+    // chosen source + resulting K, then exits. Used by test scripts.
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--check-intrinsics") {
+            const char* names[] = {"DA3/Auto", "Kinect/Preset", "Custom", "Calib"};
+            g_intrinsicsSource = autoSelectIntrinsicsSource();
+            int li = intrinsicsSourceToLegacyInt(g_intrinsicsSource);
+            std::cout << "[CheckIntrinsics] autoSelect -> source=" << li
+                      << " (" << names[std::clamp(li, 0, 3)] << ")"
+                      << " presetKey=" << g_currentPresetKey << std::endl;
+            loadIntrinsicsFromCurrentSource();
+            std::cout << "[CheckIntrinsics] g_intrinsics valid="
+                      << (g_intrinsics.valid() ? 1 : 0)
+                      << " " << g_intrinsics.width << "x" << g_intrinsics.height
+                      << " fx=" << g_intrinsics.fx << " fy=" << g_intrinsics.fy
+                      << std::endl;
+            return 0;
+        }
+    }
 
     if (!initOpenGL()) {
         std::cerr << "GLFW initialization failed" << std::endl;
@@ -3710,8 +3815,12 @@ int main() {
 
     OrbitCam.setWindowSizePointers(&gWindowWidth, &gWindowHeight);
     OrbitCam.setGlobalMatrixPointers(&view, &projection, &model, &objPos);
-    // Kinectのようなカメラの実際の内部パラメータを設定（デフォルト: K4A 720p）
-    OrbitCam.setIntrinsics(918.234f, 918.112f, 640.152f, 366.447f, 1280, 720);
+    // Step 4: 起動時に Custom > Calib > Preset > Auto の優先順位で自動選択し、
+    // 選ばれたソースから K をロードする。旧ハードコード K4A 720p は撤廃
+    // (default preset = azure_kinect_720p なので、ファイルが何も無い環境では
+    //  従来同様 K4A 720p が入る)。Auto のときは OrbitCam を未設定のままにする。
+    g_intrinsicsSource = autoSelectIntrinsicsSource();
+    loadIntrinsicsFromCurrentSource();
     OrbitCam.printCameraInfo();
 
     ShaderProgram shaderProgram;
