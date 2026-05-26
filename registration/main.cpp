@@ -3342,6 +3342,29 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
                   << rr.instrumentSegmentationMaskPath << std::endl;
     }
 
+    // ---- step7-cleanup: persist the DA3 estimate as the DA3 source ----
+    // SAM2 always writes intrinsics.txt with its own DA3 estimate (independent
+    // of any K we passed for unprojection). Promote it to intrinsics_da3_last.txt
+    // so the file-driven "DA3 (last estimate)" source becomes selectable and
+    // re-loadable -- symmetric with Custom/Calib. Done on every successful run
+    // (the file simply tracks the most recent DA3 estimate); separate file, so
+    // it never clobbers intrinsics_custom/calib.
+    {
+        Reg3DCustom::CameraIntrinsics da3K;
+        const std::string da3Src = DEPTH_OUTPUT_PATH + "intrinsics.txt";
+        const std::string da3Dst = DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt";
+        if (Reg3DCustom::loadCameraIntrinsics(da3Src, da3K) && da3K.valid()) {
+            da3K.name = "da3_last";
+            if (Reg3DCustom::saveCameraIntrinsics(da3Dst, da3K))
+                std::cout << "[RunDepth] DA3 estimate -> intrinsics_da3_last.txt ("
+                          << da3K.width << "x" << da3K.height
+                          << " fx=" << da3K.fx << ")" << std::endl;
+        } else {
+            std::cout << "[RunDepth] no usable intrinsics.txt to promote to DA3 "
+                         "(skipped)" << std::endl;
+        }
+    }
+
     std::string objPath =
         DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj";
     if (!std::filesystem::exists(objPath)) {
