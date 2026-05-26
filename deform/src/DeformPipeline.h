@@ -196,6 +196,23 @@ inline bool loadReferenceMeshes() {
         }
     }
 
+    // [intrinsics-step-1] Load the camera K that produced the depth OBJ
+    // (matches the _k4a-tagged mesh loaded below) from intrinsics_k4a.txt,
+    // instead of hardcoding K4A 720p. This lets 1080p / other resolutions get a
+    // correct target point cloud and board UV. Falls back to K4A 720p so old
+    // 720p inputs (and missing-file cases) behave exactly as before.
+    Reg3DCustom::CameraIntrinsics deformK;
+    if (!Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt", deformK)
+        || !deformK.valid()) {
+        deformK = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
+        std::cout << "[Deform] intrinsics_k4a.txt missing/invalid -> K4A 720p fallback"
+                  << std::endl;
+    } else {
+        std::cout << "[Deform] intrinsics: " << deformK.width << "x" << deformK.height
+                  << "  fx=" << deformK.fx << " fy=" << deformK.fy
+                  << " cx=" << deformK.cx << " cy=" << deformK.cy << std::endl;
+    }
+
     // ---- Target (= screenMesh) + cache 注入 ----
     {
         const std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
@@ -208,8 +225,8 @@ inline bool loadReferenceMeshes() {
             Reg3DCustom::cleanupOBJMesh(*gTargetMesh, /*cosThresh=*/0.10f, 0.0f);
 
             // === ここで cache 注入(mirror+scale 前!) ===
-            Reg3DCustom::CameraIntrinsics K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
-            auto cloud = setupTargetCloud_PathA(*gTargetMesh, K);
+            // [intrinsics-step-1] use the loaded deformK instead of hardcoded K4A 720p
+            auto cloud = setupTargetCloud_PathA(*gTargetMesh, deformK);
             if (cloud) {
                 // Path A 成功: mesh と cloud を同期して mirror のみ
                 // (registration 側の運用と完全一致, scale=10 は撤廃)
@@ -238,10 +255,11 @@ inline bool loadReferenceMeshes() {
             gBoardMesh = new mCutMesh(mCutMesh().loadMeshFromFile(objPath.c_str()));
             gBoardMesh->mColor = glm::vec3(1.0f, 1.0f, 1.0f);
 
-            // K4A 720p intrinsics で UV 生成(変換前の座標で投影) — 元コード準拠
-            constexpr float fx = 918.234f, fy = 918.112f;
-            constexpr float cx = 640.152f, cy = 366.447f;
-            constexpr int   W  = 1280,     H  = 720;
+            // [intrinsics-step-1] UV 生成(変換前の座標で投影)。K は OBJ 生成時の
+            // intrinsics (deformK) を使用 — 旧 K4A 720p ハードコードを撤廃。
+            const float fx = deformK.fx, fy = deformK.fy;
+            const float cx = deformK.cx, cy = deformK.cy;
+            const int   W  = deformK.width, H = deformK.height;
             const auto& V = gBoardMesh->mVertices;
             int nVerts = (int)(V.size() / 3);
             gBoardMesh->mTexCoords.resize(nVerts * 2);
