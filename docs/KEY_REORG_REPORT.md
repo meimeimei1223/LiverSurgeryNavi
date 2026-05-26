@@ -105,6 +105,25 @@ Branch `key-reorg` is local only (not merged to `main`, not pushed).
 
 ---
 
+## Phases 9–13 (KEY_REORG_PLAN_v2.md)
+
+| Phase | Title | Commit |
+|---|---|---|
+| 9 | Silhouette Align `Shift+E` -> `Alt+P` (byte-identical; E case + isShiftE removed) | `d87a16e` |
+| 10 | Remove `R/K/S/L` (sidebar "Run Depth" / camera toggle cover them) | `653cb61` |
+| 11 | Remove `F2/F9/F10` (F2 -> "Cam Init"; F9 -> new Viz checkbox; F10 -> Viz button). F2 onResetCamera equivalence verified incl. the 180-deg Y rotation + TARGET_TEXTURE | `f078fb8` |
+| 12 | Delete `J`; move `M`/`Shift+M` to sidebar Export buttons via `StlExport.h` (declarations) + definitions in main.cpp | `28e18d3` |
+| 13 | docs (KEY_REFERENCE.md final, DebugPanel header) | (this) |
+
+Phase 12 note: the 245-line M-case body was moved verbatim into
+`StlExport::exportRegisteredObjs()` / `exportCamMmStlWithSnapshot()` defined in
+main.cpp (declared in `StlExport.h`), avoiding a large extern block in the header.
+
+Final keyboard: 16 cases (A/C/D/G/N/O/P/Q/U/W/X + Up/Down/`,`/`.`/Esc) — action,
+display, and tuning only. ~26 keys before -> 16 after.
+
+---
+
 ## Summary of work done (final)
 
 Commits on `key-reorg` (in order):

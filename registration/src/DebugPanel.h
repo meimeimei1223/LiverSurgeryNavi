@@ -17,7 +17,7 @@
 //    Viz  — General visualization  (Cluster, CorresPoints, AABB, screen mesh,
 //           + the toggles/buttons migrated off the keyboard by the key-reorg
 //           pass: formerly V/B/Shift+B/N/W/Shift+W/Shift+R/Y/H/Shift+H/Shift+T/
-//           Shift+Y/Shift+I/F10. See docs/KEY_REFERENCE.md.)
+//           Shift+Y/Shift+I/F9/F10. See docs/KEY_REFERENCE.md.)
 //
 //  Toggle key: Ctrl+D (handled in main.cpp keyboard dispatch; plain D = AR save).
 //
