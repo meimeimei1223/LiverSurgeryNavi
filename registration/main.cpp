@@ -3707,47 +3707,43 @@ static bool initOpenGL() {
 }
 
 // =============================================================================
-//  Intrinsics startup auto-selection (Step 4)
-//  Priority (high -> low): Custom > Calib > Preset > Auto.
-//    Custom : intrinsics_custom.txt valid
-//    Calib  : intrinsics_calib_last.txt valid (legacy intrinsics_calib.txt also
-//             accepted until the Step 6 rename lands)
-//    Preset : g_currentPresetKey resolves to a valid preset (default
-//             azure_kinect_720p -> reproduces the old hardcoded K4A 720p default)
-//    Auto   : nothing usable -> delegate to SAM2/DA3, OrbitCam left unset
+//  Intrinsics startup auto-selection (Step 4 / step7-cleanup)
+//  File-driven sources are tried by existence; Preset is the always-available
+//  default fallback:
+//      Custom : intrinsics_custom.txt valid
+//      Calib  : intrinsics_calib_last.txt valid (legacy intrinsics_calib.txt
+//               also accepted until the Step 6 rename lands)
+//      DA3    : intrinsics_da3_last.txt valid (DA3 estimate from the last
+//               Run Depth)
+//      Preset : default fallback (g_currentPresetKey, currently
+//               azure_kinect_1080p) when no source file exists
+//  Note: DA3 sits above the Preset fallback so "da3_last only -> DA3" holds;
+//  the nominal "Preset > DA3" ordering only applied to a persisted preset
+//  choice, which is not implemented.
 // =============================================================================
 static IntrinsicsSource autoSelectIntrinsicsSource() {
     namespace fs = std::filesystem;
     const std::string base = DEPTH_OUTPUT_PATH;
-    Reg3DCustom::CameraIntrinsics K;
+    auto fileValid = [&](const char* f) {
+        Reg3DCustom::CameraIntrinsics K;
+        return fs::exists(base + f)
+            && Reg3DCustom::loadCameraIntrinsics(base + f, K) && K.valid();
+    };
 
     // 1. Custom — highest priority
-    if (fs::exists(base + "intrinsics_custom.txt")
-        && Reg3DCustom::loadCameraIntrinsics(base + "intrinsics_custom.txt", K)
-        && K.valid()) {
-        return IntrinsicsSource::Custom;
-    }
+    if (fileValid("intrinsics_custom.txt")) return IntrinsicsSource::Custom;
     // 2. Calib (prefer _last; tolerate legacy name until Step 6)
-    for (const char* f : { "intrinsics_calib_last.txt", "intrinsics_calib.txt" }) {
-        Reg3DCustom::CameraIntrinsics Kc;
-        if (fs::exists(base + f)
-            && Reg3DCustom::loadCameraIntrinsics(base + f, Kc)
-            && Kc.valid()) {
-            return IntrinsicsSource::Calib;
-        }
-    }
-    // 3. Preset history (default key set at startup -> K4A 720p)
-    Reg3DCustom::CameraIntrinsics Kp;
-    if (!g_currentPresetKey.empty() && Reg3DCustom::lookupPreset(g_currentPresetKey, Kp)) {
-        return IntrinsicsSource::Preset;
-    }
-    // 4. Last resort
-    return IntrinsicsSource::Auto;
+    if (fileValid("intrinsics_calib_last.txt") || fileValid("intrinsics_calib.txt"))
+        return IntrinsicsSource::Calib;
+    // 3. DA3 (last estimate, file-driven)
+    if (fileValid("intrinsics_da3_last.txt")) return IntrinsicsSource::DA3;
+    // 4. Preset — default fallback (always available)
+    return IntrinsicsSource::Preset;
 }
 
 // Load K for the currently-selected source into g_intrinsics / gApp.intrinsics /
-// OrbitCam. Auto leaves them untouched (SAM2/DA3 任せ; no intrinsics-dependent
-// processing is reached on the Auto path, so nothing crashes).
+// OrbitCam. All four sources are file/preset driven and symmetric; on failure
+// OrbitCam is left unset (warned).
 static void loadIntrinsicsFromCurrentSource() {
     Reg3DCustom::CameraIntrinsics K;
     bool ok = false;
@@ -3765,11 +3761,10 @@ static void loadIntrinsicsFromCurrentSource() {
         case IntrinsicsSource::Preset:
             ok = Reg3DCustom::lookupPreset(g_currentPresetKey, K);
             break;
-        case IntrinsicsSource::Auto:
-            std::cout << "[Intrinsics] startup source=Auto "
-                         "(delegate to SAM2/DA3); OrbitCam intrinsics left unset"
-                      << std::endl;
-            return;
+        case IntrinsicsSource::DA3:
+            ok = Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt", K);
+            break;
     }
     if (ok && K.valid()) {
         g_intrinsics    = K;
@@ -3784,7 +3779,7 @@ static void loadIntrinsicsFromCurrentSource() {
     } else {
         std::cerr << "[Intrinsics] startup: failed to load K for selected source "
                   << intrinsicsSourceToLegacyInt(g_intrinsicsSource)
-                  << "; leaving OrbitCam unset (Auto-like)" << std::endl;
+                  << "; leaving OrbitCam unset (no K)" << std::endl;
     }
 }
 
@@ -3798,7 +3793,7 @@ int main(int argc, char** argv) {
     // chosen source + resulting K, then exits. Used by test scripts.
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--check-intrinsics") {
-            const char* names[] = {"DA3/Auto", "Kinect/Preset", "Custom", "Calib"};
+            const char* names[] = {"DA3", "Kinect/Preset", "Custom", "Calib"};
             g_intrinsicsSource = autoSelectIntrinsicsSource();
             int li = intrinsicsSourceToLegacyInt(g_intrinsicsSource);
             std::cout << "[CheckIntrinsics] autoSelect -> source=" << li
@@ -9077,6 +9072,7 @@ static void syncUIState() {
         s.customAvailable    = fs::exists(base + "intrinsics_custom.txt");
         s.calibLastAvailable = fs::exists(base + "intrinsics_calib_last.txt")
                             || fs::exists(base + "intrinsics_calib.txt");
+        s.da3LastAvailable   = fs::exists(base + "intrinsics_da3_last.txt");
     }
 
     // Human-readable Active card label.
@@ -9091,8 +9087,8 @@ static void syncUIState() {
                 if (g_currentPresetKey == p.key) { s.currentDisplayName = p.displayName; break; }
             break;
         }
-        case IntrinsicsSource::Auto:
-            s.currentDisplayName = "Auto (delegate to DA3)"; break;
+        case IntrinsicsSource::DA3:
+            s.currentDisplayName = "DA3 (last estimate)"; break;
     }
 
     // Preset list for the dropdown (rebuilt each frame; small + cheap).
@@ -9529,7 +9525,7 @@ static void setupUICallbacks() {
     // ---- Step 7: new intrinsics source dropdown callbacks (案 Y) ----
     a.onSourceChanged = [](IntrinsicsSource s) {
         g_intrinsicsSource = s;
-        const char* nm[] = {"Custom", "Calib", "Preset", "Auto"};
+        const char* nm[] = {"Custom", "Calib", "Preset", "DA3"};
         std::cout << "[Intrinsics] Source -> " << nm[std::clamp((int)s, 0, 3)] << std::endl;
         loadIntrinsicsFromCurrentSource();
     };

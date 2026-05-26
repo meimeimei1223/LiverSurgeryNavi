@@ -303,13 +303,14 @@ struct RegUIState {
 
     // ---- Step 7: intrinsics source (案 Y dropdown + Active card) ----
     //   syncUIState() が main.cpp の g_intrinsicsSource / g_intrinsics 等から毎フレーム反映。
-    IntrinsicsSource intrinsicsSource = IntrinsicsSource::Auto;
+    IntrinsicsSource intrinsicsSource = IntrinsicsSource::DA3;
     std::string currentPresetKey;      // Preset 選択時の key
     std::string currentDisplayName;    // Active カードの表示名
     float currentFx=0, currentFy=0, currentCx=0, currentCy=0;
     int   currentWidth=0, currentHeight=0;
     bool  customAvailable=false;       // intrinsics_custom.txt が存在し valid
     bool  calibLastAvailable=false;    // intrinsics_calib_last.txt (or legacy) が存在し valid
+    bool  da3LastAvailable=false;      // intrinsics_da3_last.txt が存在 (DA3 推定結果)
     // Factory/dynamic presets (main.cpp が presetRegistry() から syncUIState で詰める)
     struct PresetEntry { std::string key; std::string displayName; bool available=false; bool dynamic=false; };
     std::vector<PresetEntry> presetList;
@@ -2049,7 +2050,7 @@ private:
             case IntrinsicsSource::Custom: label = "Custom"; col = ImVec4(0.9f,0.7f,0.2f,1); break;
             case IntrinsicsSource::Calib:  label = "Calib";  col = ImVec4(0.9f,0.4f,0.6f,1); break;
             case IntrinsicsSource::Preset: label = "Preset"; col = ImVec4(0.2f,0.6f,1.0f,1); break;
-            case IntrinsicsSource::Auto:   label = "Auto";   col = ImVec4(0.45f,0.47f,0.52f,1); break;
+            case IntrinsicsSource::DA3:    label = "DA3";    col = ImVec4(0.3f,0.8f,0.6f,1); break;
             default:                       label = "?";      col = colDim(); break;
         }
     }
@@ -2073,8 +2074,9 @@ private:
 
             if (!state.currentDisplayName.empty())
                 ImGui::TextColored(colDim(), "%s", state.currentDisplayName.c_str());
-            if (state.intrinsicsSource == IntrinsicsSource::Auto) {
-                ImGui::TextColored(colMuted(), "(no K; delegated to DA3)");
+            bool haveK = (state.currentWidth > 0 && state.currentHeight > 0);
+            if (!haveK) {
+                ImGui::TextColored(colMuted(), "(no K loaded; run depth to populate)");
             } else {
                 ImGui::Text("fx %.2f   fy %.2f", state.currentFx, state.currentFy);
                 ImGui::Text("cx %.2f   cy %.2f", state.currentCx, state.currentCy);
@@ -2091,12 +2093,14 @@ private:
         const std::string preview = state.currentDisplayName.empty()
                                    ? std::string("(select source)") : state.currentDisplayName;
         // green "o" = available, dim "-" = missing; then a Selectable.
+        // Unavailable entries are disabled (greyed + non-clickable).
         auto entry = [&](const char* label, bool available, bool selected) -> bool {
             ImGui::PushStyleColor(ImGuiCol_Text, available ? colGreen() : colMuted());
             ImGui::TextUnformatted(available ? "o" : "-");
             ImGui::PopStyleColor();
             ImGui::SameLine();
-            return ImGui::Selectable(label, selected);
+            ImGuiSelectableFlags flags = available ? 0 : ImGuiSelectableFlags_Disabled;
+            return ImGui::Selectable(label, selected, flags);
         };
         char comboId[64]; snprintf(comboId, sizeof(comboId), "##srcCombo%s", suffix);
         ImGui::SetNextItemWidth(-1);
@@ -2144,11 +2148,12 @@ private:
             // Saved calibrations (Step 6 placeholder)
             ImGui::Separator();
             ImGui::TextColored(colMuted(), "Saved calibrations: (Step 6)");
-            // 4. Auto
+            // 4. DA3 (file-driven: intrinsics_da3_last.txt). Disabled until a
+            //    Run Depth has produced an estimate.
             ImGui::Separator();
-            if (entry("Auto (delegate to DA3)", true,
-                      state.intrinsicsSource == IntrinsicsSource::Auto)) {
-                if (actions.onSourceChanged) actions.onSourceChanged(IntrinsicsSource::Auto);
+            if (entry("DA3 (last estimate)", state.da3LastAvailable,
+                      state.intrinsicsSource == IntrinsicsSource::DA3)) {
+                if (actions.onSourceChanged) actions.onSourceChanged(IntrinsicsSource::DA3);
             }
             ImGui::EndCombo();
         }
@@ -2156,7 +2161,7 @@ private:
         ImGui::Spacing();
         // ---- Buttons ----
         float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
-        bool noK = (state.intrinsicsSource == IntrinsicsSource::Auto);
+        bool noK = (state.currentWidth <= 0 || state.currentHeight <= 0);  // no valid K loaded
         if (colorButton("Save current K as Custom", colYellow(), false, noK, bw)) {
             if (actions.onSaveAsCustom) actions.onSaveAsCustom();
         }
@@ -2172,7 +2177,7 @@ private:
         ImGui::TextColored(colYellow(), "Custom intrinsics");
         ImGui::TextWrapped("File: intrinsics_custom.txt  (edit externally, then Reload)");
         float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
-        bool noK = (state.intrinsicsSource == IntrinsicsSource::Auto);
+        bool noK = (state.currentWidth <= 0 || state.currentHeight <= 0);  // no valid K loaded
         if (colorButton("Save current K", colYellow(), false, noK, bw)) {
             if (actions.onSaveAsCustom) actions.onSaveAsCustom();
         }
@@ -2398,12 +2403,12 @@ private:
             ImGui::TextColored(state.splitScreen ? colGreen() : colMuted(), state.splitScreen ? "ON" : "OFF");
             ImGui::TextColored(colDim(), "Intrinsics");
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
-            const char* isrcName = "Auto";
+            const char* isrcName = "DA3";
             switch (state.intrinsicsSource) {
                 case IntrinsicsSource::Custom: isrcName = "Custom"; break;
                 case IntrinsicsSource::Calib:  isrcName = "Calib";  break;
                 case IntrinsicsSource::Preset: isrcName = "Preset"; break;
-                case IntrinsicsSource::Auto:   isrcName = "Auto";   break;
+                case IntrinsicsSource::DA3:    isrcName = "DA3";    break;
             }
             ImGui::TextColored(colDepth(), "%s", isrcName);
             ImGui::TextColored(colDim(), "Image Source");
