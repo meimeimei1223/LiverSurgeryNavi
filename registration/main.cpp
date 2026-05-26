@@ -69,6 +69,7 @@
 #include "imgui_impl_opengl3.h"
 #include "RegistrationImGuiManager.h"
 #include "DebugPanel.h"
+#include "StlExport.h"
 #include "UmeyamaController.h"
 // PoseLibrary.h は RegistrationActions.h の後で include する
 // (RegistrationActions.h 内の inline computeUnifiedMetrics 定義を見えてからで
@@ -1362,15 +1363,188 @@ static void rebuildOBJWithCurrentThreshold() {
     std::cout << "=== Rebuild done ===" << std::endl;
 }
 
+// [key-reorg Phase 12] STL/OBJ export, moved verbatim out of the old
+// GLFW_KEY_M switch case. Declared in StlExport.h; called by the sidebar
+// Export buttons (onExportStl / onExportStlFlipped).
+void StlExport::exportRegisteredObjs() {
+    if (gApp.mode != AppMode::kRegistration) {
+        std::cout << "[ExportObj] only valid in Registration mode" << std::endl;
+        return;
+    }
+    std::filesystem::create_directories(REG_MODEL_PATH);
+    if (liverMesh3D)   liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
+    if (portalMesh3D)  portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
+    if (veinMesh3D)    veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
+    if (tumorMesh3D)   tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
+    if (segmentMesh3D) segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
+    if (gbMesh3D)      gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
+    std::cout << "[ExportObj] Registered OBJs exported to " << REG_MODEL_PATH << std::endl;
+}
+
+void StlExport::exportCamMmStlWithSnapshot() {
+    if (gApp.mode != AppMode::kRegistration) {
+        std::cout << "[ExportSTL] only valid in Registration mode" << std::endl;
+        return;
+    }
+    std::filesystem::create_directories(REG_MODEL_PATH);
+
+    auto bboxDiag = [](const mCutMesh* m) -> float {
+        if (!m || m->mVertices.size() < 3) return 0.0f;
+        glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
+        for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+            glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
+            mn = glm::min(mn, v);
+            mx = glm::max(mx, v);
+        }
+        return glm::length(mx - mn);
+    };
+
+    float SCALE_RESTORE = 1.0f;
+    if (g_hasOriginalDiags && liverMesh3D) {
+        float current_liver_diag = bboxDiag(liverMesh3D);
+        if (current_liver_diag < 1e-9f) {
+            std::cerr << "[Shift+M] current liver diag near zero -- using 1.0 fallback"
+                      << std::endl;
+        } else {
+            SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag;
+        }
+    } else {
+        std::cerr << "[Shift+M] WARNING: original CT diagonals not captured at startup; "
+                     "using 1.0 (output will likely be in wrong scale)" << std::endl;
+    }
+    std::cout << "[Shift+M] g_originalLiverDiagMm=" << g_originalLiverDiagMm
+              << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
+              << "  SCALE_RESTORE=" << SCALE_RESTORE
+              << "  (CT-truth based, X+Z flip)" << std::endl;
+
+    auto exportCamMmStl =
+        [&](const mCutMesh* src, const std::string& outPath, const char* label) {
+            if (!src || src->mVertices.empty()) {
+                std::cout << "[Shift+M] Skip " << label << " (mesh empty)" << std::endl;
+                return;
+            }
+            mCutMesh out = *src;
+            for (size_t i = 0; i + 2 < out.mVertices.size(); i += 3) {
+                out.mVertices[i  ] = -out.mVertices[i  ] * SCALE_RESTORE;  // X flip
+                out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;  // Y keep
+                out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;  // Z flip
+            }
+            out.exportStlFile(outPath);
+            Reg3DCustom::printMeshBBox(out, label);
+        };
+
+    exportCamMmStl(tumorMesh3D, REG_MODEL_PATH + "tumor_cam_mm.stl",
+                   "tumor_cam_mm (Adagolodjo-format)");
+    exportCamMmStl(liverMesh3D, REG_MODEL_PATH + "liver_cam_mm.stl",
+                   "liver_cam_mm (Adagolodjo-format)");
+
+    std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm (Adagolodjo format)"
+              << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
+
+    try {
+        std::string srcTag = "k4a";
+        if      (g_intrinsicsSource == 2) srcTag = "custom";
+        else if (g_intrinsicsSource == 3) srcTag = "calib";
+
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tmLocal{};
+#ifdef _WIN32
+        localtime_s(&tmLocal, &t);
+#else
+        localtime_r(&t, &tmLocal);
+#endif
+        char tsBuf[32];
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmLocal);
+
+        std::string snapDir = REG_MODEL_PATH + "snapshot_" + tsBuf + "/";
+        std::filesystem::create_directories(snapDir);
+
+        const std::vector<std::string> srcFiles = {
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
+            DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
+            DEPTH_OUTPUT_PATH + "original_rectified.jpg",
+            DEPTH_OUTPUT_PATH + "segmentation_mask.png",
+            DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
+            DEPTH_OUTPUT_PATH + "texture.png",
+            REG_MODEL_PATH + "tumor_cam_mm.stl",
+            REG_MODEL_PATH + "liver_cam_mm.stl",
+        };
+
+        int copiedCount = 0;
+        int missingCount = 0;
+        std::vector<std::string> missing;
+        for (const auto& src : srcFiles) {
+            std::filesystem::path srcPath(src);
+            if (!std::filesystem::exists(srcPath)) {
+                ++missingCount;
+                missing.push_back(srcPath.filename().string());
+                continue;
+            }
+            std::filesystem::path dstPath =
+                std::filesystem::path(snapDir) / srcPath.filename();
+            try {
+                std::filesystem::copy_file(
+                    srcPath, dstPath,
+                    std::filesystem::copy_options::overwrite_existing);
+                ++copiedCount;
+            } catch (const std::exception& e) {
+                std::cerr << "[Shift+M] copy failed: " << src
+                          << " -> " << dstPath
+                          << " : " << e.what() << std::endl;
+            }
+        }
+
+        {
+            std::ofstream readme(snapDir + "README.txt");
+            if (readme.is_open()) {
+                readme << "Snapshot created: " << tsBuf << "\n"
+                       << "Intrinsics tag (g_intrinsicsSource="
+                       << g_intrinsicsSource << "): " << srcTag << "\n"
+                       << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
+                       << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
+                       << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
+                       << "\n"
+                       << "Source paths at capture time:\n"
+                       << "  DEPTH_OUTPUT_PATH = " << DEPTH_OUTPUT_PATH << "\n"
+                       << "  REG_MODEL_PATH    = " << REG_MODEL_PATH << "\n";
+                readme.close();
+                ++copiedCount;
+            }
+        }
+
+        std::cout << "[Shift+M] Snapshot saved: " << snapDir
+                  << "  (" << copiedCount << " files copied, "
+                  << missingCount << " missing)" << std::endl;
+        if (missingCount > 0) {
+            std::cout << "[Shift+M] Missing in snapshot (skipped):";
+            for (const auto& m : missing) std::cout << "\n  - " << m;
+            std::cout << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Shift+M] Snapshot creation failed: " << e.what()
+                  << "  (STL export was successful, only snapshot failed)"
+                  << std::endl;
+    }
+}
+
 static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
-    const bool isShiftV   = (key == GLFW_KEY_V) && (mods & GLFW_MOD_SHIFT);
-    const bool isShiftE   = (key == GLFW_KEY_E) && (mods & GLFW_MOD_SHIFT);
-    const bool isShiftF   = (key == GLFW_KEY_F) && (mods & GLFW_MOD_SHIFT);  // V2 BIPOP-CMA-ES (Fast)
+    // [key-reorg Phase 5] isShiftV / isShiftF removed (Shift+V/F -> Alt+G/Alt+Shift+G).
+    // [key-reorg Phase 9] isShiftE removed (Shift+E -> Alt+P; key==P already in needsScene).
     const bool isShiftG     = (key == GLFW_KEY_G) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);  // V3 BIPOP-CMA-ES (Good performance)
     const bool isCtrlShiftG = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);   // V3-RS BIPOP-CMA-ES (silhouette anchor)
     const bool isCtrlG      = (key == GLFW_KEY_G) && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V3-R BIPOP-CMA-ES (Region-aware, 4-quadrant subset)
+    const bool isAltG       = (key == GLFW_KEY_G) && (mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT);  // V1 BIPOP-CMA-ES (旧 Shift+V)
+    const bool isAltShiftG  = (key == GLFW_KEY_G) && (mods & GLFW_MOD_ALT) && (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL);   // V2 BIPOP-CMA-ES Fast (旧 Shift+F)
     // Shift+N        : Normal-Compatible refine (finishing pass after Ctrl+G)
     // Ctrl+Shift+N   : SRT Variance-Weighted refine (ablation alt)
     // Plain N        : kept as the SourceVis toggle (no scene requirement)
@@ -1378,12 +1552,11 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     const bool isCtrlShiftN = (key == GLFW_KEY_N) && (mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT);
     const bool needsScene = (key == GLFW_KEY_O      ||
                              key == GLFW_KEY_P      ||
-                             isShiftV               ||
-                             isShiftE               ||
-                             isShiftF               ||
                              isShiftG               ||
                              isCtrlG                ||
                              isCtrlShiftG           ||
+                             isAltG                 ||  // [key-reorg] V1 (旧 Shift+V)
+                             isAltShiftG            ||  // [key-reorg] V2 (旧 Shift+F)
                              isShiftN               ||
                              isCtrlShiftN           ||
                              key == GLFW_KEY_D      ||
@@ -1442,38 +1615,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::RMSE);
         }
         break;
-    case GLFW_KEY_V:
-        if (mods & GLFW_MOD_SHIFT) {
-            // 元コード line 6256-6266 (キー Shift+V) の順序
-            g_stepStartTime = std::chrono::steady_clock::now();
-            g_sessionBipopN++;
-            gUI.state.regMethod = 3;
-            poseAutoSaveBeforeRegistration();
-            runBipopCmaes();
-            poseSaveToLibrary(SaveCriterion::RMSE);
-        } else {
-            g_showClusterVisualization = !g_showClusterVisualization;
-            std::cout << "Cluster visualization: "
-                      << (g_showClusterVisualization ? "ON" : "OFF") << std::endl;
-        }
-        break;
-    case GLFW_KEY_F:
-        // Shift+F: BIPOP-CMA-ES V2 ("Fast"). V1-equivalent path that
-        // runs CmaesRefine::runV2(). Phase 1 forces eval_mode=FULL_MESH
-        // so CompRMSE is bit-identical to Shift+V from the same
-        // (g_trialSeed, g_callIdx) state -- this is the validation
-        // hook for the V2 refactor. Phase 2 will switch to SUBSET_RMSE
-        // for the speedup; Phase 3 adds OpenMP. Plain F (no shift)
-        // is intentionally left unbound for future use.
-        if (mods & GLFW_MOD_SHIFT) {
-            g_stepStartTime = std::chrono::steady_clock::now();
-            g_sessionBipopN++;
-            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V)
-            poseAutoSaveBeforeRegistration();
-            runBipopCmaesV2();
-            poseSaveToLibrary(SaveCriterion::RMSE);
-        }
-        break;
+    // [key-reorg Phase 5] GLFW_KEY_V / GLFW_KEY_F removed:
+    //   Shift+V (V1 BIPOP) -> Alt+G  ;  Shift+F (V2 BIPOP) -> Alt+Shift+G
+    //   plain V (cluster viz) -> Ctrl+D > Viz tab
     case GLFW_KEY_G:
         // Shift+G: BIPOP-CMA-ES V3 ("Good performance"). Pure-function
         // refactor of V2 with liver-only snapshot, matrix-based per-Run
@@ -1491,6 +1635,32 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         //          S4 完了: CmaesRefineV3R::runBipopCmaesV3R を呼ぶ。
         //          QUAD_ALL のとき Shift+G (V3) と数値 byte-identical
         //          (HANDOVER §2.6 受け入れ基準)。
+        // ----- Alt+G : V1 BIPOP-CMA-ES (旧 Shift+V) -----
+        //   byte-identical to the legacy Shift+V branch (same order:
+        //   g_stepStartTime / g_sessionBipopN++ / regMethod=3 /
+        //   poseAutoSaveBeforeRegistration / runBipopCmaes / poseSaveToLibrary).
+        //   Must be tested BEFORE the Ctrl+Shift+G branch (mod-order).
+        if ((mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL)
+                                  && !(mods & GLFW_MOD_SHIFT)) {
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaes();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+            break;
+        }
+        // ----- Alt+Shift+G : V2 BIPOP-CMA-ES Fast (旧 Shift+F) -----
+        if ((mods & GLFW_MOD_ALT) && (mods & GLFW_MOD_SHIFT)
+                                  && !(mods & GLFW_MOD_CONTROL)) {
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;   // BIPOP method (same as Shift+V)
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaesV2();
+            poseSaveToLibrary(SaveCriterion::RMSE);
+            break;
+        }
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ----- Ctrl+Shift+G : V3-RS (silhouette-anchored) -----
             // Independent of Ctrl+G; calls a fresh wrapper that reads
@@ -1594,31 +1764,8 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::RMSE);
         }
         break;
-    case GLFW_KEY_B:
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+B: Cyclic Boundary Registration (Shift+P) の対応点表示トグル
-            //   24 セクターを HSV サイクルで着色、source (大球) / target (中球)
-            //   を同色で描画 → 同じ色の球同士がペア。空セクターは非表示。
-            //   Shift+P を一度実行した後に有効になる。
-            g_showCyclicCorrespondence = !g_showCyclicCorrespondence;
-            std::cout << "[CyclicCorr] "
-                      << (g_showCyclicCorrespondence ? "ON" : "OFF")
-                      << "  available=" << (g_cyclicAvailable ? "YES" : "NO (run Shift+P first)")
-                      << "  sectors=" << g_cyclicSectors
-                      << "  best_shift=" << g_cyclicBestShift
-                      << "  best_dir=" << (g_cyclicBestRev ? "reverse(CCW)" : "forward(CW)")
-                      << std::endl;
-        } else {
-            // B: 境界候補の可視化トグル: 緑=採用境界, 赤=器具マスクで棄却された偽境界
-            g_showBoundaryCandidates = !g_showBoundaryCandidates;
-            std::cout << "[BoundaryCandidates] "
-                      << (g_showBoundaryCandidates ? "ON" : "OFF")
-                      << "  accepted=" << g_targetPoints.size()
-                      << "  rejected=" << g_rejectedBoundaryPoints.size()
-                      << "  threshold=" << g_instrumentPxThresh << "px"
-                      << std::endl;
-        }
-        break;
+    // [key-reorg Phase 4] GLFW_KEY_B removed: B (boundary candidates) and
+    //   Shift+B (cyclic correspondence) viz toggles moved to Ctrl+D > Viz tab.
     case GLFW_KEY_N:
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ---- Ctrl+Shift+N : SRT Variance-Weighted Refine -----------
@@ -1698,18 +1845,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                     NormalRefine::NORMAL_COMPAT, g_activeQuadrantMask);
                 poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
             }
-        } else {
-            // ---- Plain N : SourceVis toggle (existing behaviour) ------
-            //   Unchanged. ソース側可視化トグル: シアン=全可視頂点,
-            //   マゼンタ=シルエット絞り込み後
-            g_showSourceVisualization = !g_showSourceVisualization;
-            std::cout << "[SourceVis] "
-                      << (g_showSourceVisualization ? "ON" : "OFF")
-                      << "  visible=" << g_visibleSourcePoints.size()
-                      << "  silhouette=" << g_silhouetteSourcePoints.size()
-                      << "  cosThresh=" << g_silhouetteSrcCosThresh
-                      << std::endl;
         }
+        // [key-reorg Phase 4] plain N (source visualization toggle) moved to
+        // Ctrl+D > Viz tab. Shift+N / Ctrl+Shift+N (refine) kept above.
         break;
     case GLFW_KEY_W:
         // ---- Phase 7b: W-family (RIM Shape Match) ----
@@ -2235,78 +2373,11 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             g_normRefineMaxIter = saved_max_iter;
             break;
         }
-        if ((mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL)) {
-            // ==== Shift+W : Step 2 — target boundary overlay (purple) ====
-            // Toggle, mirrors Plain W's semantic.
-            if (g_showDebugTargetBoundary) {
-                g_showDebugTargetBoundary = false;
-                std::cout << "[W/TgtBound] overlay OFF (was ON, "
-                          << g_debugTargetBoundaryPoints.size()
-                          << " pts cached)" << std::endl;
-                break;
-            }
-            if (gApp.mode != AppMode::kRegistration) {
-                std::cout << "[Shift+W] requires a loaded scene"
-                          << " (Registration mode) — drop an image and"
-                          << " press R first" << std::endl;
-                break;
-            }
-            const bool ok = populateDebugTargetBoundary();
-            g_showDebugTargetBoundary = ok;
-            std::cout << "[W/TgtBound] overlay "
-                      << (ok ? "ON" : "OFF (populate failed)")
-                      << "  size=" << g_debugTargetBoundaryPoints.size()
-                      << "  (purple dots, target is static — no live"
-                      << " fetch needed)" << std::endl;
-            break;
-        }
-        if (mods == 0) {
-            // Toggle semantic, matching Plain N (SourceVis toggle):
-            //   ON  -> turn off, keep the chain in memory
-            //   OFF -> (re)populate from current g_liverRegion + toggle ON
-            if (g_showDebugSourceRimChain) {
-                g_showDebugSourceRimChain = false;
-                std::cout << "[W/RimChain] overlay OFF (was ON, "
-                          << g_debugSourceRimChain.size() << " pts cached)"
-                          << std::endl;
-                break;
-            }
-            if (gApp.mode != AppMode::kRegistration) {
-                std::cout << "[W] requires a loaded scene"
-                          << " (Registration mode) — drop an image and"
-                          << " press R first" << std::endl;
-                break;
-            }
-            // Auto-trigger region/LR/CC labelling if missing (same
-            // pattern as Shift+O / Shift+N / Ctrl+G). Region+LR は必須
-            // (quadrant subset の前提)、CC は caudal-only ON のときだけ
-            // 必要だが、トグル切替で頻繁に必要になるので予防的に確保。
-            if (!g_liverRegion.valid()) {
-                std::cout << "[W] g_liverRegion not yet computed,"
-                          << " auto-running recomputeLiverRegion()..."
-                          << std::endl;
-                recomputeLiverRegion();
-            }
-            if (!g_liverLR.valid()) {
-                std::cout << "[W] g_liverLR not yet computed,"
-                          << " auto-running recomputeLiverLR()..."
-                          << std::endl;
-                recomputeLiverLR();
-            }
-            if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) {
-                std::cout << "[W] caudal-only ON but g_liverCC not yet"
-                          << " computed, auto-running recomputeLiverCC()..."
-                          << std::endl;
-                recomputeLiverCC();
-            }
-            const bool ok = populateDebugSourceRimChain();
-            g_showDebugSourceRimChain = ok;
-            std::cout << "[W/RimChain] overlay "
-                      << (ok ? "ON" : "OFF (populate failed)")
-                      << "  size=" << g_debugSourceRimChain.size()
-                      << "  (green dots, fetched live from"
-                      << " liverMesh3D->mVertices)" << std::endl;
-        }
+        // [key-reorg Phase 4] Shift+W (target boundary overlay) and plain W
+        // (source rim chain overlay) viz toggles moved to Ctrl+D > Viz tab
+        // ("Debug Target Boundary" / "Debug Source Rim Chain"). The W-family
+        // ACTION shortcuts (Ctrl+W, Ctrl+Shift+W, Alt+W, Ctrl+Alt+W) are kept
+        // above.
         break;
     case GLFW_KEY_P:
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_ALT)) {
@@ -2389,6 +2460,18 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseAutoSaveBeforeRegistration();
             runQuadCyclic();
             poseSaveToLibrary(SaveCriterion::RMSE);
+        } else if ((mods & GLFW_MOD_ALT) && !(mods & GLFW_MOD_CONTROL)
+                                         && !(mods & GLFW_MOD_SHIFT)) {
+            // [key-reorg Phase 9] Alt+P : Silhouette Align (was Shift+E).
+            // byte-identical to the old GLFW_KEY_E Shift branch. Placed after
+            // the Ctrl* branches and before Shift+P / Plain P (mod precedence).
+            std::cout << "[Alt+P] dispatching Silhouette Align..." << std::endl;
+            g_stepStartTime = std::chrono::steady_clock::now();
+            poseAutoSaveBeforeRegistration();
+            runShiftE();
+            g_sessionSilhouetteN++;
+            gUI.state.regMethod = 5;
+            poseSaveToLibrary(SaveCriterion::IOU);
         } else if (mods & GLFW_MOD_SHIFT) {
             // Shift+P: Cyclic Boundary Registration
             //  Key P と同じ前処理 (source silhouette + target boundary) を使うが、
@@ -2415,35 +2498,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseSaveToLibrary(SaveCriterion::RMSE);
         }
         break;
-    case GLFW_KEY_E:
-        if (mods & GLFW_MOD_SHIFT) {
-            // 元コード line 2854 (runShiftE 内冒頭) と line 3073-3075 の順序
-            // g_stepStartTime をリセットして各Shift+E呼出しごとの所要時間を記録
-            g_stepStartTime = std::chrono::steady_clock::now();
-            poseAutoSaveBeforeRegistration();
-            runShiftE();
-            g_sessionSilhouetteN++;
-            gUI.state.regMethod = 5;
-            poseSaveToLibrary(SaveCriterion::IOU);
-        }
-        break;
-    case GLFW_KEY_I:
-        // Shift+I : dump IoU debug bitmaps (hitmap, target mask, composite,
-        // boundary map) to DEPTH_OUTPUT_PATH.  Useful when registrationHandle
-        // .compIoU2D looks wrong: open the PNGs to see whether the right
-        // mask is being used and where the liver silhouette actually lands.
-        if ((mods & GLFW_MOD_SHIFT) && gApp.mode == AppMode::kRegistration) {
-            glm::mat4 silView = buildSilhouetteView();
-            glm::mat4 silProj = buildSilhouetteProj();
-            int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
-            int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
-            IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
-                           liverMesh3D, silView, silProj, silW, silH, /*step=*/8);
-        } else if (mods & GLFW_MOD_SHIFT) {
-            std::cout << "[Shift+I] requires Registration mode (run depth first)"
-                      << std::endl;
-        }
-        break;
+    // [key-reorg Phase 9] GLFW_KEY_E removed: Shift+E (Silhouette Align) -> Alt+P.
+    // [key-reorg Phase 4] GLFW_KEY_I removed: Shift+I (IoU debug dump) moved to
+    //   Ctrl+D > Viz tab "Dump IoU debug PNG" button.
     case GLFW_KEY_Q:
         // Pose Library ウィンドウ開閉
         g_poseLibrary.showWindow = !g_poseLibrary.showWindow;
@@ -2456,15 +2513,9 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseUndo();
         }
         break;
-    case GLFW_KEY_F2:
-        OrbitCam.resetToInitialState();
-        if (gApp.mode == AppMode::kRegistration) {
-            OrbitCam.rotation = glm::angleAxis(glm::radians(180.0f),
-                                               glm::vec3(0.0f, 1.0f, 0.0f));
-            OrbitCam.currentTarget = TARGET_TEXTURE;
-        }
-        std::cout << "Camera reset" << std::endl;
-        break;
+    // [key-reorg Phase 11] GLFW_KEY_F2 removed: camera reset via sidebar
+    //   "Cam Init" button (onResetCamera lambda is equivalent, incl. the
+    //   Registration-mode 180-deg Y rotation + currentTarget=TARGET_TEXTURE).
     case GLFW_KEY_A:
         gApp.arMode = !gApp.arMode;
         std::cout << "[AR] background overlay: "
@@ -2487,32 +2538,10 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         }
         break;
 
-    case GLFW_KEY_F9:
-        // V3RS Phase 2 diagnostic: toggle silhouette IoU overlay window.
-        // Window contents are filled by the per-Run + Final captures
-        // performed inside runBipopCmaesV3RS (RegistrationActions.h).
-        // Pattern mirrors GLFW_KEY_A (AR-mode toggle).
-        SilOverlay::g_silOverlay.showWindow =
-            !SilOverlay::g_silOverlay.showWindow;
-        std::cout << "[F9] V3RS silhouette overlay: "
-                  << (SilOverlay::g_silOverlay.showWindow ? "ON" : "OFF")
-                  << std::endl;
-        break;
-
-    case GLFW_KEY_F10:
-        // V3RS vertex-squash raster diagnostic (HANDOVER §5.2, Phase A).
-        // Measurement-only: rasterizes the quadrant-filtered liver
-        // silhouette at the CURRENT static pose with BOTH the hot-path
-        // triangle-bbox splat AND a plain vertex-squash 3x3, prints the
-        // [V3RS/vsq-diag] hole / write-count / edge-length comparison,
-        // and uploads both composites to the F9 overlay's Diagnostic
-        // slot. Does NOT run CMA-ES and does NOT touch the optimiser or
-        // the liver pose. Guards (mesh / labels / boundary map) live
-        // inside diagnoseVertexSquashV3RS. Quadrant filter uses the
-        // same g_activeQuadrantMask the Ctrl+Shift+G cost function does.
-        diagnoseVertexSquashV3RS(g_activeQuadrantMask);
-        break;
-
+    // [key-reorg Phase 11] GLFW_KEY_F9 / GLFW_KEY_F10 removed:
+    //   F9 (silhouette IoU overlay window) -> Ctrl+D > Viz tab checkbox
+    //     "Show Silhouette Overlay window".
+    //   F10 (vertex-squash diagnose) -> Ctrl+D > Viz tab button (added Phase 1).
     case GLFW_KEY_COMMA: {
         const float step = (mods & GLFW_MOD_SHIFT) ? 0.05f : 0.01f;
         g_silhouetteCosThreshold = std::max(0.0f,
@@ -2527,112 +2556,11 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
         rebuildOBJWithCurrentThreshold();
         break;
     }
-    case GLFW_KEY_R: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+R: 肝臓領域 (anterior/rim/posterior) の可視化トグル
-            //   赤=前面コア, 橙=ヘリ帯, 青=後面
-            //   初回 ON 時に自動計算 (~数百 ms)。
-            //   登録 (CMA-ES 等) で頂点が動いてもラベルは頂点 index に
-            //   紐づくので球マーカーは追従する。
-            g_showLiverRegion = !g_showLiverRegion;
-            if (g_showLiverRegion && !g_liverRegion.valid()) {
-                recomputeLiverRegion();
-            }
-            std::cout << "[Region] visualization: "
-                      << (g_showLiverRegion ? "ON" : "OFF")
-                      << "  available=" << (g_liverRegion.valid() ? "YES" : "NO")
-                      << std::endl;
-            break;
-        }
-        // Plain R: 既存の Run depth (image-only mode)
-        if (gApp.mode != AppMode::kImageOnly) {
-            std::cout << "[R] only valid in image-only mode" << std::endl;
-            break;
-        }
-        if (!gApp.image.loaded) {
-            std::cout << "[R] no image loaded" << std::endl;
-            break;
-        }
-        runDepthAndUpdateScene(gApp);
-        break;
-    }
-    case GLFW_KEY_T: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+T: 肝臓領域ラベルの再計算 (現在の g_rimTargetMm で)。
-            //   メッシュを差し替えた後や、rim 厚さを変えたいときに使う。
-            std::cout << "[Region] recomputing with target_rim_mm = "
-                      << g_rimTargetMm << std::endl;
-            recomputeLiverRegion();
-        }
-        break;
-    }
-    case GLFW_KEY_Y: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+Y: 肝臓左右ラベルの再計算 (現在の g_lrPureFrac, g_lrFullFrac で)。
-            //   メッシュを差し替えた後や、fraction を変えたいときに使う。
-            std::cout << "[LR] recomputing with right_pure_fraction = "
-                      << g_lrPureFrac << "  right_full_fraction = "
-                      << g_lrFullFrac << std::endl;
-            recomputeLiverLR();
-        } else {
-            // Y: 肝臓左右領域 (pure-R / boundary / pure-L) の可視化トグル。
-            //   緑=純右, 黄=境界, 紫=純左
-            //   初回 ON 時に自動計算 (~数百 ms)。
-            //   登録 (CMA-ES 等) で頂点が動いてもラベルは頂点 index に
-            //   紐づくので球マーカーは追従する。
-            g_showLiverLR = !g_showLiverLR;
-            if (g_showLiverLR && !g_liverLR.valid()) {
-                recomputeLiverLR();
-            }
-            std::cout << "[LR] visualization: "
-                      << (g_showLiverLR ? "ON" : "OFF")
-                      << "  available=" << (g_liverLR.valid() ? "YES" : "NO")
-                      << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_H: {
-        if (mods & GLFW_MOD_SHIFT) {
-            // Shift+H: 肝臓 cranial/caudal 可視化トグル (Phase 1)。
-            //   黄=CRANIAL(頭側), 青=CAUDAL(足側)
-            //   初回 ON 時に Shift+R / Y のラベルを必要なら自動計算 → v7 実行。
-            //   confidence < 5% で [WEAK] を std::cout に出力 (UI Flip は Phase 2 で検討)。
-            //   Phase 1 段階では registration には未統合 (可視化のみ)。
-            g_showLiverCC = !g_showLiverCC;
-            if (g_showLiverCC && !g_liverCC.valid()) {
-                recomputeLiverCC();
-            }
-            std::cout << "[CC] visualization: "
-                      << (g_showLiverCC ? "ON" : "OFF")
-                      << "  available=" << (g_liverCC.valid() ? "YES" : "NO");
-            if (g_liverCC.valid()) {
-                std::cout << "  confidence="
-                          << (g_liverCC.cc.confidence * 100.0f) << "%"
-                          << (g_liverCC.cc.weak ? " [WEAK]" : "");
-            }
-            std::cout << std::endl;
-            break;
-        }
-        // ---- plain H: 4象限可視化トグル (anterior/rim/posterior と pure_R/boundary/pure_L
-        //    の組合せを「重複所属」方式で 4 象限に分けて表示)。
-        //    緑=ant_right, 紫=ant_left, 青=pos_right, 橙=pos_left
-        //    初回 ON 時に Shift+R / Y のラベルを必要なら自動計算。
-        //    rim と boundary は重複所属するので、該当頂点は複数の球マーカーが重なる。
-        g_showLiverQuad = !g_showLiverQuad;
-        if (g_showLiverQuad && (g_quadVizIdxAR.empty() &&
-                                g_quadVizIdxAL.empty() &&
-                                g_quadVizIdxPR.empty() &&
-                                g_quadVizIdxPL.empty())) {
-            recomputeLiverQuad();
-        }
-        bool valid = !(g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
-                       g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty());
-        std::cout << "[Quad] visualization: "
-                  << (g_showLiverQuad ? "ON" : "OFF")
-                  << "  available=" << (valid ? "YES" : "NO")
-                  << std::endl;
-        break;
-    }
+    // [key-reorg Phase 10] GLFW_KEY_R removed: Run depth via sidebar "Run Depth" button.
+    // [key-reorg Phase 4] GLFW_KEY_T / GLFW_KEY_Y / GLFW_KEY_H removed:
+    //   Shift+T (region recompute), Shift+Y (LR recompute), Y (LR viz),
+    //   Shift+H (CC viz), H (4-quadrant viz) all moved to Ctrl+D > Viz tab
+    //   (checkboxes with auto-recompute + "Recompute Region/LR" buttons).
     case GLFW_KEY_U:
         if (gApp.mode == AppMode::kImageOnly) MaskPicker::undo(gApp);
         break;
@@ -2651,308 +2579,15 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             std::cout << "[VoxelSize] " << g_voxelSize << std::endl;
         }
         break;
-    case GLFW_KEY_K: {
-        // カメラから深度推定を実行
-        if (!gCamera.active) {
-            std::cout << "[K] Camera is not active. Starting camera..." << std::endl;
-            if (!gCamera.start()) {
-                std::cerr << "[K] Failed to start camera" << std::endl;
-                break;
-            }
-        }
-
-        std::cout << "[K] Running depth estimation from camera..." << std::endl;
-        if (runCameraDepthEstimation()) {
-            std::cout << "[K] Depth estimation completed successfully" << std::endl;
-            // 自動的にRegistrationモードに切り替え
-            if (gApp.mode != AppMode::kRegistration) {
-                gApp.mode = AppMode::kRegistration;
-                std::cout << "[K] Switched to Registration mode" << std::endl;
-            }
-        } else {
-            std::cerr << "[K] Depth estimation failed" << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_J: {
-        // カメラフレームをJPEGファイルとして保存
-        if (!gCamera.active) {
-            std::cerr << "[J] Camera is not active" << std::endl;
-            break;
-        }
-
-        std::string filename = gCamera.saveForDepthEstimation();
-        if (!filename.empty()) {
-            std::cout << "[J] Saved camera frame to: " << filename << std::endl;
-        } else {
-            std::cerr << "[J] Failed to save camera frame" << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_S: {
-        // カメラモードで静止画キャプチャ（Sキー = Snapshot）
-        if (gCamera.active && !gCamera.captured) {
-            gCamera.captureCurrentFrame();
-            gApp.image.path = "[Camera Captured]";
-            std::cout << "[S] Camera frame captured for mask selection" << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_L: {
-        // カメラモードでライブビューに戻る（Lキー = Live）
-        if (gCamera.active && gCamera.captured) {
-            gCamera.releaseCapture();
-            gApp.image.path = "[Camera Live]";
-            std::cout << "[L] Returned to camera live view" << std::endl;
-        }
-        break;
-    }
-    case GLFW_KEY_M: {
-        if (gApp.mode != AppMode::kRegistration) {
-            std::cout << "[M] only valid in Registration mode" << std::endl;
-            break;
-        }
-        std::filesystem::create_directories(REG_MODEL_PATH);
-
-        if (mods & GLFW_MOD_SHIFT) {
-            // -----------------------------------------------------------------
-            //  Shift+M (v4): cam-mm + (X flip + Z flip) STL export
-            //                (EchoLiver dataset 評価用、TRE 13.03 mm 達成版)
-            //
-            //  目的: registered organ mesh (cam frame, scene 単位) を
-            //        Adagolodjo の出力フォーマット (cam-mm OpenGL 規約) に
-            //        変換して出力する。
-            //
-            //  スケール復元方針 (CT 真値基準):
-            //    SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag
-            //
-            //  これは prealign + registration + 手合わせのどの段階で scale が
-            //  どう変わっても、最終 mesh の extent が CT 真値と一致するよう
-            //  正規化する。CT mm スケールは absolute 不変量なので、scale chain
-            //  を track する必要がなくなる (堅牢性が大きく上がる)。
-            //
-            //  liver を基準にしているのは tumor よりも 10 倍大きく
-            //  numerically stable なため。同じ scale 係数を全 organ に適用する
-            //  (uniform similarity transform 前提なので、全 organ で本来同じ値)。
-            //
-            //  3 つの変換 (v4 = X flip + Z flip + scale restore):
-            //    v_out.x = -SCALE_RESTORE * v_internal.x   ← X flip (mirrorMeshAndCloudX 戻し)
-            //    v_out.y = +SCALE_RESTORE * v_internal.y
-            //    v_out.z = -SCALE_RESTORE * v_internal.z   ← Z flip (OpenGL +Z back 規約)
-            //
-            //  X flip は mirrorMeshAndCloudX で screenMesh / targetCloud にだけ
-            //  入った内部 X 反転を最終出力で「戻す」目的 (organ はその反転を
-            //  受けていないが、処理空間が X 反転している状態で配置されている)。
-            //  これを入れないと TRE が ~60 mm 級まで悪化する (v3 の症状)。
-            //
-            //  X+Z 二重反射の合成は det (+1)(-1)(-1) = +1 で Y 軸まわり 180° 回転と
-            //  等価。triangle winding は保存されるので index swap は不要。
-            //  (v3 の Z-only 反転 det=-1 では winding 補正のため index swap が
-            //  必要だったが、v4 では除去)
-            //
-            //  Evaluation.m が読込時に y,z 反転 → cam OpenCV (LUS GT 比較フレーム)。
-            //
-            //  no-registration 状態で実行しても extent は CT 真値と一致する
-            //  (round-trip identity 維持)。
-            // -----------------------------------------------------------------
-            auto bboxDiag = [](const mCutMesh* m) -> float {
-                if (!m || m->mVertices.size() < 3) return 0.0f;
-                glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
-                for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
-                    glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
-                    mn = glm::min(mn, v);
-                    mx = glm::max(mx, v);
-                }
-                return glm::length(mx - mn);
-            };
-
-            float SCALE_RESTORE = 1.0f;
-            if (g_hasOriginalDiags && liverMesh3D) {
-                float current_liver_diag = bboxDiag(liverMesh3D);
-                if (current_liver_diag < 1e-9f) {
-                    std::cerr << "[Shift+M] current liver diag near zero -- using 1.0 fallback"
-                              << std::endl;
-                } else {
-                    SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag;
-                }
-            } else {
-                std::cerr << "[Shift+M] WARNING: original CT diagonals not captured at startup; "
-                             "using 1.0 (output will likely be in wrong scale)" << std::endl;
-            }
-            std::cout << "[Shift+M] g_originalLiverDiagMm=" << g_originalLiverDiagMm
-                      << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
-                      << "  SCALE_RESTORE=" << SCALE_RESTORE
-                      << "  (CT-truth based, X+Z flip)" << std::endl;
-
-            auto exportCamMmStl =
-                [&](const mCutMesh* src, const std::string& outPath, const char* label) {
-                    if (!src || src->mVertices.empty()) {
-                        std::cout << "[Shift+M] Skip " << label << " (mesh empty)" << std::endl;
-                        return;
-                    }
-                    mCutMesh out = *src;
-                    for (size_t i = 0; i + 2 < out.mVertices.size(); i += 3) {
-                        out.mVertices[i  ] = -out.mVertices[i  ] * SCALE_RESTORE;  // X flip (mirrorMeshAndCloudX 戻し)
-                        out.mVertices[i+1] =  out.mVertices[i+1] * SCALE_RESTORE;  // Y keep
-                        out.mVertices[i+2] = -out.mVertices[i+2] * SCALE_RESTORE;  // Z flip (OpenGL +Z back)
-                    }
-                    // X+Z 二重反射: det = (-1)*(+1)*(-1) = +1 → Y 軸まわり 180° 回転と等価。
-                    // triangle winding は保存されるので index swap 不要。
-                    out.exportStlFile(outPath);
-                    Reg3DCustom::printMeshBBox(out, label);
-                };
-
-            exportCamMmStl(tumorMesh3D, REG_MODEL_PATH + "tumor_cam_mm.stl",
-                           "tumor_cam_mm (Adagolodjo-format)");
-            exportCamMmStl(liverMesh3D, REG_MODEL_PATH + "liver_cam_mm.stl",
-                           "liver_cam_mm (Adagolodjo-format)");
-
-            std::cout << "[Shift+M] Exported tumor/liver STL in cam-mm (Adagolodjo format)"
-                      << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
-
-            // -----------------------------------------------------------------
-            //  Snapshot: 再現性のため Run Depth 入力一式 + 出力 STL を
-            //            REG_MODEL_PATH/snapshot_YYYYMMDD_HHMMSS/ にコピー
-            //
-            //  動機: depth_output/ は次の Run Depth で上書きされるため、
-            //        この時点で評価につながる入力 (OBJ/intrinsics/mask 等) を
-            //        まとめて保管しておかないと再現できない。
-            //
-            //  方針: STL 出力に成功してもしなくても可能な範囲で保存し、
-            //        snapshot 作成自体が失敗しても STL は既に保存済みなので
-            //        ログのみ出して継続する (best-effort)。
-            // -----------------------------------------------------------------
-            try {
-                // intrinsics タグの自動判別 (Run Depth と同じロジック)
-                std::string srcTag = "k4a";
-                if      (g_intrinsicsSource == 2) srcTag = "custom";
-                else if (g_intrinsicsSource == 3) srcTag = "calib";
-
-                // timestamp YYYYMMDD_HHMMSS
-                auto now = std::chrono::system_clock::now();
-                std::time_t t = std::chrono::system_clock::to_time_t(now);
-                std::tm tmLocal{};
-#ifdef _WIN32
-                localtime_s(&tmLocal, &t);
-#else
-                localtime_r(&t, &tmLocal);
-#endif
-                char tsBuf[32];
-                std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmLocal);
-
-                std::string snapDir = REG_MODEL_PATH + "snapshot_" + tsBuf + "/";
-                std::filesystem::create_directories(snapDir);
-
-                // コピー候補一覧 (存在しないものはスキップ、害なし)
-                const std::vector<std::string> srcFiles = {
-                    // registration target cloud (主役)
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
-                    // full cloud (board display 用)
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
-                    DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
-                    // camera K と入力画像/マスク
-                    DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
-                    DEPTH_OUTPUT_PATH + "original_rectified.jpg",
-                    DEPTH_OUTPUT_PATH + "segmentation_mask.png",
-                    DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
-                    DEPTH_OUTPUT_PATH + "texture.png",
-                    // 直前に出した STL も同梱
-                    REG_MODEL_PATH + "tumor_cam_mm.stl",
-                    REG_MODEL_PATH + "liver_cam_mm.stl",
-                };
-
-                int copiedCount = 0;
-                int missingCount = 0;
-                std::vector<std::string> missing;
-                for (const auto& src : srcFiles) {
-                    std::filesystem::path srcPath(src);
-                    if (!std::filesystem::exists(srcPath)) {
-                        ++missingCount;
-                        missing.push_back(srcPath.filename().string());
-                        continue;
-                    }
-                    std::filesystem::path dstPath =
-                        std::filesystem::path(snapDir) / srcPath.filename();
-                    try {
-                        std::filesystem::copy_file(
-                            srcPath, dstPath,
-                            std::filesystem::copy_options::overwrite_existing);
-                        ++copiedCount;
-                    } catch (const std::exception& e) {
-                        std::cerr << "[Shift+M] copy failed: " << src
-                                  << " -> " << dstPath
-                                  << " : " << e.what() << std::endl;
-                    }
-                }
-
-                // README.txt (メタ情報 + 復元手順)
-                {
-                    std::ofstream readme(snapDir + "README.txt");
-                    if (readme.is_open()) {
-                        readme << "Snapshot created: " << tsBuf << "\n"
-                               << "Intrinsics tag (g_intrinsicsSource="
-                               << g_intrinsicsSource << "): " << srcTag << "\n"
-                               << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
-                               << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
-                               << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
-                               << "\n"
-                               << "Source paths at capture time:\n"
-                               << "  DEPTH_OUTPUT_PATH = " << DEPTH_OUTPUT_PATH << "\n"
-                               << "  REG_MODEL_PATH    = " << REG_MODEL_PATH << "\n"
-                               << "\n"
-                               << "Restore example (bash):\n"
-                               << "  SNAP=\"" << snapDir << "\"\n"
-                               << "  DEST=\"" << DEPTH_OUTPUT_PATH << "\"\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_masked_" << srcTag << ".obj        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_masked_" << srcTag << ".mtl        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_full_"   << srcTag << "_light.obj  \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/pc_metric_pinhole_full_"   << srcTag << "_light.mtl  \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/intrinsics_"               << srcTag << ".txt        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/original_rectified.jpg                  \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/segmentation_mask.png                   \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/instrument_segmentation_mask.png        \"$DEST\"/\n"
-                               << "  cp \"$SNAP\"/texture.png                             \"$DEST\"/\n"
-                               << "  # GUI 起動 -> 自動的に最新 OBJ を再ロード\n"
-                               << "\n"
-                               << "STL outputs (already saved directly to REG_MODEL_PATH):\n"
-                               << "  tumor_cam_mm.stl\n"
-                               << "  liver_cam_mm.stl\n";
-                        readme.close();
-                        ++copiedCount;
-                    }
-                }
-
-                std::cout << "[Shift+M] Snapshot saved: " << snapDir
-                          << "  (" << copiedCount << " files copied, "
-                          << missingCount << " missing)" << std::endl;
-                if (missingCount > 0) {
-                    std::cout << "[Shift+M] Missing in snapshot (skipped):";
-                    for (const auto& m : missing) {
-                        std::cout << "\n  - " << m;
-                    }
-                    std::cout << std::endl;
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "[Shift+M] Snapshot creation failed: " << e.what()
-                          << "  (STL export was successful, only snapshot failed)"
-                          << std::endl;
-            }
-        } else {
-            if (liverMesh3D)   liverMesh3D->exportObjFile(Reg_TARGET_FILE_PATH);
-            if (portalMesh3D)  portalMesh3D->exportObjFile(Reg_PORTAL_FILE_PATH);
-            if (veinMesh3D)    veinMesh3D->exportObjFile(Reg_VEIN_FILE_PATH);
-            if (tumorMesh3D)   tumorMesh3D->exportObjFile(Reg_TUMOR_FILE_PATH);
-            if (segmentMesh3D) segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
-            if (gbMesh3D)      gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
-            std::cout << "[M] Registered OBJs exported to " << REG_MODEL_PATH << std::endl;
-        }
-        break;
-    }
+    // [key-reorg Phase 10] GLFW_KEY_K removed: camera depth via sidebar
+    //   "Run Depth" button (camera mode uses the same button).
+    // [key-reorg Phase 12] GLFW_KEY_J removed: camera_frame_temp.jpg is written
+    //   automatically by "Run Depth" (camera mode); standalone save not needed.
+    // [key-reorg Phase 10] GLFW_KEY_S / GLFW_KEY_L removed: snapshot / live-view
+    //   handled by the sidebar camera toggle ("Capture" / "Re-Capture").
+    // [key-reorg Phase 12] GLFW_KEY_M removed: OBJ/STL export moved to the
+    //   sidebar Export buttons (StlExport::exportRegisteredObjs /
+    //   exportCamMmStlWithSnapshot, wired via onExportStl / onExportStlFlipped).
     }
 }
 
@@ -6461,9 +6096,9 @@ int main() {
             ImGui::Separator();
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Other markers:");
-            ImGui::Checkbox("Boundary candidates (B key)##viz_b",
+            ImGui::Checkbox("Boundary candidates (was B)##viz_b",
                             &g_showBoundaryCandidates);
-            ImGui::Checkbox("Source visualization (N key)##viz_n",
+            ImGui::Checkbox("Source visualization (was N)##viz_n",
                             &g_showSourceVisualization);
 
             ImGui::Spacing();
@@ -6502,6 +6137,104 @@ int main() {
                     ImGui::Text("|err| = %.4f m  (%.1f mm)", d, d * 1000.0f);
                 }
             }
+
+            // ---- [Phase 1] viz toggles migrated from keyboard ---------------
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                               "Visualization toggles (formerly keyboard):");
+
+            // [Phase 5.5] Cluster viz (was V) already exists above as
+            // drawTabViz's "Cluster markers" (onToggleClusterVis). Duplicate
+            // checkbox removed to avoid two toggles for the same global.
+
+            // B key family (cyclic correspondence: pure toggle; needs Shift+P
+            // to have run first to have pairs to show).
+            ImGui::Checkbox("Cyclic Correspondence - Shift+P pairs (was Shift+B)##viz_cyclic",
+                            &g_showCyclicCorrespondence);
+
+            // W key family — enabling must POPULATE the overlay data (mirror the
+            // old plain-W / Shift+W keys), otherwise the flag is on but nothing
+            // is drawn. On populate failure the toggle is reverted.
+            if (ImGui::Checkbox("Debug Source Rim Chain - green dots (was W)##viz_rim_src",
+                                &g_showDebugSourceRimChain)) {
+                if (g_showDebugSourceRimChain) {
+                    if (!g_liverRegion.valid()) recomputeLiverRegion();
+                    if (!g_liverLR.valid())     recomputeLiverLR();
+                    if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) recomputeLiverCC();
+                    if (!populateDebugSourceRimChain()) g_showDebugSourceRimChain = false;
+                }
+            }
+            if (ImGui::Checkbox("Debug Target Boundary - purple dots (was Shift+W)##viz_rim_tgt",
+                                &g_showDebugTargetBoundary)) {
+                if (g_showDebugTargetBoundary) {
+                    if (!populateDebugTargetBoundary()) g_showDebugTargetBoundary = false;
+                }
+            }
+
+            // Liver label viz
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Liver labels:");
+            if (ImGui::Checkbox("Liver Region (anterior/rim/posterior) - was Shift+R##viz_region",
+                                &g_showLiverRegion)) {
+                if (g_showLiverRegion && !g_liverRegion.valid()) recomputeLiverRegion();
+            }
+            if (ImGui::Checkbox("Liver Left/Right - was Y##viz_lr",
+                                &g_showLiverLR)) {
+                if (g_showLiverLR && !g_liverLR.valid()) recomputeLiverLR();
+            }
+            if (ImGui::Checkbox("Liver Cranio/Caudal - was Shift+H##viz_cc",
+                                &g_showLiverCC)) {
+                if (g_showLiverCC && !g_liverCC.valid()) recomputeLiverCC();
+            }
+            if (ImGui::Checkbox("Liver 4-Quadrant overlay - was H##viz_quad",
+                                &g_showLiverQuad)) {
+                if (g_showLiverQuad &&
+                    g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
+                    g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty()) {
+                    recomputeLiverQuad();
+                }
+            }
+
+            // Recompute buttons (formerly Shift+T / Shift+Y)
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Recompute labels:");
+            if (ImGui::Button("Recompute Region  (was Shift+T)##btn_recompute_region")) {
+                std::cout << "[Region] recomputing with target_rim_mm = "
+                          << g_rimTargetMm << std::endl;
+                recomputeLiverRegion();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Recompute LR  (was Shift+Y)##btn_recompute_lr")) {
+                std::cout << "[LR] recomputing  right_pure_fraction = "
+                          << g_lrPureFrac << "  right_full_fraction = "
+                          << g_lrFullFrac << std::endl;
+                recomputeLiverLR();
+            }
+
+            // Debug dumps (formerly Shift+I / F10)
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Debug dumps:");
+            if (ImGui::Button("Dump IoU debug PNG  (was Shift+I)##btn_iou_dump")) {
+                if (gApp.mode == AppMode::kRegistration) {
+                    glm::mat4 silView = buildSilhouetteView();
+                    glm::mat4 silProj = buildSilhouetteProj();
+                    int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+                    int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+                    IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
+                                   liverMesh3D, silView, silProj, silW, silH, 8);
+                } else {
+                    std::cout << "[IoU dump] requires Registration mode" << std::endl;
+                }
+            }
+            if (ImGui::Button("Vertex-Squash diagnose  (was F10)##btn_vsq_diag")) {
+                diagnoseVertexSquashV3RS(g_activeQuadrantMask);
+            }
+            // [key-reorg Phase 11] F9 -> checkbox for the Silhouette IoU window.
+            ImGui::Checkbox("Show Silhouette Overlay window  (was F9)##viz_sil_overlay",
+                            &SilOverlay::g_silOverlay.showWindow);
+            // ---- end Phase 1 migration -------------------------------------
         };  // end g_debugPanel.drawVizExtra (migrated ScreenMesh Display + B/N viz)
 
         // Consolidated Debug Panel (Ctrl+D). Same registration / non-Umeyama
@@ -9551,6 +9284,10 @@ static void setupUICallbacks() {
             OrbitCam.currentTarget = TARGET_TEXTURE;
         }
     };
+
+    // [key-reorg Phase 12] Export buttons (were M / Shift+M keys).
+    a.onExportStl        = []() { StlExport::exportRegisteredObjs(); };
+    a.onExportStlFlipped = []() { StlExport::exportCamMmStlWithSnapshot(); };
 
     a.onToggleClusterVis = []() {
         g_showClusterVisualization = !g_showClusterVisualization;
