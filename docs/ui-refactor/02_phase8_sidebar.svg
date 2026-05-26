@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 720" font-family="system-ui, sans-serif">
+  <rect width="900" height="720" fill="#1a1c22"/>
+  <text x="20" y="28" fill="#e8eaed" font-size="16" font-weight="600">Phase 8 — Main sidebar BEFORE / AFTER</text>
+  <text x="20" y="48" fill="#9aa0a6" font-size="11">drawRegistrationSection rewrite. 約 370 行 → 約 250 行。15 callback すべて保持。</text>
+
+  <g transform="translate(20, 80)">
+    <text x="0" y="-8" fill="#9aa0a6" font-size="11" font-weight="500">BEFORE (現状 = Phase 0+2 適用済)</text>
+    <rect width="400" height="600" fill="#11131a" stroke="#3d4148" rx="2"/>
+    <rect width="400" height="36" fill="#0d0e14"/>
+    <text x="200" y="22" fill="#9aa0a6" font-size="10" text-anchor="middle">① Depth ── ② Registration ── ③ Deform</text>
+    <line x1="0" y1="36" x2="400" y2="36" stroke="#3d4148"/>
+    <rect y="36" width="400" height="24" fill="#0d0e14"/>
+    <text x="14" y="52" fill="#9aa0a6" font-size="10">▸ DEPTH GENERATION  [done]</text>
+    <line x1="0" y1="60" x2="400" y2="60" stroke="#3d4148"/>
+    <rect y="60" width="400" height="24" fill="#1a0f04"/>
+    <text x="14" y="76" fill="#f08e30" font-size="10" font-weight="500">▾ REGISTRATION</text>
+
+    <g transform="translate(8, 92)">
+      <rect width="384" height="200" fill="#0a1118" rx="2"/>
+      <text x="10" y="14" fill="#7388a8" font-size="9">INITIAL ORIENTATION (子 window — 常時展開)</text>
+      <text x="10" y="32" fill="#909aaa" font-size="8">ANATOMICAL AXES + POSITION 2x2 + Quick Presets + ORIENTATION</text>
+      <text x="10" y="46" fill="#909aaa" font-size="8">+ Apply Init Pose ボタン (全部 inline)</text>
+      <text x="10" y="100" fill="#7388a8" font-size="8" text-anchor="start">...縦に 200px 占有...</text>
+    </g>
+
+    <g transform="translate(8, 300)">
+      <rect width="256" height="22" fill="#3b2412" rx="2"/>
+      <text x="128" y="15" fill="#f5b078" font-size="9" text-anchor="middle">Hemi Auto  v:0.50</text>
+      <rect x="260" width="124" height="22" fill="#3b2412" rx="2"/>
+      <text x="322" y="15" fill="#f5b078" font-size="9" text-anchor="middle">AutoProbe</text>
+    </g>
+
+    <g transform="translate(8, 326)">
+      <rect width="256" height="22" fill="#3b2412" rx="2"/>
+      <text x="128" y="15" fill="#f5b078" font-size="9" text-anchor="middle">AutoQCR  6-DoF</text>
+      <rect x="260" width="124" height="22" fill="#11151e" rx="2"/>
+      <text x="322" y="15" fill="#cdd0d6" font-size="9" text-anchor="middle">☑ 6-DoF</text>
+    </g>
+
+    <rect x="8" y="352" width="384" height="14" fill="#11151e" rx="2"/>
+    <text x="14" y="362" fill="#7388a8" font-size="9">▸ QCR Tuning  (Shift+Ctrl+P / AutoQCR)</text>
+
+    <g transform="translate(8, 370)">
+      <rect width="256" height="24" fill="#3b2412" rx="2"/>
+      <text x="128" y="16" fill="#f5b078" font-size="9" text-anchor="middle">Ctrl+G  V3-R  [Refine]</text>
+      <rect x="260" width="124" height="24" fill="#11151e" rx="2"/>
+      <text x="322" y="16" fill="#cdd0d6" font-size="9" text-anchor="middle">☐ 6-DoF</text>
+    </g>
+
+    <rect x="8" y="398" width="384" height="16" fill="#11151e" rx="2"/>
+    <text x="200" y="409" fill="#cdd0d6" font-size="9" text-anchor="middle">Umeyama Manual</text>
+
+    <g transform="translate(8, 418)">
+      <rect width="190" height="14" fill="#11151e"/>
+      <text x="95" y="10" fill="#cdd0d6" font-size="9" text-anchor="middle">Pose Library</text>
+      <rect x="194" width="190" height="14" fill="#11151e"/>
+      <text x="289" y="10" fill="#cdd0d6" font-size="9" text-anchor="middle">Undo</text>
+    </g>
+
+    <rect x="8" y="436" width="384" height="14" fill="#2a0e0e" rx="2"/>
+    <text x="200" y="446" fill="#e85555" font-size="9" text-anchor="middle">Reset Reg  (full width, Phase 0 適用済)</text>
+
+    <rect x="8" y="454" width="384" height="14" fill="#11151e" rx="2"/>
+    <text x="14" y="464" fill="#7388a8" font-size="9">▸ Advanced</text>
+
+    <g transform="translate(8, 476)">
+      <rect width="190" height="16" fill="#1a2a1a"/>
+      <text x="95" y="11" fill="#9fd07a" font-size="9" text-anchor="middle">Proceed Deform &gt;&gt;</text>
+      <rect x="194" width="190" height="16" fill="#0e2128"/>
+      <text x="289" y="11" fill="#7ec0d0" font-size="9" text-anchor="middle">&lt;&lt; Back Depth</text>
+    </g>
+
+    <line x1="0" y1="502" x2="400" y2="502" stroke="#3d4148"/>
+    <text x="14" y="518" fill="#9aa0a6" font-size="10">▸ DEFORM</text>
+
+    <text x="14" y="560" fill="#909aaa" font-size="9" font-style="italic">= 12 段 (INITIAL ORIENTATION ブロック含)</text>
+    <text x="14" y="574" fill="#909aaa" font-size="9" font-style="italic">= drawRegistrationSection 約 370 行</text>
+  </g>
+
+  <g transform="translate(460, 80)">
+    <text x="0" y="-8" fill="#9fd07a" font-size="11" font-weight="500">AFTER (Phase 8 適用後 = 目標)</text>
+    <rect width="400" height="600" fill="#11131a" stroke="#3d4148" rx="2"/>
+    <rect width="400" height="36" fill="#0d0e14"/>
+    <text x="200" y="22" fill="#9aa0a6" font-size="10" text-anchor="middle">① Depth ── ② Registration ── ③ Deform</text>
+    <line x1="0" y1="36" x2="400" y2="36" stroke="#3d4148"/>
+    <rect y="36" width="400" height="24" fill="#0d0e14"/>
+    <text x="14" y="52" fill="#9aa0a6" font-size="10">▸ DEPTH GENERATION  [done]</text>
+    <line x1="0" y1="60" x2="400" y2="60" stroke="#3d4148"/>
+    <rect y="60" width="400" height="24" fill="#1a0f04"/>
+    <text x="14" y="76" fill="#f08e30" font-size="10" font-weight="500">▾ REGISTRATION</text>
+
+    <rect x="8" y="92" width="384" height="18" fill="#0a1118" rx="2"/>
+    <text x="14" y="105" fill="#7388a8" font-size="10">▸ INITIAL ORIENTATION  [Q:ALL | Base]</text>
+
+    <rect x="8" y="116" width="384" height="28" fill="#1a4480" rx="3"/>
+    <text x="200" y="134" fill="#dde6f5" font-size="12" text-anchor="middle" font-weight="500">Apply Init Pose</text>
+
+    <g transform="translate(8, 152)">
+      <rect width="256" height="28" fill="#3b2412" rx="2"/>
+      <text x="128" y="18" fill="#f5b078" font-size="10" text-anchor="middle">Hemi Quad (Shift+O)</text>
+      <rect x="260" width="124" height="28" fill="#3b2412" rx="2"/>
+      <text x="322" y="18" fill="#f5b078" font-size="10" text-anchor="middle">Probe</text>
+    </g>
+
+    <g transform="translate(8, 186)">
+      <rect width="256" height="28" fill="#3b2412" rx="2"/>
+      <text x="128" y="18" fill="#f5b078" font-size="10" text-anchor="middle">AutoQCR</text>
+      <rect x="260" width="124" height="28" fill="#11151e" rx="2"/>
+      <text x="322" y="18" fill="#7388a8" font-size="10" text-anchor="middle">▸ QCR Tuning</text>
+    </g>
+
+    <g transform="translate(8, 220)">
+      <rect width="256" height="32" fill="#3b2412" rx="2"/>
+      <text x="128" y="20" fill="#f5b078" font-size="12" text-anchor="middle" font-weight="500">Ctrl+G</text>
+      <rect x="260" width="124" height="32" fill="#11151e" rx="2"/>
+      <text x="322" y="20" fill="#7388a8" font-size="10" text-anchor="middle">▸ Advanced</text>
+    </g>
+
+    <rect x="8" y="258" width="384" height="22" fill="#11151e" rx="2"/>
+    <text x="200" y="272" fill="#cdd0d6" font-size="11" text-anchor="middle">Umeyama Manual</text>
+
+    <g transform="translate(8, 286)">
+      <rect width="190" height="22" fill="#11151e" rx="2"/>
+      <text x="95" y="15" fill="#cdd0d6" font-size="10" text-anchor="middle">Pose Library (3)</text>
+      <rect x="194" width="190" height="22" fill="#11151e" rx="2"/>
+      <text x="289" y="15" fill="#cdd0d6" font-size="10" text-anchor="middle">Pose Undo</text>
+    </g>
+
+    <g transform="translate(8, 314)">
+      <rect width="125" height="22" fill="#1a2a1a" rx="2"/>
+      <text x="62" y="15" fill="#9fd07a" font-size="10" text-anchor="middle">Deform &gt;&gt;</text>
+      <rect x="129" width="125" height="22" fill="#0e2128" rx="2"/>
+      <text x="191" y="15" fill="#7ec0d0" font-size="10" text-anchor="middle">&lt;&lt; Depth</text>
+      <rect x="258" width="126" height="22" fill="#2a0e0e" rx="2"/>
+      <text x="321" y="15" fill="#e85555" font-size="10" text-anchor="middle">Reset</text>
+    </g>
+
+    <line x1="0" y1="350" x2="400" y2="350" stroke="#3d4148"/>
+    <text x="14" y="366" fill="#9aa0a6" font-size="10">▸ DEFORM</text>
+
+    <text x="14" y="420" fill="#9fd07a" font-size="10" font-weight="500">改善ポイント:</text>
+    <text x="14" y="438" fill="#cdd0d6" font-size="10">• 8 段 (INITIAL ORIENTATION 折りたたみ済)</text>
+    <text x="14" y="454" fill="#cdd0d6" font-size="10">• Apply Init Pose が主動線として目立つ</text>
+    <text x="14" y="470" fill="#cdd0d6" font-size="10">• 6-DoF checkbox 撤去 → 右側「▸ Tuning」 で集約</text>
+    <text x="14" y="486" fill="#cdd0d6" font-size="10">• Hemi Quad (Shift+O) に改名 + 改良版に切替</text>
+    <text x="14" y="502" fill="#cdd0d6" font-size="10">• フッター 3 列 (Deform / Depth / Reset) で統一</text>
+    <text x="14" y="518" fill="#cdd0d6" font-size="10">• Pose Library に件数バッジ (3 entries 表示)</text>
+    <text x="14" y="540" fill="#909aaa" font-size="9" font-style="italic">= drawRegistrationSection 約 250 行 (-32%)</text>
+  </g>
+
+  <g transform="translate(20, 700)">
+    <text x="0" y="0" fill="#9aa0a6" font-size="10">※ INITIAL ORIENTATION の中身 (anat axes / position grid / orientation / quick presets) は drawInitOrientationPanel 内で完全保持。CollapsingHeader でラップするだけ。</text>
+  </g>
+</svg>
