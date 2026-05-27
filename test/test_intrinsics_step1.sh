@@ -4,21 +4,22 @@
 #  ---------------------------------------------------------------------------
 #  INTRINSICS Step 1 (DeformPipeline.h: K4A 720p ハードコード除去) の CLI 自動検証。
 #
-#  検証対象: deform/src/DeformPipeline.h が depth_output/intrinsics_k4a.txt から
-#  カメラ内部パラメータ K を読み、board UV を K から計算していること。
-#  GUI/OpenGL なしで lsn_deform --dry-run を使って確認する。
+#  検証対象: deform/src/DeformPipeline.h が canonical depth_output/intrinsics.txt
+#  (Phase 4 で primary、legacy intrinsics_k4a.txt は fallback) から K を読み、
+#  board UV を K から計算していること。GUI/OpenGL なし lsn_deform --dry-run で確認。
 #
 #  Tests:
 #    A. ハードコード残渣 grep (918.234 等が DeformPipeline.h に無いこと)
 #    B. lsn_deform のビルドが成功すること (exit 0)
-#    C. 720p の K を書き、--dry-run で "deformK fx=918" がログに出ること
-#    D. 1080p の K を書き、--dry-run で "deformK fx=1377" がログに出ること
+#    C. 720p の K を intrinsics.txt に書き、"deformK fx=918" がログに出ること
+#    D. 1080p の K を intrinsics.txt に書き、"deformK fx=1377" がログに出ること
 #    E. K を変えると board UV 範囲が変わること (= K が UV 計算に効いている)
-#    F. intrinsics_k4a.txt が無効/欠損だと fallback ログが出ること
+#    F. intrinsics.txt も intrinsics_k4a.txt も無い -> K4A 720p hardcode fallback
+#    G. intrinsics.txt 無し + intrinsics_k4a.txt 有り -> legacy fallback (fx=918 + warn)
 #
 #  使い方:  bash test/test_intrinsics_step1.sh
-#  既存の depth_output/intrinsics_k4a.txt は冒頭でバックアップし、終了時(成否問わず)
-#  に必ず復元する (trap)。テストで壊さない。
+#  depth_output/intrinsics.txt と intrinsics_k4a.txt を冒頭でバックアップし、終了時
+#  (成否問わず) に必ず元の状態へ復元する (trap)。テストで壊さない。
 # =============================================================================
 set -u
 
@@ -28,7 +29,10 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
 DEFORM_H="$ROOT/deform/src/DeformPipeline.h"
-INTR="$ROOT/depth_output/intrinsics_k4a.txt"
+# obj-migration Phase 4: DEFORM now loads the canonical intrinsics.txt first
+# (legacy intrinsics_k4a.txt is only a fallback). Tests write the canonical file.
+INTR="$ROOT/depth_output/intrinsics.txt"
+INTR_K4A="$ROOT/depth_output/intrinsics_k4a.txt"
 BIN="$ROOT/build/bin/lsn_deform"
 BUILD_DIR="$ROOT/build"
 
@@ -40,24 +44,19 @@ ok()   { echo "  [PASS] $1"; PASS=$((PASS+1)); }
 ng()   { echo "  [FAIL] $1 :: $2"; FAIL=$((FAIL+1)); FAILED_TESTS+=("$1"); }
 hr()   { echo "-----------------------------------------------------------------"; }
 
-# --- intrinsics_k4a.txt のバックアップ / 復元 -------------------------------------
-BACKUP=""
-HAD_INTR=0
-if [[ -f "$INTR" ]]; then
-    HAD_INTR=1
-    BACKUP="$(mktemp)"
-    cp "$INTR" "$BACKUP"
-fi
+# --- intrinsics.txt + intrinsics_k4a.txt のバックアップ / 復元 --------------------
+BK_DIR="$(mktemp -d)"
+declare -A HAD
+for f in "$INTR" "$INTR_K4A"; do
+    if [[ -f "$f" ]]; then HAD["$f"]=1; cp "$f" "$BK_DIR/$(basename "$f")"; else HAD["$f"]=0; fi
+done
 restore_intrinsics() {
-    if [[ "$HAD_INTR" -eq 1 && -n "$BACKUP" && -f "$BACKUP" ]]; then
-        cp "$BACKUP" "$INTR"
-        rm -f "$BACKUP"
-        echo "[cleanup] depth_output/intrinsics_k4a.txt を復元しました"
-    elif [[ "$HAD_INTR" -eq 0 ]]; then
-        # テスト前に存在しなかった -> テストが作ったものを削除して元の状態へ
-        rm -f "$INTR"
-        echo "[cleanup] (元から無かったため) intrinsics_k4a.txt を削除しました"
-    fi
+    for f in "$INTR" "$INTR_K4A"; do
+        if [[ "${HAD[$f]}" -eq 1 ]]; then cp "$BK_DIR/$(basename "$f")" "$f";
+        else rm -f "$f"; fi
+    done
+    rm -rf "$BK_DIR"
+    echo "[cleanup] intrinsics.txt / intrinsics_k4a.txt を元の状態に復元しました"
 }
 trap restore_intrinsics EXIT
 
@@ -194,9 +193,9 @@ else
 fi
 
 # === Test F: fallback ==========================================================
-hr; echo "Test F: intrinsics 無効/欠損 -> fallback"
-# fx 等を 0 にして valid() を失敗させる
-printf 'fx 0\nfy 0\ncx 0\ncy 0\nwidth 0\nheight 0\n' > "$INTR"
+hr; echo "Test F: canonical & legacy 両方 欠損 -> K4A 720p hardcode fallback"
+# canonical-first なので、両方とも無い状態でハードコード fallback を確認する。
+rm -f "$INTR" "$INTR_K4A"
 LOG_F="$(run_dry_run)"
 FALLBACK_LINE="$(echo "$LOG_F" | grep -iE 'fallback|default|k4a_color_720p|missing|invalid' | head -n1)"
 echo "  log: $FALLBACK_LINE"
@@ -204,6 +203,18 @@ if echo "$LOG_F" | grep -qiE 'fallback|default|k4a_color_720p'; then
     ok "F"
 else
     ng "F" "fallback/default を示すログが無い"
+fi
+
+# === Test G: legacy _k4a fallback (canonical 無し, _k4a 有り) ===================
+hr; echo "Test G: intrinsics.txt 無し + intrinsics_k4a.txt(720p) -> legacy fallback で fx=918"
+rm -f "$INTR"
+printf 'fx 918.234\nfy 918.112\ncx 640.152\ncy 366.447\nwidth 1280\nheight 720\n' > "$INTR_K4A"
+LOG_G="$(run_dry_run)"
+echo "  $(echo "$LOG_G" | grep -E '\[DryRun\] deformK' | head -n1)"
+if echo "$LOG_G" | grep -qE 'deformK fx=918' && echo "$LOG_G" | grep -qiE 'legacy|intrinsics_k4a'; then
+    ok "G (legacy _k4a fallback works + warns)"
+else
+    ng "G" "legacy _k4a fallback で fx=918 + warn が出ていない"
 fi
 
 # === サマリ =====================================================================

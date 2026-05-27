@@ -107,7 +107,7 @@ FINAL doc §2.2/§6.1 は「image_utils は std のみ依存の自己完結ヘ�
 - [x] Phase 3: depth_metric.bin/intrinsics_da3.txt + DepthToObjExport + REG フック A/B/C → `[obj-migration p3]`
 - [ ] 🛑 停止 → GPU で Run Depth 検証（ユーザー）= 現在地
 - [ ] (task) depth_to_obj_tool 追加（低優先・Phase 2 後）
-- [ ] Phase 4: DEFORM カノニカル名 + _k4a フォールバック
+- [x] Phase 4: DEFORM カノニカル名 + _k4a フォールバック（4箇所 + test 更新）→ `[obj-migration p4]`
 - [ ] Phase 5: sam2 から OBJ/round-trip K/texture 削除（DA3 推定出力 intrinsics_da3.txt は KEEP）
 - [ ] Phase 6: ドキュメント + クリーン再生成テスト
 
