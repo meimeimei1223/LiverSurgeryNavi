@@ -9238,6 +9238,22 @@ static void syncUIState() {
         s.presetList.push_back(std::move(e));
     }
 
+    // Reconstruct-from-BIN slot mirror (FEATURE Task 5).
+    {
+        auto cp = [](RegUIState::ReconSlot& d, const ReconstructFromBin::Slot& sl) {
+            d.status = (int)sl.status; d.width = sl.width; d.height = sl.height;
+            d.err = sl.errorMessage;
+        };
+        cp(s.reconBin,  g_reconstructState.bin);
+        cp(s.reconMask, g_reconstructState.mask);
+        cp(s.reconRgb,  g_reconstructState.rgb);
+        s.reconReady       = g_reconstructState.isReconstructReady();
+        s.reconHasAny      = g_reconstructState.hasAny();
+        s.reconKWidth      = g_intrinsics.width;
+        s.reconKHeight     = g_intrinsics.height;
+        s.reconKSourceName = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+    }
+
     // Settings tab — calibration parameters.
     s.chessboardFolder    = g_chessboardFolder;
     s.chessboardBoardCols = g_chessboardCols;
@@ -9691,6 +9707,55 @@ static void setupUICallbacks() {
     a.onChessboardFolderChanged = [](const std::string& f) { g_chessboardFolder = f; };
     a.onBoardSizeChanged = [](int c, int r) { g_chessboardCols = c; g_chessboardRows = r; };
     a.onSquareSizeChanged = [](float mm) { g_chessboardSquareMm = mm; };
+
+    // ---- Reconstruct from BIN (FEATURE Task 7) ----
+    a.onReconstructClear = []() {
+        g_reconstructState.clear();
+        std::cout << "[Reconstruct] cleared all slots" << std::endl;
+    };
+    a.onReconstruct = []() {
+        // K source-of-truth = current g_intrinsics; tag from the source enum.
+        Reg3DCustom::CameraIntrinsics K = g_intrinsics;
+        K.name = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+        auto res = ReconstructFromBin::execute(g_reconstructState, DEPTH_OUTPUT_PATH, K);
+        if (!res.ok) {
+            std::cerr << "[Reconstruct] aborted: " << res.errorMessage << std::endl;
+            return;
+        }
+        // AR background = the (processed-resolution) original.jpg just written.
+        // No re-rectify: the dropped bin/mask/rgb are a self-consistent set.
+        {
+            const std::string orig = DEPTH_OUTPUT_PATH + "original.jpg";
+            if (std::filesystem::exists(orig)) ImageSession::load(gApp, orig);
+        }
+        // Mask-derived caches depend on segmentation_mask.png (just replaced).
+        g_boundaryDistMap.invalidate();
+        g_instrumentDistMap.invalidate();
+        g_projectedLiverMask.invalidate();
+        g_gnUnsignedBdyValid = false;
+
+        // Load the reconstructed canonical OBJ into the scene.
+        g_objSourcePath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+        if (!setupObjScene()) {
+            std::cerr << "[Reconstruct] setupObjScene failed" << std::endl;
+            return;
+        }
+        // Reconstruct AR image is the processed-res original.jpg, so use the
+        // scaled canonical K (intrinsics.txt) for display/OrbitCam too -- matches
+        // the AR image AND the OBJ (avoids the 4K-display vs 1080p-image mismatch).
+        Reg3DCustom::CameraIntrinsics Kc;
+        if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", Kc)
+            && Kc.valid()) {
+            g_intrinsics = Kc; gApp.intrinsics = Kc;
+            OrbitCam.setIntrinsics(Kc.fx, Kc.fy, Kc.cx, Kc.cy, Kc.width, Kc.height);
+        }
+        snapshotInitialPose();
+        computeTargetSubsetAabbs();
+        computeSourceLiverSubsetAabbs();
+        gApp.mode = AppMode::kRegistration;
+        std::cout << "[Reconstruct] scene updated from BIN; mode=Registration"
+                  << std::endl;
+    };
 
     a.onRunCalibration = []() {
         std::cout << "[Calib] Running calibration_tool..." << std::endl;

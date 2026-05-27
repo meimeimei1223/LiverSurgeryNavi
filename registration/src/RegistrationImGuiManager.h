@@ -111,6 +111,9 @@ struct RegUIActions {
     std::function<void(const std::string&)> onChessboardFolderChanged;
     std::function<void(int,int)>             onBoardSizeChanged;
     std::function<void(float)>               onSquareSizeChanged;
+    // ---- Reconstruct from BIN (FEATURE Task 5) ----
+    std::function<void()> onReconstruct;       // run exportDepthArtifacts on dropped data
+    std::function<void()> onReconstructClear;  // clear all reconstruct slots
     std::function<void(float)> onInstrumentPxThreshChanged;   // ★追加
     // Vignette auto-detection toggle. Called when the checkbox in the
     // DEPTH GENERATION section is toggled. main.cpp side updates
@@ -325,6 +328,15 @@ struct RegUIState {
     float calibRms = 0;
     int   calibImgCount = 0;
     std::string calibFolder = "../../../chessboard/";
+
+    // ---- Reconstruct from BIN (FEATURE Task 5) ----
+    // syncUIState() copies these from g_reconstructState / g_intrinsics each frame.
+    struct ReconSlot { int status=0; int width=0, height=0; std::string err; };  // status: 0=Empty 1=Loaded 2=Error
+    ReconSlot   reconBin, reconMask, reconRgb;
+    bool        reconReady = false;       // bin+mask loaded, resolutions agree
+    bool        reconHasAny = false;
+    int         reconKWidth = 0, reconKHeight = 0;  // current K resolution
+    std::string reconKSourceName;          // tag of current K (custom/calib/...)
 };
 
 class RegistrationImGuiManager {
@@ -671,6 +683,7 @@ public:
         if (ImGui::Begin("##RegSidebar", nullptr, flags)) {
             drawWorkflowStepper();
             drawDepthSection();
+            drawReconstructSection();
             drawRegistrationSection();
             drawDeformSection();
             drawExport();
@@ -2237,6 +2250,66 @@ private:
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
         // ---- Saved calibrations (Step 6) ----
         ImGui::TextColored(colMuted(), "Saved calibrations: (Step 6)");
+    }
+
+    // ---- Reconstruct from BIN (FEATURE Task 5) ----
+    //   Drop depth_metric.bin + segmentation_mask.png (+ original.jpg) and rebuild
+    //   the OBJ with the current K, no DA3/SAM2. State lives in g_reconstructState
+    //   (main.cpp); syncUIState mirrors it into state.recon*.
+    void drawReconstructSection() {
+        if (!ImGui::CollapsingHeader("Reconstruct from depth (BIN)")) return;
+        ImGui::Indent(16); ImGui::Spacing();
+        ImGui::TextWrapped("Drop depth_metric.bin + segmentation_mask.png "
+                           "(+ original.jpg) or a depth_output/ folder.");
+        ImGui::Spacing();
+
+        auto slotRow = [&](const char* name, const RegUIState::ReconSlot& s,
+                           const char* emptyHint) {
+            if (s.status == 1) {  // Loaded
+                ImGui::TextColored(colGreen(), "o");
+                ImGui::SameLine();
+                ImGui::Text("%s  (%dx%d)", name, s.width, s.height);
+            } else if (s.status == 2) {  // Error
+                ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "!");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1,0.5f,0.5f,1), "%s  %s", name,
+                                   s.err.empty() ? "error" : s.err.c_str());
+            } else {  // Empty
+                ImGui::TextColored(colMuted(), "-");
+                ImGui::SameLine();
+                ImGui::TextColored(colDim(), "%s  %s", name, emptyHint);
+            }
+        };
+        slotRow("depth_metric.bin",      state.reconBin,  "(required)");
+        slotRow("segmentation_mask.png", state.reconMask, "(required)");
+        slotRow("original.jpg",          state.reconRgb,  "(optional - white texture if absent)");
+
+        ImGui::Spacing();
+        // Resolution check vs current K.
+        if (state.reconBin.status == 1 && state.reconMask.status == 1) {
+            const bool resMatch = (state.reconBin.width  == state.reconKWidth &&
+                                   state.reconBin.height == state.reconKHeight);
+            ImGui::TextColored(colDim(), "data %dx%d   K %dx%d (%s)",
+                               state.reconBin.width, state.reconBin.height,
+                               state.reconKWidth, state.reconKHeight,
+                               state.reconKSourceName.empty() ? "?" : state.reconKSourceName.c_str());
+            if (resMatch)
+                ImGui::TextColored(colGreen(), "  match");
+            else
+                ImGui::TextColored(colYellow(), "  K will be auto-scaled to %dx%d",
+                                   state.reconBin.width, state.reconBin.height);
+        }
+
+        ImGui::Spacing();
+        float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
+        if (colorButton("Reconstruct from BIN", colGreen(), false, !state.reconReady, bw)) {
+            if (actions.onReconstruct) actions.onReconstruct();
+        }
+        ImGui::SameLine();
+        if (colorButton("Clear all", colDim(), false, !state.reconHasAny, bw)) {
+            if (actions.onReconstructClear) actions.onReconstructClear();
+        }
+        ImGui::Spacing(); ImGui::Unindent(16); ImGui::Separator();
     }
 
     // [key-reorg Phase 12] Export section — replaces the removed M / Shift+M
