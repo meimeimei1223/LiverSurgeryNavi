@@ -23,7 +23,7 @@
 //      OpenGL convention -- no axis change, only the projection step
 //      flips Y.
 //
-//  Verified against data:   depth_output/pc_metric_pinhole_masked_k4a.obj
+//  Verified against data:   depth_output/pc_metric_pinhole_masked.obj
 //  Diagnostic tool:         diagnose_obj.cpp (100% mask-alignment PASS)
 // =============================================================================
 

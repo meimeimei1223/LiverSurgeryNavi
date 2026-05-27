@@ -1462,9 +1462,9 @@ void StlExport::exportCamMmStlWithSnapshot() {
               << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
 
     try {
-        std::string srcTag = "k4a";
-        if      (g_intrinsicsSource == IntrinsicsSource::Custom) srcTag = "custom";
-        else if (g_intrinsicsSource == IntrinsicsSource::Calib)  srcTag = "calib";
+        // obj-migration Phase 6: snapshot the canonical (tag-less) outputs.
+        const std::string srcName = intrinsicsSourceToTag(g_intrinsicsSource,
+                                                          g_currentPresetKey);
 
         auto now = std::chrono::system_clock::now();
         std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -1481,15 +1481,13 @@ void StlExport::exportCamMmStlWithSnapshot() {
         std::filesystem::create_directories(snapDir);
 
         const std::vector<std::string> srcFiles = {
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
-            DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_light.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_light.mtl",
+            DEPTH_OUTPUT_PATH + "intrinsics.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_da3.txt",
+            DEPTH_OUTPUT_PATH + "depth_metric.bin",
             DEPTH_OUTPUT_PATH + "original_rectified.jpg",
             DEPTH_OUTPUT_PATH + "segmentation_mask.png",
             DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
@@ -1526,8 +1524,8 @@ void StlExport::exportCamMmStlWithSnapshot() {
             std::ofstream readme(snapDir + "README.txt");
             if (readme.is_open()) {
                 readme << "Snapshot created: " << tsBuf << "\n"
-                       << "Intrinsics tag (g_intrinsicsSource="
-                       << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << "): " << srcTag << "\n"
+                       << "Intrinsics source (g_intrinsicsSource="
+                       << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << "): " << srcName << "\n"
                        << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
                        << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
                        << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
@@ -4015,49 +4013,60 @@ int main(int argc, char** argv) {
     // そのため候補を「修正時刻の新しい順」で並べ直し、**最新** の OBJ を選ぶ。
     // 直近の Run Depth が書き出したものが常に正解。
     {
-        struct CandObj {
-            std::string path;
-            std::string tag;
-            std::filesystem::file_time_type mtime;
-        };
-        std::vector<CandObj> objCandidates;
-        for (const auto& tag : {"k4a", "custom", "calib"}) {
-            std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + tag + ".obj";
-            std::error_code ec;
-            if (std::filesystem::exists(p, ec)) {
-                auto t = std::filesystem::last_write_time(p, ec);
-                if (!ec) objCandidates.push_back({p, tag, t});
-            }
-        }
-        // Most recent first
-        std::sort(objCandidates.begin(), objCandidates.end(),
-                  [](const CandObj& a, const CandObj& b){ return a.mtime > b.mtime; });
-
+        // obj-migration Phase 6: prefer the canonical (tag-less) OBJ that REG now
+        // writes. Fall back to legacy tagged OBJs (most-recent wins) only for
+        // pre-migration data left on disk.
         g_objSourcePath.clear();
-        if (!objCandidates.empty()) {
-            const auto& chosen = objCandidates.front();
-            g_objSourcePath = chosen.path;
-            // 古い OBJ もまだディスクにあるならログで警告 (混乱を防ぐため)
-            if (objCandidates.size() > 1) {
-                std::cout << "[main] Multiple existing OBJs found, picking most recent:"
-                          << std::endl;
-                for (const auto& c : objCandidates) {
-                    std::cout << "[main]   " << (c.path == chosen.path ? "* " : "  ")
-                    << c.path << std::endl;
+        const std::string canon = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+        std::error_code ec0;
+        if (std::filesystem::exists(canon, ec0)) {
+            g_objSourcePath = canon;
+            std::cout << "[main] Using canonical OBJ: " << canon << std::endl;
+            // Align g_intrinsicsSource with intrinsics.txt's name field so
+            // setupObjScene loads the matching K.
+            Reg3DCustom::CameraIntrinsics k;
+            if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", k)) {
+                if      (k.name == "custom") g_intrinsicsSource = IntrinsicsSource::Custom;
+                else if (k.name == "calib")  g_intrinsicsSource = IntrinsicsSource::Calib;
+                else if (k.name == "da3" || k.name == "da3_last")
+                                             g_intrinsicsSource = IntrinsicsSource::DA3;
+                else                         g_intrinsicsSource = IntrinsicsSource::Preset;
+                std::cout << "[main] Intrinsics source from intrinsics.txt name='"
+                          << k.name << "' (g_intrinsicsSource="
+                          << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << ")" << std::endl;
+            }
+        } else {
+            // Legacy fallback: tagged OBJs, most-recent first.
+            struct CandObj { std::string path; std::string tag;
+                             std::filesystem::file_time_type mtime; };
+            std::vector<CandObj> objCandidates;
+            for (const auto& tag : {"k4a", "custom", "calib"}) {
+                std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + tag + ".obj";
+                std::error_code ec;
+                if (std::filesystem::exists(p, ec)) {
+                    auto t = std::filesystem::last_write_time(p, ec);
+                    if (!ec) objCandidates.push_back({p, tag, t});
                 }
             }
-            std::cout << "[main] Using existing OBJ: " << chosen.path << std::endl;
-
-            // 起動時の g_intrinsicsSource をその OBJ のソースに合わせる。
-            // これがないと OBJ は custom メッシュなのに intrinsicsSource=Kinect、
-            // という不整合が起きて intrinsics_k4a.txt の方を読みに行ってしまう。
-            if      (chosen.tag == "custom") g_intrinsicsSource = IntrinsicsSource::Custom;
-            else if (chosen.tag == "calib")  g_intrinsicsSource = IntrinsicsSource::Calib;
-            else                             g_intrinsicsSource = IntrinsicsSource::Preset;  // k4a
-            std::cout << "[main] Intrinsics source aligned to OBJ tag: "
-                      << chosen.tag << " (g_intrinsicsSource="
-                      << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << ")"
-                      << std::endl;
+            std::sort(objCandidates.begin(), objCandidates.end(),
+                      [](const CandObj& a, const CandObj& b){ return a.mtime > b.mtime; });
+            if (!objCandidates.empty()) {
+                const auto& chosen = objCandidates.front();
+                g_objSourcePath = chosen.path;
+                if (objCandidates.size() > 1) {
+                    std::cout << "[main] (legacy) Multiple tagged OBJs, picking most recent:"
+                              << std::endl;
+                    for (const auto& c : objCandidates)
+                        std::cout << "[main]   " << (c.path == chosen.path ? "* " : "  ")
+                                  << c.path << std::endl;
+                }
+                std::cout << "[main] Using legacy tagged OBJ: " << chosen.path << std::endl;
+                if      (chosen.tag == "custom") g_intrinsicsSource = IntrinsicsSource::Custom;
+                else if (chosen.tag == "calib")  g_intrinsicsSource = IntrinsicsSource::Calib;
+                else                             g_intrinsicsSource = IntrinsicsSource::Preset;  // k4a
+                std::cout << "[main] Intrinsics source aligned to legacy OBJ tag: "
+                          << chosen.tag << std::endl;
+            }
         }
     }
     if (!g_objSourcePath.empty()) {

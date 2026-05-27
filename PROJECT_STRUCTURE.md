@@ -109,10 +109,19 @@ MeshDrawingSoftBody.h                                          (MeshDrawing.h �
 
 `lsn_registration` / `lsn_deform` は外部実行ファイルをサブプロセス起動（パス解決は
 `common/src/PathConfig.h`）：
-- **sam2_da3_lite**：深度推定 + SAM2 セグメンテーション。入力はディスク上ファイルを
-  `fopen`（カメラ撮影時は `depth_output/camera_frame_temp.jpg` に保存してから渡す）。
+- **sam2_da3_lite**：深度推定 + SAM2 セグメンテーション + vignette 検出。入力はディスク上
+  ファイルを `fopen`（カメラ撮影時は `depth_output/camera_frame_temp.jpg` に保存してから渡す）。
+  出力は depth/mask 系（`depth_metric.bin`=float32+DEPTH ヘッダ, `segmentation_mask.png`,
+  `depth_*.png`）と DA3 推定 K（`intrinsics_da3.txt`）のみ。**K は受け取らず、OBJ/texture も書かない**
+  （obj-migration リファクタ。詳細 `docs/refactor/`）。
 - **calibration_tool**：チェスボードによるカメラ内部パラメータ算出。
-出力は `depth_output/` に。REG→DEFORM 連携は `registration_model/reg_liver.obj` 等。
+
+**OBJ / intrinsics の生成は REG 側**（`common/src/DepthToObjExport.h`）が担当：REG が自前の K で
+`depth_metric.bin` をアンプロジェクトし、カノニカル名 `pc_metric_pinhole_masked.obj` /
+`pc_metric_pinhole_full_light.obj` / `intrinsics.txt`（name フィールドに source）/ `texture.png` を
+`depth_output/` に書く。DEFORM はこのカノニカル名を読む（旧 `_k4a` 名はレガシー fallback）。
+`depth_metric.bin` が無く既存 OBJ がある場合は REG はそれをそのまま使う（外部 depth ソース投入経路）。
+REG→DEFORM 連携は `registration_model/reg_liver.obj` 等。
 
 ---
 

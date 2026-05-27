@@ -113,7 +113,10 @@ FINAL doc §2.2/§6.1 は「image_utils は std のみ依存の自己完結ヘ�
       - p5b: DepthRunner config K フィールド+buildCmd K append 削除、REG applyIntrinsicsToRunnerConfig 撤去、objPath を canonical 化
       - ガードレール確認済: sam2 K round-trip=0 / OBJ-read 経路温存 / 外部OBJ A/B/C 温存
       - ★Shift+M snapshot(main.cpp 1465-1530)は tagged 名のまま=Phase 6 で canonical 化(現状 missing をコピーしないだけ、compile OK)
-- [ ] Phase 6: ドキュメント + クリーン再生成テスト
+- [x] Phase 6 (コード/ドキュメント分): 起動時OBJ選択 canonical化 / Shift+M snapshot canonical化 /
+      PROJECT_STRUCTURE §5 + OBJTargetExtraction.h コメント更新 → `[obj-migration p6]`
+  - [ ] クリーン再生成テスト(§10.4) = ユーザーが GPU で実施（検証1+4 もここで）
+  - [ ] (Optional/別PR) depth_to_obj_tool
 
 ## 検証コマンド
 ```
