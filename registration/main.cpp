@@ -3256,57 +3256,10 @@ static bool setupObjScene() {
     return true;
 }
 
-// =============================================================================
-//  Step 10: configure the SAM2 runner's intrinsics from the current source.
-//  Tag mapping: Custom->"custom", Calib->"calib", Preset->g_currentPresetKey,
-//  DA3->"da3". K is passed for every source EXCEPT DA3 (which lets SAM2 use its
-//  own estimate / default). g_intrinsics is the single source of truth (loaded
-//  by loadIntrinsicsFromCurrentSource on selection), so Calib/Preset go through
-//  the same path as Custom.
-// =============================================================================
-static void applyIntrinsicsToRunnerConfig(DepthRunner& runner) {
-    std::string srcTag;
-    switch (g_intrinsicsSource) {
-        case IntrinsicsSource::Custom: srcTag = "custom";            break;
-        case IntrinsicsSource::Calib:  srcTag = "calib";             break;
-        case IntrinsicsSource::Preset: srcTag = g_currentPresetKey;  break;
-        case IntrinsicsSource::DA3:    srcTag = "da3";               break;
-    }
-    runner.config.intrinsicsSourceName = srcTag;
-
-    if (g_intrinsicsSource != IntrinsicsSource::DA3 && g_intrinsics.valid()) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = g_intrinsics.fx;
-        runner.config.fy = g_intrinsics.fy;
-        runner.config.cx = g_intrinsics.cx;
-        runner.config.cy = g_intrinsics.cy;
-        runner.config.k1 = g_intrinsics.k1;
-        runner.config.k2 = g_intrinsics.k2;
-        runner.config.k3 = g_intrinsics.k3;
-        runner.config.k4 = g_intrinsics.k4;
-        runner.config.p1 = g_intrinsics.p1;
-        runner.config.p2 = g_intrinsics.p2;
-        std::cout << "[RunDepth] passing intrinsics: tag=" << srcTag
-                  << " fx=" << g_intrinsics.fx
-                  << " fy=" << g_intrinsics.fy
-                  << " cx=" << g_intrinsics.cx
-                  << " cy=" << g_intrinsics.cy
-                  << " res=" << g_intrinsics.width << "x"
-                  << g_intrinsics.height << std::endl;
-        if (g_intrinsics.hasDistortion()) {
-            std::cout << "[RunDepth] passing distortion: "
-                      << "k1=" << g_intrinsics.k1 << " k2=" << g_intrinsics.k2
-                      << " k3=" << g_intrinsics.k3 << " k4=" << g_intrinsics.k4
-                      << " p1=" << g_intrinsics.p1 << " p2=" << g_intrinsics.p2
-                      << std::endl;
-        }
-    } else {
-        // DA3: do not pass K. SAM2 uses its own estimate / built-in default.
-        runner.config.useCustomIntrinsics = false;
-        std::cout << "[RunDepth] DA3 mode: no K passed, SAM2 will estimate"
-                  << std::endl;
-    }
-}
+// obj-migration Phase 5: applyIntrinsicsToRunnerConfig() removed. REG no longer
+// passes K to sam2 (sam2 owns no K). REG builds the OBJ from its own K after
+// Run Depth via the export hook below (DepthToObjExport), which uses
+// intrinsicsSourceToTag(g_intrinsicsSource, ...) directly.
 
 static bool runDepthAndUpdateScene(AppContext& ctx) {
     if (ctx.image.path.empty() || !ctx.image.loaded) {
@@ -3328,11 +3281,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     // when sam2_da3_lite is a CPU-only build (silent CPU fallback).
     runner.config.useCuda = ctx.useCuda;
 
-    // Step 10: configure SAM2 intrinsics from the current source (passes K for
-    // Custom/Calib/Preset; DA3 lets SAM2 estimate). srcTag is the OBJ/intrinsics
-    // filename tag used downstream.
-    applyIntrinsicsToRunnerConfig(runner);
-    const std::string srcTag = runner.config.intrinsicsSourceName;
+    // Phase 5: no K is passed to sam2. REG builds the canonical OBJ after the run.
 
     if (!runner.isAvailable()) {
         std::cerr << "[RunDepth] exe not found: " << runner.config.exePath
@@ -3502,27 +3451,17 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
         }
     }
 
-    std::string objPath =
-        DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj";
+    // Phase 5: REG wrote the canonical OBJ above (export hook). Load it; fall back
+    // to the legacy _k4a name only for pre-migration data on disk.
+    std::string objPath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
     if (!std::filesystem::exists(objPath)) {
-        std::cerr << "[RunDepth] expected OBJ missing: " << objPath << std::endl;
-        // Backwards compat: fall back to legacy _k4a.obj if the source-tagged
-        // file isn't there (e.g. older pipeline build that doesn't know about
-        // --intrinsics-source). Keeps things working until sam2_da3_lite
-        // is rebuilt with the new flag.
-        std::string fallback =
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
-        std::string canon =
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
-        if (std::filesystem::exists(fallback)) {
-            std::cerr << "[RunDepth] falling back to legacy: " << fallback
-                      << std::endl;
-            objPath = fallback;
-        } else if (std::filesystem::exists(canon)) {
-            // Canonical (REG-written or externally-injected) OBJ.
-            std::cerr << "[RunDepth] falling back to canonical: " << canon << std::endl;
-            objPath = canon;
+        std::string legacy = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
+        if (std::filesystem::exists(legacy)) {
+            std::cerr << "[RunDepth] canonical OBJ missing; using legacy "
+                      << legacy << std::endl;
+            objPath = legacy;
         } else {
+            std::cerr << "[RunDepth] no OBJ found (canonical nor legacy)" << std::endl;
             return false;
         }
     }
@@ -3658,9 +3597,7 @@ static bool runSegmentOnly(AppContext& ctx, MaskKind kind) {
     // CUDA / GPU acceleration. Same logic as runDepthAndUpdateScene.
     runner.config.useCuda = ctx.useCuda;
 
-    // Same intrinsics dispatch as runDepthAndUpdateScene (Step 10). Stage=Segment
-    // only writes a mask, but we keep the K consistent so the preview matches.
-    applyIntrinsicsToRunnerConfig(runner);
+    // Phase 5: no K passed to sam2 (Segment stage only writes a mask anyway).
 
     // Stage selector: SAM2 only.
     runner.config.stage = DepthStage::Segment;

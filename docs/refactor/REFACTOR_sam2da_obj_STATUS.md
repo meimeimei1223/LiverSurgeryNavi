@@ -108,7 +108,11 @@ FINAL doc §2.2/§6.1 は「image_utils は std のみ依存の自己完結ヘ�
 - [ ] 🛑 停止 → GPU で Run Depth 検証（ユーザー）= 現在地
 - [ ] (task) depth_to_obj_tool 追加（低優先・Phase 2 後）
 - [x] Phase 4: DEFORM カノニカル名 + _k4a フォールバック（4箇所 + test 更新）→ `[obj-migration p4]`
-- [ ] Phase 5: sam2 から OBJ/round-trip K/texture 削除（DA3 推定出力 intrinsics_da3.txt は KEEP）
+- [x] Phase 5: sam2 から OBJ/round-trip K/texture 削除（intrinsics_da3.txt KEEP）→ `[obj-migration p5a/p5b]`
+      - p5a: sam2 main.cpp 910→583行（OBJ/texture/K Options+CLI 削除、depth_metric.bin/intrinsics_da3.txt KEEP）
+      - p5b: DepthRunner config K フィールド+buildCmd K append 削除、REG applyIntrinsicsToRunnerConfig 撤去、objPath を canonical 化
+      - ガードレール確認済: sam2 K round-trip=0 / OBJ-read 経路温存 / 外部OBJ A/B/C 温存
+      - ★Shift+M snapshot(main.cpp 1465-1530)は tagged 名のまま=Phase 6 で canonical 化(現状 missing をコピーしないだけ、compile OK)
 - [ ] Phase 6: ドキュメント + クリーン再生成テスト
 
 ## 検証コマンド
