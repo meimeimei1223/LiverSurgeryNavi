@@ -411,45 +411,42 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Image size: " << image.width << "x" << image.height << "\n";
 
-    // --- Resize to calibration resolution (Kinect 720p) if needed ---
+    // --- Resize policy: cap at 1920x1080, preserve aspect, scale K to match ---
     //
-    // The default depth pipeline assumes Azure Kinect 720p calibration, so
-    // arbitrary input images are scaled to 1280x720 to match the hard-coded
-    // K. When the caller passes its OWN intrinsics via --kinect-intrinsics
-    // (i.e. opts.intrinsicsSourceName is "custom" or "calib"), that K is
-    // already calibrated for the input image's native resolution -- forcing
-    // a resize here would break the K<->image correspondence and the
-    // back-projected mesh would shatter (each pixel unprojects with the
-    // wrong focal length).
-    //
-    // Heuristic: skip the resize when we're using a non-default intrinsics
-    // source. This keeps the original 1280x720 assumption intact for stock
-    // Kinect / DA3 paths while letting custom-calibrated cameras flow
-    // through at native resolution.
-    const bool skipResize =
-        (opts.intrinsicsSourceName != "k4a") &&
-        opts.hasKinectIntrinsics;
-
-    if (skipResize) {
-        std::cout << "[Resize] skipped (intrinsics-source="
-                  << opts.intrinsicsSourceName
-                  << "); processing image at native "
-                  << image.width << "x" << image.height << std::endl;
-    } else {
-        const int TARGET_W = 1280, TARGET_H = 720;
-        if (image.width != TARGET_W || image.height != TARGET_H) {
-            float sx = (float)TARGET_W / image.width;
-            float sy = (float)TARGET_H / image.height;
-            std::cout << "[Resize] " << image.width << "x" << image.height
-                      << " -> " << TARGET_W << "x" << TARGET_H
-                      << " (scale " << sx << ", " << sy << ")" << std::endl;
-            image = img::resize(image, TARGET_W, TARGET_H);
-            // Scale mask point coordinates to new resolution
-            for (auto& p : opts.points) {
-                p.x *= sx;
-                p.y *= sy;
-            }
+    // No special-casing of intrinsicsSourceName. Images within the 1920x1080
+    // cap are processed at native resolution (so a 1080p Kinect / preset flows
+    // through unchanged); larger images (e.g. phone photos) are downscaled with
+    // aspect preserved. When the caller passed its own K (--kinect-intrinsics),
+    // that K MUST be scaled by the same factor so the K<->image correspondence
+    // (and hence the back-projected mesh) stays correct. Mask point coordinates
+    // are scaled likewise.
+    const int MAX_W = 1920, MAX_H = 1080;
+    if (image.width > MAX_W || image.height > MAX_H) {
+        float scale = std::min((float)MAX_W / image.width,
+                               (float)MAX_H / image.height);
+        int newW = (int)std::round(image.width  * scale);
+        int newH = (int)std::round(image.height * scale);
+        std::cout << "[Resize] " << image.width << "x" << image.height
+                  << " -> " << newW << "x" << newH
+                  << " (scale " << scale << ")" << std::endl;
+        image = img::resize(image, newW, newH);
+        // mask 座標もスケール
+        for (auto& p : opts.points) { p.x *= scale; p.y *= scale; }
+        // K も同じスケールで変換 (重要)
+        if (opts.hasKinectIntrinsics) {
+            opts.kinectFx *= scale;
+            opts.kinectFy *= scale;
+            opts.kinectCx *= scale;
+            opts.kinectCy *= scale;
+            std::cout << "[Resize] K scaled: fx=" << opts.kinectFx
+                      << " fy=" << opts.kinectFy
+                      << " cx=" << opts.kinectCx
+                      << " cy=" << opts.kinectCy << std::endl;
         }
+    } else {
+        std::cout << "[Resize] skipped (within " << MAX_W << "x" << MAX_H
+                  << ", processing at native "
+                  << image.width << "x" << image.height << ")" << std::endl;
     }
     std::cout << "Processing size: " << image.width << "x" << image.height << "\n\n";
 
