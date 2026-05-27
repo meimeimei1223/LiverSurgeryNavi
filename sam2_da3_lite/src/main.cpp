@@ -1,7 +1,6 @@
 #include "depth_anything_v3.hpp"
 #include "sam2_segmentor.hpp"
 #include "image_utils.hpp"
-#include "obj_exporter.hpp"
 #include "VignetteDetection.h"
 
 #include <iostream>
@@ -34,42 +33,6 @@ struct Options {
     bool  showHelp       = false;
     float metricScale    = 1.0f;
 
-    bool  saveObjFull    = true;
-    bool  saveObjMasked  = true;
-    float skirtThreshold = 0.05f;
-    objexp::ZMode zMode  = objexp::ZMode::Metric;
-    bool  hasKinectIntrinsics = true;
-    float kinectFx = 918.234f;
-    float kinectFy = 918.112f;
-    float kinectCx = 640.152f;
-    float kinectCy = 366.447f;
-
-    // Brown-Conrady distortion coefficients (OpenCV convention). When the
-    // caller passes --kinect-distortion k1,k2,k3,k4,p1,p2, these values are
-    // written back into intrinsics_<tag>.txt alongside fx/fy/cx/cy. The
-    // depth pipeline itself does NOT apply undistortion to the input image
-    // -- that happens C++ side via Undistort.h. The values here are a
-    // pass-through so user-edited distortion coefficients survive a Run
-    // Depth (which would otherwise silently truncate them).
-    //
-    // Default 0 = no distortion lines written; output file is byte-identical
-    // to the legacy format for cameras without a distortion model.
-    float kinectK1 = 0.0f, kinectK2 = 0.0f, kinectK3 = 0.0f, kinectK4 = 0.0f;
-    float kinectP1 = 0.0f, kinectP2 = 0.0f;
-
-    // Tag used as a suffix on intrinsics-related output files. Default keeps
-    // backwards compat ("k4a"); the caller passes --intrinsics-source <name>
-    // to label outputs accurately when overriding K with custom or calibrated
-    // values. Examples:
-    //   --intrinsics-source custom -> intrinsics_custom.txt,
-    //                                 pc_metric_pinhole_*_custom*.obj
-    //   --intrinsics-source calib  -> intrinsics_calib.txt,
-    //                                 pc_metric_pinhole_*_calib*.obj
-    // Only ASCII letters/digits/_ are expected; not validated here, but the
-    // string is interpolated into filenames so avoid spaces/slashes upstream.
-    std::string intrinsicsSourceName = "k4a";
-
-    int   maskDilate = 2;
 
     // ---- Vignette auto-detection ----
     // When true (default), every code path that writes the occluder mask
@@ -123,20 +86,6 @@ void printUsage(const char* programName) {
               << "                             (otherwise it is OR-merged into the occluder mask).\n"
               << "  --cuda                     Use CUDA for inference\n"
               << "  --scale <f>                Depth scale factor (default 1.0)\n"
-              << "  --skirt <f>                OBJ skirt threshold in meters (default 0.05)\n"
-              << "  --zmode <metric|neg|hill>  Z convention (default: metric, camera at origin, Z=d)\n"
-              << "  --no-obj-full              Skip full OBJ\n"
-              << "  --no-obj-masked            Skip masked OBJ\n"
-              << "  --kinect-intrinsics <fx,fy,cx,cy>     Override intrinsics (default: Azure Kinect 720p)\n"
-              << "  --kinect-distortion <k1,k2,k3,k4,p1,p2>  Brown-Conrady distortion (OpenCV convention).\n"
-              << "                             Pipeline does NOT apply these; values are written back into\n"
-              << "                             intrinsics_<name>.txt so the registration app can apply\n"
-              << "                             undistortion. Default: all zero (no distortion).\n"
-              << "  --intrinsics-source <name> Tag for output filenames (default: k4a). Examples: custom, calib.\n"
-              << "                             intrinsics_<name>.txt and pc_metric_pinhole_*_<name>*.obj\n"
-              << "  --no-kinect                Skip _<name> outputs\n"
-              << "  --dilate <px>              Dilate mask by N pixels for masked OBJ (default 0 = off;\n"
-              << "                             optional ablation parameter for boundary mixed-pixel handling)\n"
               << "  --stage <all|segment|depth>  Pipeline stage to run (default: all).\n"
               << "                               segment: SAM2 only, writes segmentation_mask.png and exits.\n"
               << "                               depth  : skip SAM2, load existing segmentation_mask.png\n"
@@ -198,63 +147,8 @@ Options parseArgs(int argc, char* argv[]) {
             opts.useCuda = true;
         } else if (arg == "--scale" && i + 1 < argc) {
             opts.metricScale = std::stof(argv[++i]);
-        } else if (arg == "--skirt" && i + 1 < argc) {
-            opts.skirtThreshold = std::stof(argv[++i]);
-        } else if (arg == "--zmode" && i + 1 < argc) {
-            std::string m = argv[++i];
-            if      (m == "metric") opts.zMode = objexp::ZMode::Metric;
-            else if (m == "neg")    opts.zMode = objexp::ZMode::Negated;
-            else if (m == "hill")   opts.zMode = objexp::ZMode::HillInverted;
-        } else if (arg == "--no-obj-full") {
-            opts.saveObjFull = false;
-        } else if (arg == "--no-obj-masked") {
-            opts.saveObjMasked = false;
-        } else if (arg == "--no-kinect") {
-            opts.hasKinectIntrinsics = false;
         } else if (arg == "--no-vignette-detect") {
             opts.detectVignette = false;
-        } else if (arg == "--dilate" && i + 1 < argc) {
-            opts.maskDilate = std::stoi(argv[++i]);
-            if (opts.maskDilate < 0) opts.maskDilate = 0;
-        } else if (arg == "--kinect-intrinsics" && i + 1 < argc) {
-            std::stringstream ss(argv[++i]);
-            std::string tok;
-            std::vector<float> vs;
-            while (std::getline(ss, tok, ',')) {
-                try { vs.push_back(std::stof(tok)); } catch (...) {}
-            }
-            if (vs.size() >= 4) {
-                opts.hasKinectIntrinsics = true;
-                opts.kinectFx = vs[0]; opts.kinectFy = vs[1];
-                opts.kinectCx = vs[2]; opts.kinectCy = vs[3];
-            } else {
-                std::cerr << "[warn] --kinect-intrinsics expects fx,fy,cx,cy\n";
-            }
-        } else if (arg == "--kinect-distortion" && i + 1 < argc) {
-            // Brown-Conrady distortion coefficients (OpenCV convention).
-            // Expects exactly 6 comma-separated floats: k1,k2,k3,k4,p1,p2.
-            // Used downstream only as a pass-through into intrinsics_<tag>.txt;
-            // see Options::kinectK1..kinectP2 for rationale.
-            std::stringstream ss(argv[++i]);
-            std::string tok;
-            std::vector<float> vs;
-            while (std::getline(ss, tok, ',')) {
-                try { vs.push_back(std::stof(tok)); } catch (...) {}
-            }
-            if (vs.size() >= 6) {
-                opts.kinectK1 = vs[0]; opts.kinectK2 = vs[1];
-                opts.kinectK3 = vs[2]; opts.kinectK4 = vs[3];
-                opts.kinectP1 = vs[4]; opts.kinectP2 = vs[5];
-            } else {
-                std::cerr << "[warn] --kinect-distortion expects "
-                             "k1,k2,k3,k4,p1,p2 (6 values)\n";
-            }
-        } else if (arg == "--intrinsics-source" && i + 1 < argc) {
-            opts.intrinsicsSourceName = argv[++i];
-            if (opts.intrinsicsSourceName.empty()) {
-                std::cerr << "[warn] --intrinsics-source empty; reverting to k4a\n";
-                opts.intrinsicsSourceName = "k4a";
-            }
         } else if (arg == "--stage" && i + 1 < argc) {
             std::string s = argv[++i];
             if      (s == "all")     opts.stage = Stage::All;
@@ -396,15 +290,13 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Image size: " << image.width << "x" << image.height << "\n";
 
-    // --- Resize policy: cap at 1920x1080, preserve aspect, scale K to match ---
+    // --- Resize policy: cap at 1920x1080, preserve aspect ---
     //
-    // No special-casing of intrinsicsSourceName. Images within the 1920x1080
-    // cap are processed at native resolution (so a 1080p Kinect / preset flows
-    // through unchanged); larger images (e.g. phone photos) are downscaled with
-    // aspect preserved. When the caller passed its own K (--kinect-intrinsics),
-    // that K MUST be scaled by the same factor so the K<->image correspondence
-    // (and hence the back-projected mesh) stays correct. Mask point coordinates
-    // are scaled likewise.
+    // Images within the 1920x1080 cap are processed at native resolution; larger
+    // images (e.g. phone photos) are downscaled with aspect preserved, and mask
+    // point coordinates are scaled likewise. sam2 no longer receives or scales K
+    // (obj-migration Phase 5): REG owns K and unprojects depth_metric.bin itself,
+    // scaling its own K to the depth resolution as needed.
     const int MAX_W = 1920, MAX_H = 1080;
     if (image.width > MAX_W || image.height > MAX_H) {
         float scale = std::min((float)MAX_W / image.width,
@@ -417,17 +309,6 @@ int main(int argc, char* argv[]) {
         image = img::resize(image, newW, newH);
         // mask 座標もスケール
         for (auto& p : opts.points) { p.x *= scale; p.y *= scale; }
-        // K も同じスケールで変換 (重要)
-        if (opts.hasKinectIntrinsics) {
-            opts.kinectFx *= scale;
-            opts.kinectFy *= scale;
-            opts.kinectCx *= scale;
-            opts.kinectCy *= scale;
-            std::cout << "[Resize] K scaled: fx=" << opts.kinectFx
-                      << " fy=" << opts.kinectFy
-                      << " cx=" << opts.kinectCx
-                      << " cy=" << opts.kinectCy << std::endl;
-        }
     } else {
         std::cout << "[Resize] skipped (within " << MAX_W << "x" << MAX_H
                   << ", processing at native "
@@ -685,225 +566,17 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    bool textureWritten = false;
-
-    std::vector<float> depthForOutput(depthRaw.size());
-    {
-        float maxD = 0.0f;
-        for (float d : depthRaw) if (d > maxD) maxD = d;
-        if (maxD <= 0.0f) maxD = 1.0f;
-        for (size_t i = 0; i < depthRaw.size(); ++i) {
-            float d = depthRaw[i];
-            switch (opts.zMode) {
-            case objexp::ZMode::HillInverted: depthForOutput[i] = maxD - d; break;
-            case objexp::ZMode::Negated:      depthForOutput[i] = -d; break;
-            default:                          depthForOutput[i] = d; break;
-            }
-        }
-        std::cout << "[zMode] "
-                  << (opts.zMode == objexp::ZMode::HillInverted ? "hill (Z=maxD-d, far=0, near=+Z)" :
-                          opts.zMode == objexp::ZMode::Negated ? "neg (Z=-d)" :
-                          "metric (Z=d, near=0, far=+Z)")
-                  << " maxD=" << maxD << std::endl;
-    }
-
-
-    if (depthResult.hasIntrinsics) {
-
-// [COMMENTED OUT] DA3-intrinsics OBJ — not used by registration app
-// (Kinect intrinsics version is used instead)
-#if 0
-        objexp::ObjExportOptions oo;
-        oo.intrinsics.fx    = depthResult.intrinsics.fx;
-        oo.intrinsics.fy    = depthResult.intrinsics.fy;
-        oo.intrinsics.cx    = depthResult.intrinsics.cx;
-        oo.intrinsics.cy    = depthResult.intrinsics.cy;
-        oo.depthScale       = opts.metricScale;
-        oo.flipY            = true;
-        oo.zMode            = objexp::ZMode::Metric;
-        oo.skirtThreshold   = opts.skirtThreshold;
-        oo.writeTexture     = !textureWritten;
-        oo.textureFilename  = "texture.png";
-        oo.materialName     = "screenMat";
-
-        if (opts.saveObjFull) {
-            objexp::saveFullMeshObj(
-                opts.outputDir + "/pc_metric_pinhole_full.obj",
-                image, depthForOutput, oo);
-            textureWritten = true;
-        }
-        if (opts.saveObjMasked) {
-            objexp::ObjExportOptions ooMasked = oo;
-            ooMasked.writeTexture = !textureWritten;
-            objexp::saveMaskedMeshObj(
-                opts.outputDir + "/pc_metric_pinhole_masked.obj",
-                image, depthForOutput, mask, ooMasked);
-            textureWritten = true;
-        }
-        if (opts.saveHq && hasConfFilter) {
-            objexp::ObjExportOptions ooHq = oo;
-            ooHq.writeTexture   = !textureWritten;
-            ooHq.confidence     = &depthResult.confidence;
-            ooHq.confidenceMin  = confThreshold;
-            objexp::saveMaskedMeshObj(
-                opts.outputDir + "/pc_metric_pinhole_masked_hq.obj",
-                image, depthForOutput, mask, ooHq);
-        }
-#endif
-
-        if (opts.hasKinectIntrinsics) {
-            const std::string& tag = opts.intrinsicsSourceName;  // "k4a"|"custom"|"calib"|...
-            std::cout << "[intrinsics:" << tag
-                      << "] Using intrinsics fx=" << opts.kinectFx
-                      << " fy=" << opts.kinectFy
-                      << " cx=" << opts.kinectCx
-                      << " cy=" << opts.kinectCy << std::endl;
-
-            {
-                // This file records the K we ACTUALLY USED (post-resize). For
-                // tag="custom" the user-provided intrinsics_custom.txt is the
-                // authoritative source K and must NOT be overwritten with the
-                // resized values, so we write to intrinsics_custom_used.txt
-                // instead. Other tags keep intrinsics_<tag>.txt.
-                std::string saveName = (tag == "custom")
-                                     ? std::string("intrinsics_custom_used.txt")
-                                     : std::string("intrinsics_") + tag + ".txt";
-                std::string intrPath = opts.outputDir + "/" + saveName;
-                std::ofstream ofs(intrPath);
-                if (ofs.is_open()) {
-                    // Bump precision: default 6 sig-figs would drop the
-                    // trailing digit of small coefficients (e.g. p1 ~ 1e-3),
-                    // and we want round-trips with the C++ side's float K
-                    // to be lossless. 9 digits is enough for IEEE-754
-                    // single-precision (≤ 7-8 significant digits).
-                    ofs << std::setprecision(9);
-                    ofs << "fx "     << opts.kinectFx << "\n";
-                    ofs << "fy "     << opts.kinectFy << "\n";
-                    ofs << "cx "     << opts.kinectCx << "\n";
-                    ofs << "cy "     << opts.kinectCy << "\n";
-                    ofs << "width "  << image.width  << "\n";
-                    ofs << "height " << image.height << "\n";
-                    ofs << "name   " << tag << "\n";
-
-                    // Brown-Conrady distortion (round-tripped from caller via
-                    // --kinect-distortion). Written only when at least one
-                    // coefficient is non-zero, so files for distortion-free
-                    // cameras stay byte-identical to the legacy format and
-                    // are unchanged when --kinect-distortion is not passed.
-                    const float kEps = 1e-6f;
-                    const bool hasDist =
-                        std::fabs(opts.kinectK1) > kEps || std::fabs(opts.kinectK2) > kEps ||
-                        std::fabs(opts.kinectK3) > kEps || std::fabs(opts.kinectK4) > kEps ||
-                        std::fabs(opts.kinectP1) > kEps || std::fabs(opts.kinectP2) > kEps;
-                    if (hasDist) {
-                        ofs << "# Brown-Conrady distortion (OpenCV convention)\n";
-                        ofs << "k1     " << opts.kinectK1 << "\n";
-                        ofs << "k2     " << opts.kinectK2 << "\n";
-                        ofs << "k3     " << opts.kinectK3 << "\n";
-                        ofs << "k4     " << opts.kinectK4 << "\n";
-                        ofs << "p1     " << opts.kinectP1 << "\n";
-                        ofs << "p2     " << opts.kinectP2 << "\n";
-                    }
-                    std::cout << "[intrinsics_" << tag << "] Saved: "
-                              << intrPath
-                              << (hasDist ? "  (with distortion)" : "")
-                              << std::endl;
-                }
-            }
-
-            // [COMMENTED OUT] k4a PLY — not used by registration app
-            // ply::saveTexturedPly(".../pc_metric_pinhole_full_k4a.ply", ...);
-            // ply::saveTexturedPly(".../pc_metric_pinhole_masked_k4a.ply", ...);
-            // ply::saveTexturedPly(".../pc_metric_pinhole_masked_hq_k4a.ply", ...);
-
-            objexp::ObjExportOptions ok;
-            ok.intrinsics.fx    = opts.kinectFx;
-            ok.intrinsics.fy    = opts.kinectFy;
-            ok.intrinsics.cx    = opts.kinectCx;
-            ok.intrinsics.cy    = opts.kinectCy;
-            ok.depthScale       = opts.metricScale;
-            ok.flipY            = true;
-            ok.zMode            = objexp::ZMode::Metric;
-            ok.skirtThreshold   = opts.skirtThreshold;
-            ok.writeTexture     = !textureWritten;
-            ok.textureFilename  = "texture.png";
-            ok.materialName     = "screenMat";
-            ok.confidence       = nullptr;
-            ok.confidenceMin    = 0.0f;
-
-            // Full mesh — stride=10 for lightweight display mesh
-            if (opts.saveObjFull) {
-                objexp::ObjExportOptions okLight = ok;
-                okLight.stride = 10;
-                objexp::saveFullMeshObj(
-                    opts.outputDir + "/pc_metric_pinhole_full_" + tag + "_light.obj",
-                    image, depthForOutput, okLight);
-                textureWritten = true;
-
-                // Companion full mesh with skirt disabled, for inspection.
-                // All depth-jump triangles preserved (rubber sheets visible).
-                objexp::ObjExportOptions okLightNoSkirt = okLight;
-                okLightNoSkirt.skirtThreshold = 0.0f;
-                okLightNoSkirt.writeTexture   = false;
-                objexp::saveFullMeshObj(
-                    opts.outputDir + "/pc_metric_pinhole_full_" + tag + "_light_noskirt.obj",
-                    image, depthForOutput, okLightNoSkirt);
-            }
-            // Masked mesh — full resolution for registration
-            if (opts.saveObjMasked) {
-                std::vector<uint8_t> maskForObj =
-                    (opts.maskDilate > 0)
-                        ? img::dilateMask(mask, image.width, image.height,
-                                          opts.maskDilate)
-                        : mask;
-                if (opts.maskDilate > 0) {
-                    int before = 0, after = 0;
-                    for (auto v : mask)       if (v) ++before;
-                    for (auto v : maskForObj) if (v) ++after;
-                    std::cout << "[mask-dilate] " << opts.maskDilate
-                              << " px : " << before << " -> " << after
-                              << " pixels (+" << (after - before) << ")"
-                              << std::endl;
-                }
-
-                objexp::ObjExportOptions okMasked = ok;
-                okMasked.writeTexture = !textureWritten;
-                objexp::saveMaskedMeshObj(
-                    opts.outputDir + "/pc_metric_pinhole_masked_" + tag + ".obj",
-                    image, depthForOutput, maskForObj, okMasked);
-                textureWritten = true;
-
-                // Companion masked mesh with skirt disabled, for inspection.
-                // Mask already excludes background, so internal depth jumps
-                // (crease edges) stay connected.
-                objexp::ObjExportOptions okMaskedNoSkirt = okMasked;
-                okMaskedNoSkirt.skirtThreshold = 0.0f;
-                okMaskedNoSkirt.writeTexture   = false;
-                objexp::saveMaskedMeshObj(
-                    opts.outputDir + "/pc_metric_pinhole_masked_" + tag + "_noskirt.obj",
-                    image, depthForOutput, maskForObj, okMaskedNoSkirt);
-            }
-            // [COMMENTED OUT] HQ confidence-filtered OBJ — not used
-        }
-    } else {
-        std::cout << "[ply/obj] No intrinsics from model, skipping metric exports\n";
-    }
 
     std::cout << "Results saved to: " << opts.outputDir << "\n";
     {
-        const std::string& tag = opts.intrinsicsSourceName;
+        // obj-migration Phase 5: sam2 no longer writes OBJ / texture / round-trip K.
+        // It outputs depth + masks + the DA3-estimated K; REG builds the OBJ.
         std::cout << "\n===== Done! =====\n"
                   << "Output files:\n"
                   << "  - original.jpg / segmentation_mask.png / segmentation_overlay.jpg\n"
                   << "  - depth_full.png / depth_masked.png / depth_masked_renorm.png (+colored)\n"
-                  << "  - intrinsics.txt (DA3-estimated fx/fy/cx/cy/width/height)\n";
-        if (opts.hasKinectIntrinsics) {
-            std::cout
-                << "  - intrinsics_" << tag << ".txt (intrinsics actually used)\n"
-                << "  - pc_metric_pinhole_full_" << tag << "_light.obj (stride=10, display mesh)\n"
-                << "  - pc_metric_pinhole_masked_" << tag << ".obj (full-res, registration)\n";
-        }
-        std::cout << "  - texture.png + .mtl per obj\n";
+                  << "  - depth_metric.bin (float32 metric depth, 16B DEPT header)\n"
+                  << "  - intrinsics_da3.txt (DA3-estimated K, 7 lines)\n";
     }
 
     return 0;

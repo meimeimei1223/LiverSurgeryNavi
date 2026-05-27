@@ -68,7 +68,6 @@ add_library(sam2_da3_lite_lib STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/image_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/depth_anything_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sam2_segmentor.cpp
-    ${CMAKE_SOURCE_DIR}/common/src/obj_exporter.cpp   # moved to common/ (Phase 2 bridge)
 
 )
 
