@@ -908,7 +908,15 @@ int main(int argc, char* argv[]) {
                       << " cy=" << opts.kinectCy << std::endl;
 
             {
-                std::string intrPath = opts.outputDir + "/intrinsics_" + tag + ".txt";
+                // This file records the K we ACTUALLY USED (post-resize). For
+                // tag="custom" the user-provided intrinsics_custom.txt is the
+                // authoritative source K and must NOT be overwritten with the
+                // resized values, so we write to intrinsics_custom_used.txt
+                // instead. Other tags keep intrinsics_<tag>.txt.
+                std::string saveName = (tag == "custom")
+                                     ? std::string("intrinsics_custom_used.txt")
+                                     : std::string("intrinsics_") + tag + ".txt";
+                std::string intrPath = opts.outputDir + "/" + saveName;
                 std::ofstream ofs(intrPath);
                 if (ofs.is_open()) {
                     // Bump precision: default 6 sig-figs would drop the

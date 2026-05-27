@@ -2988,8 +2988,28 @@ static bool setupObjScene() {
               << " res=" << K.width << "x" << K.height << ")"
               << std::endl;
 
+    // OBJ projection K: SAM2 builds the OBJ with the RESIZED K (it caps input
+    // at 1920x1080) and records that in intrinsics_custom_used.txt -- the
+    // original intrinsics_custom.txt (user 4K) is left untouched. The target
+    // cloud must be projected with that SAME used K to match the OBJ geometry,
+    // so prefer the _used file when present (Custom source). OrbitCam / AR
+    // background above keep the original K (which matches the rectified image).
+    Reg3DCustom::CameraIntrinsics K_obj = K;
+    if (g_intrinsicsSource == IntrinsicsSource::Custom) {
+        Reg3DCustom::CameraIntrinsics Kused;
+        if (Reg3DCustom::loadCameraIntrinsics(
+                DEPTH_OUTPUT_PATH + "intrinsics_custom_used.txt", Kused)
+            && Kused.valid()) {
+            K_obj = Kused;
+            std::cout << "[OBJ Setup] OBJ-projection K from intrinsics_custom_used.txt: "
+                      << K_obj.width << "x" << K_obj.height << " fx=" << K_obj.fx
+                      << "  (display/OrbitCam keeps " << K.width << "x" << K.height
+                      << " fx=" << K.fx << ")" << std::endl;
+        }
+    }
+
     auto targetCloud = Reg3DCustom::setupOBJTarget(
-        *screenMesh, K, Reg3DCustom::OBJ_Y_SIGN_OPENGL);
+        *screenMesh, K_obj, Reg3DCustom::OBJ_Y_SIGN_OPENGL);
     if (!targetCloud || targetCloud->empty()) {
         std::cerr << "[OBJ Setup] FAILED to build target cloud" << std::endl;
         return false;
