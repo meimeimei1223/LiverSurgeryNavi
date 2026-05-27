@@ -2888,30 +2888,35 @@ static bool setupObjScene() {
     Reg3DCustom::printMeshBBox(*screenMesh, "OBJ raw (meters)");
 
     Reg3DCustom::CameraIntrinsics K;
-    // intrinsicsSource (UI 状態) に応じて候補リストを切り替える。
-    // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
+    // intrinsicsSource に応じて候補リストを切り替える。Step 10 で Run Depth が
+    // 使う srcTag (Custom/Calib/Preset=key/DA3) と対応させ、SAM2 が書き出す
+    // intrinsics_<tag>.txt を読む。
     std::vector<std::string> intrinsicsCandidates;
     if (g_intrinsicsSource == IntrinsicsSource::Custom) {
-        // Custom: depth pipeline が intrinsics_custom.txt を出すのでそれを読む
         intrinsicsCandidates = {
             DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
         };
     } else if (g_intrinsicsSource == IntrinsicsSource::Calib) {
-        // Calib: depth pipeline が intrinsics_calib.txt を出すのでそれを読む
         intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_calib_last.txt",
             DEPTH_OUTPUT_PATH + "intrinsics_calib.txt",
         };
     } else if (g_intrinsicsSource == IntrinsicsSource::Preset) {
+        // SAM2 round-trips the passed preset K to intrinsics_<key>.txt; fall
+        // back to legacy intrinsics_k4a.txt for older k4a-tagged OBJs.
         intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_" + g_currentPresetKey + ".txt",
             DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
         };
     } else {
-        // DA3 / その他 fallback
+        // DA3: the OBJ is built with the K SAM2 actually used (intrinsics_da3.txt
+        // / legacy intrinsics_k4a.txt); intrinsics_da3_last.txt / intrinsics.txt
+        // hold the DA3 estimate.
         intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_da3.txt",
             DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
-            DEPTH_OUTPUT_PATH + "intrinsics_realsense.txt",
-            DEPTH_OUTPUT_PATH + "intrinsics_iphone.txt",
-            DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics.txt",
         };
     }
 
@@ -3160,7 +3165,57 @@ static bool setupObjScene() {
     return true;
 }
 
+// =============================================================================
+//  Step 10: configure the SAM2 runner's intrinsics from the current source.
+//  Tag mapping: Custom->"custom", Calib->"calib", Preset->g_currentPresetKey,
+//  DA3->"da3". K is passed for every source EXCEPT DA3 (which lets SAM2 use its
+//  own estimate / default). g_intrinsics is the single source of truth (loaded
+//  by loadIntrinsicsFromCurrentSource on selection), so Calib/Preset go through
+//  the same path as Custom.
+// =============================================================================
+static void applyIntrinsicsToRunnerConfig(DepthRunner& runner) {
+    std::string srcTag;
+    switch (g_intrinsicsSource) {
+        case IntrinsicsSource::Custom: srcTag = "custom";            break;
+        case IntrinsicsSource::Calib:  srcTag = "calib";             break;
+        case IntrinsicsSource::Preset: srcTag = g_currentPresetKey;  break;
+        case IntrinsicsSource::DA3:    srcTag = "da3";               break;
+    }
+    runner.config.intrinsicsSourceName = srcTag;
 
+    if (g_intrinsicsSource != IntrinsicsSource::DA3 && g_intrinsics.valid()) {
+        runner.config.useCustomIntrinsics = true;
+        runner.config.fx = g_intrinsics.fx;
+        runner.config.fy = g_intrinsics.fy;
+        runner.config.cx = g_intrinsics.cx;
+        runner.config.cy = g_intrinsics.cy;
+        runner.config.k1 = g_intrinsics.k1;
+        runner.config.k2 = g_intrinsics.k2;
+        runner.config.k3 = g_intrinsics.k3;
+        runner.config.k4 = g_intrinsics.k4;
+        runner.config.p1 = g_intrinsics.p1;
+        runner.config.p2 = g_intrinsics.p2;
+        std::cout << "[RunDepth] passing intrinsics: tag=" << srcTag
+                  << " fx=" << g_intrinsics.fx
+                  << " fy=" << g_intrinsics.fy
+                  << " cx=" << g_intrinsics.cx
+                  << " cy=" << g_intrinsics.cy
+                  << " res=" << g_intrinsics.width << "x"
+                  << g_intrinsics.height << std::endl;
+        if (g_intrinsics.hasDistortion()) {
+            std::cout << "[RunDepth] passing distortion: "
+                      << "k1=" << g_intrinsics.k1 << " k2=" << g_intrinsics.k2
+                      << " k3=" << g_intrinsics.k3 << " k4=" << g_intrinsics.k4
+                      << " p1=" << g_intrinsics.p1 << " p2=" << g_intrinsics.p2
+                      << std::endl;
+        }
+    } else {
+        // DA3: do not pass K. SAM2 uses its own estimate / built-in default.
+        runner.config.useCustomIntrinsics = false;
+        std::cout << "[RunDepth] DA3 mode: no K passed, SAM2 will estimate"
+                  << std::endl;
+    }
+}
 
 static bool runDepthAndUpdateScene(AppContext& ctx) {
     if (ctx.image.path.empty() || !ctx.image.loaded) {
@@ -3182,76 +3237,11 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     // when sam2_da3_lite is a CPU-only build (silent CPU fallback).
     runner.config.useCuda = ctx.useCuda;
 
-    // 出力ファイル名のサフィックスを決定。setupObjScene の intrinsics 候補
-    // 分岐 (パッチ2) と完全に対応させる。
-    //   0 (DA3)    : intrinsics をオーバーライドしない -> default "k4a"
-    //                 (このソースでは hasKinectIntrinsics 経路に乗らない)
-    //   1 (Kinect) : "k4a"   -> intrinsics_k4a.txt, pc_*_k4a*.obj  (従来動作)
-    //   2 (Custom) : "custom" -> intrinsics_custom.txt, pc_*_custom*.obj
-    //   3 (Calib)  : "calib"  -> intrinsics_calib.txt, pc_*_calib*.obj
-    std::string srcTag = "k4a";  // 既定 (Kinect / DA3)
-    if      (g_intrinsicsSource == IntrinsicsSource::Custom) srcTag = "custom";
-    else if (g_intrinsicsSource == IntrinsicsSource::Calib)  srcTag = "calib";
-    runner.config.intrinsicsSourceName = srcTag;
-
-    // Custom intrinsics 選択時、外部 sam2_da3_lite に --kinect-intrinsics
-    // で K を渡す。これがないと外部側はデフォルト Azure Kinect 720p を使って
-    // メッシュをアンプロジェクトしてしまい、AR で 3D メッシュと背景画像が
-    // ずれる (C++ 側の射影行列は Custom K、メッシュは Kinect K で生成、で
-    // 食い違うのが原因)。
-    if (g_intrinsicsSource == IntrinsicsSource::Custom && g_intrinsics.valid()) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = g_intrinsics.fx;
-        runner.config.fy = g_intrinsics.fy;
-        runner.config.cx = g_intrinsics.cx;
-        runner.config.cy = g_intrinsics.cy;
-        // Brown-Conrady distortion: round-trip so the pipeline does NOT
-        // truncate user-edited intrinsics_custom.txt on every Run Depth.
-        // Zero coefficients pass through silently; only non-zero values
-        // emit --kinect-distortion on the sam side.
-        runner.config.k1 = g_intrinsics.k1;
-        runner.config.k2 = g_intrinsics.k2;
-        runner.config.k3 = g_intrinsics.k3;
-        runner.config.k4 = g_intrinsics.k4;
-        runner.config.p1 = g_intrinsics.p1;
-        runner.config.p2 = g_intrinsics.p2;
-        std::cout << "[RunDepth] passing custom intrinsics to depth pipeline: "
-                  << "fx=" << g_intrinsics.fx << " fy=" << g_intrinsics.fy
-                  << " cx=" << g_intrinsics.cx << " cy=" << g_intrinsics.cy
-                  << "  (image " << g_intrinsics.width << "x"
-                  << g_intrinsics.height << ")"
-                  << "  tag=" << srcTag << std::endl;
-        if (g_intrinsics.hasDistortion()) {
-            std::cout << "[RunDepth] passing distortion: "
-                      << "k1=" << g_intrinsics.k1 << " k2=" << g_intrinsics.k2
-                      << " k3=" << g_intrinsics.k3 << " k4=" << g_intrinsics.k4
-                      << " p1=" << g_intrinsics.p1 << " p2=" << g_intrinsics.p2
-                      << std::endl;
-        }
-    } else if (g_intrinsicsSource == IntrinsicsSource::Calib && g_calibResult.valid) {
-        // Calibrated source: same idea
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = (float)g_calibResult.fx;
-        runner.config.fy = (float)g_calibResult.fy;
-        runner.config.cx = (float)g_calibResult.cx;
-        runner.config.cy = (float)g_calibResult.cy;
-        // CalibResult only carries k1, k2 (the in-house Zhang tool fits only
-        // those). k3/k4/p1/p2 stay 0; the sam pipeline will then either
-        // emit them (if non-zero) or skip the --kinect-distortion flag
-        // entirely (when all zero).
-        runner.config.k1 = (float)g_calibResult.k1;
-        runner.config.k2 = (float)g_calibResult.k2;
-        std::cout << "[RunDepth] passing calibrated intrinsics to depth pipeline"
-                  << "  tag=" << srcTag << std::endl;
-        if (std::fabs((float)g_calibResult.k1) > 1e-6f ||
-            std::fabs((float)g_calibResult.k2) > 1e-6f) {
-            std::cout << "[RunDepth] passing distortion (calib): "
-                      << "k1=" << g_calibResult.k1 << " k2=" << g_calibResult.k2
-                      << std::endl;
-        }
-    }
-    // Otherwise (DA3 / Kinect default) leave runner.config.useCustomIntrinsics
-    // = false; the external pipeline uses its built-in Azure Kinect 720p.
+    // Step 10: configure SAM2 intrinsics from the current source (passes K for
+    // Custom/Calib/Preset; DA3 lets SAM2 estimate). srcTag is the OBJ/intrinsics
+    // filename tag used downstream.
+    applyIntrinsicsToRunnerConfig(runner);
+    const std::string srcTag = runner.config.intrinsicsSourceName;
 
     if (!runner.isAvailable()) {
         std::cerr << "[RunDepth] exe not found: " << runner.config.exePath
@@ -3515,38 +3505,9 @@ static bool runSegmentOnly(AppContext& ctx, MaskKind kind) {
     // CUDA / GPU acceleration. Same logic as runDepthAndUpdateScene.
     runner.config.useCuda = ctx.useCuda;
 
-    // ---- Same intrinsics tag dispatch as runDepthAndUpdateScene ----
-    std::string srcTag = "k4a";
-    if      (g_intrinsicsSource == IntrinsicsSource::Custom) srcTag = "custom";
-    else if (g_intrinsicsSource == IntrinsicsSource::Calib)  srcTag = "calib";
-    runner.config.intrinsicsSourceName = srcTag;
-
-    if (g_intrinsicsSource == IntrinsicsSource::Custom && g_intrinsics.valid()) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = g_intrinsics.fx;
-        runner.config.fy = g_intrinsics.fy;
-        runner.config.cx = g_intrinsics.cx;
-        runner.config.cy = g_intrinsics.cy;
-        // Distortion round-trip (same rationale as in runDepthAndUpdateScene).
-        // Stage=Segment does NOT regenerate intrinsics_<tag>.txt (only the
-        // mask is written), so emitting --kinect-distortion here is just
-        // for consistency / future-proofing if the pipeline ever starts to
-        // write the intrinsics file in Stage=Segment too.
-        runner.config.k1 = g_intrinsics.k1;
-        runner.config.k2 = g_intrinsics.k2;
-        runner.config.k3 = g_intrinsics.k3;
-        runner.config.k4 = g_intrinsics.k4;
-        runner.config.p1 = g_intrinsics.p1;
-        runner.config.p2 = g_intrinsics.p2;
-    } else if (g_intrinsicsSource == IntrinsicsSource::Calib && g_calibResult.valid) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = (float)g_calibResult.fx;
-        runner.config.fy = (float)g_calibResult.fy;
-        runner.config.cx = (float)g_calibResult.cx;
-        runner.config.cy = (float)g_calibResult.cy;
-        runner.config.k1 = (float)g_calibResult.k1;
-        runner.config.k2 = (float)g_calibResult.k2;
-    }
+    // Same intrinsics dispatch as runDepthAndUpdateScene (Step 10). Stage=Segment
+    // only writes a mask, but we keep the K consistent so the preview matches.
+    applyIntrinsicsToRunnerConfig(runner);
 
     // Stage selector: SAM2 only.
     runner.config.stage = DepthStage::Segment;
