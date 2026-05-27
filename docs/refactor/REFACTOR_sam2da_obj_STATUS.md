@@ -86,6 +86,17 @@ FINAL doc §2.2/§6.1 は「image_utils は std のみ依存の自己完結ヘ�
 - **R2: STB 実装の1本化** — reg/deform main.cpp の STB_IMAGE_IMPLEMENTATION 群を撤去し、
   単一 TU（例 common の image_utils.cpp 等）に集約。STB 初期化順（SimpleCamera.hpp 等）に
   触れる中リスク作業なので本移管とは別 PR で。
+- **depth_to_obj_tool** — bin+mask+texture+K → OBJ の A/B 比較用 CLI（reconstruct feature §6.6）。
+- **(A) Reconstruct 後の RESOLUTION MISMATCH 警告ノイズ** — Reconstruct で intrinsics.txt を
+  1080p スケール済みに更新するが、setupObjScene の display-K チェックが intrinsics_custom.txt(4K)を
+  読んで 1080p original.jpg と比較し警告を出す（実害なし: K_obj は canonical を正しく使用、display/
+  OrbitCam は setupObjScene 後に scaled K へ同期済み）。reconstruct モードフラグで setupObjScene の
+  display-K も intrinsics.txt 優先にすれば警告解消。GPU 検証 2026-05-27 で確認、軽微。
+- **(B) REG board mesh ロードのレガシー名のみ試行** — registration/main.cpp:3173/3176 が
+  `pc_metric_pinhole_full_<tag>_light.obj` / `_k4a_light.obj` を見るだけで canonical
+  `pc_metric_pinhole_full_light.obj` を試さない。Phase 4 の DEFORM `resolveDeformObjPath`
+  と同じ canonical-first + _k4a fallback パターンを REG board ロードにも適用すべき。実害なし
+  （canonical は別経路で正しくロード）だがログがノイズ。
 
 ## Phase 3 実装メモ
 - sam2: `depth_metric.bin` 再有効化（16B "DEPT" ヘッダ）、`intrinsics.txt`→`intrinsics_da3.txt`
