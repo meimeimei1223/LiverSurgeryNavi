@@ -281,13 +281,17 @@ static bool writeIntrinsicsTxt(const std::string& path,
         std::cerr << "[intrinsics] Failed to open: " << path << std::endl;
         return false;
     }
+    // DA3-estimated K (Phase 3): 7 lines, no distortion (DA3 does not estimate it).
+    // name="da3" so REG reads this as the IntrinsicsSource::DA3 source.
+    ofs << std::setprecision(9);
     ofs << "fx "     << r.intrinsics.fx << "\n";
     ofs << "fy "     << r.intrinsics.fy << "\n";
     ofs << "cx "     << r.intrinsics.cx << "\n";
     ofs << "cy "     << r.intrinsics.cy << "\n";
     ofs << "width "  << r.width  << "\n";
     ofs << "height " << r.height << "\n";
-    std::cout << "[intrinsics] Saved: " << path << std::endl;
+    ofs << "name   da3\n";
+    std::cout << "[intrinsics_da3] Saved (DA3 estimated K): " << path << std::endl;
     return true;
 }
 
@@ -654,10 +658,13 @@ int main(int argc, char* argv[]) {
     img::saveImage(opts.outputDir + "/depth_masked_renorm_colored.png",
                    maskedDepthRenormColored);
 
-    writeIntrinsicsTxt(opts.outputDir + "/intrinsics.txt", depthResult);
+    // Phase 3: DA3-estimated K is an inference OUTPUT (not a K round-trip), so it
+    // goes to intrinsics_da3.txt -- NOT intrinsics.txt (which REG owns as canonical).
+    writeIntrinsicsTxt(opts.outputDir + "/intrinsics_da3.txt", depthResult);
 
-// [COMMENTED OUT] depth_metric.bin — not used by registration app
-#if 0
+    // Phase 3: depth_metric.bin RE-ENABLED. float32 metric depth + 16B header
+    // ("DEPT" magic, W, H, reserved). This is the canonical metric-depth handoff
+    // that REG reads (DepthToObjExport::loadDepthMetricBin) to build the OBJ.
     {
         std::string binPath = opts.outputDir + "/depth_metric.bin";
         std::ofstream ofs(binPath, std::ios::binary);
@@ -673,9 +680,10 @@ int main(int argc, char* argv[]) {
             ofs.write(reinterpret_cast<const char*>(depthRaw.data()),
                       sizeof(float) * depthRaw.size());
             ofs.close();
+            std::cout << "[depth_metric.bin] saved: " << binPath
+                      << " (" << W << "x" << H << ", float32)" << std::endl;
         }
     }
-#endif
 
     bool textureWritten = false;
 

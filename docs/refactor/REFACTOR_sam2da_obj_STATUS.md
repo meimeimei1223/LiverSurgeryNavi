@@ -87,12 +87,26 @@ FINAL doc §2.2/§6.1 は「image_utils は std のみ依存の自己完結ヘ�
   単一 TU（例 common の image_utils.cpp 等）に集約。STB 初期化順（SimpleCamera.hpp 等）に
   触れる中リスク作業なので本移管とは別 PR で。
 
+## Phase 3 実装メモ
+- sam2: `depth_metric.bin` 再有効化（16B "DEPT" ヘッダ）、`intrinsics.txt`→`intrinsics_da3.txt`
+  に改名（writeIntrinsicsTxt が name=da3 + setprecision(9) の7行）。Kinect OBJ ブロック(902+)は並行存置。
+- 新規 `common/src/DepthToObjExport.{h,cpp}`: exportDepthArtifacts（canonical+tagged+noskirt）/
+  saveIntrinsicsFile / loadDepthMetricBin。`img::dilateMask` は local 複製（image_utils.cpp 非依存）。
+  texture は obj_exporter の saveImageStb 任せ。
+- `IntrinsicsSource.h`: `intrinsicsSourceToTag()` 追加。
+- REG `runDepthAndUpdateScene`: 経路 A（bin→exportDepthArtifacts, RGB=original.jpg・depth解像度,
+  mask=segmentation_mask.png, K=g_intrinsics）/ B（bin無→既存OBJ温存+intrinsics.txt）/ C（警告のみ）。
+  objPath に canonical フォールバック追加。DA3 promote を `intrinsics_da3.txt`→`intrinsics_da3_last.txt` に更新。
+- ODR fix: `mCutMesh.h::setUp()` を inline 化（common の新 .cpp と多重定義回避）。
+- **既知の制限**: K 解像度 ≠ depth 解像度（4K入力を sam2 が縮小したケース）の K スケーリングは
+  REG 側未実装＝警告ログのみ。検証済みの 1080p custom（縮小なし）経路では問題なし。
+
 ## 進捗
-- [x] Phase 1: 死コード掃除（867–903 温存・depth_metric.bin 温存）→ commit `[obj-migration p1]`
-- [x] Phase 2: obj_exporter + image_utils.hpp を common/src へ移動（Option R）
+- [x] Phase 1: 死コード掃除（867–903 温存・depth_metric.bin 温存）→ `[obj-migration p1]`
+- [x] Phase 2: obj_exporter + image_utils.hpp を common/src へ移動（Option R）→ `[obj-migration p2]`
+- [x] Phase 3: depth_metric.bin/intrinsics_da3.txt + DepthToObjExport + REG フック A/B/C → `[obj-migration p3]`
+- [ ] 🛑 停止 → GPU で Run Depth 検証（ユーザー）= 現在地
 - [ ] (task) depth_to_obj_tool 追加（低優先・Phase 2 後）
-- [ ] 🛑 停止 → GPU で Run Depth 検証（ユーザー）
-- [ ] Phase 3: depth_metric.bin 再有効化 + DepthToObjExport(REG) + sam2 intrinsics.txt→intrinsics_da3.txt(7行) + 867–903 切り出し
 - [ ] Phase 4: DEFORM カノニカル名 + _k4a フォールバック
 - [ ] Phase 5: sam2 から OBJ/round-trip K/texture 削除（DA3 推定出力 intrinsics_da3.txt は KEEP）
 - [ ] Phase 6: ドキュメント + クリーン再生成テスト

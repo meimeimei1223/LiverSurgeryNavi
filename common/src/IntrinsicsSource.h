@@ -57,3 +57,19 @@ inline int intrinsicsSourceToLegacyInt(IntrinsicsSource s) {
     }
     return 0;
 }
+
+// Filename tag for OBJ / intrinsics outputs (obj-migration Phase 3).
+//   Custom -> "custom", Calib -> "calib", Preset -> the preset key (e.g. "k4a"),
+//   DA3 -> "da3". Stored in CameraIntrinsics::name and used as the <tag> in
+//   pc_metric_pinhole_*_<tag>*.obj / intrinsics_<tag>.txt debug copies.
+#include <string>
+inline std::string intrinsicsSourceToTag(IntrinsicsSource s,
+                                         const std::string& presetKey = "k4a") {
+    switch (s) {
+        case IntrinsicsSource::Custom: return "custom";
+        case IntrinsicsSource::Calib:  return "calib";
+        case IntrinsicsSource::Preset: return presetKey;
+        case IntrinsicsSource::DA3:    return "da3";
+    }
+    return "unknown";
+}

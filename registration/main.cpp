@@ -46,6 +46,7 @@
 #include "OBJTargetExtraction.h"
 #include "IntrinsicsSource.h"
 #include "IntrinsicsPresets.h"
+#include "DepthToObjExport.h"   // obj-migration Phase 3: REG-side OBJ export
 #include "MeshCleanup.h"
 #include "AR.h"
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
@@ -3422,16 +3423,14 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
                   << rr.instrumentSegmentationMaskPath << std::endl;
     }
 
-    // ---- step7-cleanup: persist the DA3 estimate as the DA3 source ----
-    // SAM2 always writes intrinsics.txt with its own DA3 estimate (independent
-    // of any K we passed for unprojection). Promote it to intrinsics_da3_last.txt
-    // so the file-driven "DA3 (last estimate)" source becomes selectable and
-    // re-loadable -- symmetric with Custom/Calib. Done on every successful run
-    // (the file simply tracks the most recent DA3 estimate); separate file, so
-    // it never clobbers intrinsics_custom/calib.
+    // ---- persist the DA3 estimate as the DA3 source ----
+    // Phase 3: sam2 now writes its DA3-estimated K to intrinsics_da3.txt (NOT
+    // intrinsics.txt, which REG owns as canonical). Promote it to
+    // intrinsics_da3_last.txt so the file-driven "DA3 (last estimate)" source
+    // stays selectable/re-loadable, symmetric with Custom/Calib.
     {
         Reg3DCustom::CameraIntrinsics da3K;
-        const std::string da3Src = DEPTH_OUTPUT_PATH + "intrinsics.txt";
+        const std::string da3Src = DEPTH_OUTPUT_PATH + "intrinsics_da3.txt";
         const std::string da3Dst = DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt";
         if (Reg3DCustom::loadCameraIntrinsics(da3Src, da3K) && da3K.valid()) {
             da3K.name = "da3_last";
@@ -3440,8 +3439,66 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
                           << da3K.width << "x" << da3K.height
                           << " fx=" << da3K.fx << ")" << std::endl;
         } else {
-            std::cout << "[RunDepth] no usable intrinsics.txt to promote to DA3 "
-                         "(skipped)" << std::endl;
+            std::cout << "[RunDepth] no usable intrinsics_da3.txt to promote (skipped)"
+                      << std::endl;
+        }
+    }
+
+    // ---- obj-migration Phase 3: REG-side OBJ export (routes A/B/C) ----
+    // sam2 still writes its tagged OBJ in parallel (Phase 3); REG additionally
+    // writes the canonical OBJ + intrinsics.txt from its OWN K, overwriting the
+    // tagged copy (last-writer-wins, REG後勝ち) for the diff comparison.
+    {
+        namespace fs = std::filesystem;
+        const std::string binPath  = DEPTH_OUTPUT_PATH + "depth_metric.bin";
+        const std::string canonObj = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+
+        if (fs::exists(binPath)) {
+            // Route A: metric depth present -> REG builds the OBJ from its own K.
+            depthexport::DepthBin db;
+            if (depthexport::loadDepthMetricBin(binPath, db)) {
+                int rw = 0, rh = 0, rc = 0, mw = 0, mh = 0, mc = 0;
+                unsigned char* rgb  = stbi_load(rr.originalPath.c_str(), &rw, &rh, &rc, 3);
+                unsigned char* mraw = stbi_load(rr.segmentationMaskPath.c_str(), &mw, &mh, &mc, 1);
+                if (rgb && mraw && rw == db.width && rh == db.height
+                    && mw == db.width && mh == db.height) {
+                    std::vector<uint8_t> mask((size_t)mw * mh);
+                    for (size_t i = 0; i < mask.size(); ++i) mask[i] = (mraw[i] > 127) ? 255 : 0;
+                    std::vector<uint8_t> rgbv(rgb, rgb + (size_t)rw * rh * 3);
+
+                    depthexport::Request req;
+                    req.rgbPixels   = rgbv.data();
+                    req.width       = db.width;
+                    req.height      = db.height;
+                    req.depthMetric = &db.depth;
+                    req.mask        = &mask;
+                    req.K           = g_intrinsics;
+                    req.K.name      = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+                    req.tag         = req.K.name;
+                    req.outDir      = DEPTH_OUTPUT_PATH;
+                    auto er = depthexport::exportDepthArtifacts(req);
+                    if (!er.ok) std::cerr << "[RunDepth] REG exportDepthArtifacts failed" << std::endl;
+                } else {
+                    std::cerr << "[RunDepth] REG export skipped (res mismatch): bin="
+                              << db.width << "x" << db.height << " rgb=" << rw << "x" << rh
+                              << " mask=" << mw << "x" << mh << std::endl;
+                }
+                if (rgb)  stbi_image_free(rgb);
+                if (mraw) stbi_image_free(mraw);
+            }
+        } else if (fs::exists(canonObj)) {
+            // Route B: external OBJ injected (no metric depth). Keep it as-is;
+            // just emit intrinsics.txt from the current K so downstream matches.
+            std::cout << "[RunDepth] depth_metric.bin absent; using existing OBJ as-is: "
+                      << canonObj << std::endl;
+            depthexport::saveIntrinsicsFile(DEPTH_OUTPUT_PATH + "intrinsics.txt",
+                                            g_intrinsics, g_intrinsics.width, g_intrinsics.height);
+        } else {
+            // Route C: no metric depth and no canonical OBJ. In Phase 3 sam2 still
+            // writes a tagged OBJ in parallel, so objPath below can still load it;
+            // we log rather than hard-fail (post-Phase-5 this becomes a real error).
+            std::cerr << "[RunDepth] WARNING: no depth_metric.bin and no canonical OBJ; "
+                         "relying on sam2 tagged OBJ (Phase 3 parallel)" << std::endl;
         }
     }
 
@@ -3455,10 +3512,16 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
         // is rebuilt with the new flag.
         std::string fallback =
             DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
+        std::string canon =
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
         if (std::filesystem::exists(fallback)) {
             std::cerr << "[RunDepth] falling back to legacy: " << fallback
                       << std::endl;
             objPath = fallback;
+        } else if (std::filesystem::exists(canon)) {
+            // Canonical (REG-written or externally-injected) OBJ.
+            std::cerr << "[RunDepth] falling back to canonical: " << canon << std::endl;
+            objPath = canon;
         } else {
             return false;
         }
