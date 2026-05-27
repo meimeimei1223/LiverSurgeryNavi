@@ -1,7 +1,6 @@
 #include "depth_anything_v3.hpp"
 #include "sam2_segmentor.hpp"
 #include "image_utils.hpp"
-#include "ply_exporter.hpp"
 #include "obj_exporter.hpp"
 #include "VignetteDetection.h"
 
@@ -34,14 +33,10 @@ struct Options {
     bool  useCuda        = false;
     bool  showHelp       = false;
     float metricScale    = 1.0f;
-    float confPercentile = 0.15f;
 
     bool  saveObjFull    = true;
     bool  saveObjMasked  = true;
-    bool  saveHq         = true;
-    bool  saveRelief     = true;
     float skirtThreshold = 0.05f;
-    float reliefThickness = 0.05f;
     objexp::ZMode zMode  = objexp::ZMode::Metric;
     bool  hasKinectIntrinsics = true;
     float kinectFx = 918.234f;
@@ -128,14 +123,10 @@ void printUsage(const char* programName) {
               << "                             (otherwise it is OR-merged into the occluder mask).\n"
               << "  --cuda                     Use CUDA for inference\n"
               << "  --scale <f>                Depth scale factor (default 1.0)\n"
-              << "  --conf-percentile <f>      Drop lowest X fraction of conf for _hq (default 0.15)\n"
               << "  --skirt <f>                OBJ skirt threshold in meters (default 0.05)\n"
-              << "  --thickness <f>            Relief thickness in units (default 0.05)\n"
               << "  --zmode <metric|neg|hill>  Z convention (default: metric, camera at origin, Z=d)\n"
               << "  --no-obj-full              Skip full OBJ\n"
               << "  --no-obj-masked            Skip masked OBJ\n"
-              << "  --no-hq                    Skip confidence-filtered _hq outputs\n"
-              << "  --no-relief                Skip PlaneRelief outputs (raw-style)\n"
               << "  --kinect-intrinsics <fx,fy,cx,cy>     Override intrinsics (default: Azure Kinect 720p)\n"
               << "  --kinect-distortion <k1,k2,k3,k4,p1,p2>  Brown-Conrady distortion (OpenCV convention).\n"
               << "                             Pipeline does NOT apply these; values are written back into\n"
@@ -207,14 +198,8 @@ Options parseArgs(int argc, char* argv[]) {
             opts.useCuda = true;
         } else if (arg == "--scale" && i + 1 < argc) {
             opts.metricScale = std::stof(argv[++i]);
-        } else if (arg == "--conf-percentile" && i + 1 < argc) {
-            opts.confPercentile = std::stof(argv[++i]);
-            if (opts.confPercentile < 0.0f) opts.confPercentile = 0.0f;
-            if (opts.confPercentile > 0.99f) opts.confPercentile = 0.99f;
         } else if (arg == "--skirt" && i + 1 < argc) {
             opts.skirtThreshold = std::stof(argv[++i]);
-        } else if (arg == "--thickness" && i + 1 < argc) {
-            opts.reliefThickness = std::stof(argv[++i]);
         } else if (arg == "--zmode" && i + 1 < argc) {
             std::string m = argv[++i];
             if      (m == "metric") opts.zMode = objexp::ZMode::Metric;
@@ -224,10 +209,6 @@ Options parseArgs(int argc, char* argv[]) {
             opts.saveObjFull = false;
         } else if (arg == "--no-obj-masked") {
             opts.saveObjMasked = false;
-        } else if (arg == "--no-hq") {
-            opts.saveHq = false;
-        } else if (arg == "--no-relief") {
-            opts.saveRelief = false;
         } else if (arg == "--no-kinect") {
             opts.hasKinectIntrinsics = false;
         } else if (arg == "--no-vignette-detect") {
@@ -718,145 +699,8 @@ int main(int argc, char* argv[]) {
                   << " maxD=" << maxD << std::endl;
     }
 
-// [COMMENTED OUT] Relief outputs — not used by registration app
-// To re-enable: uncomment and set opts.saveRelief = true
-#if 0
-    if (opts.saveRelief) {
-        ply::ExportOptions pr;
-        pr.projection   = ply::Projection::PlaneRelief;
-        pr.normalize    = ply::Normalize::None;
-        pr.invertDepth  = false;
-        pr.flipY        = true;
-        pr.thickness    = 0.0f;
-        pr.depthScale   = opts.metricScale;
-        pr.binary       = true;
-
-        pr.maskMode = ply::MaskMode::IgnoreMask;
-        ply::saveTexturedPly(opts.outputDir + "/pc_relief_full.ply",
-                             image, depthForOutput, mask, pr);
-
-        pr.maskMode = ply::MaskMode::SkipOutside;
-        ply::saveTexturedPly(opts.outputDir + "/pc_relief_masked.ply",
-                             image, depthForOutput, mask, pr);
-
-        objexp::ObjExportOptions orel;
-        orel.projection      = objexp::Projection::PlaneRelief;
-        orel.depthScale      = opts.metricScale;
-        orel.thickness       = 0.0f;
-        orel.flipY           = true;
-        orel.invertDepth     = false;
-        orel.skirtThreshold  = opts.skirtThreshold;
-        orel.writeTexture    = !textureWritten;
-        orel.textureFilename = "texture.png";
-        orel.materialName    = "screenMat";
-
-        objexp::saveFullMeshObj(
-            opts.outputDir + "/pc_relief_full.obj",
-            image, depthForOutput, orel);
-        textureWritten = true;
-
-        orel.writeTexture = false;
-        objexp::saveMaskedMeshObj(
-            opts.outputDir + "/pc_relief_masked.obj",
-            image, depthForOutput, mask, orel);
-
-        std::vector<float> maskVals;
-        maskVals.reserve(depthRaw.size());
-        for (size_t i = 0; i < depthRaw.size(); ++i) {
-            if (mask[i] > 0) maskVals.push_back(depthRaw[i]);
-        }
-        if (maskVals.size() >= 10) {
-            std::sort(maskVals.begin(), maskVals.end());
-            float lo = maskVals[static_cast<size_t>(maskVals.size() * 0.02)];
-            float hi = maskVals[static_cast<size_t>(maskVals.size() * 0.98)];
-            float range = hi - lo;
-            if (range < 1e-6f) range = 1.0f;
-
-            std::vector<float> depthNorm(depthRaw.size(), 0.0f);
-            for (size_t i = 0; i < depthRaw.size(); ++i) {
-                if (mask[i] == 0) continue;
-                float v = std::clamp(depthRaw[i], lo, hi);
-                float d = (v - lo) / range;
-                switch (opts.zMode) {
-                case objexp::ZMode::HillInverted: depthNorm[i] = 1.0f - d; break;
-                case objexp::ZMode::Negated:      depthNorm[i] = -d; break;
-                default:                          depthNorm[i] = d; break;
-                }
-            }
-
-            ply::ExportOptions prn;
-            prn.projection   = ply::Projection::PlaneRelief;
-            prn.normalize    = ply::Normalize::None;
-            prn.invertDepth  = false;
-            prn.flipY        = true;
-            prn.thickness    = 0.0f;
-            prn.depthScale   = 1.0f;
-            prn.binary       = true;
-            prn.maskMode     = ply::MaskMode::SkipOutside;
-            ply::saveTexturedPly(opts.outputDir + "/pc_relief_masked_norm.ply",
-                                 image, depthNorm, mask, prn);
-
-            objexp::ObjExportOptions orn;
-            orn.projection      = objexp::Projection::PlaneRelief;
-            orn.depthScale      = 1.0f;
-            orn.thickness       = 0.0f;
-            orn.flipY           = true;
-            orn.invertDepth     = false;
-            orn.skirtThreshold  = opts.skirtThreshold;
-            orn.writeTexture    = false;
-            orn.textureFilename = "texture.png";
-            orn.materialName    = "screenMat";
-            orn.zMode           = objexp::ZMode::Metric;
-            objexp::saveMaskedMeshObj(
-                opts.outputDir + "/pc_relief_masked_norm.obj",
-                image, depthNorm, mask, orn);
-
-            std::vector<float> depthNormFlat(depthNorm.size());
-            for (size_t i = 0; i < depthNorm.size(); ++i) {
-                depthNormFlat[i] = depthNorm[i] * 0.3f;
-            }
-            ply::saveTexturedPly(opts.outputDir + "/pc_relief_masked_norm_flat.ply",
-                                 image, depthNormFlat, mask, prn);
-            objexp::saveMaskedMeshObj(
-                opts.outputDir + "/pc_relief_masked_norm_flat.obj",
-                image, depthNormFlat, mask, orn);
-        }
-    }
-#endif
 
     if (depthResult.hasIntrinsics) {
-        // [COMMENTED OUT] DA3-intrinsics PLY options — all PLY saves disabled
-        // ply::ExportOptions po; ...
-
-// [COMMENTED OUT] DA3-intrinsics PLY — not used by registration app
-// ply::saveTexturedPly(opts.outputDir + "/pc_metric_pinhole_full.ply", ...);
-// ply::saveTexturedPly(opts.outputDir + "/pc_metric_pinhole_masked.ply", ...);
-
-// [COMMENTED OUT] Confidence threshold — not used (HQ saves disabled)
-// To re-enable HQ outputs, uncomment this and the HQ save blocks below.
-#if 0
-        float confThreshold = 0.0f;
-        bool  hasConfFilter = false;
-        if (opts.saveHq && depthResult.hasConfidence &&
-            !depthResult.confidence.empty())
-        {
-            std::vector<float> cs;
-            cs.reserve(static_cast<size_t>(image.width) * image.height);
-            for (int i = 0; i < image.width * image.height; ++i) {
-                if (mask[i] > 0) cs.push_back(depthResult.confidence[i]);
-            }
-            if (!cs.empty()) {
-                std::sort(cs.begin(), cs.end());
-                size_t idx = static_cast<size_t>(cs.size() * opts.confPercentile);
-                if (idx >= cs.size()) idx = cs.size() - 1;
-                confThreshold = cs[idx];
-                hasConfFilter = true;
-                std::cout << "[hq] conf filter drop="
-                          << (opts.confPercentile * 100.0f)
-                          << "% threshold=" << confThreshold << std::endl;
-            }
-        }
-#endif
 
 // [COMMENTED OUT] DA3-intrinsics OBJ — not used by registration app
 // (Kinect intrinsics version is used instead)
@@ -1032,7 +876,6 @@ int main(int argc, char* argv[]) {
                     image, depthForOutput, maskForObj, okMaskedNoSkirt);
             }
             // [COMMENTED OUT] HQ confidence-filtered OBJ — not used
-            // if (opts.saveHq && hasConfFilter) { ... }
         }
     } else {
         std::cout << "[ply/obj] No intrinsics from model, skipping metric exports\n";
