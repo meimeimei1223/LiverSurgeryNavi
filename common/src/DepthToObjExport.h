@@ -37,13 +37,17 @@ struct Request {
     // --- output dir (DEPTH_OUTPUT_PATH; trailing slash tolerated) ---
     std::string                  outDir;
 
-    // --- options (defaults mirror sam2_da3_lite's: skirt 0.05, dilate 2,
-    //     stride 10, metric scale 1.0) so tagged copies match for diff ---
+    // --- options (geometry defaults mirror sam2_da3_lite's: skirt 0.05,
+    //     dilate 2, stride 10, metric scale 1.0) ---
     float skirtThreshold       = 0.05f;
     int   fullMeshStride       = 10;
     int   maskDilate           = 2;
-    bool  writeTaggedCopies    = true;
-    bool  writeNoSkirtVariants = true;
+    // Canonical-only policy: REG writes a single tag-less OBJ set. "K is owned by
+    // REG; one correct K at a time" -> tagged copies are not produced (provenance
+    // lives in intrinsics.txt's name field). These remain as opt-in debug knobs
+    // (default off); the implementation is retained but not invoked by REG.
+    bool  writeTaggedCopies    = false;
+    bool  writeNoSkirtVariants = false;
     bool  writeTextureImage    = true;
 };
 
