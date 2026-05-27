@@ -42,34 +42,12 @@ struct DepthRunnerConfig {
     bool useCuda  = false;
     bool verbose  = true;
 
-    // Optional intrinsics override. If set, --kinect-intrinsics fx,fy,cx,cy
-    // will be appended so the external pipeline back-projects depth using
-    // the user's K instead of its hard-coded Azure Kinect 720p default.
-    // The OBJ outputs (pc_metric_pinhole_*_<tag>*.obj) and intrinsics_<tag>.txt
-    // will then carry these values, where <tag> = intrinsicsSourceName.
-    bool  useCustomIntrinsics = false;
-    float fx = 0.0f, fy = 0.0f;
-    float cx = 0.0f, cy = 0.0f;
-
-    // ---- Brown-Conrady distortion (OpenCV convention) -----------------
-    // Used only when useCustomIntrinsics is true AND at least one of these
-    // coefficients is non-zero (eps=1e-6). The external pipeline does NOT
-    // apply these to its own processing; it only writes them back into
-    // intrinsics_<tag>.txt so the registration app can read them and call
-    // Undistort.h on the input image. Default 0 = no distortion (legacy
-    // behaviour, same command line as before this field existed).
-    //
-    // Closes the bug where Run Depth used to silently truncate k1..p2 from
-    // a user-edited intrinsics_<tag>.txt on every invocation.
-    float k1 = 0.0f, k2 = 0.0f, k3 = 0.0f, k4 = 0.0f;
-    float p1 = 0.0f, p2 = 0.0f;
-
-    // Tag used as a suffix on output filenames produced by the depth pipeline.
-    // Pass "k4a" (default), "custom", "calib", or any short ASCII label.
-    // The corresponding outputs are intrinsics_<name>.txt and
-    // pc_metric_pinhole_*_<name>*.obj. Caller-side OBJ loading must use the
-    // same name to find the right file.
-    std::string intrinsicsSourceName = "k4a";
+    // obj-migration Phase 5: K is owned by REG and is NOT passed to the external
+    // pipeline anymore. sam2 outputs depth_metric.bin + intrinsics_da3.txt; REG
+    // builds the OBJ from its own K (see common/src/DepthToObjExport.h). The
+    // former useCustomIntrinsics / fx..p2 / intrinsicsSourceName fields and the
+    // --kinect-intrinsics / --kinect-distortion / --intrinsics-source CLI args
+    // have been removed.
 
     // Which pipeline stage to run. Default = All preserves legacy behaviour.
     // Caller flow for split mode:
@@ -322,46 +300,10 @@ private:
           << " --output \""      << absPath(config.outputDir)  << "\"";
         if (config.useCuda) s << " --cuda";
 
-        // Pass user-provided intrinsics to the external pipeline. This makes
-        // the *_<tag>* OBJs and intrinsics_<tag>.txt use the same K the C++
-        // side is rendering with -- otherwise the mesh is back-projected with
-        // the wrong focal length and AR alignment fails.
-        if (config.useCustomIntrinsics &&
-            config.fx > 0.0f && config.fy > 0.0f) {
-            s << " --kinect-intrinsics "
-              << config.fx << "," << config.fy << ","
-              << config.cx << "," << config.cy;
-
-            // Also pass distortion coefficients when at least one is
-            // non-zero, so the external pipeline can round-trip them into
-            // intrinsics_<tag>.txt. Empty (all-zero) case is suppressed
-            // to keep the command line byte-identical to legacy invocations
-            // for cameras without a distortion model.
-            const float kEps = 1e-6f;
-            const bool hasDist =
-                std::fabs(config.k1) > kEps || std::fabs(config.k2) > kEps ||
-                std::fabs(config.k3) > kEps || std::fabs(config.k4) > kEps ||
-                std::fabs(config.p1) > kEps || std::fabs(config.p2) > kEps;
-            if (hasDist) {
-                // 9-digit precision: enough to round-trip an IEEE-754 single
-                // through text (numeric_limits<float>::max_digits10). The
-                // default 6 digits would lose the last sig-fig of small
-                // coefficients like p1 ~ 1e-3. Restored to 6 immediately
-                // below since this stream may still emit more args (points).
-                s << " --kinect-distortion "
-                  << std::setprecision(9)
-                  << config.k1 << "," << config.k2 << ","
-                  << config.k3 << "," << config.k4 << ","
-                  << config.p1 << "," << config.p2
-                  << std::setprecision(6);
-            }
-        }
-        // Tag the output files so the source is traceable in the filename.
-        // Default "k4a" preserves backwards-compat output names when the
-        // caller hasn't explicitly set this.
-        if (!config.intrinsicsSourceName.empty()) {
-            s << " --intrinsics-source " << config.intrinsicsSourceName;
-        }
+        // obj-migration Phase 5: no K is passed to the external pipeline. sam2
+        // outputs depth_metric.bin + intrinsics_da3.txt; REG owns K and builds the
+        // OBJ itself (DepthToObjExport). The former --kinect-intrinsics /
+        // --kinect-distortion / --intrinsics-source args are gone.
 
         // Pipeline stage flag. Omitted when stage=All so legacy invocations
         // remain bit-identical (no --stage in the command line).

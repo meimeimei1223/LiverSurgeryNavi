@@ -6,10 +6,38 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
+#include "stb_image_write.h"   // declarations only; impl provided per-executable
+                               // (reg/deform main.cpp, sam2 image_utils.cpp)
 
 namespace objexp {
 
 namespace fs = std::filesystem;
+
+// Local texture PNG/JPG writer. Bit-identical to the former img::saveImage
+// (image_utils.cpp): same stbi_write_* calls, same args (PNG stride = W*channels,
+// JPG quality 95). Inlined here so obj_exporter no longer depends on
+// image_utils.cpp's symbol -- only the img::Image type (header). The texture-
+// writing responsibility moves to REG entirely in Phase 3.
+static bool saveImageStb(const std::string& path, const img::Image& image) {
+    if (image.empty()) return false;
+    std::string ext = path.substr(path.find_last_of('.'));
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    if (ext == ".png") {
+        return stbi_write_png(path.c_str(), image.width, image.height,
+                              image.channels, image.data.data(),
+                              image.width * image.channels) != 0;
+    } else if (ext == ".jpg" || ext == ".jpeg") {
+        return stbi_write_jpg(path.c_str(), image.width, image.height,
+                              image.channels, image.data.data(), 95) != 0;
+    } else if (ext == ".bmp") {
+        return stbi_write_bmp(path.c_str(), image.width, image.height,
+                              image.channels, image.data.data()) != 0;
+    }
+    return stbi_write_png(path.c_str(), image.width, image.height,
+                          image.channels, image.data.data(),
+                          image.width * image.channels) != 0;
+}
 
 static std::string joinPath(const std::string& dir, const std::string& name) {
     if (dir.empty()) return name;
@@ -73,7 +101,7 @@ static bool writeTextureImage(const std::string& dir,
                               const img::Image& rgb)
 {
     if (!opt.writeTexture || opt.textureFilename.empty()) return true;
-    return img::saveImage(joinPath(dir, opt.textureFilename), rgb);
+    return saveImageStb(joinPath(dir, opt.textureFilename), rgb);
 }
 
 static void streamVertex(std::ostringstream& buf, float X, float Y, float Z) {

@@ -68,14 +68,12 @@ add_library(sam2_da3_lite_lib STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/image_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/depth_anything_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sam2_segmentor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/ply_exporter.cpp   # ← 追加
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/obj_exporter.cpp   # ← 追加
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/image_utils.hpp
 
 )
 
 target_include_directories(sam2_da3_lite_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/common/src   # obj_exporter.hpp + image_utils.hpp (moved to common)
     ${ONNXRUNTIME_INCLUDE_DIR}
 )
 

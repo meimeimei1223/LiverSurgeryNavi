@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include "PathConfig.h"
+#include "IntrinsicsSource.h"   // enum IntrinsicsSource (lightweight, no GL deps)
 
 // Forward declarations for Shift+Ctrl+P tuning globals defined in RegistrationActions.h.
 // (RegistrationActions.h is included after this header in main.cpp, so we need these
@@ -93,8 +95,25 @@ struct RegUIActions {
     //   に切り替わるが、Apply Init Pose を押すまで実適用しない。
     std::function<void(int)> onInitRotPresetSilent;
     std::function<void(int)> onInitRotPositionChanged;   // Phase 2: 重心位置 selector (legacy, deprecated)
-    std::function<void(int)> onIntrinsicsSourceChanged;
+    std::function<void(int)> onIntrinsicsSourceChanged;   // legacy 4-button (unused by Step 7 UI)
     std::function<void()>    onRunCalibration;
+    // ---- Step 7: intrinsics source dropdown (案 Y) ----
+    //   onSourceChanged : Custom / Calib / Auto を選んだとき。main.cpp が
+    //     g_intrinsicsSource を更新し loadIntrinsicsFromCurrentSource()。
+    //   onPresetChanged : ドロップダウンでプリセットを選んだとき (key 指定)。
+    //     main.cpp が source=Preset + g_currentPresetKey=key にして load。
+    //   onSaveAsCustom  : 現在の K を intrinsics_custom.txt に保存し source=Custom。
+    //   onChessboardFolderChanged / onBoardSizeChanged / onSquareSizeChanged :
+    //     Settings タブの Calibration パラメータ編集。
+    std::function<void(IntrinsicsSource)>   onSourceChanged;
+    std::function<void(const std::string&)> onPresetChanged;
+    std::function<void()>                    onSaveAsCustom;
+    std::function<void(const std::string&)> onChessboardFolderChanged;
+    std::function<void(int,int)>             onBoardSizeChanged;
+    std::function<void(float)>               onSquareSizeChanged;
+    // ---- Reconstruct from BIN (FEATURE Task 5) ----
+    std::function<void()> onReconstruct;       // run exportDepthArtifacts on dropped data
+    std::function<void()> onReconstructClear;  // clear all reconstruct slots
     std::function<void(float)> onInstrumentPxThreshChanged;   // ★追加
     // Vignette auto-detection toggle. Called when the checkbox in the
     // DEPTH GENERATION section is toggled. main.cpp side updates
@@ -285,14 +304,39 @@ struct RegUIState {
     bool  lrFlipped     = false;  // g_lrFlipManual
     bool  ccFlipped     = false;  // g_ccFlipManual
 
-    // Intrinsics source: 0=DA3, 1=Kinect, 2=Custom, 3=Calibrated
-    int  intrinsicsSource = 1;
+    // ---- Step 7: intrinsics source (案 Y dropdown + Active card) ----
+    //   syncUIState() が main.cpp の g_intrinsicsSource / g_intrinsics 等から毎フレーム反映。
+    IntrinsicsSource intrinsicsSource = IntrinsicsSource::DA3;
+    std::string currentPresetKey;      // Preset 選択時の key
+    std::string currentDisplayName;    // Active カードの表示名
+    float currentFx=0, currentFy=0, currentCx=0, currentCy=0;
+    int   currentWidth=0, currentHeight=0;
+    bool  customAvailable=false;       // intrinsics_custom.txt が存在し valid
+    bool  calibLastAvailable=false;    // intrinsics_calib_last.txt (or legacy) が存在し valid
+    bool  da3LastAvailable=false;      // intrinsics_da3_last.txt が存在 (DA3 推定結果)
+    // Factory/dynamic presets (main.cpp が presetRegistry() から syncUIState で詰める)
+    struct PresetEntry { std::string key; std::string displayName; bool available=false; bool dynamic=false; };
+    std::vector<PresetEntry> presetList;
+    // Settings タブ: Calibration パラメータ
+    std::string chessboardFolder = "../../../chessboard/";
+    int   chessboardBoardCols = 9, chessboardBoardRows = 6;
+    float chessboardSquareMm   = 22.0f;
+
     bool calibDone = false;
     std::string calibMessage;
     float calibFx=0, calibFy=0, calibCx=0, calibCy=0;
     float calibRms = 0;
     int   calibImgCount = 0;
     std::string calibFolder = "../../../chessboard/";
+
+    // ---- Reconstruct from BIN (FEATURE Task 5) ----
+    // syncUIState() copies these from g_reconstructState / g_intrinsics each frame.
+    struct ReconSlot { int status=0; int width=0, height=0; std::string err; };  // status: 0=Empty 1=Loaded 2=Error
+    ReconSlot   reconBin, reconMask, reconRgb;
+    bool        reconReady = false;       // bin+mask loaded, resolutions agree
+    bool        reconHasAny = false;
+    int         reconKWidth = 0, reconKHeight = 0;  // current K resolution
+    std::string reconKSourceName;          // tag of current K (custom/calib/...)
 };
 
 class RegistrationImGuiManager {
@@ -308,6 +352,7 @@ private:
                                               // Apply Init Pose button, consumed
                                               // next frame to fold INITIAL ORIENT.
     float sidebarWidth_ = 400.0f;
+    bool  intrinsicsWantSettingsTab_ = false;  // Step 7: "Run Calibration…" -> Settings tab
 
     // ---- INITIAL ORIENTATION panel: CollapsingHeader open states ----
     //   ImGui の CollapsingHeader は自身で開閉状態を保持するが、
@@ -638,6 +683,7 @@ public:
         if (ImGui::Begin("##RegSidebar", nullptr, flags)) {
             drawWorkflowStepper();
             drawDepthSection();
+            drawReconstructSection();
             drawRegistrationSection();
             drawDeformSection();
             drawExport();
@@ -1975,74 +2021,295 @@ private:
         ImGui::Spacing(); ImGui::Separator();
     }
 
-    // ---- Intrinsics Source selector (replaces Depth Scale) ----
+    // ---- Step 7: Intrinsics panel (案 Y: dropdown + Active card + 3 tabs) ----
     void drawIntrinsicsSource(const char* suffix = "") {
         ImGui::Spacing();
-        ImGui::TextColored(colDim(), "Intrinsics Source");
-        ImGui::Spacing();
+        char barId[64]; snprintf(barId, sizeof(barId), "##intrTabs%s", suffix);
+        if (ImGui::BeginTabBar(barId, ImGuiTabBarFlags_None)) {
+            char id[64];
 
-        const char* labels[] = {"DA3", "Kinect", "Custom", "Calib"};
-        ImVec4 colors[] = {
-            {0.3f,0.8f,0.6f,1}, {0.2f,0.6f,1.0f,1},
-            {0.9f,0.7f,0.2f,1}, {0.9f,0.4f,0.6f,1}
-        };
-        float bw = (ImGui::GetContentRegionAvail().x - 18) / 4.0f;
+            snprintf(id, sizeof(id), "Source##%s", suffix);
+            if (ImGui::BeginTabItem(id)) {
+                drawIntrinsicsSourceTab_(suffix);
+                ImGui::EndTabItem();
+            }
 
-        for (int i = 0; i < 4; i++) {
-            if (i > 0) ImGui::SameLine();
-            bool sel = (state.intrinsicsSource == i);
-            ImVec4 c = colors[i];
-            if (sel) {
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(c.x*0.25f,c.y*0.25f,c.z*0.25f,1));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(c.x*0.35f,c.y*0.35f,c.z*0.35f,1));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(c.x*0.45f,c.y*0.45f,c.z*0.45f,1));
-                ImGui::PushStyleColor(ImGuiCol_Text,           c);
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.06f,0.065f,0.08f,1));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.10f,0.11f,0.14f,1));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.14f,0.15f,0.18f,1));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f,0.47f,0.52f,1));
+            // "Run Calibration…" を押すと次フレームで Settings タブへ遷移する。
+            ImGuiTabItemFlags setFlags = intrinsicsWantSettingsTab_
+                                       ? ImGuiTabItemFlags_SetSelected : 0;
+            intrinsicsWantSettingsTab_ = false;
+            snprintf(id, sizeof(id), "Settings##%s", suffix);
+            if (ImGui::BeginTabItem(id, nullptr, setFlags)) {
+                drawIntrinsicsSettingsTab_(suffix);
+                ImGui::EndTabItem();
             }
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-            char id[64]; snprintf(id, sizeof(id), "%s##isrc%d%s", labels[i], i, suffix);
-            if (ImGui::Button(id, ImVec2(bw, 30))) {
-                if (actions.onIntrinsicsSourceChanged) actions.onIntrinsicsSourceChanged(i);
+
+            snprintf(id, sizeof(id), "Take Picture##%s", suffix);
+            if (ImGui::BeginTabItem(id)) {
+                ImGui::Spacing();
+                ImGui::TextColored(colDim(), "Coming soon");
+                ImGui::TextWrapped("In-app chessboard capture then Run Calibration "
+                                   "(Step 8).");
+                ImGui::EndTabItem();
             }
-            ImGui::PopStyleVar(); ImGui::PopStyleColor(4);
+            ImGui::EndTabBar();
         }
+        ImGui::Spacing();
+    }
 
-        // Show calibration sub-panel when Calib is selected
-        if (state.intrinsicsSource == 3) {
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f,0.06f,0.10f,1));
-            ImGui::BeginChild("##calibPanel", ImVec2(0, state.calibDone ? 110 : 60), true);
-            ImGui::TextColored(ImVec4(0.9f,0.4f,0.6f,1), "Calibration");
+    // Active source -> short label + pill color for the Active card.
+    void intrinsicsSourceLabelColor_(const char*& label, ImVec4& col) const {
+        switch (state.intrinsicsSource) {
+            case IntrinsicsSource::Custom: label = "Custom"; col = ImVec4(0.9f,0.7f,0.2f,1); break;
+            case IntrinsicsSource::Calib:  label = "Calib";  col = ImVec4(0.9f,0.4f,0.6f,1); break;
+            case IntrinsicsSource::Preset: label = "Preset"; col = ImVec4(0.2f,0.6f,1.0f,1); break;
+            case IntrinsicsSource::DA3:    label = "DA3";    col = ImVec4(0.3f,0.8f,0.6f,1); break;
+            default:                       label = "?";      col = colDim(); break;
+        }
+    }
+
+    void drawIntrinsicsSourceTab_(const char* suffix) {
+        ImGui::Spacing();
+        // ---- Active intrinsics card ----
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f,0.075f,0.095f,1));
+        ImGui::BeginChild("##activeK", ImVec2(0, 100), true);
+        {
+            const char* srcLabel; ImVec4 pill;
+            intrinsicsSourceLabelColor_(srcLabel, pill);
+            ImGui::TextColored(colDim(), "Active intrinsics");
             ImGui::SameLine();
-            ImGui::TextColored(colDim(), "(%s)", state.calibFolder.c_str());
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(pill.x*0.30f,pill.y*0.30f,pill.z*0.30f,1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(pill.x*0.30f,pill.y*0.30f,pill.z*0.30f,1));
+            ImGui::PushStyleColor(ImGuiCol_Text, pill);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+            ImGui::SmallButton(srcLabel);
+            ImGui::PopStyleVar(); ImGui::PopStyleColor(3);
 
-            if (!state.calibDone) {
-                ImGui::Spacing();
-                if (colorButton("Run Calibration##calib", ImVec4(0.9f,0.4f,0.6f,1))) {
-                    if (actions.onRunCalibration) actions.onRunCalibration();
-                }
+            if (!state.currentDisplayName.empty())
+                ImGui::TextColored(colDim(), "%s", state.currentDisplayName.c_str());
+            bool haveK = (state.currentWidth > 0 && state.currentHeight > 0);
+            if (!haveK) {
+                ImGui::TextColored(colMuted(), "(no K loaded; run depth to populate)");
             } else {
-                ImGui::TextColored(colDim(),
-                                   "fx=%.1f  fy=%.1f  cx=%.1f  cy=%.1f",
-                                   state.calibFx, state.calibFy, state.calibCx, state.calibCy);
-                ImGui::TextColored(colDim(),
-                                   "RMS=%.3f px  (%d images)", state.calibRms, state.calibImgCount);
-                ImGui::Spacing();
-                if (colorButton("Re-run##recalib", ImVec4(0.9f,0.4f,0.6f,1))) {
-                    if (actions.onRunCalibration) actions.onRunCalibration();
+                ImGui::Text("fx %.2f   fy %.2f", state.currentFx, state.currentFy);
+                ImGui::Text("cx %.2f   cy %.2f", state.currentCx, state.currentCy);
+                ImGui::TextColored(colDim(), "res %d x %d",
+                                   state.currentWidth, state.currentHeight);
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        // ---- Source dropdown (priority order) ----
+        ImGui::TextColored(colDim(), "Source");
+        const std::string preview = state.currentDisplayName.empty()
+                                   ? std::string("(select source)") : state.currentDisplayName;
+        // green "o" = available, dim "-" = missing; then a Selectable.
+        // Unavailable entries are disabled (greyed + non-clickable).
+        auto entry = [&](const char* label, bool available, bool selected) -> bool {
+            ImGui::PushStyleColor(ImGuiCol_Text, available ? colGreen() : colMuted());
+            ImGui::TextUnformatted(available ? "o" : "-");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGuiSelectableFlags flags = available ? 0 : ImGuiSelectableFlags_Disabled;
+            return ImGui::Selectable(label, selected, flags);
+        };
+        char comboId[64]; snprintf(comboId, sizeof(comboId), "##srcCombo%s", suffix);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo(comboId, preview.c_str())) {
+            // 1. Custom
+            if (entry("Custom (intrinsics_custom.txt)", state.customAvailable,
+                      state.intrinsicsSource == IntrinsicsSource::Custom)) {
+                if (actions.onSourceChanged) actions.onSourceChanged(IntrinsicsSource::Custom);
+            }
+            // 2. Calib (last)
+            if (entry("Calib (last)", state.calibLastAvailable,
+                      state.intrinsicsSource == IntrinsicsSource::Calib)) {
+                if (actions.onSourceChanged) actions.onSourceChanged(IntrinsicsSource::Calib);
+            }
+            // 3. Factory presets
+            ImGui::Separator();
+            ImGui::TextColored(colDim(), "Factory presets");
+            for (auto& p : state.presetList) {
+                if (p.dynamic) continue;
+                bool sel = (state.intrinsicsSource == IntrinsicsSource::Preset
+                            && state.currentPresetKey == p.key);
+                char lbl[112]; snprintf(lbl, sizeof(lbl), "%s##preset_%s",
+                                        p.displayName.c_str(), p.key.c_str());
+                if (entry(lbl, p.available, sel)) {
+                    if (actions.onPresetChanged) actions.onPresetChanged(p.key);
                 }
             }
-            if (!state.calibMessage.empty() && state.calibMessage != "OK") {
-                ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "%s", state.calibMessage.c_str());
+            // Dynamic presets
+            bool anyDyn = false;
+            for (auto& p : state.presetList) if (p.dynamic) { anyDyn = true; break; }
+            if (anyDyn) {
+                ImGui::Separator();
+                ImGui::TextColored(colDim(), "Dynamic");
+                for (auto& p : state.presetList) {
+                    if (!p.dynamic) continue;
+                    bool sel = (state.intrinsicsSource == IntrinsicsSource::Preset
+                                && state.currentPresetKey == p.key);
+                    char lbl[112]; snprintf(lbl, sizeof(lbl), "%s##dyn_%s",
+                                            p.displayName.c_str(), p.key.c_str());
+                    if (entry(lbl, p.available, sel)) {
+                        if (actions.onPresetChanged) actions.onPresetChanged(p.key);
+                    }
+                }
             }
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
+            // Saved calibrations (Step 6 placeholder)
+            ImGui::Separator();
+            ImGui::TextColored(colMuted(), "Saved calibrations: (Step 6)");
+            // 4. DA3 (file-driven: intrinsics_da3_last.txt). Disabled until a
+            //    Run Depth has produced an estimate.
+            ImGui::Separator();
+            if (entry("DA3 (last estimate)", state.da3LastAvailable,
+                      state.intrinsicsSource == IntrinsicsSource::DA3)) {
+                if (actions.onSourceChanged) actions.onSourceChanged(IntrinsicsSource::DA3);
+            }
+            ImGui::EndCombo();
         }
+
         ImGui::Spacing();
+        // ---- Buttons ----
+        float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
+        bool noK = (state.currentWidth <= 0 || state.currentHeight <= 0);  // no valid K loaded
+        if (colorButton("Save current K as Custom", colYellow(), false, noK, bw)) {
+            if (actions.onSaveAsCustom) actions.onSaveAsCustom();
+        }
+        ImGui::SameLine();
+        if (colorButton("Run Calibration...", ImVec4(0.9f,0.4f,0.6f,1), false, false, bw)) {
+            intrinsicsWantSettingsTab_ = true;
+        }
+    }
+
+    void drawIntrinsicsSettingsTab_(const char* suffix) {
+        ImGui::Spacing();
+        // ---- Custom intrinsics ----
+        ImGui::TextColored(colYellow(), "Custom intrinsics");
+        ImGui::TextWrapped("File: intrinsics_custom.txt  (edit externally, then Reload)");
+        float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
+        bool noK = (state.currentWidth <= 0 || state.currentHeight <= 0);  // no valid K loaded
+        if (colorButton("Save current K", colYellow(), false, noK, bw)) {
+            if (actions.onSaveAsCustom) actions.onSaveAsCustom();
+        }
+        ImGui::SameLine();
+        if (colorButton("Reload Custom", colDim(), false, !state.customAvailable, bw)) {
+            if (actions.onSourceChanged) actions.onSourceChanged(IntrinsicsSource::Custom);
+        }
+
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        // ---- Calibration parameters ----
+        ImGui::TextColored(ImVec4(0.9f,0.4f,0.6f,1), "Calibration parameters");
+
+        char folderBuf[256];
+        std::strncpy(folderBuf, state.chessboardFolder.c_str(), sizeof(folderBuf)-1);
+        folderBuf[sizeof(folderBuf)-1] = 0;
+        char fId[48]; snprintf(fId, sizeof(fId), "Chessboard folder##%s", suffix);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText(fId, folderBuf, sizeof(folderBuf))) {
+            if (actions.onChessboardFolderChanged) actions.onChessboardFolderChanged(folderBuf);
+        }
+
+        int cols = state.chessboardBoardCols, rows = state.chessboardBoardRows;
+        bool boardChanged = false;
+        ImGui::SetNextItemWidth(110);
+        char cId[32]; snprintf(cId, sizeof(cId), "cols##%s", suffix);
+        boardChanged |= ImGui::InputInt(cId, &cols);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110);
+        char rId[32]; snprintf(rId, sizeof(rId), "rows##%s", suffix);
+        boardChanged |= ImGui::InputInt(rId, &rows);
+        if (boardChanged && actions.onBoardSizeChanged) {
+            if (cols < 2) cols = 2;
+            if (rows < 2) rows = 2;
+            actions.onBoardSizeChanged(cols, rows);
+        }
+
+        float mm = state.chessboardSquareMm;
+        ImGui::SetNextItemWidth(160);
+        char sId[40]; snprintf(sId, sizeof(sId), "Square size (mm)##%s", suffix);
+        if (ImGui::InputFloat(sId, &mm, 0.5f, 1.0f, "%.2f")) {
+            if (mm < 0.1f) mm = 0.1f;
+            if (actions.onSquareSizeChanged) actions.onSquareSizeChanged(mm);
+        }
+
+        ImGui::Spacing();
+        if (colorButton("Run Calibration", ImVec4(0.9f,0.4f,0.6f,1))) {
+            if (actions.onRunCalibration) actions.onRunCalibration();
+        }
+        if (state.calibDone) {
+            ImGui::TextColored(colDim(), "Last: fx=%.1f fy=%.1f  RMS=%.3f (%d imgs)",
+                               state.calibFx, state.calibFy, state.calibRms, state.calibImgCount);
+        }
+        if (!state.calibMessage.empty() && state.calibMessage != "OK") {
+            ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "%s", state.calibMessage.c_str());
+        }
+
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        // ---- Saved calibrations (Step 6) ----
+        ImGui::TextColored(colMuted(), "Saved calibrations: (Step 6)");
+    }
+
+    // ---- Reconstruct from BIN (FEATURE Task 5) ----
+    //   Drop depth_metric.bin + segmentation_mask.png (+ original.jpg) and rebuild
+    //   the OBJ with the current K, no DA3/SAM2. State lives in g_reconstructState
+    //   (main.cpp); syncUIState mirrors it into state.recon*.
+    void drawReconstructSection() {
+        if (!ImGui::CollapsingHeader("Reconstruct from depth (BIN)")) return;
+        ImGui::Indent(16); ImGui::Spacing();
+        ImGui::TextWrapped("Drop depth_metric.bin + segmentation_mask.png "
+                           "(+ original.jpg) or a depth_output/ folder.");
+        ImGui::Spacing();
+
+        auto slotRow = [&](const char* name, const RegUIState::ReconSlot& s,
+                           const char* emptyHint) {
+            if (s.status == 1) {  // Loaded
+                ImGui::TextColored(colGreen(), "o");
+                ImGui::SameLine();
+                ImGui::Text("%s  (%dx%d)", name, s.width, s.height);
+            } else if (s.status == 2) {  // Error
+                ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "!");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1,0.5f,0.5f,1), "%s  %s", name,
+                                   s.err.empty() ? "error" : s.err.c_str());
+            } else {  // Empty
+                ImGui::TextColored(colMuted(), "-");
+                ImGui::SameLine();
+                ImGui::TextColored(colDim(), "%s  %s", name, emptyHint);
+            }
+        };
+        slotRow("depth_metric.bin",      state.reconBin,  "(required)");
+        slotRow("segmentation_mask.png", state.reconMask, "(required)");
+        slotRow("original.jpg",          state.reconRgb,  "(optional - white texture if absent)");
+
+        ImGui::Spacing();
+        // Resolution check vs current K.
+        if (state.reconBin.status == 1 && state.reconMask.status == 1) {
+            const bool resMatch = (state.reconBin.width  == state.reconKWidth &&
+                                   state.reconBin.height == state.reconKHeight);
+            ImGui::TextColored(colDim(), "data %dx%d   K %dx%d (%s)",
+                               state.reconBin.width, state.reconBin.height,
+                               state.reconKWidth, state.reconKHeight,
+                               state.reconKSourceName.empty() ? "?" : state.reconKSourceName.c_str());
+            if (resMatch)
+                ImGui::TextColored(colGreen(), "  match");
+            else
+                ImGui::TextColored(colYellow(), "  K will be auto-scaled to %dx%d",
+                                   state.reconBin.width, state.reconBin.height);
+        }
+
+        ImGui::Spacing();
+        float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
+        if (colorButton("Reconstruct from BIN", colGreen(), false, !state.reconReady, bw)) {
+            if (actions.onReconstruct) actions.onReconstruct();
+        }
+        ImGui::SameLine();
+        if (colorButton("Clear all", colDim(), false, !state.reconHasAny, bw)) {
+            if (actions.onReconstructClear) actions.onReconstructClear();
+        }
+        ImGui::Spacing(); ImGui::Unindent(16); ImGui::Separator();
     }
 
     // [key-reorg Phase 12] Export section — replaces the removed M / Shift+M
@@ -2208,10 +2475,15 @@ private:
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 20);
             ImGui::TextColored(state.splitScreen ? colGreen() : colMuted(), state.splitScreen ? "ON" : "OFF");
             ImGui::TextColored(colDim(), "Intrinsics");
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 50);
-            const char* isrcNames[] = {"DA3", "Kinect", "Custom", "Calib"};
-            int si = std::clamp(state.intrinsicsSource, 0, 3);
-            ImGui::TextColored(colDepth(), "%s", isrcNames[si]);
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
+            const char* isrcName = "DA3";
+            switch (state.intrinsicsSource) {
+                case IntrinsicsSource::Custom: isrcName = "Custom"; break;
+                case IntrinsicsSource::Calib:  isrcName = "Calib";  break;
+                case IntrinsicsSource::Preset: isrcName = "Preset"; break;
+                case IntrinsicsSource::DA3:    isrcName = "DA3";    break;
+            }
+            ImGui::TextColored(colDepth(), "%s", isrcName);
             ImGui::TextColored(colDim(), "Image Source");
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 50);
             if(state.hasLocalImage) ImGui::TextColored(colDepth(), "Local");

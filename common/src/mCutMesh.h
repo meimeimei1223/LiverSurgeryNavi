@@ -1483,7 +1483,10 @@ struct mCutMesh {
         glBindVertexArray(0);
     }
 };
-void setUp(mCutMesh& srcMesh) {
+// inline: this free function lives in a header included by multiple TUs
+// (main.cpp + common/src/DepthToObjExport.cpp etc.). Without inline it is an ODR
+// violation -> "multiple definition of setUp" at link.
+inline void setUp(mCutMesh& srcMesh) {
     while (glGetError() != GL_NO_ERROR) {}
     if (srcMesh.mVertices.empty() || srcMesh.mIndices.empty()) {
         std::cerr << "Error: Empty mesh data" << std::endl;

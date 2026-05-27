@@ -44,6 +44,11 @@
 #include "NoOpen3DRegistration.h"
 
 #include "OBJTargetExtraction.h"
+#include "IntrinsicsSource.h"
+#include "IntrinsicsPresets.h"
+#include "DepthToObjExport.h"   // obj-migration Phase 3: REG-side OBJ export
+#include "IntrinsicsScaling.h"  // scaleIntrinsics() (FEATURE Task 1/2)
+#include "ReconstructFromBin.h" // Reconstruct-from-BIN (FEATURE Task 3/4)
 #include "MeshCleanup.h"
 #include "AR.h"
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
@@ -174,6 +179,16 @@ float scaleSpeed = 1.1f;
 float                          g_silhouetteCosThreshold = 0.02f;
 std::string                    g_objSourcePath;
 Reg3DCustom::CameraIntrinsics  g_intrinsics;
+// Distorted calibration kept aside when an image is rectified: g_intrinsics then
+// holds the distortion-free K matching original_rectified.jpg, while
+// g_intrinsics_raw retains the original (distortion-bearing) K so a subsequent
+// image load can still decide/perform rectification. Invalidated whenever K is
+// (re)loaded from a source. See loadImageRectifyAware().
+Reg3DCustom::CameraIntrinsics  g_intrinsics_raw;
+// Reconstruct-from-BIN drop state (FEATURE Task 3/4). Filled by file/folder drops
+// of depth_metric.bin + segmentation_mask.png (+ original.jpg); consumed by the
+// Reconstruct action (Task 6) + UI (Task 5).
+ReconstructFromBin::State     g_reconstructState;
 
 // =========================================================
 //  Scene scale (for size-invariant registration parameters)
@@ -674,8 +689,18 @@ static SphereMesh g_sphereMarker;  // クラスタ・対応点描画用スフィ
 static ARSave::State g_arSave;    // AR保存＋プレビュー状態
 static ShaderProgram* g_pShader     = nullptr;  // AR保存用シェーダ参照
 static ShaderProgram* g_pShaderCube = nullptr;
-static int            g_intrinsicsSource = 1;   // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
+// Intrinsics source selector (enum in common/src/IntrinsicsSource.h).
+// Default Preset = the only factory preset currently in the registry
+// (Azure Kinect 1080p). Step 4 (autoSelect) overrides this at startup based on
+// available files.
+static IntrinsicsSource g_intrinsicsSource = IntrinsicsSource::Preset;
+static std::string      g_currentPresetKey = "azure_kinect_1080p";
 static CalibResult    g_calibResult;             // キャリブレーション結果
+// Step 7: Settings タブの Calibration パラメータ (UI から編集される)
+static std::string      g_chessboardFolder   = "../../../chessboard/";
+static int              g_chessboardCols     = 9;
+static int              g_chessboardRows     = 6;
+static float            g_chessboardSquareMm = 22.0f;
 
 // カメラ開始前の状態を保存
 static struct {
@@ -1063,6 +1088,7 @@ inline void recomputeLiverQuad() {
 // 前方宣言
 static bool setupObjScene();
 static bool runDepthAndUpdateScene(AppContext& ctx);
+static void loadIntrinsicsFromCurrentSource();   // defined near main(); used by sidecar import
 // Forward decl: kind selects which mask the preview pops up for.
 //   MaskKind::Liver       -> uses ctx.maskPoints, writes segmentation_mask.png
 //   MaskKind::Instrument  -> uses ctx.instrumentMaskPoints, writes
@@ -1442,9 +1468,9 @@ void StlExport::exportCamMmStlWithSnapshot() {
               << "  (v4: CT-truth scale, X+Z flip, no index swap)" << std::endl;
 
     try {
-        std::string srcTag = "k4a";
-        if      (g_intrinsicsSource == 2) srcTag = "custom";
-        else if (g_intrinsicsSource == 3) srcTag = "calib";
+        // obj-migration Phase 6: snapshot the canonical (tag-less) outputs.
+        const std::string srcName = intrinsicsSourceToTag(g_intrinsicsSource,
+                                                          g_currentPresetKey);
 
         auto now = std::chrono::system_clock::now();
         std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -1461,15 +1487,13 @@ void StlExport::exportCamMmStlWithSnapshot() {
         std::filesystem::create_directories(snapDir);
 
         const std::vector<std::string> srcFiles = {
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".mtl",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + "_noskirt.mtl",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light.mtl",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.obj",
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_" + srcTag + "_light_noskirt.mtl",
-            DEPTH_OUTPUT_PATH + "intrinsics_" + srcTag + ".txt",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.mtl",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_light.obj",
+            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_light.mtl",
+            DEPTH_OUTPUT_PATH + "intrinsics.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_da3.txt",
+            DEPTH_OUTPUT_PATH + "depth_metric.bin",
             DEPTH_OUTPUT_PATH + "original_rectified.jpg",
             DEPTH_OUTPUT_PATH + "segmentation_mask.png",
             DEPTH_OUTPUT_PATH + "instrument_segmentation_mask.png",
@@ -1506,8 +1530,8 @@ void StlExport::exportCamMmStlWithSnapshot() {
             std::ofstream readme(snapDir + "README.txt");
             if (readme.is_open()) {
                 readme << "Snapshot created: " << tsBuf << "\n"
-                       << "Intrinsics tag (g_intrinsicsSource="
-                       << g_intrinsicsSource << "): " << srcTag << "\n"
+                       << "Intrinsics source (g_intrinsicsSource="
+                       << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << "): " << srcName << "\n"
                        << "g_originalLiverDiagMm = " << g_originalLiverDiagMm << " mm\n"
                        << "g_originalTumorDiagMm = " << g_originalTumorDiagMm << " mm\n"
                        << "SCALE_RESTORE used     = " << SCALE_RESTORE << "\n"
@@ -2600,6 +2624,68 @@ static void glfw_OnFramebufferSize(GLFWwindow*, int w, int h) {
     OrbitCam.onWindowResize(w, h);
 }
 
+// Load an image, rectifying if the active K has distortion, and keep the
+// downstream intrinsics consistent with the rectified pixels.
+//
+//   - Rectification is decided/performed with the FULL (distorted) calibration.
+//     g_intrinsics may have had its distortion zeroed by a previous rectify, so
+//     restore it from g_intrinsics_raw first (when valid) for the decision.
+//   - If rectification ran, depth_output/original_rectified.jpg is now the live
+//     image and is already undistorted. We stash the distorted K in
+//     g_intrinsics_raw and ZERO the distortion in g_intrinsics so everything
+//     downstream (SAM2 unprojection, OBJTargetExtraction, OrbitCam) uses a K
+//     that matches the rectified pixels. This also makes a second pass a no-op
+//     (hasDistortion() == false), preventing double rectification.
+//   - If no rectification ran, there is no raw/effective split to track.
+// Sidecar import: if an intrinsics_custom.txt sits in the SAME directory as the
+// image being loaded, copy it into depth_output/intrinsics_custom.txt and make
+// Custom the active source. This lets per-image (per-dataset) calibration files
+// take effect on load without a manual copy. No-op if absent, or if the sidecar
+// already IS depth_output/intrinsics_custom.txt.
+static void maybeImportSidecarIntrinsics(const std::string& imagePath) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path sidecar = fs::path(imagePath).parent_path() / "intrinsics_custom.txt";
+    if (!fs::exists(sidecar, ec)) return;
+
+    const std::string dst = DEPTH_OUTPUT_PATH + "intrinsics_custom.txt";
+    fs::path srcAbs = fs::weakly_canonical(sidecar, ec);
+    fs::path dstAbs = fs::weakly_canonical(fs::path(dst), ec);
+    if (!srcAbs.empty() && srcAbs == dstAbs) return;   // would copy onto itself
+
+    fs::create_directories(DEPTH_OUTPUT_PATH, ec);
+    fs::copy_file(sidecar, dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        std::cerr << "[Sidecar] copy failed (" << sidecar << " -> " << dst
+                  << "): " << ec.message() << std::endl;
+        return;
+    }
+    std::cout << "[Sidecar] imported " << sidecar << " -> " << dst
+              << "; selecting Custom source" << std::endl;
+    g_intrinsicsSource = IntrinsicsSource::Custom;
+    g_intrinsics_raw   = Reg3DCustom::CameraIntrinsics{};  // force a fresh decision below
+    loadIntrinsicsFromCurrentSource();                     // load the imported 4K K
+}
+
+static bool loadImageRectifyAware(AppContext& ctx, const std::string& path) {
+    maybeImportSidecarIntrinsics(path);
+    if (g_intrinsics_raw.valid()) g_intrinsics = g_intrinsics_raw;
+    bool rectified = false;
+    if (!ImageSession::loadWithIntrinsics(ctx, path, g_intrinsics, &rectified))
+        return false;
+    if (rectified) {
+        g_intrinsics_raw = g_intrinsics;                 // keep distorted calibration
+        g_intrinsics.k1 = g_intrinsics.k2 = g_intrinsics.k3 = g_intrinsics.k4 = 0.0f;
+        g_intrinsics.p1 = g_intrinsics.p2 = 0.0f;        // rectified -> no distortion
+        gApp.intrinsics = g_intrinsics;
+        std::cout << "[Intrinsics] image rectified -> downstream K distortion "
+                     "zeroed (distorted K kept in g_intrinsics_raw)" << std::endl;
+    } else {
+        g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // no active rectify
+    }
+    return true;
+}
+
 // FileDropHandler.hのglfw_onFileDropを使用するように変更
 static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
     if (count <= 0 || !paths) return;
@@ -2614,6 +2700,37 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
     const std::string filePath = paths[0];
     std::cout << "[FileDrop] Attempting to load: " << filePath << std::endl;
 
+    // FEATURE Task 4: route Reconstruct-from-BIN inputs (depth_metric.bin /
+    // segmentation_mask.png / original.jpg, or a depth_output/ folder) to the
+    // reconstruct state machine instead of the normal image-load path. Each
+    // dropped path is handled independently (multi-file / folder drops supported).
+    {
+        // main.cpp owns the stb_image implementation; provide it as the decoder.
+        ReconstructFromBin::ImageDecoder decode =
+            [](const std::string& p, int channels,
+               std::vector<uint8_t>& out, int& w, int& h) -> bool {
+            int c = 0;
+            unsigned char* px = stbi_load(p.c_str(), &w, &h, &c, channels);
+            if (!px) return false;
+            out.assign(px, px + (size_t)w * h * channels);
+            stbi_image_free(px);
+            return true;
+        };
+        std::error_code ec;
+        bool consumed = false;
+        for (int i = 0; i < count; ++i) {
+            const std::string p = paths[i];
+            if (std::filesystem::is_directory(p, ec)) {
+                ReconstructFromBin::onFolderDropped(g_reconstructState, p, decode);
+                consumed = true;
+            } else if (ReconstructFromBin::isReconstructFile(p)) {
+                ReconstructFromBin::onFileDropped(g_reconstructState, p, decode);
+                consumed = true;
+            }
+        }
+        if (consumed) return;   // handled by Reconstruct; do not fall through to image load
+    }
+
     if (!ImageSession::isSupportedExtension(filePath)) {
         std::cerr << "[FileDrop] Unsupported format: " << filePath
                   << "  (expected .png .jpg .jpeg .bmp .ppm)" << std::endl;
@@ -2626,7 +2743,7 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
         std::cout << "[FileDrop] Stopping camera to load image" << std::endl;
     }
 
-    if (!ImageSession::loadWithIntrinsics(*ctx, filePath, g_intrinsics)) {
+    if (!loadImageRectifyAware(*ctx, filePath)) {
         std::cerr << "[FileDrop] Failed to load: " << filePath << std::endl;
         return;
     }
@@ -2876,37 +2993,42 @@ static bool setupObjScene() {
     Reg3DCustom::printMeshBBox(*screenMesh, "OBJ raw (meters)");
 
     Reg3DCustom::CameraIntrinsics K;
-    // intrinsicsSource (UI 状態) に応じて候補リストを切り替える。
-    // 0=DA3, 1=Kinect, 2=Custom, 3=Calib
+    // intrinsicsSource に応じて候補リストを切り替える。Step 10 で Run Depth が
+    // 使う srcTag (Custom/Calib/Preset=key/DA3) と対応させ、SAM2 が書き出す
+    // intrinsics_<tag>.txt を読む。
     std::vector<std::string> intrinsicsCandidates;
-    if (g_intrinsicsSource == 2) {
-        // Custom: depth pipeline が intrinsics_custom.txt を出すのでそれを読む
+    if (g_intrinsicsSource == IntrinsicsSource::Custom) {
         intrinsicsCandidates = {
             DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
         };
-    } else if (g_intrinsicsSource == 3) {
-        // Calib: depth pipeline が intrinsics_calib.txt を出すのでそれを読む
+    } else if (g_intrinsicsSource == IntrinsicsSource::Calib) {
         intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_calib_last.txt",
             DEPTH_OUTPUT_PATH + "intrinsics_calib.txt",
         };
-    } else if (g_intrinsicsSource == 1) {
+    } else if (g_intrinsicsSource == IntrinsicsSource::Preset) {
+        // SAM2 round-trips the passed preset K to intrinsics_<key>.txt; fall
+        // back to legacy intrinsics_k4a.txt for older k4a-tagged OBJs.
         intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_" + g_currentPresetKey + ".txt",
             DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
         };
     } else {
-        // DA3 / その他 fallback
+        // DA3: the OBJ is built with the K SAM2 actually used (intrinsics_da3.txt
+        // / legacy intrinsics_k4a.txt); intrinsics_da3_last.txt / intrinsics.txt
+        // hold the DA3 estimate.
         intrinsicsCandidates = {
+            DEPTH_OUTPUT_PATH + "intrinsics_da3.txt",
             DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt",
-            DEPTH_OUTPUT_PATH + "intrinsics_realsense.txt",
-            DEPTH_OUTPUT_PATH + "intrinsics_iphone.txt",
-            DEPTH_OUTPUT_PATH + "intrinsics_custom.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt",
+            DEPTH_OUTPUT_PATH + "intrinsics.txt",
         };
     }
 
     if (!Reg3DCustom::loadCameraIntrinsicsAny(intrinsicsCandidates, K)) {
         const char* labels[] = {"DA3", "Kinect", "Custom", "Calib"};
         std::cerr << "[Intrinsics] "
-                  << labels[std::clamp(g_intrinsicsSource, 0, 3)]
+                  << labels[std::clamp(intrinsicsSourceToLegacyInt(g_intrinsicsSource), 0, 3)]
                   << " selected but no matching file under " << DEPTH_OUTPUT_PATH
                   << "; falling back to k4a 720p" << std::endl;
         K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
@@ -2917,6 +3039,7 @@ static bool setupObjScene() {
         Reg3DCustom::checkIntrinsicsResolution(K, gApp.image.width, gApp.image.height);
     }
     g_intrinsics = K;
+    g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // fresh source K; drop any rectify-raw
 
     Reg3DCustom::printEdgeLengthStats(*screenMesh, "OBJ raw");
 
@@ -2933,8 +3056,34 @@ static bool setupObjScene() {
               << " res=" << K.width << "x" << K.height << ")"
               << std::endl;
 
+    // OBJ-projection K: REG writes the K it ACTUALLY used to build the OBJ
+    // (scaled to the depth resolution, Task 2) to the canonical intrinsics.txt.
+    // The target cloud must be projected with that same K to match the OBJ
+    // geometry, so prefer intrinsics.txt; fall back to the legacy pre-migration
+    // intrinsics_custom_used.txt, else the display K. OrbitCam / AR background
+    // above keep the display K (matches the full-res rectified image).
+    Reg3DCustom::CameraIntrinsics K_obj = K;
+    {
+        Reg3DCustom::CameraIntrinsics Kobj2;
+        if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", Kobj2)
+            && Kobj2.valid()) {
+            K_obj = Kobj2;
+            std::cout << "[OBJ Setup] OBJ-projection K from intrinsics.txt: "
+                      << K_obj.width << "x" << K_obj.height << " fx=" << K_obj.fx
+                      << "  (display/OrbitCam keeps " << K.width << "x" << K.height
+                      << " fx=" << K.fx << ")" << std::endl;
+        } else if (g_intrinsicsSource == IntrinsicsSource::Custom &&
+                   Reg3DCustom::loadCameraIntrinsics(
+                       DEPTH_OUTPUT_PATH + "intrinsics_custom_used.txt", Kobj2)
+                   && Kobj2.valid()) {
+            K_obj = Kobj2;  // legacy (pre-migration) used-K
+            std::cout << "[OBJ Setup] OBJ-projection K from legacy intrinsics_custom_used.txt"
+                      << std::endl;
+        }
+    }
+
     auto targetCloud = Reg3DCustom::setupOBJTarget(
-        *screenMesh, K, Reg3DCustom::OBJ_Y_SIGN_OPENGL);
+        *screenMesh, K_obj, Reg3DCustom::OBJ_Y_SIGN_OPENGL);
     if (!targetCloud || targetCloud->empty()) {
         std::cerr << "[OBJ Setup] FAILED to build target cloud" << std::endl;
         return false;
@@ -3148,7 +3297,10 @@ static bool setupObjScene() {
     return true;
 }
 
-
+// obj-migration Phase 5: applyIntrinsicsToRunnerConfig() removed. REG no longer
+// passes K to sam2 (sam2 owns no K). REG builds the OBJ from its own K after
+// Run Depth via the export hook below (DepthToObjExport), which uses
+// intrinsicsSourceToTag(g_intrinsicsSource, ...) directly.
 
 static bool runDepthAndUpdateScene(AppContext& ctx) {
     if (ctx.image.path.empty() || !ctx.image.loaded) {
@@ -3170,76 +3322,7 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
     // when sam2_da3_lite is a CPU-only build (silent CPU fallback).
     runner.config.useCuda = ctx.useCuda;
 
-    // 出力ファイル名のサフィックスを決定。setupObjScene の intrinsics 候補
-    // 分岐 (パッチ2) と完全に対応させる。
-    //   0 (DA3)    : intrinsics をオーバーライドしない -> default "k4a"
-    //                 (このソースでは hasKinectIntrinsics 経路に乗らない)
-    //   1 (Kinect) : "k4a"   -> intrinsics_k4a.txt, pc_*_k4a*.obj  (従来動作)
-    //   2 (Custom) : "custom" -> intrinsics_custom.txt, pc_*_custom*.obj
-    //   3 (Calib)  : "calib"  -> intrinsics_calib.txt, pc_*_calib*.obj
-    std::string srcTag = "k4a";  // 既定 (Kinect / DA3)
-    if      (g_intrinsicsSource == 2) srcTag = "custom";
-    else if (g_intrinsicsSource == 3) srcTag = "calib";
-    runner.config.intrinsicsSourceName = srcTag;
-
-    // Custom intrinsics 選択時、外部 sam2_da3_lite に --kinect-intrinsics
-    // で K を渡す。これがないと外部側はデフォルト Azure Kinect 720p を使って
-    // メッシュをアンプロジェクトしてしまい、AR で 3D メッシュと背景画像が
-    // ずれる (C++ 側の射影行列は Custom K、メッシュは Kinect K で生成、で
-    // 食い違うのが原因)。
-    if (g_intrinsicsSource == 2 && g_intrinsics.valid()) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = g_intrinsics.fx;
-        runner.config.fy = g_intrinsics.fy;
-        runner.config.cx = g_intrinsics.cx;
-        runner.config.cy = g_intrinsics.cy;
-        // Brown-Conrady distortion: round-trip so the pipeline does NOT
-        // truncate user-edited intrinsics_custom.txt on every Run Depth.
-        // Zero coefficients pass through silently; only non-zero values
-        // emit --kinect-distortion on the sam side.
-        runner.config.k1 = g_intrinsics.k1;
-        runner.config.k2 = g_intrinsics.k2;
-        runner.config.k3 = g_intrinsics.k3;
-        runner.config.k4 = g_intrinsics.k4;
-        runner.config.p1 = g_intrinsics.p1;
-        runner.config.p2 = g_intrinsics.p2;
-        std::cout << "[RunDepth] passing custom intrinsics to depth pipeline: "
-                  << "fx=" << g_intrinsics.fx << " fy=" << g_intrinsics.fy
-                  << " cx=" << g_intrinsics.cx << " cy=" << g_intrinsics.cy
-                  << "  (image " << g_intrinsics.width << "x"
-                  << g_intrinsics.height << ")"
-                  << "  tag=" << srcTag << std::endl;
-        if (g_intrinsics.hasDistortion()) {
-            std::cout << "[RunDepth] passing distortion: "
-                      << "k1=" << g_intrinsics.k1 << " k2=" << g_intrinsics.k2
-                      << " k3=" << g_intrinsics.k3 << " k4=" << g_intrinsics.k4
-                      << " p1=" << g_intrinsics.p1 << " p2=" << g_intrinsics.p2
-                      << std::endl;
-        }
-    } else if (g_intrinsicsSource == 3 && g_calibResult.valid) {
-        // Calibrated source: same idea
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = (float)g_calibResult.fx;
-        runner.config.fy = (float)g_calibResult.fy;
-        runner.config.cx = (float)g_calibResult.cx;
-        runner.config.cy = (float)g_calibResult.cy;
-        // CalibResult only carries k1, k2 (the in-house Zhang tool fits only
-        // those). k3/k4/p1/p2 stay 0; the sam pipeline will then either
-        // emit them (if non-zero) or skip the --kinect-distortion flag
-        // entirely (when all zero).
-        runner.config.k1 = (float)g_calibResult.k1;
-        runner.config.k2 = (float)g_calibResult.k2;
-        std::cout << "[RunDepth] passing calibrated intrinsics to depth pipeline"
-                  << "  tag=" << srcTag << std::endl;
-        if (std::fabs((float)g_calibResult.k1) > 1e-6f ||
-            std::fabs((float)g_calibResult.k2) > 1e-6f) {
-            std::cout << "[RunDepth] passing distortion (calib): "
-                      << "k1=" << g_calibResult.k1 << " k2=" << g_calibResult.k2
-                      << std::endl;
-        }
-    }
-    // Otherwise (DA3 / Kinect default) leave runner.config.useCustomIntrinsics
-    // = false; the external pipeline uses its built-in Azure Kinect 720p.
+    // Phase 5: no K is passed to sam2. REG builds the canonical OBJ after the run.
 
     if (!runner.isAvailable()) {
         std::cerr << "[RunDepth] exe not found: " << runner.config.exePath
@@ -3330,21 +3413,107 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
                   << rr.instrumentSegmentationMaskPath << std::endl;
     }
 
-    std::string objPath =
-        DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + srcTag + ".obj";
-    if (!std::filesystem::exists(objPath)) {
-        std::cerr << "[RunDepth] expected OBJ missing: " << objPath << std::endl;
-        // Backwards compat: fall back to legacy _k4a.obj if the source-tagged
-        // file isn't there (e.g. older pipeline build that doesn't know about
-        // --intrinsics-source). Keeps things working until sam2_da3_lite
-        // is rebuilt with the new flag.
-        std::string fallback =
-            DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
-        if (std::filesystem::exists(fallback)) {
-            std::cerr << "[RunDepth] falling back to legacy: " << fallback
-                      << std::endl;
-            objPath = fallback;
+    // ---- persist the DA3 estimate as the DA3 source ----
+    // Phase 3: sam2 now writes its DA3-estimated K to intrinsics_da3.txt (NOT
+    // intrinsics.txt, which REG owns as canonical). Promote it to
+    // intrinsics_da3_last.txt so the file-driven "DA3 (last estimate)" source
+    // stays selectable/re-loadable, symmetric with Custom/Calib.
+    {
+        Reg3DCustom::CameraIntrinsics da3K;
+        const std::string da3Src = DEPTH_OUTPUT_PATH + "intrinsics_da3.txt";
+        const std::string da3Dst = DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt";
+        if (Reg3DCustom::loadCameraIntrinsics(da3Src, da3K) && da3K.valid()) {
+            da3K.name = "da3_last";
+            if (Reg3DCustom::saveCameraIntrinsics(da3Dst, da3K))
+                std::cout << "[RunDepth] DA3 estimate -> intrinsics_da3_last.txt ("
+                          << da3K.width << "x" << da3K.height
+                          << " fx=" << da3K.fx << ")" << std::endl;
         } else {
+            std::cout << "[RunDepth] no usable intrinsics_da3.txt to promote (skipped)"
+                      << std::endl;
+        }
+    }
+
+    // ---- obj-migration Phase 3: REG-side OBJ export (routes A/B/C) ----
+    // sam2 still writes its tagged OBJ in parallel (Phase 3); REG additionally
+    // writes the canonical OBJ + intrinsics.txt from its OWN K, overwriting the
+    // tagged copy (last-writer-wins, REG後勝ち) for the diff comparison.
+    {
+        namespace fs = std::filesystem;
+        const std::string binPath  = DEPTH_OUTPUT_PATH + "depth_metric.bin";
+        const std::string canonObj = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+
+        if (fs::exists(binPath)) {
+            // Route A: metric depth present -> REG builds the OBJ from its own K.
+            depthexport::DepthBin db;
+            if (depthexport::loadDepthMetricBin(binPath, db)) {
+                int rw = 0, rh = 0, rc = 0, mw = 0, mh = 0, mc = 0;
+                unsigned char* rgb  = stbi_load(rr.originalPath.c_str(), &rw, &rh, &rc, 3);
+                unsigned char* mraw = stbi_load(rr.segmentationMaskPath.c_str(), &mw, &mh, &mc, 1);
+                if (rgb && mraw && rw == db.width && rh == db.height
+                    && mw == db.width && mh == db.height) {
+                    std::vector<uint8_t> mask((size_t)mw * mh);
+                    for (size_t i = 0; i < mask.size(); ++i) mask[i] = (mraw[i] > 127) ? 255 : 0;
+                    std::vector<uint8_t> rgbv(rgb, rgb + (size_t)rw * rh * 3);
+
+                    depthexport::Request req;
+                    req.rgbPixels   = rgbv.data();
+                    req.width       = db.width;
+                    req.height      = db.height;
+                    req.depthMetric = &db.depth;
+                    req.mask        = &mask;
+                    // Task 2: scale K to the depth resolution. sam2 may have
+                    // downscaled the image (e.g. 4K -> 1080p) and depth_metric.bin
+                    // is at that processed resolution; unprojecting with the
+                    // unscaled K would misproject (and shed ~half the vertices).
+                    req.K           = Reg3DCustom::scaleIntrinsics(g_intrinsics,
+                                                                   db.width, db.height);
+                    if (g_intrinsics.width != db.width || g_intrinsics.height != db.height)
+                        std::cout << "[RunDepth] K scaled to depth res "
+                                  << db.width << "x" << db.height
+                                  << " (from " << g_intrinsics.width << "x"
+                                  << g_intrinsics.height << ", fx " << g_intrinsics.fx
+                                  << " -> " << req.K.fx << ")" << std::endl;
+                    req.K.name      = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+                    req.tag         = req.K.name;
+                    req.outDir      = DEPTH_OUTPUT_PATH;
+                    auto er = depthexport::exportDepthArtifacts(req);
+                    if (!er.ok) std::cerr << "[RunDepth] REG exportDepthArtifacts failed" << std::endl;
+                } else {
+                    std::cerr << "[RunDepth] REG export skipped (res mismatch): bin="
+                              << db.width << "x" << db.height << " rgb=" << rw << "x" << rh
+                              << " mask=" << mw << "x" << mh << std::endl;
+                }
+                if (rgb)  stbi_image_free(rgb);
+                if (mraw) stbi_image_free(mraw);
+            }
+        } else if (fs::exists(canonObj)) {
+            // Route B: external OBJ injected (no metric depth). Keep it as-is;
+            // just emit intrinsics.txt from the current K so downstream matches.
+            std::cout << "[RunDepth] depth_metric.bin absent; using existing OBJ as-is: "
+                      << canonObj << std::endl;
+            depthexport::saveIntrinsicsFile(DEPTH_OUTPUT_PATH + "intrinsics.txt",
+                                            g_intrinsics, g_intrinsics.width, g_intrinsics.height);
+        } else {
+            // Route C: no metric depth and no canonical OBJ. In Phase 3 sam2 still
+            // writes a tagged OBJ in parallel, so objPath below can still load it;
+            // we log rather than hard-fail (post-Phase-5 this becomes a real error).
+            std::cerr << "[RunDepth] WARNING: no depth_metric.bin and no canonical OBJ; "
+                         "relying on sam2 tagged OBJ (Phase 3 parallel)" << std::endl;
+        }
+    }
+
+    // Phase 5: REG wrote the canonical OBJ above (export hook). Load it; fall back
+    // to the legacy _k4a name only for pre-migration data on disk.
+    std::string objPath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+    if (!std::filesystem::exists(objPath)) {
+        std::string legacy = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
+        if (std::filesystem::exists(legacy)) {
+            std::cerr << "[RunDepth] canonical OBJ missing; using legacy "
+                      << legacy << std::endl;
+            objPath = legacy;
+        } else {
+            std::cerr << "[RunDepth] no OBJ found (canonical nor legacy)" << std::endl;
             return false;
         }
     }
@@ -3480,38 +3649,7 @@ static bool runSegmentOnly(AppContext& ctx, MaskKind kind) {
     // CUDA / GPU acceleration. Same logic as runDepthAndUpdateScene.
     runner.config.useCuda = ctx.useCuda;
 
-    // ---- Same intrinsics tag dispatch as runDepthAndUpdateScene ----
-    std::string srcTag = "k4a";
-    if      (g_intrinsicsSource == 2) srcTag = "custom";
-    else if (g_intrinsicsSource == 3) srcTag = "calib";
-    runner.config.intrinsicsSourceName = srcTag;
-
-    if (g_intrinsicsSource == 2 && g_intrinsics.valid()) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = g_intrinsics.fx;
-        runner.config.fy = g_intrinsics.fy;
-        runner.config.cx = g_intrinsics.cx;
-        runner.config.cy = g_intrinsics.cy;
-        // Distortion round-trip (same rationale as in runDepthAndUpdateScene).
-        // Stage=Segment does NOT regenerate intrinsics_<tag>.txt (only the
-        // mask is written), so emitting --kinect-distortion here is just
-        // for consistency / future-proofing if the pipeline ever starts to
-        // write the intrinsics file in Stage=Segment too.
-        runner.config.k1 = g_intrinsics.k1;
-        runner.config.k2 = g_intrinsics.k2;
-        runner.config.k3 = g_intrinsics.k3;
-        runner.config.k4 = g_intrinsics.k4;
-        runner.config.p1 = g_intrinsics.p1;
-        runner.config.p2 = g_intrinsics.p2;
-    } else if (g_intrinsicsSource == 3 && g_calibResult.valid) {
-        runner.config.useCustomIntrinsics = true;
-        runner.config.fx = (float)g_calibResult.fx;
-        runner.config.fy = (float)g_calibResult.fy;
-        runner.config.cx = (float)g_calibResult.cx;
-        runner.config.cy = (float)g_calibResult.cy;
-        runner.config.k1 = (float)g_calibResult.k1;
-        runner.config.k2 = (float)g_calibResult.k2;
-    }
+    // Phase 5: no K passed to sam2 (Segment stage only writes a mask anyway).
 
     // Stage selector: SAM2 only.
     runner.config.stage = DepthStage::Segment;
@@ -3694,9 +3832,109 @@ static bool initOpenGL() {
     return true;
 }
 
-int main() {
+// =============================================================================
+//  Intrinsics startup auto-selection (Step 4 / step7-cleanup)
+//  File-driven sources are tried by existence; Preset is the always-available
+//  default fallback:
+//      Custom : intrinsics_custom.txt valid
+//      Calib  : intrinsics_calib_last.txt valid (legacy intrinsics_calib.txt
+//               also accepted until the Step 6 rename lands)
+//      DA3    : intrinsics_da3_last.txt valid (DA3 estimate from the last
+//               Run Depth)
+//      Preset : default fallback (g_currentPresetKey, currently
+//               azure_kinect_1080p) when no source file exists
+//  Note: DA3 sits above the Preset fallback so "da3_last only -> DA3" holds;
+//  the nominal "Preset > DA3" ordering only applied to a persisted preset
+//  choice, which is not implemented.
+// =============================================================================
+static IntrinsicsSource autoSelectIntrinsicsSource() {
+    namespace fs = std::filesystem;
+    const std::string base = DEPTH_OUTPUT_PATH;
+    auto fileValid = [&](const char* f) {
+        Reg3DCustom::CameraIntrinsics K;
+        return fs::exists(base + f)
+            && Reg3DCustom::loadCameraIntrinsics(base + f, K) && K.valid();
+    };
+
+    // 1. Custom — highest priority
+    if (fileValid("intrinsics_custom.txt")) return IntrinsicsSource::Custom;
+    // 2. Calib (prefer _last; tolerate legacy name until Step 6)
+    if (fileValid("intrinsics_calib_last.txt") || fileValid("intrinsics_calib.txt"))
+        return IntrinsicsSource::Calib;
+    // 3. DA3 (last estimate, file-driven)
+    if (fileValid("intrinsics_da3_last.txt")) return IntrinsicsSource::DA3;
+    // 4. Preset — default fallback (always available)
+    return IntrinsicsSource::Preset;
+}
+
+// Load K for the currently-selected source into g_intrinsics / gApp.intrinsics /
+// OrbitCam. All four sources are file/preset driven and symmetric; on failure
+// OrbitCam is left unset (warned).
+static void loadIntrinsicsFromCurrentSource() {
+    Reg3DCustom::CameraIntrinsics K;
+    bool ok = false;
+    switch (g_intrinsicsSource) {
+        case IntrinsicsSource::Custom:
+            ok = Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_custom.txt", K);
+            break;
+        case IntrinsicsSource::Calib:
+            ok = Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_calib_last.txt", K)
+              || Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_calib.txt", K);
+            break;
+        case IntrinsicsSource::Preset:
+            ok = Reg3DCustom::lookupPreset(g_currentPresetKey, K);
+            break;
+        case IntrinsicsSource::DA3:
+            ok = Reg3DCustom::loadCameraIntrinsics(
+                     DEPTH_OUTPUT_PATH + "intrinsics_da3_last.txt", K);
+            break;
+    }
+    if (ok && K.valid()) {
+        g_intrinsics    = K;
+        gApp.intrinsics = K;
+        g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // fresh source K; drop any rectify-raw
+        OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
+        std::cout << "[Intrinsics] startup source="
+                  << intrinsicsSourceToLegacyInt(g_intrinsicsSource)
+                  << " key=" << g_currentPresetKey
+                  << "  K " << K.width << "x" << K.height
+                  << " fx=" << K.fx << " fy=" << K.fy
+                  << " cx=" << K.cx << " cy=" << K.cy << std::endl;
+    } else {
+        std::cerr << "[Intrinsics] startup: failed to load K for selected source "
+                  << intrinsicsSourceToLegacyInt(g_intrinsicsSource)
+                  << "; leaving OrbitCam unset (no K)" << std::endl;
+    }
+}
+
+int main(int argc, char** argv) {
     initPaths();
     initFilePaths();
+
+    // Headless self-check for Step 4 autoSelect (no GUI/OpenGL). Runs the real
+    // autoSelectIntrinsicsSource() + loadIntrinsicsFromCurrentSource() against
+    // whatever intrinsics_*.txt files exist under DEPTH_OUTPUT_PATH, prints the
+    // chosen source + resulting K, then exits. Used by test scripts.
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--check-intrinsics") {
+            const char* names[] = {"DA3", "Kinect/Preset", "Custom", "Calib"};
+            g_intrinsicsSource = autoSelectIntrinsicsSource();
+            int li = intrinsicsSourceToLegacyInt(g_intrinsicsSource);
+            std::cout << "[CheckIntrinsics] autoSelect -> source=" << li
+                      << " (" << names[std::clamp(li, 0, 3)] << ")"
+                      << " presetKey=" << g_currentPresetKey << std::endl;
+            loadIntrinsicsFromCurrentSource();
+            std::cout << "[CheckIntrinsics] g_intrinsics valid="
+                      << (g_intrinsics.valid() ? 1 : 0)
+                      << " " << g_intrinsics.width << "x" << g_intrinsics.height
+                      << " fx=" << g_intrinsics.fx << " fy=" << g_intrinsics.fy
+                      << std::endl;
+            return 0;
+        }
+    }
 
     if (!initOpenGL()) {
         std::cerr << "GLFW initialization failed" << std::endl;
@@ -3705,8 +3943,12 @@ int main() {
 
     OrbitCam.setWindowSizePointers(&gWindowWidth, &gWindowHeight);
     OrbitCam.setGlobalMatrixPointers(&view, &projection, &model, &objPos);
-    // Kinectのようなカメラの実際の内部パラメータを設定（デフォルト: K4A 720p）
-    OrbitCam.setIntrinsics(918.234f, 918.112f, 640.152f, 366.447f, 1280, 720);
+    // Step 4: 起動時に Custom > Calib > Preset > Auto の優先順位で自動選択し、
+    // 選ばれたソースから K をロードする。旧ハードコード K4A 720p は撤廃
+    // (default preset = azure_kinect_720p なので、ファイルが何も無い環境では
+    //  従来同様 K4A 720p が入る)。Auto のときは OrbitCam を未設定のままにする。
+    g_intrinsicsSource = autoSelectIntrinsicsSource();
+    loadIntrinsicsFromCurrentSource();
     OrbitCam.printCameraInfo();
 
     ShaderProgram shaderProgram;
@@ -3825,48 +4067,60 @@ int main() {
     // そのため候補を「修正時刻の新しい順」で並べ直し、**最新** の OBJ を選ぶ。
     // 直近の Run Depth が書き出したものが常に正解。
     {
-        struct CandObj {
-            std::string path;
-            std::string tag;
-            std::filesystem::file_time_type mtime;
-        };
-        std::vector<CandObj> objCandidates;
-        for (const auto& tag : {"k4a", "custom", "calib"}) {
-            std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + tag + ".obj";
-            std::error_code ec;
-            if (std::filesystem::exists(p, ec)) {
-                auto t = std::filesystem::last_write_time(p, ec);
-                if (!ec) objCandidates.push_back({p, tag, t});
-            }
-        }
-        // Most recent first
-        std::sort(objCandidates.begin(), objCandidates.end(),
-                  [](const CandObj& a, const CandObj& b){ return a.mtime > b.mtime; });
-
+        // obj-migration Phase 6: prefer the canonical (tag-less) OBJ that REG now
+        // writes. Fall back to legacy tagged OBJs (most-recent wins) only for
+        // pre-migration data left on disk.
         g_objSourcePath.clear();
-        if (!objCandidates.empty()) {
-            const auto& chosen = objCandidates.front();
-            g_objSourcePath = chosen.path;
-            // 古い OBJ もまだディスクにあるならログで警告 (混乱を防ぐため)
-            if (objCandidates.size() > 1) {
-                std::cout << "[main] Multiple existing OBJs found, picking most recent:"
-                          << std::endl;
-                for (const auto& c : objCandidates) {
-                    std::cout << "[main]   " << (c.path == chosen.path ? "* " : "  ")
-                    << c.path << std::endl;
+        const std::string canon = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+        std::error_code ec0;
+        if (std::filesystem::exists(canon, ec0)) {
+            g_objSourcePath = canon;
+            std::cout << "[main] Using canonical OBJ: " << canon << std::endl;
+            // Align g_intrinsicsSource with intrinsics.txt's name field so
+            // setupObjScene loads the matching K.
+            Reg3DCustom::CameraIntrinsics k;
+            if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", k)) {
+                if      (k.name == "custom") g_intrinsicsSource = IntrinsicsSource::Custom;
+                else if (k.name == "calib")  g_intrinsicsSource = IntrinsicsSource::Calib;
+                else if (k.name == "da3" || k.name == "da3_last")
+                                             g_intrinsicsSource = IntrinsicsSource::DA3;
+                else                         g_intrinsicsSource = IntrinsicsSource::Preset;
+                std::cout << "[main] Intrinsics source from intrinsics.txt name='"
+                          << k.name << "' (g_intrinsicsSource="
+                          << intrinsicsSourceToLegacyInt(g_intrinsicsSource) << ")" << std::endl;
+            }
+        } else {
+            // Legacy fallback: tagged OBJs, most-recent first.
+            struct CandObj { std::string path; std::string tag;
+                             std::filesystem::file_time_type mtime; };
+            std::vector<CandObj> objCandidates;
+            for (const auto& tag : {"k4a", "custom", "calib"}) {
+                std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_" + tag + ".obj";
+                std::error_code ec;
+                if (std::filesystem::exists(p, ec)) {
+                    auto t = std::filesystem::last_write_time(p, ec);
+                    if (!ec) objCandidates.push_back({p, tag, t});
                 }
             }
-            std::cout << "[main] Using existing OBJ: " << chosen.path << std::endl;
-
-            // 起動時の g_intrinsicsSource をその OBJ のソースに合わせる。
-            // これがないと OBJ は custom メッシュなのに intrinsicsSource=Kinect、
-            // という不整合が起きて intrinsics_k4a.txt の方を読みに行ってしまう。
-            if      (chosen.tag == "custom") g_intrinsicsSource = 2;
-            else if (chosen.tag == "calib")  g_intrinsicsSource = 3;
-            else                             g_intrinsicsSource = 1;  // k4a
-            std::cout << "[main] Intrinsics source aligned to OBJ tag: "
-                      << chosen.tag << " (g_intrinsicsSource=" << g_intrinsicsSource << ")"
-                      << std::endl;
+            std::sort(objCandidates.begin(), objCandidates.end(),
+                      [](const CandObj& a, const CandObj& b){ return a.mtime > b.mtime; });
+            if (!objCandidates.empty()) {
+                const auto& chosen = objCandidates.front();
+                g_objSourcePath = chosen.path;
+                if (objCandidates.size() > 1) {
+                    std::cout << "[main] (legacy) Multiple tagged OBJs, picking most recent:"
+                              << std::endl;
+                    for (const auto& c : objCandidates)
+                        std::cout << "[main]   " << (c.path == chosen.path ? "* " : "  ")
+                                  << c.path << std::endl;
+                }
+                std::cout << "[main] Using legacy tagged OBJ: " << chosen.path << std::endl;
+                if      (chosen.tag == "custom") g_intrinsicsSource = IntrinsicsSource::Custom;
+                else if (chosen.tag == "calib")  g_intrinsicsSource = IntrinsicsSource::Calib;
+                else                             g_intrinsicsSource = IntrinsicsSource::Preset;  // k4a
+                std::cout << "[main] Intrinsics source aligned to legacy OBJ tag: "
+                          << chosen.tag << std::endl;
+            }
         }
     }
     if (!g_objSourcePath.empty()) {
@@ -3888,7 +4142,7 @@ int main() {
         bool fallbackLoaded = false;
         for (const auto& p : candidates) {
             if (p.empty() || !std::filesystem::exists(p)) continue;
-            if (ImageSession::loadWithIntrinsics(gApp, p, g_intrinsics)) { fallbackLoaded = true; break; }
+            if (loadImageRectifyAware(gApp, p)) { fallbackLoaded = true; break; }
         }
         if (!fallbackLoaded) {
             std::cout << "[main] No fallback image -- viewport stays black"
@@ -8942,8 +9196,71 @@ static void syncUIState() {
     s.boardAlpha  = g_meshAlpha[6];
     s.targetAlpha = g_meshAlpha[7];
 
-    // Calibration state
-    s.intrinsicsSource = g_intrinsicsSource;
+    // ---- Step 7: intrinsics source dropdown + Active card ----
+    s.intrinsicsSource  = g_intrinsicsSource;          // enum, direct
+    s.currentPresetKey  = g_currentPresetKey;
+    s.currentFx = g_intrinsics.fx; s.currentFy = g_intrinsics.fy;
+    s.currentCx = g_intrinsics.cx; s.currentCy = g_intrinsics.cy;
+    s.currentWidth = g_intrinsics.width; s.currentHeight = g_intrinsics.height;
+
+    // Availability of file-backed sources.
+    {
+        namespace fs = std::filesystem;
+        const std::string base = DEPTH_OUTPUT_PATH;
+        s.customAvailable    = fs::exists(base + "intrinsics_custom.txt");
+        s.calibLastAvailable = fs::exists(base + "intrinsics_calib_last.txt")
+                            || fs::exists(base + "intrinsics_calib.txt");
+        s.da3LastAvailable   = fs::exists(base + "intrinsics_da3_last.txt");
+    }
+
+    // Human-readable Active card label.
+    switch (g_intrinsicsSource) {
+        case IntrinsicsSource::Custom:
+            s.currentDisplayName = "Custom (intrinsics_custom.txt)"; break;
+        case IntrinsicsSource::Calib:
+            s.currentDisplayName = "Calib (last)"; break;
+        case IntrinsicsSource::Preset: {
+            s.currentDisplayName = g_currentPresetKey;
+            for (auto& p : Reg3DCustom::presetRegistry())
+                if (g_currentPresetKey == p.key) { s.currentDisplayName = p.displayName; break; }
+            break;
+        }
+        case IntrinsicsSource::DA3:
+            s.currentDisplayName = "DA3 (last estimate)"; break;
+    }
+
+    // Preset list for the dropdown (rebuilt each frame; small + cheap).
+    s.presetList.clear();
+    for (auto& p : Reg3DCustom::presetRegistry()) {
+        RegUIState::PresetEntry e;
+        e.key = p.key; e.displayName = p.displayName;
+        e.available = p.K.valid(); e.dynamic = false;  // no dynamic presets anymore
+        s.presetList.push_back(std::move(e));
+    }
+
+    // Reconstruct-from-BIN slot mirror (FEATURE Task 5).
+    {
+        auto cp = [](RegUIState::ReconSlot& d, const ReconstructFromBin::Slot& sl) {
+            d.status = (int)sl.status; d.width = sl.width; d.height = sl.height;
+            d.err = sl.errorMessage;
+        };
+        cp(s.reconBin,  g_reconstructState.bin);
+        cp(s.reconMask, g_reconstructState.mask);
+        cp(s.reconRgb,  g_reconstructState.rgb);
+        s.reconReady       = g_reconstructState.isReconstructReady();
+        s.reconHasAny      = g_reconstructState.hasAny();
+        s.reconKWidth      = g_intrinsics.width;
+        s.reconKHeight     = g_intrinsics.height;
+        s.reconKSourceName = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+    }
+
+    // Settings tab — calibration parameters.
+    s.chessboardFolder    = g_chessboardFolder;
+    s.chessboardBoardCols = g_chessboardCols;
+    s.chessboardBoardRows = g_chessboardRows;
+    s.chessboardSquareMm  = g_chessboardSquareMm;
+
+    // Calibration result state.
     s.calibDone     = g_calibResult.valid;
     s.calibMessage  = g_calibResult.message;
     s.calibFx       = (float)g_calibResult.fx;
@@ -9030,7 +9347,7 @@ static void setupUICallbacks() {
             );
         if (selected) {
             std::cout << "[FilePicker] Selected: " << selected << std::endl;
-            ImageSession::loadWithIntrinsics(gApp, selected, g_intrinsics);
+            loadImageRectifyAware(gApp, selected);
             if (gApp.mode == AppMode::kRegistration) {
                 gApp.mode = AppMode::kImageOnly;
             }
@@ -9166,7 +9483,7 @@ static void setupUICallbacks() {
     };
 
     a.onResetDefaultImage = []() {
-        ImageSession::loadWithIntrinsics(gApp, DEPTH_OUTPUT_PATH + "original.jpg", g_intrinsics);
+        loadImageRectifyAware(gApp, DEPTH_OUTPUT_PATH + "original.jpg");
         gApp.maskPoints.clear();
     };
 
@@ -9303,7 +9620,11 @@ static void setupUICallbacks() {
     };
 
     a.onIntrinsicsSourceChanged = [](int i) {
-        g_intrinsicsSource = i;
+        // i is the legacy 4-button index (0=DA3,1=Kinect,2=Custom,3=Calib);
+        // bridge to the enum. Kinect maps to the (sole) Azure Kinect preset.
+        g_intrinsicsSource = intrinsicsSourceFromLegacyInt(i);
+        if (g_intrinsicsSource == IntrinsicsSource::Preset)
+            g_currentPresetKey = "azure_kinect_1080p";
         const char* names[] = {"DA3", "Kinect", "Custom", "Calibrated"};
         std::cout << "[Intrinsics] Source: " << names[std::clamp(i,0,3)] << std::endl;
 
@@ -9342,6 +9663,7 @@ static void setupUICallbacks() {
         if (loaded && K.valid()) {
             g_intrinsics    = K;
             gApp.intrinsics = K;
+            g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // fresh source K; drop any rectify-raw
             OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
             std::cout << "[Intrinsics] Live K updated: "
                       << (K.name.empty() ? "(unnamed)" : K.name)
@@ -9353,6 +9675,86 @@ static void setupUICallbacks() {
                       << names[std::clamp(i,0,3)]
                       << " -- keeping previous K" << std::endl;
         }
+    };
+
+    // ---- Step 7: new intrinsics source dropdown callbacks (案 Y) ----
+    a.onSourceChanged = [](IntrinsicsSource s) {
+        g_intrinsicsSource = s;
+        const char* nm[] = {"Custom", "Calib", "Preset", "DA3"};
+        std::cout << "[Intrinsics] Source -> " << nm[std::clamp((int)s, 0, 3)] << std::endl;
+        loadIntrinsicsFromCurrentSource();
+    };
+    a.onPresetChanged = [](const std::string& key) {
+        g_currentPresetKey = key;
+        g_intrinsicsSource = IntrinsicsSource::Preset;
+        std::cout << "[Intrinsics] Preset -> " << key << std::endl;
+        loadIntrinsicsFromCurrentSource();
+    };
+    a.onSaveAsCustom = []() {
+        if (!g_intrinsics.valid()) {
+            std::cerr << "[Intrinsics] Save as Custom: current K invalid; ignored" << std::endl;
+            return;
+        }
+        Reg3DCustom::CameraIntrinsics K = g_intrinsics;
+        K.name = "custom";
+        const std::string path = DEPTH_OUTPUT_PATH + "intrinsics_custom.txt";
+        if (Reg3DCustom::saveCameraIntrinsics(path, K)) {
+            g_intrinsicsSource = IntrinsicsSource::Custom;
+            loadIntrinsicsFromCurrentSource();
+            std::cout << "[Intrinsics] Saved current K as Custom -> " << path << std::endl;
+        }
+    };
+    a.onChessboardFolderChanged = [](const std::string& f) { g_chessboardFolder = f; };
+    a.onBoardSizeChanged = [](int c, int r) { g_chessboardCols = c; g_chessboardRows = r; };
+    a.onSquareSizeChanged = [](float mm) { g_chessboardSquareMm = mm; };
+
+    // ---- Reconstruct from BIN (FEATURE Task 7) ----
+    a.onReconstructClear = []() {
+        g_reconstructState.clear();
+        std::cout << "[Reconstruct] cleared all slots" << std::endl;
+    };
+    a.onReconstruct = []() {
+        // K source-of-truth = current g_intrinsics; tag from the source enum.
+        Reg3DCustom::CameraIntrinsics K = g_intrinsics;
+        K.name = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+        auto res = ReconstructFromBin::execute(g_reconstructState, DEPTH_OUTPUT_PATH, K);
+        if (!res.ok) {
+            std::cerr << "[Reconstruct] aborted: " << res.errorMessage << std::endl;
+            return;
+        }
+        // AR background = the (processed-resolution) original.jpg just written.
+        // No re-rectify: the dropped bin/mask/rgb are a self-consistent set.
+        {
+            const std::string orig = DEPTH_OUTPUT_PATH + "original.jpg";
+            if (std::filesystem::exists(orig)) ImageSession::load(gApp, orig);
+        }
+        // Mask-derived caches depend on segmentation_mask.png (just replaced).
+        g_boundaryDistMap.invalidate();
+        g_instrumentDistMap.invalidate();
+        g_projectedLiverMask.invalidate();
+        g_gnUnsignedBdyValid = false;
+
+        // Load the reconstructed canonical OBJ into the scene.
+        g_objSourcePath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+        if (!setupObjScene()) {
+            std::cerr << "[Reconstruct] setupObjScene failed" << std::endl;
+            return;
+        }
+        // Reconstruct AR image is the processed-res original.jpg, so use the
+        // scaled canonical K (intrinsics.txt) for display/OrbitCam too -- matches
+        // the AR image AND the OBJ (avoids the 4K-display vs 1080p-image mismatch).
+        Reg3DCustom::CameraIntrinsics Kc;
+        if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", Kc)
+            && Kc.valid()) {
+            g_intrinsics = Kc; gApp.intrinsics = Kc;
+            OrbitCam.setIntrinsics(Kc.fx, Kc.fy, Kc.cx, Kc.cy, Kc.width, Kc.height);
+        }
+        snapshotInitialPose();
+        computeTargetSubsetAabbs();
+        computeSourceLiverSubsetAabbs();
+        gApp.mode = AppMode::kRegistration;
+        std::cout << "[Reconstruct] scene updated from BIN; mode=Registration"
+                  << std::endl;
     };
 
     a.onRunCalibration = []() {
@@ -9385,11 +9787,15 @@ static void setupUICallbacks() {
         try { exe = std::filesystem::absolute(exe).string(); } catch (...) {}
         std::cout << "[Calib] exe: " << exe << std::endl;
 
-        std::string folder  = "../../../chessboard/";
+        // Step 7: Calibration パラメータは Settings タブから編集可能な globals を使う。
+        std::string folder  = g_chessboardFolder;
         std::string outFile = DEPTH_OUTPUT_PATH + "intrinsics_calib.txt";
+        std::string board   = std::to_string(g_chessboardCols) + ","
+                            + std::to_string(g_chessboardRows);
+        std::ostringstream sq; sq << g_chessboardSquareMm;
 
         std::string cmd = "\"" + exe + "\" \"" + folder + "\""
-                          + " --board 9,6 --square 22"
+                          + " --board " + board + " --square " + sq.str()
                           + " --output \"" + outFile + "\""
                           + " 2>&1";
 
@@ -9430,7 +9836,7 @@ static void setupUICallbacks() {
         }
         g_calibResult.valid = (g_calibResult.fx > 0 && g_calibResult.fy > 0);
         g_calibResult.message = g_calibResult.valid ? "OK" : "Invalid result";
-        if (g_calibResult.valid) g_intrinsicsSource = 3;
+        if (g_calibResult.valid) g_intrinsicsSource = IntrinsicsSource::Calib;
 
         std::cout << "[Calib] Result: fx=" << g_calibResult.fx
                   << " fy=" << g_calibResult.fy

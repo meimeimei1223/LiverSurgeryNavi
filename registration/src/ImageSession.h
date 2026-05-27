@@ -92,10 +92,16 @@ inline bool load(AppContext& ctx, const std::string& path) {
 // raw input file stays on disk untouched; rectified pixels are written to
 // 'depth_output/original_rectified.jpg' and that's what the AR background
 // + depth runner see from this point on.
+// outRectified (optional): set to true iff the image was undistorted and the
+// live path now points at depth_output/original_rectified.jpg. The caller uses
+// this to switch the downstream intrinsics to a distortion-free K (the rectified
+// pixels no longer carry distortion). See main.cpp's loadImageRectifyAware().
 inline bool loadWithIntrinsics(AppContext& ctx,
                                const std::string& srcPath,
-                               const Reg3DCustom::CameraIntrinsics& K)
+                               const Reg3DCustom::CameraIntrinsics& K,
+                               bool* outRectified = nullptr)
 {
+    if (outRectified) *outRectified = false;
     // If image dimensions disagree with K, skip rectification (the user is
     // either cross-loading an image from a different camera or hasn't set
     // intrinsics correctly). We still load the original so they can iterate.
@@ -106,6 +112,7 @@ inline bool loadWithIntrinsics(AppContext& ctx,
     if (K.valid() && K.hasDistortion()) {
         if (w == K.width && h == K.height) {
             usePath = maybeRectify(srcPath, K);
+            if (outRectified) *outRectified = (usePath != srcPath);
         } else {
             std::cerr << "[ImageSession] image " << w << "x" << h
                       << " mismatches K " << K.width << "x" << K.height

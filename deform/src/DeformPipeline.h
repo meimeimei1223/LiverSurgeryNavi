@@ -163,6 +163,97 @@ inline float autoMeasureRMSE(
 //   旧コードを残したい場合は kDisplayScale を 10.0f に戻して
 //   applyMirrorAndScale 経路を復活させればよい(下にコメントで残してある)。
 // ============================================================================
+
+// [obj-migration p4] Resolve a depth OBJ path: prefer the canonical (tag-less)
+// name REG now writes; fall back to the legacy _k4a-tagged name for pre-migration
+// data. Returns "" if neither exists.
+inline std::string resolveDeformObjPath(const std::string& canonical,
+                                        const std::string& legacyK4a) {
+    namespace fs = std::filesystem;
+    if (fs::exists(DEPTH_OUTPUT_PATH + canonical)) return DEPTH_OUTPUT_PATH + canonical;
+    if (fs::exists(DEPTH_OUTPUT_PATH + legacyK4a)) {
+        std::cout << "[Deform] (warn) canonical " << canonical
+                  << " not found; using legacy " << legacyK4a
+                  << " (re-run Run Depth in REG to update)" << std::endl;
+        return DEPTH_OUTPUT_PATH + legacyK4a;
+    }
+    return std::string();
+}
+
+// [obj-migration p4] Load the camera K that produced the depth OBJ. Canonical
+// intrinsics.txt (REG-written) first, legacy intrinsics_k4a.txt next, then the
+// K4A 720p hardcode as last resort. Shared by loadReferenceMeshes() and --dry-run.
+inline Reg3DCustom::CameraIntrinsics loadDeformIntrinsics() {
+    Reg3DCustom::CameraIntrinsics K;
+    if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", K)
+        && K.valid()) {
+        std::cout << "[Deform] intrinsics.txt: " << K.width << "x" << K.height
+                  << "  fx=" << K.fx << " fy=" << K.fy
+                  << " cx=" << K.cx << " cy=" << K.cy
+                  << " (name=" << (K.name.empty() ? "?" : K.name) << ")" << std::endl;
+        return K;
+    }
+    if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics_k4a.txt", K)
+        && K.valid()) {
+        std::cout << "[Deform] (warn) intrinsics.txt not found; using legacy "
+                     "intrinsics_k4a.txt (re-run Run Depth in REG to update)" << std::endl;
+        return K;
+    }
+    K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
+    std::cout << "[Deform] intrinsics.txt & intrinsics_k4a.txt missing/invalid "
+                 "-> K4A 720p hardcode fallback" << std::endl;
+    return K;
+}
+
+// [intrinsics-step-1] Project board vertices to texture coords using the source
+// camera K (the exact pre-transform pinhole projection). Fills board.mTexCoords
+// and returns the resulting UV bounds {uMin, uMax, vMin, vMax} (for diagnostics).
+inline glm::vec4 computeBoardUV(mCutMesh& board, const Reg3DCustom::CameraIntrinsics& K) {
+    const float fx = K.fx, fy = K.fy;
+    const float cx = K.cx, cy = K.cy;
+    const int   W  = K.width, H = K.height;
+    const auto& V = board.mVertices;
+    int nVerts = (int)(V.size() / 3);
+    board.mTexCoords.resize(nVerts * 2);
+    float uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
+    for (int i = 0; i < nVerts; i++) {
+        float x = V[i*3], y = V[i*3+1], z = V[i*3+2];
+        if (std::abs(z) < 1e-6f) z = 1e-6f;
+        float u = (fx * x / z + cx) / (float)W;
+        float v = (fy * y / z + cy) / (float)H;
+        board.mTexCoords[i*2]     = u;
+        board.mTexCoords[i*2 + 1] = v;
+        uMin = std::min(uMin, u); uMax = std::max(uMax, u);
+        vMin = std::min(vMin, v); vMax = std::max(vMax, v);
+    }
+    return glm::vec4(uMin, uMax, vMin, vMax);
+}
+
+// [intrinsics-step-1] CPU-only verification of the Step-1 path (no GL, no
+// reg_*.obj needed): loads K, loads the board OBJ, computes UV, logs results.
+// Driven by lsn_deform --dry-run.
+inline void dryRunStep1() {
+    std::cout << "[DryRun] === Step 1 intrinsics check (no GL) ===" << std::endl;
+    Reg3DCustom::CameraIntrinsics K = loadDeformIntrinsics();
+    std::cout << "[DryRun] deformK fx=" << K.fx << " fy=" << K.fy
+              << " cx=" << K.cx << " cy=" << K.cy
+              << " width=" << K.width << " height=" << K.height << std::endl;
+
+    const std::string p = resolveDeformObjPath("pc_metric_pinhole_full_light.obj",
+                                               "pc_metric_pinhole_full_k4a_light.obj");
+    if (p.empty()) {
+        std::cout << "[DryRun] board OBJ not found (canonical nor legacy)"
+                  << " (UV range check skipped)" << std::endl;
+        return;
+    }
+    mCutMesh board = mCutMesh().loadMeshFromFile(p.c_str());
+    glm::vec4 uv = computeBoardUV(board, K);
+    std::cout << "[DryRun] board verts=" << board.mVertices.size() / 3
+              << " UV u=[" << uv.x << "," << uv.y << "]"
+              << " v=[" << uv.z << "," << uv.w << "]" << std::endl;
+}
+
+// ============================================================================
 inline bool loadReferenceMeshes() {
     // mirror-only 版(registration 側 mirrorMeshAndCloudX と等価, mesh 専用):
     //   1) vertex X 反転  2) 法線 X 反転  3) winding flip
@@ -196,10 +287,17 @@ inline bool loadReferenceMeshes() {
         }
     }
 
+    // [intrinsics-step-1] Load the camera K that produced the depth OBJ
+    // (matches the _k4a-tagged mesh loaded below) instead of hardcoding K4A
+    // 720p, so 1080p / other resolutions get a correct target cloud + board UV.
+    // Shared helper (also used by the --dry-run check).
+    Reg3DCustom::CameraIntrinsics deformK = loadDeformIntrinsics();
+
     // ---- Target (= screenMesh) + cache 注入 ----
     {
-        const std::string p = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked_k4a.obj";
-        if (std::filesystem::exists(p)) {
+        const std::string p = resolveDeformObjPath("pc_metric_pinhole_masked.obj",
+                                                    "pc_metric_pinhole_masked_k4a.obj");
+        if (!p.empty()) {
             if (gTargetMesh) { gTargetMesh->cleanup(); delete gTargetMesh; }
             gTargetMesh = new mCutMesh(mCutMesh().loadMeshFromFile(p.c_str()));
             gTargetMesh->mColor = glm::vec3(0.3f, 0.6f, 0.9f);
@@ -208,8 +306,8 @@ inline bool loadReferenceMeshes() {
             Reg3DCustom::cleanupOBJMesh(*gTargetMesh, /*cosThresh=*/0.10f, 0.0f);
 
             // === ここで cache 注入(mirror+scale 前!) ===
-            Reg3DCustom::CameraIntrinsics K = Reg3DCustom::CameraIntrinsics::k4a_color_720p();
-            auto cloud = setupTargetCloud_PathA(*gTargetMesh, K);
+            // [intrinsics-step-1] use the loaded deformK instead of hardcoded K4A 720p
+            auto cloud = setupTargetCloud_PathA(*gTargetMesh, deformK);
             if (cloud) {
                 // Path A 成功: mesh と cloud を同期して mirror のみ
                 // (registration 側の運用と完全一致, scale=10 は撤廃)
@@ -231,26 +329,17 @@ inline bool loadReferenceMeshes() {
 
     // ---- Board (= boardMesh3D, テクスチャ付き) ----
     {
-        const std::string objPath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_k4a_light.obj";
+        const std::string objPath = resolveDeformObjPath("pc_metric_pinhole_full_light.obj",
+                                                          "pc_metric_pinhole_full_k4a_light.obj");
         const std::string texPath = DEPTH_OUTPUT_PATH + "texture.png";
-        if (std::filesystem::exists(objPath)) {
+        if (!objPath.empty()) {
             if (gBoardMesh) { gBoardMesh->cleanup(); delete gBoardMesh; }
             gBoardMesh = new mCutMesh(mCutMesh().loadMeshFromFile(objPath.c_str()));
             gBoardMesh->mColor = glm::vec3(1.0f, 1.0f, 1.0f);
 
-            // K4A 720p intrinsics で UV 生成(変換前の座標で投影) — 元コード準拠
-            constexpr float fx = 918.234f, fy = 918.112f;
-            constexpr float cx = 640.152f, cy = 366.447f;
-            constexpr int   W  = 1280,     H  = 720;
-            const auto& V = gBoardMesh->mVertices;
-            int nVerts = (int)(V.size() / 3);
-            gBoardMesh->mTexCoords.resize(nVerts * 2);
-            for (int i = 0; i < nVerts; i++) {
-                float x = V[i*3], y = V[i*3+1], z = V[i*3+2];
-                if (std::abs(z) < 1e-6f) z = 1e-6f;
-                gBoardMesh->mTexCoords[i*2]     = (fx * x / z + cx) / (float)W;
-                gBoardMesh->mTexCoords[i*2 + 1] = (fy * y / z + cy) / (float)H;
-            }
+            // [intrinsics-step-1] UV 生成(変換前の座標で投影)。OBJ 生成時の K
+            // (deformK) を使用 — 旧 K4A 720p ハードコード撤廃。共有ヘルパー。
+            computeBoardUV(*gBoardMesh, deformK);
 
             applyMirrorOnly(*gBoardMesh);
 
