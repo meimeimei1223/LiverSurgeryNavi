@@ -176,6 +176,12 @@ float scaleSpeed = 1.1f;
 float                          g_silhouetteCosThreshold = 0.02f;
 std::string                    g_objSourcePath;
 Reg3DCustom::CameraIntrinsics  g_intrinsics;
+// Distorted calibration kept aside when an image is rectified: g_intrinsics then
+// holds the distortion-free K matching original_rectified.jpg, while
+// g_intrinsics_raw retains the original (distortion-bearing) K so a subsequent
+// image load can still decide/perform rectification. Invalidated whenever K is
+// (re)loaded from a source. See loadImageRectifyAware().
+Reg3DCustom::CameraIntrinsics  g_intrinsics_raw;
 
 // =========================================================
 //  Scene scale (for size-invariant registration parameters)
@@ -2612,6 +2618,37 @@ static void glfw_OnFramebufferSize(GLFWwindow*, int w, int h) {
     OrbitCam.onWindowResize(w, h);
 }
 
+// Load an image, rectifying if the active K has distortion, and keep the
+// downstream intrinsics consistent with the rectified pixels.
+//
+//   - Rectification is decided/performed with the FULL (distorted) calibration.
+//     g_intrinsics may have had its distortion zeroed by a previous rectify, so
+//     restore it from g_intrinsics_raw first (when valid) for the decision.
+//   - If rectification ran, depth_output/original_rectified.jpg is now the live
+//     image and is already undistorted. We stash the distorted K in
+//     g_intrinsics_raw and ZERO the distortion in g_intrinsics so everything
+//     downstream (SAM2 unprojection, OBJTargetExtraction, OrbitCam) uses a K
+//     that matches the rectified pixels. This also makes a second pass a no-op
+//     (hasDistortion() == false), preventing double rectification.
+//   - If no rectification ran, there is no raw/effective split to track.
+static bool loadImageRectifyAware(AppContext& ctx, const std::string& path) {
+    if (g_intrinsics_raw.valid()) g_intrinsics = g_intrinsics_raw;
+    bool rectified = false;
+    if (!ImageSession::loadWithIntrinsics(ctx, path, g_intrinsics, &rectified))
+        return false;
+    if (rectified) {
+        g_intrinsics_raw = g_intrinsics;                 // keep distorted calibration
+        g_intrinsics.k1 = g_intrinsics.k2 = g_intrinsics.k3 = g_intrinsics.k4 = 0.0f;
+        g_intrinsics.p1 = g_intrinsics.p2 = 0.0f;        // rectified -> no distortion
+        gApp.intrinsics = g_intrinsics;
+        std::cout << "[Intrinsics] image rectified -> downstream K distortion "
+                     "zeroed (distorted K kept in g_intrinsics_raw)" << std::endl;
+    } else {
+        g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // no active rectify
+    }
+    return true;
+}
+
 // FileDropHandler.hのglfw_onFileDropを使用するように変更
 static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
     if (count <= 0 || !paths) return;
@@ -2638,7 +2675,7 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
         std::cout << "[FileDrop] Stopping camera to load image" << std::endl;
     }
 
-    if (!ImageSession::loadWithIntrinsics(*ctx, filePath, g_intrinsics)) {
+    if (!loadImageRectifyAware(*ctx, filePath)) {
         std::cerr << "[FileDrop] Failed to load: " << filePath << std::endl;
         return;
     }
@@ -2934,6 +2971,7 @@ static bool setupObjScene() {
         Reg3DCustom::checkIntrinsicsResolution(K, gApp.image.width, gApp.image.height);
     }
     g_intrinsics = K;
+    g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // fresh source K; drop any rectify-raw
 
     Reg3DCustom::printEdgeLengthStats(*screenMesh, "OBJ raw");
 
@@ -3753,6 +3791,7 @@ static void loadIntrinsicsFromCurrentSource() {
     if (ok && K.valid()) {
         g_intrinsics    = K;
         gApp.intrinsics = K;
+        g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // fresh source K; drop any rectify-raw
         OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
         std::cout << "[Intrinsics] startup source="
                   << intrinsicsSourceToLegacyInt(g_intrinsicsSource)
@@ -3988,7 +4027,7 @@ int main(int argc, char** argv) {
         bool fallbackLoaded = false;
         for (const auto& p : candidates) {
             if (p.empty() || !std::filesystem::exists(p)) continue;
-            if (ImageSession::loadWithIntrinsics(gApp, p, g_intrinsics)) { fallbackLoaded = true; break; }
+            if (loadImageRectifyAware(gApp, p)) { fallbackLoaded = true; break; }
         }
         if (!fallbackLoaded) {
             std::cout << "[main] No fallback image -- viewport stays black"
@@ -9177,7 +9216,7 @@ static void setupUICallbacks() {
             );
         if (selected) {
             std::cout << "[FilePicker] Selected: " << selected << std::endl;
-            ImageSession::loadWithIntrinsics(gApp, selected, g_intrinsics);
+            loadImageRectifyAware(gApp, selected);
             if (gApp.mode == AppMode::kRegistration) {
                 gApp.mode = AppMode::kImageOnly;
             }
@@ -9313,7 +9352,7 @@ static void setupUICallbacks() {
     };
 
     a.onResetDefaultImage = []() {
-        ImageSession::loadWithIntrinsics(gApp, DEPTH_OUTPUT_PATH + "original.jpg", g_intrinsics);
+        loadImageRectifyAware(gApp, DEPTH_OUTPUT_PATH + "original.jpg");
         gApp.maskPoints.clear();
     };
 
@@ -9493,6 +9532,7 @@ static void setupUICallbacks() {
         if (loaded && K.valid()) {
             g_intrinsics    = K;
             gApp.intrinsics = K;
+            g_intrinsics_raw = Reg3DCustom::CameraIntrinsics{};  // fresh source K; drop any rectify-raw
             OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
             std::cout << "[Intrinsics] Live K updated: "
                       << (K.name.empty() ? "(unnamed)" : K.name)
