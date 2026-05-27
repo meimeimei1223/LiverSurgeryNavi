@@ -1081,6 +1081,7 @@ inline void recomputeLiverQuad() {
 // 前方宣言
 static bool setupObjScene();
 static bool runDepthAndUpdateScene(AppContext& ctx);
+static void loadIntrinsicsFromCurrentSource();   // defined near main(); used by sidecar import
 // Forward decl: kind selects which mask the preview pops up for.
 //   MaskKind::Liver       -> uses ctx.maskPoints, writes segmentation_mask.png
 //   MaskKind::Instrument  -> uses ctx.instrumentMaskPoints, writes
@@ -2631,7 +2632,38 @@ static void glfw_OnFramebufferSize(GLFWwindow*, int w, int h) {
 //     that matches the rectified pixels. This also makes a second pass a no-op
 //     (hasDistortion() == false), preventing double rectification.
 //   - If no rectification ran, there is no raw/effective split to track.
+// Sidecar import: if an intrinsics_custom.txt sits in the SAME directory as the
+// image being loaded, copy it into depth_output/intrinsics_custom.txt and make
+// Custom the active source. This lets per-image (per-dataset) calibration files
+// take effect on load without a manual copy. No-op if absent, or if the sidecar
+// already IS depth_output/intrinsics_custom.txt.
+static void maybeImportSidecarIntrinsics(const std::string& imagePath) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path sidecar = fs::path(imagePath).parent_path() / "intrinsics_custom.txt";
+    if (!fs::exists(sidecar, ec)) return;
+
+    const std::string dst = DEPTH_OUTPUT_PATH + "intrinsics_custom.txt";
+    fs::path srcAbs = fs::weakly_canonical(sidecar, ec);
+    fs::path dstAbs = fs::weakly_canonical(fs::path(dst), ec);
+    if (!srcAbs.empty() && srcAbs == dstAbs) return;   // would copy onto itself
+
+    fs::create_directories(DEPTH_OUTPUT_PATH, ec);
+    fs::copy_file(sidecar, dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        std::cerr << "[Sidecar] copy failed (" << sidecar << " -> " << dst
+                  << "): " << ec.message() << std::endl;
+        return;
+    }
+    std::cout << "[Sidecar] imported " << sidecar << " -> " << dst
+              << "; selecting Custom source" << std::endl;
+    g_intrinsicsSource = IntrinsicsSource::Custom;
+    g_intrinsics_raw   = Reg3DCustom::CameraIntrinsics{};  // force a fresh decision below
+    loadIntrinsicsFromCurrentSource();                     // load the imported 4K K
+}
+
 static bool loadImageRectifyAware(AppContext& ctx, const std::string& path) {
+    maybeImportSidecarIntrinsics(path);
     if (g_intrinsics_raw.valid()) g_intrinsics = g_intrinsics_raw;
     bool rectified = false;
     if (!ImageSession::loadWithIntrinsics(ctx, path, g_intrinsics, &rectified))
