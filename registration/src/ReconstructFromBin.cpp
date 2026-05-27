@@ -4,6 +4,9 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <ctime>
+#include <vector>
 // No stb here: PNG/JPG decoding is delegated to the injected ImageDecoder (the
 // stb_image implementation lives in registration/main.cpp's TU only).
 
@@ -121,14 +124,137 @@ void onFolderDropped(State& state, const std::string& folderPath, const ImageDec
               << "  ready=" << (state.isReconstructReady() ? 1 : 0) << std::endl;
 }
 
-// execute(): implemented in Task 6. Stub keeps the build green until then.
-ReconstructResult execute(State& /*state*/,
-                          const std::string& /*depthOutputPath*/,
-                          const Reg3DCustom::CameraIntrinsics& /*currentK*/) {
+static std::string timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+    return buf;
+}
+
+static std::string joinp(const std::string& dir, const std::string& f) {
+    if (!dir.empty() && (dir.back() == '/' || dir.back() == '\\')) return dir + f;
+    return dir + "/" + f;
+}
+
+// Files in depth_output/ that Reconstruct overwrites; backed up before + the
+// rollback set on failure.
+static const char* kManagedFiles[] = {
+    "depth_metric.bin", "segmentation_mask.png", "original.jpg", "texture.png",
+    "intrinsics.txt", "intrinsics_da3.txt",
+    "pc_metric_pinhole_masked.obj",  "pc_metric_pinhole_masked.mtl",
+    "pc_metric_pinhole_full_light.obj", "pc_metric_pinhole_full_light.mtl",
+};
+
+ReconstructResult execute(State& state,
+                          const std::string& depthOutputPath,
+                          const Reg3DCustom::CameraIntrinsics& currentK) {
     ReconstructResult r;
-    r.ok = false;
-    r.errorMessage = "Reconstruct execute() not yet implemented (Task 6)";
-    std::cerr << "[Reconstruct] " << r.errorMessage << std::endl;
+    if (!state.isReconstructReady()) {
+        r.errorMessage = "Not ready (need bin + mask of matching resolution)";
+        std::cerr << "[Reconstruct] " << r.errorMessage << std::endl;
+        return r;
+    }
+    if (!currentK.valid()) {
+        r.errorMessage = "No valid camera intrinsics. Set a K source first.";
+        std::cerr << "[Reconstruct] " << r.errorMessage << std::endl;
+        return r;
+    }
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    // 1. Back up the managed files before overwriting.
+    std::string base = depthOutputPath;
+    while (!base.empty() && (base.back() == '/' || base.back() == '\\')) base.pop_back();
+    const std::string backupDir = base + "_backup_" + timestamp();
+    fs::create_directories(backupDir, ec);
+    std::vector<std::string> backedUp;
+    for (const char* f : kManagedFiles) {
+        const std::string src = joinp(depthOutputPath, f);
+        if (fs::exists(src, ec)) {
+            fs::copy_file(src, joinp(backupDir, f),
+                          fs::copy_options::overwrite_existing, ec);
+            if (!ec) backedUp.push_back(f);
+        }
+    }
+    r.backupPath = backupDir;
+    std::cout << "[Reconstruct] backed up " << backedUp.size() << " files -> "
+              << backupDir << std::endl;
+
+    auto rollback = [&](const std::string& why) {
+        std::cerr << "[Reconstruct] FAILED: " << why << " -- rolling back from "
+                  << backupDir << std::endl;
+        for (const auto& f : backedUp)
+            fs::copy_file(joinp(backupDir, f), joinp(depthOutputPath, f),
+                          fs::copy_options::overwrite_existing, ec);
+    };
+
+    // 2. Copy the dropped inputs into depth_output/ (skip self-copies).
+    auto copyInto = [&](const std::string& srcPath, const std::string& dstName) {
+        if (srcPath.empty()) return;
+        const std::string dst = joinp(depthOutputPath, dstName);
+        fs::path s = fs::weakly_canonical(srcPath, ec), d = fs::weakly_canonical(dst, ec);
+        if (!s.empty() && s == d) return;  // already in place
+        fs::create_directories(depthOutputPath, ec);
+        fs::copy_file(srcPath, dst, fs::copy_options::overwrite_existing, ec);
+    };
+    copyInto(state.bin.filePath,  "depth_metric.bin");
+    copyInto(state.mask.filePath, "segmentation_mask.png");
+    if (state.rgb.status == SlotStatus::Loaded) copyInto(state.rgb.filePath, "original.jpg");
+
+    // 3. Scale K to the data (bin) resolution (Phase 3 limitation fix, reused).
+    Reg3DCustom::CameraIntrinsics K =
+        Reg3DCustom::scaleIntrinsics(currentK, state.bin.width, state.bin.height);
+    if (currentK.width != state.bin.width || currentK.height != state.bin.height)
+        std::cout << "[Reconstruct] K auto-scaled from " << currentK.width << "x"
+                  << currentK.height << " to " << state.bin.width << "x"
+                  << state.bin.height << " (fx " << currentK.fx << " -> " << K.fx << ")"
+                  << std::endl;
+
+    // 4. RGB for texture: use the dropped rgb, else a white placeholder
+    //    (writeTextureImage off so no texture.png is produced).
+    const int W = state.bin.width, H = state.bin.height;
+    const bool haveRgb = (state.rgb.status == SlotStatus::Loaded
+                          && state.rgbImage.width == W && state.rgbImage.height == H);
+    std::vector<uint8_t> whiteRgb;
+    const uint8_t* rgbPx = nullptr;
+    if (haveRgb) {
+        rgbPx = state.rgbImage.data.data();
+    } else {
+        whiteRgb.assign((size_t)W * H * 3, 255);
+        rgbPx = whiteRgb.data();
+        std::cout << "[Reconstruct] no matching rgb; using white texture placeholder"
+                  << std::endl;
+    }
+
+    // 5. Generate canonical OBJ + intrinsics.txt via the shared exporter.
+    depthexport::Request req;
+    req.rgbPixels        = rgbPx;
+    req.width            = W;
+    req.height           = H;
+    req.depthMetric      = &state.depthData.depth;
+    req.mask             = &state.maskData;
+    req.K                = K;
+    req.tag              = K.name.empty() ? "custom" : K.name;
+    req.outDir           = depthOutputPath;
+    req.writeTextureImage = haveRgb;
+    auto er = depthexport::exportDepthArtifacts(req);
+    if (!er.ok) {
+        rollback("exportDepthArtifacts failed");
+        r.errorMessage = "OBJ export failed";
+        return r;
+    }
+
+    r.ok = true;
+    std::cout << "[Reconstruct] OK: canonical OBJ + intrinsics.txt written ("
+              << W << "x" << H << ", tag=" << req.tag << ")" << std::endl;
     return r;
 }
 
