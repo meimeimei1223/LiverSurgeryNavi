@@ -48,6 +48,7 @@
 #include "IntrinsicsPresets.h"
 #include "DepthToObjExport.h"   // obj-migration Phase 3: REG-side OBJ export
 #include "IntrinsicsScaling.h"  // scaleIntrinsics() (FEATURE Task 1/2)
+#include "ReconstructFromBin.h" // Reconstruct-from-BIN (FEATURE Task 3/4)
 #include "MeshCleanup.h"
 #include "AR.h"
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
@@ -184,6 +185,10 @@ Reg3DCustom::CameraIntrinsics  g_intrinsics;
 // image load can still decide/perform rectification. Invalidated whenever K is
 // (re)loaded from a source. See loadImageRectifyAware().
 Reg3DCustom::CameraIntrinsics  g_intrinsics_raw;
+// Reconstruct-from-BIN drop state (FEATURE Task 3/4). Filled by file/folder drops
+// of depth_metric.bin + segmentation_mask.png (+ original.jpg); consumed by the
+// Reconstruct action (Task 6) + UI (Task 5).
+ReconstructFromBin::State     g_reconstructState;
 
 // =========================================================
 //  Scene scale (for size-invariant registration parameters)
@@ -2694,6 +2699,37 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
 
     const std::string filePath = paths[0];
     std::cout << "[FileDrop] Attempting to load: " << filePath << std::endl;
+
+    // FEATURE Task 4: route Reconstruct-from-BIN inputs (depth_metric.bin /
+    // segmentation_mask.png / original.jpg, or a depth_output/ folder) to the
+    // reconstruct state machine instead of the normal image-load path. Each
+    // dropped path is handled independently (multi-file / folder drops supported).
+    {
+        // main.cpp owns the stb_image implementation; provide it as the decoder.
+        ReconstructFromBin::ImageDecoder decode =
+            [](const std::string& p, int channels,
+               std::vector<uint8_t>& out, int& w, int& h) -> bool {
+            int c = 0;
+            unsigned char* px = stbi_load(p.c_str(), &w, &h, &c, channels);
+            if (!px) return false;
+            out.assign(px, px + (size_t)w * h * channels);
+            stbi_image_free(px);
+            return true;
+        };
+        std::error_code ec;
+        bool consumed = false;
+        for (int i = 0; i < count; ++i) {
+            const std::string p = paths[i];
+            if (std::filesystem::is_directory(p, ec)) {
+                ReconstructFromBin::onFolderDropped(g_reconstructState, p, decode);
+                consumed = true;
+            } else if (ReconstructFromBin::isReconstructFile(p)) {
+                ReconstructFromBin::onFileDropped(g_reconstructState, p, decode);
+                consumed = true;
+            }
+        }
+        if (consumed) return;   // handled by Reconstruct; do not fall through to image load
+    }
 
     if (!ImageSession::isSupportedExtension(filePath)) {
         std::cerr << "[FileDrop] Unsupported format: " << filePath
