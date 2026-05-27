@@ -123,6 +123,13 @@ MeshDrawingSoftBody.h                                          (MeshDrawing.h �
 `depth_metric.bin` が無く既存 OBJ がある場合は REG はそれをそのまま使う（外部 depth ソース投入経路）。
 REG→DEFORM 連携は `registration_model/reg_liver.obj` 等。
 
+**Reconstruct from BIN（経路 D）**：過去/外部由来の `depth_metric.bin` + `segmentation_mask.png`
+（+ optional `original.jpg`）を REG の UI にドロップすると、DA3/SAM2 推論なしで現在の K（解像度が
+違えば自動スケール）で OBJ を再生成できる（`registration/src/ReconstructFromBin.{h,cpp}` +
+`common/src/IntrinsicsScaling.h`）。K だけ変えた焼き直し・過去症例の再処理・DA3 以外の depth ソース
+（Kinect/RealSense/Stereo を bin 形式に変換）に使える。実行前に depth_output を
+`depth_output_backup_<ts>/` へ退避し、失敗時はロールバック。詳細 `FEATURE_PLAN_external_depth_drop.md`。
+
 ---
 
 ## 6. Qt Creator 利用時の注意

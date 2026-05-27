@@ -5,6 +5,7 @@
 | `test_intrinsics_step1.sh` | Step 1 | `lsn_deform --dry-run` で DeformPipeline の K 読込/UV を検証 |
 | `test_intrinsics_presets.sh` | Step 5 | `IntrinsicsPresets.h` の lookupPreset / 最小化後の registry |
 | `test_intrinsics_step4.sh` | Step 4 / step7-cleanup | `lsn_registration --check-intrinsics` で autoSelect 優先順位を検証 |
+| `test_intrinsics_scaling.sh` | reconstruct-from-bin | `IntrinsicsScaling.h::scaleIntrinsics` (4K↔1080p スケール/往復/no-op) |
 
 実行はいずれも `bash test/<script>` 。全テスト pass で exit 0、失敗で exit 1。
 intrinsics 系ファイル（`intrinsics_k4a.txt` / `intrinsics_custom.txt` /

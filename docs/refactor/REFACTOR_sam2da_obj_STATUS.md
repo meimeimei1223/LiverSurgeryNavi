@@ -98,8 +98,10 @@ FINAL doc §2.2/§6.1 は「image_utils は std のみ依存の自己完結ヘ�
   mask=segmentation_mask.png, K=g_intrinsics）/ B（bin無→既存OBJ温存+intrinsics.txt）/ C（警告のみ）。
   objPath に canonical フォールバック追加。DA3 promote を `intrinsics_da3.txt`→`intrinsics_da3_last.txt` に更新。
 - ODR fix: `mCutMesh.h::setUp()` を inline 化（common の新 .cpp と多重定義回避）。
-- **既知の制限**: K 解像度 ≠ depth 解像度（4K入力を sam2 が縮小したケース）の K スケーリングは
-  REG 側未実装＝警告ログのみ。検証済みの 1080p custom（縮小なし）経路では問題なし。
+- **既知の制限 → 解消済み (2026-05-27)**: K 解像度 ≠ depth 解像度（4K入力を sam2 が縮小した
+  ケース）の K スケーリングは当初未実装(警告のみ)だったが、後続 feature (FEATURE_PLAN_external_depth_drop.md
+  Task 1/2 の `common/src/IntrinsicsScaling.h::scaleIntrinsics`) を Run Depth 経路 A に適用して解消。
+  Patient3 4K Custom で頂点数が 804k(半減)→939k に復活、検証済み。
 
 ## 進捗
 - [x] Phase 1: 死コード掃除（867–903 温存・depth_metric.bin 温存）→ `[obj-migration p1]`
