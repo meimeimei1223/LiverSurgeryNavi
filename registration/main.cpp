@@ -47,6 +47,7 @@
 #include "IntrinsicsSource.h"
 #include "IntrinsicsPresets.h"
 #include "DepthToObjExport.h"   // obj-migration Phase 3: REG-side OBJ export
+#include "IntrinsicsScaling.h"  // scaleIntrinsics() (FEATURE Task 1/2)
 #include "MeshCleanup.h"
 #include "AR.h"
 #include "SilOverlayDebug.h"   // V3RS Phase 2: silhouette IoU ImGui overlay (F9 toggle)
@@ -3019,23 +3020,29 @@ static bool setupObjScene() {
               << " res=" << K.width << "x" << K.height << ")"
               << std::endl;
 
-    // OBJ projection K: SAM2 builds the OBJ with the RESIZED K (it caps input
-    // at 1920x1080) and records that in intrinsics_custom_used.txt -- the
-    // original intrinsics_custom.txt (user 4K) is left untouched. The target
-    // cloud must be projected with that SAME used K to match the OBJ geometry,
-    // so prefer the _used file when present (Custom source). OrbitCam / AR
-    // background above keep the original K (which matches the rectified image).
+    // OBJ-projection K: REG writes the K it ACTUALLY used to build the OBJ
+    // (scaled to the depth resolution, Task 2) to the canonical intrinsics.txt.
+    // The target cloud must be projected with that same K to match the OBJ
+    // geometry, so prefer intrinsics.txt; fall back to the legacy pre-migration
+    // intrinsics_custom_used.txt, else the display K. OrbitCam / AR background
+    // above keep the display K (matches the full-res rectified image).
     Reg3DCustom::CameraIntrinsics K_obj = K;
-    if (g_intrinsicsSource == IntrinsicsSource::Custom) {
-        Reg3DCustom::CameraIntrinsics Kused;
-        if (Reg3DCustom::loadCameraIntrinsics(
-                DEPTH_OUTPUT_PATH + "intrinsics_custom_used.txt", Kused)
-            && Kused.valid()) {
-            K_obj = Kused;
-            std::cout << "[OBJ Setup] OBJ-projection K from intrinsics_custom_used.txt: "
+    {
+        Reg3DCustom::CameraIntrinsics Kobj2;
+        if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", Kobj2)
+            && Kobj2.valid()) {
+            K_obj = Kobj2;
+            std::cout << "[OBJ Setup] OBJ-projection K from intrinsics.txt: "
                       << K_obj.width << "x" << K_obj.height << " fx=" << K_obj.fx
                       << "  (display/OrbitCam keeps " << K.width << "x" << K.height
                       << " fx=" << K.fx << ")" << std::endl;
+        } else if (g_intrinsicsSource == IntrinsicsSource::Custom &&
+                   Reg3DCustom::loadCameraIntrinsics(
+                       DEPTH_OUTPUT_PATH + "intrinsics_custom_used.txt", Kobj2)
+                   && Kobj2.valid()) {
+            K_obj = Kobj2;  // legacy (pre-migration) used-K
+            std::cout << "[OBJ Setup] OBJ-projection K from legacy intrinsics_custom_used.txt"
+                      << std::endl;
         }
     }
 
@@ -3419,7 +3426,18 @@ static bool runDepthAndUpdateScene(AppContext& ctx) {
                     req.height      = db.height;
                     req.depthMetric = &db.depth;
                     req.mask        = &mask;
-                    req.K           = g_intrinsics;
+                    // Task 2: scale K to the depth resolution. sam2 may have
+                    // downscaled the image (e.g. 4K -> 1080p) and depth_metric.bin
+                    // is at that processed resolution; unprojecting with the
+                    // unscaled K would misproject (and shed ~half the vertices).
+                    req.K           = Reg3DCustom::scaleIntrinsics(g_intrinsics,
+                                                                   db.width, db.height);
+                    if (g_intrinsics.width != db.width || g_intrinsics.height != db.height)
+                        std::cout << "[RunDepth] K scaled to depth res "
+                                  << db.width << "x" << db.height
+                                  << " (from " << g_intrinsics.width << "x"
+                                  << g_intrinsics.height << ", fx " << g_intrinsics.fx
+                                  << " -> " << req.K.fx << ")" << std::endl;
                     req.K.name      = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
                     req.tag         = req.K.name;
                     req.outDir      = DEPTH_OUTPUT_PATH;
