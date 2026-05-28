@@ -158,6 +158,29 @@ static void onMouseMove(GLFWwindow* win, double x, double y) {
     bool L = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT)  == GLFW_PRESS;
     bool R = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
 
+    // RIGID_MODE drag: move the whole rigid body. Ported from the legacy
+    // unified main.cpp's glfw_onMouseMoveOrbit DEFORM_MODE block.
+    //   L+R : translate along camera depth (Z)
+    //   L   : rotate around camera right/up
+    //   R   : translate in the screen plane (pan-like)
+    if (isDragging && deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE && multiBody) {
+        if (L && R) {
+            glm::vec3 mv = OrbitCam.cameraDirection * (-dy) * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
+            multiBody->rigidTranslate(mv);
+        } else if (L && !R) {
+            float rotX = dy * 0.01f;
+            float rotY = dx * 0.01f;
+            if (std::abs(rotX) > 1e-5f) multiBody->rigidRotateAroundCenter(OrbitCam.cameraRight, rotX);
+            if (std::abs(rotY) > 1e-5f) multiBody->rigidRotateAroundCenter(OrbitCam.cameraUp,    rotY);
+        } else if (R && !L) {
+            float tdx =  dx * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
+            float tdy = -dy * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
+            glm::vec3 mv = OrbitCam.cameraRight * tdx + OrbitCam.cameraUp * tdy;
+            multiBody->rigidTranslate(mv);
+        }
+        return;
+    }
+
     // DEFORM_MODE で左ドラッグ中ならグラブ移動
     if (isDragging && deformHandlPlace.state == DeformHandlPlaceData::DEFORM_MODE) {
         DeformPipeline::onMouseMove(x, y, 1.0f / 60.0f);
