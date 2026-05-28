@@ -313,13 +313,12 @@ static void setupUICallbacks() {
         }
     };
 
-    // DEFORM -> REG transition. Spawns lsn_registration detached and tears
-    // this window down. The REG side will read intrinsics_calib.txt etc as
-    // usual; nothing is passed via argv.
+    // DEFORM stays an independent process. The button just acknowledges the
+    // intent in the log; launching lsn_registration is left to the user
+    // (Qt Creator, terminal, ...). Phase 3 unified binary will replace this
+    // with an in-process currentMainMode = REGISTRATION_MODE switch.
     a.onStartFromDepth = []{
-        std::cout << "[Deform] Restart from Depth -> spawning lsn_registration" << std::endl;
-        platform_launch_detached(REG_EXE_PATH);
-        glfwSetWindowShouldClose(gWindow, GLFW_TRUE);
+        std::cout << "[Deform] Start From Depth requested -- launch lsn_registration manually" << std::endl;
     };
 
     // We are already in DEFORM mode; the REG-side "Deform >>" button is what

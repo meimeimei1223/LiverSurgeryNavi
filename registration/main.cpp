@@ -10327,14 +10327,13 @@ static void setupUICallbacks() {
     };
 
     a.onSwitchToDeformMode = []() {
-        // REG -> DEFORM transition. Export reg_*.obj (DeformPipeline::
-        // initFromRegistered reads them) then spawn lsn_deform detached.
-        // Phase 3 unified binary will replace the spawn with an in-process
+        // REG side stays an independent process. The button only exports the
+        // reg_*.obj snapshot that DeformPipeline::initFromRegistered() reads;
+        // launching lsn_deform is left to the user (Qt Creator, terminal, ...).
+        // Phase 3 unified binary will replace this with an in-process
         // currentMainMode = DEFORM_MODE + initFromRegistered() call.
-        std::cout << "[Reg] Switch to Deform -> exporting reg_*.obj + spawning lsn_deform" << std::endl;
+        std::cout << "[Reg->Deform] Exporting reg_*.obj (you can now launch lsn_deform manually)" << std::endl;
         StlExport::exportRegisteredObjs();
-        platform_launch_detached(DEFORM_EXE_PATH);
-        glfwSetWindowShouldClose(gWindow, GLFW_TRUE);
     };
 
     a.onRefine = []() {
