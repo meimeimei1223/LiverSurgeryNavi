@@ -57,3 +57,15 @@ DatasetEchoLiver/
 レジストレーション*.h
 元の長い*.h
 元の長い*.cpp
+過去の指示書/
+
+# ImGui runtime state
+imgui.ini
+
+# Live calibration session captures + backups + test snapshots
+depth_output/chessboard_live_*/
+depth_output/*.bin
+depth_output_backup_*/
+depth_output.bak/
+depth_output (コピー)/
+snapshot_*/

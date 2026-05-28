@@ -111,6 +111,22 @@ struct RegUIActions {
     std::function<void(const std::string&)> onChessboardFolderChanged;
     std::function<void(int,int)>             onBoardSizeChanged;
     std::function<void(float)>               onSquareSizeChanged;
+    // ---- Live Calibration (Take Picture tab) ----
+    //   onLiveCalibStart   : make a new session folder AND open the camera
+    //                        (live view) so the user can capture without
+    //                        hunting for a separate Start Camera button.
+    //   onLiveCalibCapture : save the current camera frame into the session folder.
+    //   onLiveCalibRun     : point g_chessboardFolder at the session folder and
+    //                        call onRunCalibration() (external calibration_tool).
+    //   onLiveCalibClear   : delete all captured frames in the session folder.
+    //   onLiveCalibOpenFolder : open the session folder in the OS file manager.
+    //   onLiveCalibStop    : end the session AND stop the camera (one mode).
+    std::function<void()> onLiveCalibStart;
+    std::function<void()> onLiveCalibCapture;
+    std::function<void()> onLiveCalibRun;
+    std::function<void()> onLiveCalibClear;
+    std::function<void()> onLiveCalibOpenFolder;
+    std::function<void()> onLiveCalibStop;
     // ---- Reconstruct from BIN (FEATURE Task 5) ----
     std::function<void()> onReconstruct;       // run exportDepthArtifacts on dropped data
     std::function<void()> onReconstructClear;  // clear all reconstruct slots
@@ -329,6 +345,17 @@ struct RegUIState {
     int   calibImgCount = 0;
     std::string calibFolder = "../../../chessboard/";
 
+    // ---- Live Calibration (Take Picture tab) ----
+    // syncUIState() copies these from g_liveCalib* each frame. The Run path
+    // delegates to onRunCalibration (external calibration_tool), so no result
+    // fields are duplicated here — the Calib result is shared via calib* above.
+    bool        liveCalibSessionActive = false;       // session started?
+    std::string liveCalibFolder;                       // chessboard_live_<ts>/
+    int         liveCalibCapturedCount = 0;            // frames captured
+    std::vector<std::string> liveCalibCapturedFiles;   // basenames, UI list
+    std::string liveCalibLastMessage;                  // "Captured frame_003.jpg"
+    int         liveCalibCamW = 0, liveCalibCamH = 0;  // live camera resolution
+
     // ---- Reconstruct from BIN (FEATURE Task 5) ----
     // syncUIState() copies these from g_reconstructState / g_intrinsics each frame.
     struct ReconSlot { int status=0; int width=0, height=0; std::string err; };  // status: 0=Empty 1=Loaded 2=Error
@@ -349,8 +376,8 @@ private:
     bool showRestartConfirm_ = false;
     bool regPhaseActive_ = false;
     bool initOrientShouldCollapse_ = false;   // [Phase 9c] One-shot: set by the
-                                              // Apply Init Pose button, consumed
-                                              // next frame to fold INITIAL ORIENT.
+        // Apply Init Pose button, consumed
+        // next frame to fold INITIAL ORIENT.
     float sidebarWidth_ = 400.0f;
     bool  intrinsicsWantSettingsTab_ = false;  // Step 7: "Run Calibration…" -> Settings tab
 
@@ -694,6 +721,11 @@ public:
         ImGui::End();
         ImGui::PopStyleColor();
         ImGui::PopStyleVar(3);
+
+        // Live calib shutter overlay sits over the camera viewport. Drawn
+        // AFTER the sidebar so it is on top in stacking order, but its
+        // own NoBringToFrontOnFocus keeps it from stealing focus.
+        drawLiveCalibShutter(windowWidth, windowHeight);
     }
 
     float getViewportWidth(int windowWidth) const {
@@ -826,7 +858,17 @@ private:
             case 2:  cl = "> Restart Camera"; cc2 = colBlue();  break;
             default: cl = "Camera";           cc2 = colDim();   break;
             }
-            if (state.cameraState == 0 && !state.depthDone) {
+            // Live Calibration owns the camera. The regular "Capture" button
+            // here would flip cameraState 1 -> 2 (freeze + kMaskSelection),
+            // which (a) stops fresh frames from reaching saveFrameAsJPEG and
+            // (b) yanks the user into the segmentation flow mid-session. Show
+            // a locked stub so the only capture path during a session is the
+            // shutter button in the viewport / Capture Frame in the tab.
+            if (state.liveCalibSessionActive) {
+                colorButton("Capture (locked: live calibration)", colDim(),
+                            false, true, -1, 0,
+                            state.btnIconTex[RegUIState::ICON_CAMERA]);
+            } else if (state.cameraState == 0 && !state.depthDone) {
                 if (glowButton(cl, colDepth(), false, -1, 36, state.btnIconTex[RegUIState::ICON_CAMERA])) { if(actions.onToggleCamera) actions.onToggleCamera(); }
             } else {
                 if (colorButton(cl, cc2, isActive, false, -1, 0, state.btnIconTex[RegUIState::ICON_CAMERA])) { if(actions.onToggleCamera) actions.onToggleCamera(); }
@@ -835,7 +877,13 @@ private:
 
         ImGui::Spacing();
 
-        if (state.cameraState == 0 && !state.depthDone) {
+        // Same logic for Load Local Image: a fresh image during a live calib
+        // session would clobber gApp.image.loaded and pull the segmentation
+        // overlay back. Keep it locked until the session ends.
+        if (state.liveCalibSessionActive) {
+            colorButton("Load Local Image (locked)", colDim(), false, true,
+                        -1, 0, state.btnIconTex[RegUIState::ICON_LOAD_IMAGES]);
+        } else if (state.cameraState == 0 && !state.depthDone) {
             if (glowButton("Load Local Image", colDepth(), false, -1, 36, state.btnIconTex[RegUIState::ICON_LOAD_IMAGES])) {
                 if(actions.onLoadLocalImage) actions.onLoadLocalImage();
             }
@@ -1205,7 +1253,7 @@ private:
             childH += 3.0f * (22.0f + 4.0f);           // orientation 3 行
         }
         childH += 8.0f;                                // tail padding only
-                                                       // (Phase 9d: Apply moved out)
+            // (Phase 9d: Apply moved out)
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.06f, 0.10f, 0.5f));
         ImGui::BeginChild("##initOrient", ImVec2(-1, childH), false);
@@ -1653,8 +1701,8 @@ private:
             const float hemiW   = (availW - gap) * 0.66f;
 
             if(glowButton("Hemi Quad (Shift+O)", colReg(),
-                          anyP && state.regMethod!=1, hemiW, 52,
-                          state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
+                           anyP && state.regMethod!=1, hemiW, 52,
+                           state.btnIconTex[RegUIState::ICON_HEMI_AUTO])) {
                 state.regMethod = 1;
                 if(actions.onQuadAuto) actions.onQuadAuto();
             }
@@ -1781,7 +1829,7 @@ private:
                                                     : "Pose Library");
             }
             if(colorButton(libLabel,
-                           state.poseLibraryOpen ? colGreen() : colReg(), false, false, bw2)) {
+                            state.poseLibraryOpen ? colGreen() : colReg(), false, false, bw2)) {
                 if(actions.onPoseLibraryToggle) actions.onPoseLibraryToggle();
             }
             ImGui::SameLine();
@@ -2036,7 +2084,7 @@ private:
 
             // "Run Calibration…" を押すと次フレームで Settings タブへ遷移する。
             ImGuiTabItemFlags setFlags = intrinsicsWantSettingsTab_
-                                       ? ImGuiTabItemFlags_SetSelected : 0;
+                                             ? ImGuiTabItemFlags_SetSelected : 0;
             intrinsicsWantSettingsTab_ = false;
             snprintf(id, sizeof(id), "Settings##%s", suffix);
             if (ImGui::BeginTabItem(id, nullptr, setFlags)) {
@@ -2044,12 +2092,9 @@ private:
                 ImGui::EndTabItem();
             }
 
-            snprintf(id, sizeof(id), "Take Picture##%s", suffix);
+            snprintf(id, sizeof(id), "Live Calibration##%s", suffix);
             if (ImGui::BeginTabItem(id)) {
-                ImGui::Spacing();
-                ImGui::TextColored(colDim(), "Coming soon");
-                ImGui::TextWrapped("In-app chessboard capture then Run Calibration "
-                                   "(Step 8).");
+                drawIntrinsicsTakePictureTab_(suffix);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -2057,14 +2102,147 @@ private:
         ImGui::Spacing();
     }
 
+    // ---- "Take Picture" tab: Live Calibration ------------------------------
+    // Capture chessboard frames straight from the live camera into a session
+    // folder, then hand the folder to the existing Run Calibration path
+    // (external calibration_tool). Board params are shared with the Settings
+    // tab; the result is shared via state.calib* (set on Calib success).
+    void drawIntrinsicsTakePictureTab_(const char* suffix) {
+        ImGui::Spacing();
+        ImGui::TextColored(colDepth(), "LIVE CALIBRATION");
+        ImGui::Spacing();
+
+        if (!state.liveCalibSessionActive) {
+            ImGui::TextWrapped("Capture chessboard images from the live camera, then "
+                               "run calibration automatically. Uses the board settings "
+                               "below.");
+            ImGui::Spacing();
+        }
+
+        // ---- Board parameters (shared with Settings tab globals) ----
+        ImGui::TextColored(colDim(), "Board (shared with Settings tab)");
+        int cols = state.chessboardBoardCols, rows = state.chessboardBoardRows;
+        bool boardChanged = false;
+        ImGui::SetNextItemWidth(110);
+        char cId[32]; snprintf(cId, sizeof(cId), "cols##live_%s", suffix);
+        boardChanged |= ImGui::InputInt(cId, &cols);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110);
+        char rId[32]; snprintf(rId, sizeof(rId), "rows##live_%s", suffix);
+        boardChanged |= ImGui::InputInt(rId, &rows);
+        if (boardChanged && actions.onBoardSizeChanged) {
+            actions.onBoardSizeChanged(std::max(2, cols), std::max(2, rows));
+        }
+        float sq = state.chessboardSquareMm;
+        ImGui::SetNextItemWidth(150);
+        char sId[32]; snprintf(sId, sizeof(sId), "square (mm)##live_%s", suffix);
+        if (ImGui::InputFloat(sId, &sq, 0.5f, 5.0f, "%.2f")) {
+            if (actions.onSquareSizeChanged) actions.onSquareSizeChanged(std::max(1.0f, sq));
+        }
+
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+        // ---- Session control (single self-contained mode) ----
+        if (!state.liveCalibSessionActive) {
+            // One button: create session folder + open the camera together.
+            if (colorButton("Start Live Calibration\n(creates session + opens camera)",
+                            colGreen(), false, false, -1, 50)) {
+                if (actions.onLiveCalibStart) actions.onLiveCalibStart();
+            }
+        } else {
+            ImGui::TextColored(colDim(), "Session:");
+            ImGui::TextWrapped("%s", state.liveCalibFolder.c_str());
+
+            // Camera status line.
+            if (state.cameraState == 1) {
+                ImGui::TextColored(colGreen(), "Camera: LIVE (%dx%d)",
+                                   state.liveCalibCamW, state.liveCalibCamH);
+            } else {
+                ImGui::TextColored(ImVec4(0.9f,0.3f,0.3f,1), "Camera: OFF");
+            }
+            ImGui::Spacing();
+
+            if (state.cameraState == 1) {
+                // Live view -> capture is ready immediately.
+                if (colorButton("Capture Frame", colGreen(), false, false, -1, 40)) {
+                    if (actions.onLiveCalibCapture) actions.onLiveCalibCapture();
+                }
+            } else {
+                // Camera stopped mid-session: let the user resume WITHOUT
+                // losing already-captured frames (Stop Session would discard
+                // the session). Resume just re-opens the live view.
+                ImGui::TextColored(colYellow(),
+                                   "Camera stopped. Resume to keep capturing.");
+                if (colorButton("Resume Camera", colDepth(), false, false, -1, 36)) {
+                    if (actions.onToggleCamera) actions.onToggleCamera();
+                }
+            }
+
+            ImGui::Spacing();
+
+            ImGui::TextColored(colYellow(),
+                               "Captured: %d frame(s) (need >= 3)", state.liveCalibCapturedCount);
+            if (!state.liveCalibLastMessage.empty()) {
+                ImGui::TextColored(colDim(), "%s", state.liveCalibLastMessage.c_str());
+            }
+            int n = (int)state.liveCalibCapturedFiles.size();
+            int start = std::max(0, n - 6);
+            for (int i = start; i < n; i++) {
+                ImGui::BulletText("%s", state.liveCalibCapturedFiles[i].c_str());
+            }
+
+            ImGui::Spacing();
+
+            float bw = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
+            if (colorButton("Clear All", ImVec4(0.6f,0.3f,0.3f,1), false,
+                            state.liveCalibCapturedCount == 0, bw)) {
+                if (actions.onLiveCalibClear) actions.onLiveCalibClear();
+            }
+            ImGui::SameLine();
+            if (colorButton("Open Folder", colDim(), false, false, bw)) {
+                if (actions.onLiveCalibOpenFolder) actions.onLiveCalibOpenFolder();
+            }
+
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+            bool canRun = (state.liveCalibCapturedCount >= 3);
+            if (colorButton("Run Calibration", ImVec4(0.9f,0.4f,0.6f,1),
+                            false, !canRun, -1, 40)) {
+                if (actions.onLiveCalibRun) actions.onLiveCalibRun();
+            }
+            if (!canRun) {
+                ImGui::TextColored(colDim(), "Need >= 3 captures.");
+            }
+
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+            // End the session and stop the camera in one action.
+            if (colorButton("Stop Session", colDim(), false, false, -1, 30)) {
+                if (actions.onLiveCalibStop) actions.onLiveCalibStop();
+            }
+        }
+
+        // ---- Result (shared with Settings tab: state.calib*) ----
+        if (state.calibDone) {
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+            ImGui::TextColored(colGreen(), "Last calibration result:");
+            ImGui::Text("fx=%.2f fy=%.2f", state.calibFx, state.calibFy);
+            ImGui::Text("cx=%.2f cy=%.2f", state.calibCx, state.calibCy);
+            ImGui::Text("RMS=%.3f px (%d imgs)", state.calibRms, state.calibImgCount);
+            if (!state.calibMessage.empty() && state.calibMessage != "OK") {
+                ImGui::TextColored(colDim(), "%s", state.calibMessage.c_str());
+            }
+        }
+    }
+
     // Active source -> short label + pill color for the Active card.
     void intrinsicsSourceLabelColor_(const char*& label, ImVec4& col) const {
         switch (state.intrinsicsSource) {
-            case IntrinsicsSource::Custom: label = "Custom"; col = ImVec4(0.9f,0.7f,0.2f,1); break;
-            case IntrinsicsSource::Calib:  label = "Calib";  col = ImVec4(0.9f,0.4f,0.6f,1); break;
-            case IntrinsicsSource::Preset: label = "Preset"; col = ImVec4(0.2f,0.6f,1.0f,1); break;
-            case IntrinsicsSource::DA3:    label = "DA3";    col = ImVec4(0.3f,0.8f,0.6f,1); break;
-            default:                       label = "?";      col = colDim(); break;
+        case IntrinsicsSource::Custom: label = "Custom"; col = ImVec4(0.9f,0.7f,0.2f,1); break;
+        case IntrinsicsSource::Calib:  label = "Calib";  col = ImVec4(0.9f,0.4f,0.6f,1); break;
+        case IntrinsicsSource::Preset: label = "Preset"; col = ImVec4(0.2f,0.6f,1.0f,1); break;
+        case IntrinsicsSource::DA3:    label = "DA3";    col = ImVec4(0.3f,0.8f,0.6f,1); break;
+        default:                       label = "?";      col = colDim(); break;
         }
     }
 
@@ -2104,7 +2282,7 @@ private:
         // ---- Source dropdown (priority order) ----
         ImGui::TextColored(colDim(), "Source");
         const std::string preview = state.currentDisplayName.empty()
-                                   ? std::string("(select source)") : state.currentDisplayName;
+                                        ? std::string("(select source)") : state.currentDisplayName;
         // green "o" = available, dim "-" = missing; then a Selectable.
         // Unavailable entries are disabled (greyed + non-clickable).
         auto entry = [&](const char* label, bool available, bool selected) -> bool {
@@ -2136,7 +2314,7 @@ private:
                 bool sel = (state.intrinsicsSource == IntrinsicsSource::Preset
                             && state.currentPresetKey == p.key);
                 char lbl[112]; snprintf(lbl, sizeof(lbl), "%s##preset_%s",
-                                        p.displayName.c_str(), p.key.c_str());
+                         p.displayName.c_str(), p.key.c_str());
                 if (entry(lbl, p.available, sel)) {
                     if (actions.onPresetChanged) actions.onPresetChanged(p.key);
                 }
@@ -2152,7 +2330,7 @@ private:
                     bool sel = (state.intrinsicsSource == IntrinsicsSource::Preset
                                 && state.currentPresetKey == p.key);
                     char lbl[112]; snprintf(lbl, sizeof(lbl), "%s##dyn_%s",
-                                            p.displayName.c_str(), p.key.c_str());
+                             p.displayName.c_str(), p.key.c_str());
                     if (entry(lbl, p.available, sel)) {
                         if (actions.onPresetChanged) actions.onPresetChanged(p.key);
                     }
@@ -2478,10 +2656,10 @@ private:
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
             const char* isrcName = "DA3";
             switch (state.intrinsicsSource) {
-                case IntrinsicsSource::Custom: isrcName = "Custom"; break;
-                case IntrinsicsSource::Calib:  isrcName = "Calib";  break;
-                case IntrinsicsSource::Preset: isrcName = "Preset"; break;
-                case IntrinsicsSource::DA3:    isrcName = "DA3";    break;
+            case IntrinsicsSource::Custom: isrcName = "Custom"; break;
+            case IntrinsicsSource::Calib:  isrcName = "Calib";  break;
+            case IntrinsicsSource::Preset: isrcName = "Preset"; break;
+            case IntrinsicsSource::DA3:    isrcName = "DA3";    break;
             }
             ImGui::TextColored(colDepth(), "%s", isrcName);
             ImGui::TextColored(colDim(), "Image Source");
@@ -2591,6 +2769,91 @@ private:
     }
 
 public:  // drawDepthOverlayをpublicに変更（マスク選択モードから呼ぶため）
+    // ---- Live Calibration shutter overlay --------------------------------
+    // Bottom-center floating panel during a live calibration session:
+    //   [ big circular shutter ]   [ Run Calibration pill ]
+    //                Capture Frame    N / >=3
+    // The shutter mirrors Space hotkey (handled in main.cpp's glfw_onKey).
+    // Run Calibration is enabled at N>=3; clicking it ends the session
+    // whether or not the calibration succeeds (see onLiveCalibRun).
+    void drawLiveCalibShutter(int windowWidth, int windowHeight) {
+        if (!state.liveCalibSessionActive) return;
+        if (state.cameraState != 1) return;  // need a live feed to capture
+
+        const float btnR  = 52.0f;                 // shutter radius (bigger)
+        const float btnW  = btnR * 2.0f;           // 104
+        const float runW  = 150.0f;
+        const float runH  = 54.0f;
+        const float gap   = 18.0f;
+        const float pad   = 18.0f;
+        const float winW  = pad + btnW + gap + runW + pad;   // ~308
+        const float capH  = 22.0f;
+        const float winH  = pad + btnW + 8 + capH + pad;     // ~178
+
+        const float cx = (windowWidth - sidebarWidth_) * 0.5f;
+        const float cy = (float)windowHeight - winH * 0.5f - 20.0f;
+
+        ImGui::SetNextWindowPos(ImVec2(cx, cy), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(winW, winH));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        // Semi-transparent backdrop so the overlay reads against any
+        // background (bright wall, dark scene, etc.).
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0.55f));
+        ImGui::Begin("##liveCalibShutter", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        ImDrawList* dl  = ImGui::GetWindowDrawList();
+        ImVec2 winPos   = ImGui::GetWindowPos();
+
+        // ---- Shutter (left) -----------------------------------------
+        ImGui::SetCursorPos(ImVec2(pad, pad));
+        bool clicked = ImGui::InvisibleButton("##shutter", ImVec2(btnW, btnW));
+        bool hov     = ImGui::IsItemHovered();
+        bool held    = ImGui::IsItemActive();
+
+        ImVec2 sc(winPos.x + pad + btnR, winPos.y + pad + btnR);
+        ImU32 ringCol = IM_COL32(255, 255, 255, hov ? 255 : 230);
+        ImU32 fillCol = held ? IM_COL32( 50, 160,  85, 255)
+                        : hov ? IM_COL32(110, 230, 150, 255)
+                              : IM_COL32( 80, 200, 120, 235);
+        dl->AddCircleFilled(sc, btnR - 4, fillCol, 64);
+        dl->AddCircle      (sc, btnR,     ringCol, 64, 4.0f);
+
+        // Camera glyph (simple body + lens).
+        float bw = btnR * 0.95f, bh = btnR * 0.58f;
+        dl->AddRectFilled(ImVec2(sc.x - bw*0.5f, sc.y - bh*0.5f),
+                          ImVec2(sc.x + bw*0.5f, sc.y + bh*0.5f),
+                          IM_COL32(255,255,255,240), 6.0f);
+        dl->AddCircleFilled(sc, btnR * 0.24f, IM_COL32(45, 75, 60, 255), 28);
+        dl->AddCircleFilled(sc, btnR * 0.13f, IM_COL32(255,255,255,235), 20);
+
+        if (clicked && actions.onLiveCalibCapture) actions.onLiveCalibCapture();
+
+        // ---- Run Calibration pill (right) ---------------------------
+        bool canRun = (state.liveCalibCapturedCount >= 3);
+        ImGui::SetCursorPos(ImVec2(pad + btnW + gap, pad + (btnW - runH) * 0.5f));
+        if (colorButton("Run Calibration", ImVec4(0.9f, 0.4f, 0.6f, 1.0f),
+                        false, !canRun, runW, runH)) {
+            if (actions.onLiveCalibRun) actions.onLiveCalibRun();
+        }
+
+        // ---- Caption (below) ----------------------------------------
+        char caption[64];
+        snprintf(caption, sizeof(caption), "Capture Frame    %d / >=3",
+                 state.liveCalibCapturedCount);
+        ImVec2 tSize = ImGui::CalcTextSize(caption);
+        ImGui::SetCursorPos(ImVec2((winW - tSize.x) * 0.5f, pad + btnW + 8));
+        ImGui::TextColored(ImVec4(1, 1, 1, 0.95f), "%s", caption);
+
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(3);
+    }
+
     void drawDepthOverlay(int windowWidth, int windowHeight) {
         const float sc = 2.0f;
 
