@@ -45,6 +45,12 @@
 #include "DeformPipeline.h"   // initFromRegistered, updateAndDraw, onMouse*
 #include "AR.h"               // AR::Background (KeyA で背景オーバーレイ)
 
+// ImGui (DEFORM UI 統合). RegistrationImGuiManager は REG/DEFORM 共通の UI
+// 本体で、state.mainMode==1 を見て DEFORM 専用表示に切り替わる。
+#include "imgui.h"
+#include "AppImGuiBoot.h"
+#include "RegistrationImGuiManager.h"
+
 // ============================================================================
 // グローバル(RayCast.h / Grabber.h が extern で要求するもの)
 // ============================================================================
@@ -61,6 +67,9 @@ glm::vec3    hit_position(0.0f);
 
 FullSphereCamera OrbitCam;
 
+// UI manager: REG/DEFORM 共通クラス。DEFORM 側は state.mainMode=1 固定で起動する。
+RegistrationImGuiManager gUI;
+
 // ============================================================================
 // AR モード（KeyA で切替）
 //   レジストレーション側 main.cpp と同一ロジック:
@@ -71,6 +80,19 @@ FullSphereCamera OrbitCam;
 // ============================================================================
 static AR::Background g_arBg;
 static bool           g_arMode = false;
+
+// QCR Tuning globals (REG-only feature). RegistrationImGuiManager.h's
+// QCR slider panel short-returns before referencing these when
+// state.mainMode==1, so the values are never read in DEFORM; but the
+// extern declarations still need definitions at link time.
+int   g_qcrSubsetK        = 3;
+int   g_qcrMaxTrials      = 100000;
+float g_qcrMaxAxisRotDeg  = 45.0f;
+float g_qcrMaxTotalRotDeg = 90.0f;
+
+// Forward decls for the two functions that wire / sync the shared UI.
+static void setupUICallbacks();
+static void syncUIState();
 
 // ============================================================================
 // GLFW コールバック
@@ -83,6 +105,10 @@ static void onFramebufferSize(GLFWwindow*, int w, int h) {
 }
 
 static void onKey(GLFWwindow* win, int key, int, int action, int mods) {
+    // While the UI has keyboard focus (text fields etc), swallow the key so
+    // it does not also drive scene shortcuts.
+    if (ImGui::GetIO().WantCaptureKeyboard) return;
+
     if (action != GLFW_PRESS) return;
     if (key == GLFW_KEY_ESCAPE) {
         glfwSetWindowShouldClose(win, GLFW_TRUE);
@@ -97,18 +123,34 @@ static void onKey(GLFWwindow* win, int key, int, int action, int mods) {
                   << (g_arMode ? "ON" : "OFF") << std::endl;
         return;
     }
-    // この minimal 版は常に DEFORM_MODE。統合時はここでモード分岐する。
-    DeformPipeline::onKey(key, mods);
+
+    // Mode-dispatch scaffold. Phase 1 only fires DEFORM_MODE; the
+    // REGISTRATION_MODE branch is a placeholder for the Phase 3 unified app.
+    switch (currentMainMode) {
+    case DEFORM_MODE:
+        DeformPipeline::onKey(key, mods);
+        break;
+    case REGISTRATION_MODE:
+        // Phase 3: dispatch to REG-side handlers here.
+        break;
+    }
 }
 
 static void onMouseButton(GLFWwindow* win, int button, int action, int) {
+    if (ImGui::GetIO().WantCaptureMouse) return;
     double x, y; glfwGetCursorPos(win, &x, &y);
     if (action == GLFW_PRESS)        DeformPipeline::onMousePress(button, x, y);
     else if (action == GLFW_RELEASE) DeformPipeline::onMouseRelease(button);
 }
 
 static void onMouseMove(GLFWwindow* win, double x, double y) {
+    // Keep the last position fresh even while the UI captures the mouse,
+    // otherwise the first frame back in the scene jumps by a large dx/dy.
     static glm::vec2 last(0.0f);
+    if (ImGui::GetIO().WantCaptureMouse) {
+        last = glm::vec2((float)x, (float)y);
+        return;
+    }
     float dx = (float)x - last.x;
     float dy = (float)y - last.y;
     last = glm::vec2((float)x, (float)y);
@@ -128,6 +170,7 @@ static void onMouseMove(GLFWwindow* win, double x, double y) {
 }
 
 static void onMouseScroll(GLFWwindow*, double, double dy) {
+    if (ImGui::GetIO().WantCaptureMouse) return;
     OrbitCam.Zoom(dy);
 }
 
@@ -192,6 +235,131 @@ static bool initOpenGL() {
 }
 
 // ============================================================================
+// UI Actions wire-up. Only the actions that DEFORM mode actually triggers
+// are wired; the rest of the RegUIActions table is left as default-constructed
+// std::function (the UI side guards with `if (actions.xxx)` before calling).
+// ============================================================================
+static void setupUICallbacks() {
+    auto& a = gUI.actions;
+
+    a.onRigidMode = []{
+        if (currentMainMode != DEFORM_MODE) return;
+        deformHandlPlace.state = DeformHandlPlaceData::RIGID_MODE;
+        if (multiBody) multiBody->setRigidMode(true);
+        std::cout << "[UI] Rigid mode" << std::endl;
+    };
+
+    a.onHandlePlaceMode = []{
+        if (currentMainMode != DEFORM_MODE) return;
+        if (multiBody) {
+            multiBody->setRigidMode(true);
+            multiBody->initPhysics();
+            multiBody->reapplyHandleConstraints();
+        }
+        deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
+        std::cout << "[UI] Handle Place mode" << std::endl;
+    };
+
+    a.onDeformMode = []{
+        if (currentMainMode != DEFORM_MODE) return;
+        if (multiBody) multiBody->setRigidMode(false);
+        deformHandlPlace.state = DeformHandlPlaceData::DEFORM_MODE;
+        std::cout << "[UI] Deform mode" << std::endl;
+    };
+
+    a.onFullReset = []{
+        if (currentMainMode != DEFORM_MODE) return;
+        deformHandlPlace.reset();
+        if (multiBody) {
+            multiBody->fullReset();
+            multiBody->setRigidMode(true);
+            multiBody->initPhysics();
+        }
+        deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
+        std::cout << "[UI] Full Reset" << std::endl;
+    };
+
+    a.onHandleRadiusChanged = [](float r) {
+        gGroupRadius = r;
+    };
+
+    // Visibility toggle: REG side has per-organ g_meshAlpha[8]; DEFORM only
+    // has 3 single values (gOrganAlpha / gBoardAlpha / gTargetAlpha). For
+    // Phase 1 we accept "all organs together" -- i=0..5 all cycle gOrganAlpha,
+    // i=6 cycles gBoardAlpha, i=7 cycles gTargetAlpha. syncUIState() mirrors
+    // the same value into all 6 organ UI slots so the buttons stay in sync.
+    a.onToggleOrgan = [](int i) {
+        if (i >= 0 && i <= 5) {
+            cycleAlpha(gOrganAlpha);
+            std::cout << "[UI] Organs = " << alphaLabel(gOrganAlpha) << std::endl;
+        } else if (i == 6) {
+            cycleAlpha(gBoardAlpha);
+            std::cout << "[UI] Board = " << alphaLabel(gBoardAlpha) << std::endl;
+        } else if (i == 7) {
+            cycleAlpha(gTargetAlpha);
+            std::cout << "[UI] Target = " << alphaLabel(gTargetAlpha) << std::endl;
+        }
+    };
+
+    // AR snapshot save: not yet ported to DEFORM, no-op for now.
+    a.onSaveAR = []{
+        std::cout << "[UI] Save AR Image (not yet implemented in DEFORM)" << std::endl;
+    };
+
+    a.onResetCamera = []{
+        if (gOrbitCamPtr) {
+            gOrbitCamPtr->resetToInitialState();
+            std::cout << "[UI] Camera reset" << std::endl;
+        }
+    };
+
+    // DEFORM -> REG transition. Spawns lsn_registration detached and tears
+    // this window down. The REG side will read intrinsics_calib.txt etc as
+    // usual; nothing is passed via argv.
+    a.onStartFromDepth = []{
+        std::cout << "[Deform] Restart from Depth -> spawning lsn_registration" << std::endl;
+        platform_launch_detached(REG_EXE_PATH);
+        glfwSetWindowShouldClose(gWindow, GLFW_TRUE);
+    };
+
+    // We are already in DEFORM mode; the REG-side "Deform >>" button is what
+    // got us here. Logging is enough.
+    a.onSwitchToDeformMode = []{
+        std::cout << "[UI] Already in DEFORM mode" << std::endl;
+    };
+}
+
+// ============================================================================
+// UI State sync (globals -> gUI.state, per frame).
+//   - Keep state.mainMode pinned to 1 (DEFORM) so the UI stays in DEFORM
+//     presentation no matter what the user fiddles with.
+//   - Mirror DEFORM sub-mode and the 3 alpha values so toggles done via the
+//     V/T/B keyboard shortcuts stay in sync with the side panel.
+//   - REG-side state fields (regState, depthRunning, cameraState, ...) are
+//     set once at startup and never touched here; the UI short-returns on
+//     them because state.mainMode==1.
+// ============================================================================
+static void syncUIState() {
+    auto& s = gUI.state;
+    s.mainMode  = 1;
+    s.depthDone = true;
+    s.regState  = 4;
+
+    s.deformState     = (int)deformHandlPlace.state;
+    s.handleGroups    = multiBody ? (int)multiBody->handleGroups.size() : 0;
+    s.maxHandleGroups = SoftBody::MAX_HANDLE_GROUPS;
+    s.handleRadius    = gGroupRadius;
+
+    for (int k = 0; k < 6; k++) {
+        s.organs[k].alpha = gOrganAlpha;
+    }
+    s.boardAlpha  = gBoardAlpha;
+    s.targetAlpha = gTargetAlpha;
+
+    if (s.arSavedTimer > 0) s.arSavedTimer -= ImGui::GetIO().DeltaTime;
+}
+
+// ============================================================================
 // main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -237,6 +405,20 @@ int main(int argc, char** argv) {
         std::cerr << "[AR] background image missing -- overlay disabled"
                   << std::endl;
     }
+
+    // ImGui (REG/DEFORM 共通の AppImGuiBoot 経由)
+    AppImGuiBoot::init(gWindow);
+
+    // DEFORM アプリは常に DEFORM フェーズで起動。UI 側は state.mainMode==1
+    // を見て DEFORM 専用表示に切り替わる(DEPTH セクション compact、REG セク
+    // ション "Registration: Done"、DEFORM/Visibility セクションが active)。
+    currentMainMode           = DEFORM_MODE;   // default だが明示
+    gUI.state.mainMode        = 1;
+    gUI.state.depthDone       = true;
+    gUI.state.regState        = 4;             // 4 = REGISTERED
+    gUI.state.maxHandleGroups = SoftBody::MAX_HANDLE_GROUPS;
+
+    setupUICallbacks();
 
     // 変形パイプラインの初期化
     if (!DeformPipeline::initFromRegistered()) {
@@ -303,6 +485,9 @@ int main(int argc, char** argv) {
         showFPS(gWindow);
         glfwPollEvents();
 
+        AppImGuiBoot::beginFrame();
+        syncUIState();
+
         // liver / texture の中心をカメラに通知(レジストレーション側と同じ運用)
         DeformPipeline::updateCameraTargets(OrbitCam);
         OrbitCam.UpdateCamera(dt);
@@ -327,9 +512,13 @@ int main(int argc, char** argv) {
             dt, shaderProgram, shaderProgramCube,
             view, projection, OrbitCam.cameraPos);
 
+        gUI.draw(gWindowWidth, gWindowHeight);
+
+        AppImGuiBoot::endFrame();
         glfwSwapBuffers(gWindow);
     }
 
+    AppImGuiBoot::shutdown();
     DeformPipeline::cleanup();
     glfwDestroyWindow(gWindow);
     glfwTerminate();
