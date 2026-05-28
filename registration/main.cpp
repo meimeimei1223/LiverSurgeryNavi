@@ -702,6 +702,32 @@ static int              g_chessboardCols     = 9;
 static int              g_chessboardRows     = 6;
 static float            g_chessboardSquareMm = 22.0f;
 
+// ---- Live Calibration session state (Take Picture tab) ----
+//   Frames are captured into g_liveCalibFolder; onLiveCalibRun points
+//   g_chessboardFolder at it and delegates to the existing onRunCalibration
+//   (external calibration_tool), which writes intrinsics_calib.txt and flips
+//   the active source to Calib on success.
+static std::string              g_liveCalibFolder;       // <DEPTH_OUTPUT_PATH>chessboard_live_<ts>/
+static std::vector<std::string> g_liveCalibFiles;        // full paths of saved JPEGs
+static int                      g_liveCalibCounter = 0;  // next frame number
+static bool                     g_liveCalibActive  = false;
+static std::string              g_liveCalibLastMsg;      // latest UI feedback line
+
+// Cross-platform "YYYYMMDD_HHMMSS" timestamp (mirrors the Shift+M snapshot code).
+static std::string makeTimestampString() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tmLocal{};
+#ifdef _WIN32
+    localtime_s(&tmLocal, &t);
+#else
+    localtime_r(&t, &tmLocal);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tmLocal);
+    return std::string(buf);
+}
+
 // カメラ開始前の状態を保存
 static struct {
     AppMode previousMode = AppMode::kEmpty;
@@ -1598,6 +1624,17 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     if (key == GLFW_KEY_D && (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT)) {
         g_debugPanel.showWindow = !g_debugPanel.showWindow;
         std::cout << "[DebugPanel] " << (g_debugPanel.showWindow ? "ON" : "OFF") << std::endl;
+        return;
+    }
+
+    // Space — Live Calibration shutter hotkey. Active only while a session
+    // is in progress AND the camera is in live (not captured) mode. Mirrors
+    // the on-screen shutter button so the user can hold the chessboard in
+    // both hands and tap Space to take a frame. No conflict with the rest
+    // of the app because Space is otherwise unused.
+    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS && !mods &&
+        g_liveCalibActive && gCamera.active && !gCamera.captured) {
+        if (gUI.actions.onLiveCalibCapture) gUI.actions.onLiveCalibCapture();
         return;
     }
 
@@ -6522,7 +6559,32 @@ int main(int argc, char** argv) {
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        if (gApp.mode == AppMode::kMaskSelection) {
+        // ---- Live Calibration preview branch ---------------------------------
+        // Active session + open camera -> dedicated render path that wins over
+        // whatever AppMode the user came from (typically kRegistration). This
+        // is the ONLY place that pumps gCamera.capture() during a live calib
+        // session, so originalFrame stays fresh for saveFrameAsJPEG().
+        // Critically: no MaskPicker, no drawDepthOverlay. The viewport shows
+        // the camera; the Take Picture tab in the sidebar handles control.
+        if (g_liveCalibActive && gCamera.active) {
+            gCamera.capture(gApp.arBg);
+
+            // Letterbox to camera aspect ratio (same math as kMaskSelection).
+            float imgAspect = (float)gCamera.width  / (float)gCamera.height;
+            float winAspect = (float)gWindowWidth   / (float)gWindowHeight;
+            int viewW = gWindowWidth, viewH = gWindowHeight, viewX = 0, viewY = 0;
+            if (imgAspect > winAspect) {
+                viewH = (int)(gWindowWidth / imgAspect);
+                viewY = (gWindowHeight - viewH) / 2;
+            } else {
+                viewW = (int)(gWindowHeight * imgAspect);
+                viewX = (gWindowWidth - viewW) / 2;
+            }
+            glViewport(viewX, viewY, viewW, viewH);
+            gApp.arBg.draw();
+            glViewport(0, 0, gWindowWidth, gWindowHeight);
+        }
+        else if (gApp.mode == AppMode::kMaskSelection) {
             // カメラモードの場合はフレームをキャプチャ
             if (gCamera.active) {
                 gCamera.capture(gApp.arBg);
@@ -9270,6 +9332,18 @@ static void syncUIState() {
     s.calibRms      = (float)g_calibResult.rmsError;
     s.calibImgCount = g_calibResult.numImages;
 
+    // Live Calibration (Take Picture tab) state.
+    s.liveCalibSessionActive = g_liveCalibActive;
+    s.liveCalibFolder        = g_liveCalibFolder;
+    s.liveCalibCapturedCount = (int)g_liveCalibFiles.size();
+    s.liveCalibLastMessage   = g_liveCalibLastMsg;
+    s.liveCalibCamW          = gCamera.width;
+    s.liveCalibCamH          = gCamera.height;
+    s.liveCalibCapturedFiles.clear();
+    for (const auto& fp : g_liveCalibFiles) {
+        s.liveCalibCapturedFiles.push_back(std::filesystem::path(fp).filename().string());
+    }
+
     // チャット 9: 4-quadrant mask 連動 (Ctrl+G ↔ Initial Orientation で完全共有)
     //   g_activeQuadrantMask を毎フレーム UI 側にコピー → 別 panel で変えても
     //   両方の checkbox が同期して見える。
@@ -9836,13 +9910,174 @@ static void setupUICallbacks() {
         }
         g_calibResult.valid = (g_calibResult.fx > 0 && g_calibResult.fy > 0);
         g_calibResult.message = g_calibResult.valid ? "OK" : "Invalid result";
-        if (g_calibResult.valid) g_intrinsicsSource = IntrinsicsSource::Calib;
+        if (g_calibResult.valid) {
+            g_intrinsicsSource = IntrinsicsSource::Calib;
+            // Pre-existing bug fix: switching the source enum is NOT enough.
+            // The in-memory K (g_intrinsics) is what the depth runner reads
+            // at L3495 (req.K = scaleIntrinsics(g_intrinsics, ...)). Without
+            // this reload, the next Run Depth would unproject with the stale
+            // previous-source K (e.g. Factory 3840x2160 fx=2606 -> scaled
+            // 1280x720 fx=868) and bake the wrong intrinsics into the OBJ
+            // vertex positions, even though g_intrinsicsSource says "Calib"
+            // and intrinsics.txt is later overwritten. loadIntrinsicsFrom-
+            // CurrentSource reads the right file for the current enum and
+            // updates g_intrinsics / gApp.intrinsics / OrbitCam in one shot.
+            loadIntrinsicsFromCurrentSource();
+        }
 
         std::cout << "[Calib] Result: fx=" << g_calibResult.fx
                   << " fy=" << g_calibResult.fy
                   << " cx=" << g_calibResult.cx
                   << " cy=" << g_calibResult.cy
                   << " rms=" << g_calibResult.rmsError << std::endl;
+    };
+
+    // ---- Live Calibration handlers (Take Picture tab) ----
+    a.onLiveCalibStart = []() {
+        namespace fs = std::filesystem;
+        g_liveCalibFolder = std::string(DEPTH_OUTPUT_PATH)
+                          + "chessboard_live_" + makeTimestampString() + "/";
+        std::error_code ec;
+        fs::create_directories(g_liveCalibFolder, ec);
+        if (ec) {
+            std::cerr << "[LiveCalib] Failed to create folder: " << ec.message() << std::endl;
+            g_liveCalibLastMsg = "Folder creation failed";
+            return;
+        }
+        g_liveCalibFiles.clear();
+        g_liveCalibCounter = 0;
+        g_liveCalibActive  = true;
+        g_liveCalibLastMsg.clear();
+        std::cout << "[LiveCalib] Session started: " << g_liveCalibFolder << std::endl;
+
+        // Open the camera DIRECTLY here. We must NOT route through
+        // onToggleCamera(): its start branch sets
+        //   gApp.mode         = AppMode::kImageOnly;
+        //   gApp.image.loaded = true;
+        //   gApp.image.path   = "[Camera Live]";
+        // which (a) hides the Take Picture tab — drawIntrinsicsSource is
+        // gated on state.depthDone == (gApp.mode == kRegistration) — and
+        // (b) makes drawDepthOverlay() paint the "[Liver] L-click = FG"
+        // segmentation overlay (gated on hasLocalImage && !depthDone).
+        // gApp.mode is left untouched so the workflow phase (typically
+        // kRegistration when the tab is reachable) survives the session.
+        // The dedicated live-calib branch in the main render loop pumps
+        // frames into originalFrame and draws the preview full-screen
+        // without MaskPicker / overlay.
+        if (!gCamera.active) {
+            if (!gCamera.start()) {
+                std::cerr << "[LiveCalib] Camera failed to start" << std::endl;
+                g_liveCalibLastMsg = "Camera start failed";
+                g_liveCalibActive  = false;   // roll back so Stop is not needed
+            }
+        }
+    };
+
+    a.onLiveCalibStop = []() {
+        g_liveCalibActive = false;
+        g_liveCalibLastMsg.clear();
+        // Symmetric with onLiveCalibStart: we did not touch gApp.mode or
+        // gApp.image.loaded on the start side, so we do not touch them
+        // here either. Clobbering them would yank the user out of e.g.
+        // the registration phase they came from. Just stop the camera.
+        if (gCamera.active) {
+            gCamera.stop();
+        }
+        std::cout << "[LiveCalib] Session stopped" << std::endl;
+    };
+
+    a.onLiveCalibCapture = []() {
+        if (!g_liveCalibActive) {
+            std::cerr << "[LiveCalib] No active session" << std::endl;
+            return;
+        }
+        if (!gCamera.active) {
+            std::cerr << "[LiveCalib] Camera not running" << std::endl;
+            g_liveCalibLastMsg = "Camera not running";
+            return;
+        }
+        char fname[64];
+        snprintf(fname, sizeof(fname), "frame_%03d.jpg", g_liveCalibCounter + 1);
+        std::string fullPath = g_liveCalibFolder + fname;
+        if (gCamera.saveFrameAsJPEG(fullPath)) {
+            ++g_liveCalibCounter;
+            g_liveCalibFiles.push_back(fullPath);
+            g_liveCalibLastMsg = std::string("Captured ") + fname;
+            std::cout << "[LiveCalib] Captured: " << fullPath << std::endl;
+        } else {
+            std::cerr << "[LiveCalib] Save failed: " << fullPath << std::endl;
+            g_liveCalibLastMsg = "Save failed";
+        }
+    };
+
+    a.onLiveCalibClear = []() {
+        namespace fs = std::filesystem;
+        if (!g_liveCalibActive) return;
+        for (const auto& f : g_liveCalibFiles) {
+            std::error_code ec;
+            fs::remove(f, ec);
+        }
+        g_liveCalibFiles.clear();
+        g_liveCalibCounter = 0;
+        g_liveCalibLastMsg = "Cleared all captures";
+        std::cout << "[LiveCalib] Cleared all captures" << std::endl;
+    };
+
+    a.onLiveCalibRun = []() {
+        if (!g_liveCalibActive || g_liveCalibFiles.size() < 3) {
+            std::cerr << "[LiveCalib] Need >= 3 captures" << std::endl;
+            return;
+        }
+        // Reset the success flag BEFORE delegating. onRunCalibration only
+        // writes g_calibResult.valid on the full happy path (L9875); any
+        // early return (calibration_tool not found, popen fail, non-zero
+        // exit, unreadable output) leaves valid at its previous value.
+        // Without this reset, a prior successful session would make the
+        // current failure look like success to our post-call check.
+        g_calibResult.valid = false;
+
+        // Point the shared calibration folder at this session and delegate to
+        // the existing Run Calibration path (external calibration_tool). It
+        // writes intrinsics_calib.txt and flips the source to Calib on success.
+        // Per design decision: g_chessboardFolder stays on the live folder
+        // afterwards, so the Settings tab shows where the frames came from.
+        g_chessboardFolder = g_liveCalibFolder;
+        std::cout << "[LiveCalib] Running calibration on " << g_liveCalibFolder
+                  << " (" << g_liveCalibFiles.size() << " frames)" << std::endl;
+        if (gUI.actions.onRunCalibration) gUI.actions.onRunCalibration();
+
+        // Always end the session after Run Calibration, success OR failure.
+        // Rationale: user explicitly wants to "return to the original image"
+        // after pressing the button -- they should not be stuck in the
+        // camera overlay if the calibration_tool exits non-zero (e.g. Zhang
+        // method couldn't separate intrinsics). The captured JPEGs stay on
+        // disk under g_liveCalibFolder so they can be re-run via the
+        // Settings tab if desired. On success g_intrinsicsSource is
+        // already switched to Calib by onRunCalibration (so the new K
+        // takes effect immediately); state.calib* shows the result in the
+        // Live Calibration tab. On failure g_liveCalibLastMsg explains
+        // what happened so the user can start a new session.
+        bool ok = g_calibResult.valid;
+        g_liveCalibActive  = false;
+        g_liveCalibLastMsg = ok
+            ? std::string("Calibration OK - returned to scene")
+            : std::string("Calibration failed - retry with new frames");
+        if (gCamera.active) gCamera.stop();
+        std::cout << "[LiveCalib] Session ended ("
+                  << (ok ? "success" : "failure") << ")" << std::endl;
+    };
+
+    a.onLiveCalibOpenFolder = []() {
+        if (g_liveCalibFolder.empty()) return;
+#if defined(_WIN32)
+        std::string cmd = "explorer \"" + g_liveCalibFolder + "\"";
+#elif defined(__APPLE__)
+        std::string cmd = "open \"" + g_liveCalibFolder + "\"";
+#else
+        std::string cmd = "xdg-open \"" + g_liveCalibFolder + "\" &";
+#endif
+        int rc = std::system(cmd.c_str());
+        (void)rc;  // best-effort; file manager launch failure is non-fatal
     };
 
     a.onToggleOrgan = [](int i) {
