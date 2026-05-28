@@ -1,7 +1,9 @@
 # AAA_LiverSurgeryNaviComb プロジェクト構造
 
-> 最終更新: 2026-05-26
+> 最終更新: 2026-05-28
 > 3プロジェクト構成（common / registration / deform）＋ Ctrl+D Debug Panel ＋ DEFORM 分離済み。
+> **DEFORM UI 統合 Phase 1 完了**（共有 `RegistrationImGuiManager` を `common/src/` に集約、DEFORM 側もサイドバー表示）。
+> **REG/DEFORM は独立プロセスのまま** — 互いの遷移ボタンは export + log のみで、ユーザが手動で他方を起動する運用。
 
 ---
 
@@ -14,14 +16,14 @@ AAA_LiverSurgeryNaviComb/
 ├── README.md / PROJECT_STRUCTURE.md(このファイル)
 │
 ├── common/
-│   └── src/                    ← 両アプリ共有 25ファイル (.cpp 3 + .h/.hpp 22)
+│   └── src/                    ← 両アプリ共有 35ファイル (.cpp 5 + .h/.hpp 30)
 │
 ├── registration/
 │   ├── main.cpp                ← REGアプリのmain
-│   └── src/                    ← REG専用 28ファイル
+│   └── src/                    ← REG専用 29ファイル
 │
 ├── deform/
-│   ├── main.cpp                ← DEFORMアプリのmain
+│   ├── main.cpp                ← DEFORMアプリのmain (Phase 1 で ImGui サイドバー導入 +190行)
 │   └── src/                    ← DEFORM専用 15ファイル
 │
 ├── sam2_da3_lite/              ← 外部ヘルパー(深度推定 Depth Anything V3 + SAM2)
@@ -61,27 +63,39 @@ AAA_LiverSurgeryNaviComb/
 
 ## 3. ソース分類
 
-### common/src (25) — 両アプリ共有・**SoftBody 非依存**
+### common/src (35) — 両アプリ共有・**SoftBody 非依存**
 ```
-AR.h  DepthRunner.h  DepthUtils.h  FullSphereCameraWithTarget.h  Hash.h
-MeshCleanup.h  MeshDataTypes(.cpp/.h)  MeshDrawing.h  NoOpen3DRegistration.h
-OBJTargetExtraction.h  PathConfig.h  PinholeProjection.h  PlatformCompat.h
-RayCast.h  RegistrationCore.h  ScreenMeshPoints.h  ShaderProgram(.cpp/.h)
-SimpleCamera.hpp  Sphere(.cpp/.h)  VectorMath.h  mCutMesh.h  simple_multi_obj_processor.h
+AR.h  AppImGuiBoot.h  DepthRunner.h  DepthToObjExport(.cpp/.h)  DepthUtils.h
+FullSphereCameraWithTarget.h  Hash.h  IntrinsicsPresets.h  IntrinsicsScaling.h
+IntrinsicsSource.h  MeshCleanup.h  MeshDataTypes(.cpp/.h)  MeshDrawing.h
+NoOpen3DRegistration.h  OBJTargetExtraction.h  PathConfig.h  PinholeProjection.h
+PlatformCompat.h  RayCast.h  RegistrationCore.h  RegistrationImGuiManager.h
+ScreenMeshPoints.h  ShaderProgram(.cpp/.h)  SimpleCamera.hpp  Sphere(.cpp/.h)
+VectorMath.h  image_utils.hpp  mCutMesh.h  obj_exporter(.cpp/.hpp)
+simple_multi_obj_processor.h
 ```
 - `RayCast.h`：SoftBody 非依存の汎用 ray-mesh 交差（deform-separation で汎用化）。
 - `MeshDrawing.h`：mCutMesh 描画のみ（SoftBody 版は deform へ分離）。
 - `ScreenMeshPoints.h`：重い screen/target メッシュを GL_POINTS で軽量描画（REG/DEFORM 共有）。
+- **`RegistrationImGuiManager.h`** [Phase 1 移動]：REG/DEFORM 共有 UI 本体。クラス名は据え置き、`state.mainMode=0/1` で REG/DEFORM 表示を切替（include path は両アプリで `common/src` を含むので `#include "RegistrationImGuiManager.h"` のまま）。
+- **`AppImGuiBoot.h`** [Phase 1 新規]：ImGui ライフサイクル集約（`init` / `shutdown` / `beginFrame` / `endFrame` / `loadFont`）。Phase 1 では DEFORM 側のみ採用、REG 側は既存 inline コードを据え置き（Phase 3 で移行予定）。
+- **`IntrinsicsSource.h` / `IntrinsicsPresets.h` / `IntrinsicsScaling.h`** [intrinsics-refactor]：K の出所管理（DA3/Calib/Custom）、プリセット、解像度スケーリング。
+- **`DepthToObjExport.h/cpp`** [obj-migration]：`depth_metric.bin` から OBJ + intrinsics.txt + texture.png を生成。
+- **`obj_exporter.hpp/cpp`**：汎用 OBJ exporter。
+- `PlatformCompat.h`：cross-platform マクロ + `platform_launch_detached`（detach spawn ヘルパ。Phase 1 では未使用、`nohup ... </dev/null >/dev/null 2>&1 &` で SIGPIPE 対策済み）。
+- `PathConfig.h`：`DEPTH_EXE_PATH` / `REG_EXE_PATH` / `DEFORM_EXE_PATH` を `initPaths()` で解決。
 
-### registration/src (28) — REG専用
+### registration/src (29) — REG専用
 AppContext, CameraPreview, CmaesRefineV2/V3/V3R/V3RS, CmaesUtils, **DebugPanel.h**,
 FileDropHandler, ImageSession, InteractionHelpers, IoUDebugDump, LiverCranioCaudalLabel,
 LiverLeftRightLabel, LiverRegionLabel, MaskPicker, NormalCompatibleRefine,
-OBJDistributionDiag, PoseLibrary, RegistrationActions, RegistrationImGuiManager,
+OBJDistributionDiag, PoseLibrary, **ReconstructFromBin(.cpp/.h)**, RegistrationActions,
 RegistrationUI, RimPairSampling, RimShapeMatch, SilOverlayDebug, **StlExport.h**,
 UmeyamaController, Undistort
 - `DebugPanel.h`：Ctrl+D で開く統合デバッグパネル（6タブ G/O/N/W/U/Viz）。
-- `StlExport.h`：旧 M/Shift+M キーの STL/OBJ export（宣言。定義は main.cpp）。
+- `StlExport.h`：旧 M/Shift+M キーの STL/OBJ export（宣言。定義は main.cpp）。Phase 1 で `exportRegisteredObjs()` が「Deform >>」ボタンからも呼ばれる。
+- **`ReconstructFromBin.h/cpp`** [reconstruct-bin]：過去/外部由来の `depth_metric.bin` から OBJ 再生成（経路 D。Section 5 参照）。
+- ※ `RegistrationImGuiManager.h` は Phase 1 で `common/src/` へ移動済み（rename なし、include 文も無修正）。
 
 ### deform/src (15) — DEFORM専用（SoftBody 系を含む）
 ```
@@ -102,6 +116,14 @@ MeshDrawingSoftBody.h                                          (MeshDrawing.h �
 - **キーボードは action/display/tuning のみ16キー**。viz/debug トグルは Ctrl+D へ、
   BIPOP V1/V2 は Alt+G/Alt+Shift+G、Silhouette Align は Alt+P、camera/depth/export は
   サイドバーボタン。早見表は `docs/KEY_REFERENCE.md`。
+- **Live Calibration（Take Picture タブ）**：Intrinsics セクションのタブ内で、カメラからチェスボード画像をライブ撮影 → `calibration_tool` サブプロセスへそのまま投げる UX。Start Live Calibration 1 ボタンでセッション作成＋カメラ起動、Stop でセッション終了＋カメラ停止、Run で既存 `onRunCalibration` に委譲（`intrinsics_calib.txt` 出力・Source→Calib 切替は既存処理）。
+
+## 4b. UI / キーボード（deform） [Phase 1 で追加]
+
+- **サイドバー**：`common/src/RegistrationImGuiManager.h` を共有し、`state.mainMode=1` 固定で DEFORM 専用表示（DEPTH compact / REG "Registration: Done" / DEFORM + VISIBILITY が active）。Rigid / Handle / Deform ボタン、Sphere Radius スライダ、Reset All、Visibility（organs 一括 + Board + Target）、Start From Depth（log only）を提供。
+- **キーボード**：R/H/D サブモード、V/T/B alpha cycle、1-7/0/P/N/Bksp/-/= は従来通り `DeformPipeline::onKey` が処理。A は AR 背景オーバーレイ切替。
+- **マウス**：RIGID_MODE 中の左ドラッグ=回転 / 右ドラッグ=画面平面移動 / 左右同時=カメラ奥行移動（旧 `元の長いmain.cpp` から復活）。DEFORM_MODE 中の左ドラッグは grab、非ドラッグ時はカメラ orbit/pan。ImGui がマウス・キーボードを capture しているときは scene 側を short-return（`WantCaptureMouse/Keyboard` ガード）。
+- **alpha は単一値 3 個**（`gOrganAlpha`/`gBoardAlpha`/`gTargetAlpha`）：REG の `g_meshAlpha[8]` per-organ 配列と異なり、Visibility ボタン i=0..5 は全 organ 一括で `gOrganAlpha` を cycle。Phase 3 統合時に統一予定。
 
 ---
 
@@ -123,6 +145,11 @@ MeshDrawingSoftBody.h                                          (MeshDrawing.h �
 `depth_metric.bin` が無く既存 OBJ がある場合は REG はそれをそのまま使う（外部 depth ソース投入経路）。
 REG→DEFORM 連携は `registration_model/reg_liver.obj` 等。
 
+**REG ↔ DEFORM の遷移ボタン**（Phase 1）：両アプリは独立プロセスのまま運用。
+- REG「Deform >>」：`StlExport::exportRegisteredObjs()` で reg_*.obj を出力＋ログのみ。REG ウィンドウは閉じない。ユーザは Qt Creator から手動で `lsn_deform` を起動。
+- DEFORM「Start From Depth」：ログのみ。ユーザが Qt Creator から手動で `lsn_registration` を再起動。
+- `platform_launch_detached`（`PlatformCompat.h`）と `REG_EXE_PATH`/`DEFORM_EXE_PATH`（`PathConfig.h`）は Phase 3 統合時の足場として残置（現在未使用）。auto-spawn を試した際に Qt Creator の親パイプ閉鎖で子が SIGPIPE silent crash する罠を踏んだ経緯あり（対策は `nohup ... </dev/null >/dev/null 2>&1 &`、実装済みだが未使用）。
+
 **Reconstruct from BIN（経路 D）**：過去/外部由来の `depth_metric.bin` + `segmentation_mask.png`
 （+ optional `original.jpg`）を REG の UI にドロップすると、DA3/SAM2 推論なしで現在の K（解像度が
 違えば自動スケール）で OBJ を再生成できる（`registration/src/ReconstructFromBin.{h,cpp}` +
@@ -138,3 +165,14 @@ REG→DEFORM 連携は `registration_model/reg_liver.obj` 等。
   （`CACHE PATH` 変数の旧値が残ってビルド失敗するため）。
 - `.cpp`/`.h` の変更のみは通常ビルドでOK。`CMakeLists.txt.user` は改名時にターゲット名要更新。
 - ビルドが `No space left on device` で落ちたらディスク容量を確認。
+- **Qt Creator から起動した親プロセスが `std::system("./child &")` で子を spawn すると、子は親の stdout/stderr fd を継承し、親終了時に Qt Creator がそのパイプを閉じる → 子は次の `std::cout` で SIGPIPE silent crash する**。detach spawn する関数の Linux 版は `nohup <exe> </dev/null >/dev/null 2>&1 &` のように stdio を全部リダイレクトすること（`platform_launch_detached` は対策済み）。症状: 親 exit code 0・子は単独起動なら動く・Qt Creator から直接子起動でも動く・REG → DEFORM 系の auto-spawn でだけ落ちる。
+
+---
+
+## 7. ブランチ・リファクタ履歴メモ
+
+- **`main`**：直近のマージ済み実装（live-calibration 含む）。
+- **`feature/deform-ui-integration`**（未マージ）：Phase 1 (DEFORM UI 統合) の 8 commits。設計書 `IMPLEMENTATION_PLAN_DEFORM_UI_v2.md`、進捗 `memory/deform-ui-progress.md`。
+- **過去ブランチ**：feature/reconstruct-from-bin（Reconstruct from BIN、merge commit e84a63e）/ feature/live-calibration（Take Picture タブ、merge commit 895d230）/ intrinsics-refactor 系。
+
+**今後 (Phase 3)**：単一バイナリ `lsn_unified` への統合。`onSwitchToDeformMode`/`onStartFromDepth` を in-process `currentMainMode` switch に置換、AR モードグローバル統一、alpha state 統一（REG `g_meshAlpha[8]` ↔ DEFORM 単一値 3 個）、`MainMode` enum を `common/` へ、REG 側も `AppImGuiBoot` に移行、`RegistrationImGuiManager` を `AppImGuiManager` 等にリネーム。詳細は `IMPLEMENTATION_PLAN_DEFORM_UI_v2.md` Section 10 のチェックリスト。
