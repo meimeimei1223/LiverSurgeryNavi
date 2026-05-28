@@ -10327,7 +10327,14 @@ static void setupUICallbacks() {
     };
 
     a.onSwitchToDeformMode = []() {
-        std::cout << "[stub] onSwitchToDeformMode" << std::endl;
+        // REG -> DEFORM transition. Export reg_*.obj (DeformPipeline::
+        // initFromRegistered reads them) then spawn lsn_deform detached.
+        // Phase 3 unified binary will replace the spawn with an in-process
+        // currentMainMode = DEFORM_MODE + initFromRegistered() call.
+        std::cout << "[Reg] Switch to Deform -> exporting reg_*.obj + spawning lsn_deform" << std::endl;
+        StlExport::exportRegisteredObjs();
+        platform_launch_detached(DEFORM_EXE_PATH);
+        glfwSetWindowShouldClose(gWindow, GLFW_TRUE);
     };
 
     a.onRefine = []() {
