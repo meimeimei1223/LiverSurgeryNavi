@@ -806,6 +806,10 @@ struct RegistrationData {
     std::vector<glm::vec3> boardPoints;
     std::vector<glm::vec3> objectPoints;
 
+    // Phase U-1: object クリック時にヒットした liver mesh 頂点 idx を並行保存。
+    // objectPoints と同じ index で対応。Umeyama 自体はこの idx を使わない。
+    std::vector<int> objectVertIdx;
+
     glm::mat4 registrationMatrix = glm::mat4(1.0f);
     glm::mat4 appliedTransform    = glm::mat4(1.0f);
     bool useRegistration = false;
@@ -844,6 +848,7 @@ struct RegistrationData {
     void reset() {
         boardPoints.clear();
         objectPoints.clear();
+        objectVertIdx.clear();   // Phase U-1
         state = IDLE;
         useRegistration = false;
         registrationMatrix = glm::mat4(1.0f);
@@ -898,6 +903,7 @@ struct RegistrationData {
     void clearPoints() {
         boardPoints.clear();
         objectPoints.clear();
+        objectVertIdx.clear();   // Phase U-1
     }
 
     bool canRegister() const {

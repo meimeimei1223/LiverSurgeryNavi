@@ -76,6 +76,7 @@
 #include "DebugPanel.h"
 #include "StlExport.h"
 #include "UmeyamaController.h"
+#include "SoftPartition.h"   // Phase U-1 (グローバル定義のため明示 include)
 // PoseLibrary.h は RegistrationActions.h の後で include する
 // (RegistrationActions.h 内の inline computeUnifiedMetrics 定義を見えてからで
 //  ないと、PoseLibrary.h の inline 関数本体が unresolved になるため)
@@ -122,6 +123,27 @@ double    g_debugSourceRimPlanarity     = 1.0;
 // Phase 7b Step 2 (Shift+W) — target side rim band 3D point cloud
 std::vector<glm::vec3> g_debugTargetBoundaryPoints;
 bool                   g_showDebugTargetBoundary = false;
+
+// Phase 7c (REDGE/稜線) — extern 宣言は RegistrationActions.h
+//   source ridge: ANTERIOR_CORE のうち AR カメラに対し法線が grazing な
+//   頂点 = ドームのオクルーディング輪郭 (境界 ∩ 非RIM ∩ 非後面)。頂点
+//   index 保持 → mVertices から fetch して mesh 追従 (rim chain と同じ)。
+std::vector<int> g_debugSourceRidge;
+bool             g_showDebugSourceRidge = false;
+//   target ridge: g_debugTargetBoundaryPoints の上半分 (p.y <= 2D
+//   centroid.y)。target は静止なので 3D 直接保持。
+std::vector<glm::vec3> g_debugTargetRidgePoints;
+bool                   g_showDebugTargetRidge = false;
+//   source grazing band: |cos(n, -view)| < これ → silhouette とみなす。
+float g_ctrlgRidgeCosBand = 0.30f;   // 既定 ~±17.5deg around edge-on
+//   target ridge outlier removal (debug toggle, 稜線にだけ適用)。
+bool  g_ridgeTgtRemoveOutliers = false;   // 既定 OFF (生を基準に残す)
+int   g_ridgeTgtOutlierMode    = 0;       // 0=SOR, 1=largest connected component
+int   g_ridgeTgtSorK           = 16;      // SOR: k nearest neighbors
+float g_ridgeTgtSorStd         = 2.0f;    // SOR: mean + std*sigma 超えを除外
+float g_ridgeTgtCcRadius       = 0.0f;    // CC: 0 → auto (median NN dist * 2.5)
+int   g_ridgeTgtCcMinPts       = 50;      // CC: この点数未満のクラスタを捨てる
+bool  g_ridgeTgtSplitLongEdge  = false;   // 上下分割: false=up/down(y), true=bbox長辺(PCA短軸)
 
 // Phase 7b Step 3 (Ctrl+W) — Shape Match coarse search outputs
 std::vector<glm::vec3> g_debugShapeMatchBestSrc;
@@ -171,6 +193,55 @@ float g_voxelSize = 0.3f;
 bool      isDragging   = false;
 int       hit_index    = -1;
 glm::vec3 hit_position(0.0f);
+
+// ---- Phase U-1: SoftPartition グローバル状態 (ここで定義、ヘッダで extern) ----
+SoftPartition::AnchorSet       g_softAnchors;
+SoftPartition::PartitionField  g_softTgtField;
+SoftPartition::PartitionField  g_softSrcField;
+SoftPartition::PartitionParams g_softPartParams;
+std::vector<float>             g_softGroupRadii;
+float                          g_softUmeyamaScale = 1.0f;
+bool                           g_softShowHeatmap  = false;
+bool                           g_softPartReady    = false;
+// ヒートマップ描画は既存 g_sphereMarker を再利用 (新 marker 不要)
+
+// ---- Phase U-2: soft-weighted ICP state ----
+SoftPartition::SoftICPParams   g_softIcpParams;
+int                            g_softIcpLastIters  = 0;
+float                          g_softIcpRmseBefore = 0.0f;
+float                          g_softIcpRmseAfter  = 0.0f;
+float                          g_softIcpIoUBefore  = 0.0f;
+float                          g_softIcpIoUAfter   = 0.0f;
+glm::dmat4                     g_softIcpAppliedT   = glm::dmat4(1.0); // last applied (for revert)
+bool                           g_softIcpCanRevert  = false;
+bool                           g_softShowGroups    = true;            // heatmap color groups visible
+
+// Per-group heatmap visibility (G0..G7). A checkbox next to each Gi in the U
+// tab toggles these. Default all-on => identical to the previous behaviour.
+bool g_softGroupVisible[SoftPartition::MAX_GROUPS] =
+    { true, true, true, true, true, true, true, true };
+
+// Visibility of the "none" points (vertices that don't belong to any group,
+// i.e. none-mass > 0.5). Toggled by the extra "none" checkbox in the legend.
+// Default ON => identical to the previous behaviour (none points always drawn).
+bool g_softShowNone = true;
+
+// Decide whether a heatmap vertex should be drawn given the per-group / none /
+// show-groups toggles. `p` is the soft prob vector, numGroups the active group
+// count. A vertex is "grouped" when its none-mass <= 0.5 (matches the legacy
+// show-groups test): grouped points obey show-groups AND their dominant group's
+// checkbox; none points (none-mass > 0.5) obey the "none" checkbox. The heatmap
+// master toggle still gates the whole overlay upstream.
+static inline bool softHeatmapVertexVisible(
+        const std::array<float, SoftPartition::MAX_GROUPS + 1>& p, int numGroups) {
+    const bool grouped = (p[SoftPartition::NONE_IDX] <= 0.5f);
+    if (!grouped)            return g_softShowNone;  // none points: own toggle
+    if (!g_softShowGroups)   return false;    // colored points hidden (legacy)
+    int dom = 0; float best = -1.0f;
+    for (int i = 0; i < numGroups && i < SoftPartition::MAX_GROUPS; ++i)
+        if (p[i] > best) { best = p[i]; dom = i; }
+    return g_softGroupVisible[dom];           // per-group filter
+}
 std::vector<mCutMesh*> allMeshes;
 float scaleSpeed = 1.1f;
 
@@ -641,6 +712,7 @@ extern mCutMesh* liverMesh3D;
 #include "RegistrationActions.h"
 #include "PoseLibrary.h"   // RegistrationActions.h の後ろで include
 #include "RimPairSampling.h"   // [Phase C] colored RIM pairs sampler
+#include "SilComparePanel.h"   // G tab: silhouette method A/B/C compare (reuses runShiftE / runBipopCmaesV3RS / SilOverlay F9)
     // (inline computeUnifiedMetrics の宣言が必要なため)
 
 // SimpleCameraPreview は CameraPreview.h に移動
@@ -1605,6 +1677,7 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                              isShiftG               ||
                              isCtrlG                ||
                              isCtrlShiftG           ||
+                             key == GLFW_KEY_I      ||   // [V3I] Ctrl+I pure squash-IoU
                              isAltG                 ||  // [key-reorg] V1 (旧 Shift+V)
                              isAltShiftG            ||  // [key-reorg] V2 (旧 Shift+F)
                              isShiftN               ||
@@ -1679,6 +1752,42 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     // [key-reorg Phase 5] GLFW_KEY_V / GLFW_KEY_F removed:
     //   Shift+V (V1 BIPOP) -> Alt+G  ;  Shift+F (V2 BIPOP) -> Alt+Shift+G
     //   plain V (cluster viz) -> Ctrl+D > Viz tab
+    // ============================================================
+    // [V3I] Ctrl+I : pure squash-IoU registration. Objective-only
+    //   change of Ctrl+Shift+G -- reuses the entire V3RS pipeline via
+    //   runBipopCmaesV3I() (cost = 1 - IoU2D, RMSE cap bypassed,
+    //   selector by IoU). Ctrl+G / Ctrl+Shift+G are untouched.
+    // ============================================================
+    case GLFW_KEY_I:
+        if ((mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT)
+                                      && !(mods & GLFW_MOD_ALT)) {
+            std::cout << "[Ctrl+I] V3I pure squash-IoU session start" << std::endl;
+            const auto maskStrI = LiverLeftRightLabel::quadrantMaskString(
+                g_activeQuadrantMask);
+            std::cout << "[Ctrl+I] quadrant_mask = " << maskStrI
+                      << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
+                      << std::dec << ")" << std::endl;
+            if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+                std::cerr << "[Ctrl+I] ERROR: labels not computed. "
+                             "Run HemiAuto (O) first." << std::endl;
+                break;
+            }
+            auto subsetI = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+                g_liverRegion.labels, g_liverLR.labels,
+                g_activeQuadrantMask);
+            if (subsetI.empty()) {
+                std::cerr << "[Ctrl+I] ERROR: subset is empty." << std::endl;
+                break;
+            }
+            g_stepStartTime = std::chrono::steady_clock::now();
+            g_sessionBipopN++;
+            gUI.state.regMethod = 3;   // same lane as V3RS
+            poseAutoSaveBeforeRegistration();
+            runBipopCmaesV3I(g_activeQuadrantMask);
+            poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+        }
+        break;
+
     case GLFW_KEY_G:
         // Shift+G: BIPOP-CMA-ES V3 ("Good performance"). Pure-function
         // refactor of V2 with liver-only snapshot, matrix-based per-Run
@@ -1828,6 +1937,14 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     // [key-reorg Phase 4] GLFW_KEY_B removed: B (boundary candidates) and
     //   Shift+B (cyclic correspondence) viz toggles moved to Ctrl+D > Viz tab.
     case GLFW_KEY_N:
+        // [LIVE] Don't let Shift+N start while a CPD/soft-ICP replay is
+        //   animating (both would apply transforms to the mesh the same
+        //   frame). The reverse is already guarded by anyRegLiveActive().
+        if ((mods & GLFW_MOD_SHIFT) && (CpdLive::active || SoftIcpLive::active)) {
+            std::cout << "[Shift+N] a CPD/soft-ICP live session is animating — "
+                         "wait for it to finish" << std::endl;
+            break;
+        }
         if ((mods & GLFW_MOD_CONTROL) && (mods & GLFW_MOD_SHIFT)) {
             // ---- Ctrl+Shift+N : SRT Variance-Weighted Refine -----------
             //   Same wrapper as Shift+N but method = SRT_VARIANCE. Uses
@@ -2623,7 +2740,55 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
     //   Shift+H (CC viz), H (4-quadrant viz) all moved to Ctrl+D > Viz tab
     //   (checkboxes with auto-recompute + "Recompute Region/LR" buttons).
     case GLFW_KEY_U:
-        if (gApp.mode == AppMode::kImageOnly) MaskPicker::undo(gApp);
+        if (gApp.mode == AppMode::kImageOnly) {
+            MaskPicker::undo(gApp);                       // 既存動作 (byte-identical)
+        } else if (gApp.mode == AppMode::kRegistration &&
+                   (mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL)) {
+            // Phase U-1: soft partition 計算 + ヒートマップ toggle
+            if (!g_softAnchors.valid()) {
+                std::cerr << "[Shift+U] Need >=" << SoftPartition::MIN_GROUPS
+                          << " Umeyama anchors first (have "
+                          << g_softAnchors.count() << ")" << std::endl;
+            } else {
+                if (!g_softPartReady) runSoftPartitionCompute();
+                if (g_softPartReady) {
+                    g_softShowHeatmap = !g_softShowHeatmap;
+                    std::cout << "[Shift+U] heatmap "
+                              << (g_softShowHeatmap ? "ON" : "OFF")
+                              << "  groups=" << g_softAnchors.count() << std::endl;
+                }
+            }
+        } else if (gApp.mode == AppMode::kRegistration &&
+                   (mods & GLFW_MOD_CONTROL) && !(mods & GLFW_MOD_SHIFT)) {
+            // Ctrl+U: run the selected registration method (both start from
+            // the same Umeyama init). Phase U-CPD added the CPD branch.
+            if (g_regMethod == METHOD_CPD) {
+                // Phase U-CPD: pure rigid CPD (anchor-free). LIVE = animate
+                //   stages 1-4 then replay; the render loop saves on finish.
+                if (g_regLiveMode) {
+                    poseAutoSaveBeforeRegistration();
+                    startCpdLive();
+                } else {
+                    poseAutoSaveBeforeRegistration();
+                    runCpdRegistration();          // stages 1->5 (blocking)
+                    poseSaveToLibrary(SaveCriterion::RMSE);
+                    if (!g_cpdCanRevert) g_cpdStageDone[5] = false; // session reverted it
+                }
+            } else if (!g_softPartReady) {
+                std::cerr << "[Ctrl+U] run Shift+U (soft partition) first"
+                          << std::endl;
+            } else {
+                // Phase U-2: soft-weighted ICP (LIVE animates the convergence).
+                if (g_regLiveMode) {
+                    poseAutoSaveBeforeRegistration();
+                    startSoftIcpLive();
+                } else {
+                    poseAutoSaveBeforeRegistration();
+                    runSoftWeightedICP();
+                    poseSaveToLibrary(SaveCriterion::RMSE);
+                }
+            }
+        }
         break;
     case GLFW_KEY_C:
         if (gApp.mode == AppMode::kImageOnly) MaskPicker::clear(gApp);
@@ -2723,6 +2888,194 @@ static bool loadImageRectifyAware(AppContext& ctx, const std::string& path) {
     return true;
 }
 
+// =========================================================================
+//  臓器セットのドラッグ&ドロップ（CTモデル差し替え）
+//  -----------------------------------------------------------------------
+//  フォルダ（標準）または複数 .obj をまとめてドロップして、現在の臓器セット
+//  (liver/portal/vein/tumor/segment/gb) を差し替え、既存の深度ターゲットへ
+//  再 prealign する。ルール:
+//    - liver.obj は必須。無いセットは拒否（門脈単独などもこれで弾ける）。
+//    - ドロップに含まれない臓器は空メッシュにクリア＝完全置換。よって
+//      liver.obj だけ落とせば肝臓だけが残る。
+//    - 深度ターゲット(screenMesh)が既にロード済みであること。無い場合は
+//      整列できない(生CT座標で画面外)ため、エラーで拒否する。
+//    - ターゲットは据え置きなので g_sceneDiag / voxel は変わらない。再計算
+//      されるのは prealign 変換と肝臓の幾何ラベル(Region/LR/CC)のみ。
+//  照合するcanonicalファイル名(大文字小文字無視):
+//    liver.obj portal.obj vein.obj tumor.obj segment.obj gb.obj
+// =========================================================================
+static const char* kOrganCanonical[6] = {
+    "liver.obj", "portal.obj", "vein.obj",
+    "tumor.obj", "segment.obj", "gb.obj"
+};
+
+struct OrganDropScan {
+    bool                      anyOrgan = false;  // canonical臓器objを1つ以上検出
+    std::array<std::string,6> path{};            // path[role]; 空=不在
+    bool hasLiver() const { return !path[0].empty(); }
+};
+
+// ドロップされたパス群(ファイル/フォルダ混在可)を走査し role->path に解決
+static OrganDropScan scanOrganDrop(int count, const char** paths) {
+    OrganDropScan scan;
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c){ return (char)std::tolower(c); });
+        return s;
+    };
+    std::error_code ec;
+    for (int i = 0; i < count; ++i) {
+        const std::string p = paths[i];
+        if (std::filesystem::is_directory(p, ec)) {
+            // フォルダドロップ（標準）: 中の各canonical名を探す
+            for (int r = 0; r < 6; ++r) {
+                std::string cand =
+                    (std::filesystem::path(p) / kOrganCanonical[r]).string();
+                if (std::filesystem::exists(cand, ec)) {
+                    scan.path[r]  = cand;
+                    scan.anyOrgan = true;
+                }
+            }
+        } else {
+            // 個別ファイル: basename を canonical名と照合
+            const std::string fn =
+                lower(std::filesystem::path(p).filename().string());
+            for (int r = 0; r < 6; ++r) {
+                if (fn == kOrganCanonical[r]) {
+                    scan.path[r]  = p;   // 重複は後勝ち
+                    scan.anyOrgan = true;
+                    break;
+                }
+            }
+        }
+    }
+    return scan;
+}
+
+// 臓器セットを差し替え、既存ターゲットへ再 prealign する。
+// ターゲット未ロードなら false（ログ出力）。
+static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
+    if (!screenMesh || screenMesh->mVertices.empty()) {
+        std::cerr << "[OrganDrop] REFUSED: no depth target loaded. "
+                     "先に画像ロード / Run Depth(または bin から再構成)してから、"
+                     "臓器セットをドロップしてターゲットへ登録してください。"
+                  << std::endl;
+        return false;
+    }
+
+    struct Spec { mCutMesh** ptr; int role; glm::vec3 defColor; };
+    Spec specs[6] = {
+        { &liverMesh3D,   0, glm::vec3(0.8f, 0.2f, 0.2f) },
+        { &portalMesh3D,  1, glm::vec3(0.2f, 0.2f, 0.8f) },
+        { &veinMesh3D,    2, glm::vec3(0.2f, 0.5f, 0.5f) },
+        { &tumorMesh3D,   3, glm::vec3(0.8f, 0.5f, 0.5f) },
+        { &segmentMesh3D, 4, glm::vec3(0.2f, 0.8f, 0.5f) },
+        { &gbMesh3D,      5, glm::vec3(0.2f, 0.8f, 0.2f) },
+    };
+
+    // 1. メッシュ置換: ドロップにあればロード、無ければ空にクリア（完全置換）
+    int loaded = 0;
+    for (auto& s : specs) {
+        glm::vec3 keepColor = (*s.ptr) ? (*s.ptr)->mColor : s.defColor;
+        delete *s.ptr;
+        const std::string& src = srcPaths[s.role];
+        if (!src.empty()) {
+            *s.ptr = new mCutMesh(mCutMesh().loadMeshFromFile(src.c_str()));
+            if (!(*s.ptr)->mVertices.empty()) {
+                ++loaded;
+                std::cout << "[OrganDrop]   " << kOrganCanonical[s.role]
+                          << "  V:" << (*s.ptr)->mVertices.size()/3
+                          << "  <- " << src << std::endl;
+            } else {
+                std::cerr << "[OrganDrop]   " << kOrganCanonical[s.role]
+                          << "  load FAILED (" << src << ") -> empty" << std::endl;
+            }
+        } else {
+            *s.ptr = new mCutMesh();   // セットに無い → クリア
+            std::cout << "[OrganDrop]   " << kOrganCanonical[s.role]
+                      << "  cleared (not in dropped set)" << std::endl;
+        }
+        (*s.ptr)->mColor = keepColor;
+        setUp(**s.ptr);
+    }
+
+    // 1b. Shift+M / Region ラベルの物理スケール基準を新しい raw メッシュから取り直す。
+    //     prealign 前（= 生CT座標）で測る。これを更新しないと Region のリム幅換算
+    //     (units/mm = meshDiag / origCTDiag) と Shift+M が旧症例のスケールのまま狂う。
+    //     起動時 4191- と同じ計算。
+    {
+        auto bboxDiag = [](const mCutMesh* m) -> float {
+            if (!m || m->mVertices.size() < 3) return 0.0f;
+            glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
+            for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+                glm::vec3 v(m->mVertices[i], m->mVertices[i+1], m->mVertices[i+2]);
+                mn = glm::min(mn, v); mx = glm::max(mx, v);
+            }
+            return glm::length(mx - mn);
+        };
+        g_originalLiverDiagMm = bboxDiag(liverMesh3D);
+        g_originalTumorDiagMm = bboxDiag(tumorMesh3D);
+        g_hasOriginalDiags    = (g_originalLiverDiagMm > 1e-6f);
+        std::cout << "[OrganDrop] CT-mm ref refreshed: liver=" << g_originalLiverDiagMm
+                  << " tumor=" << g_originalTumorDiagMm
+                  << "  (Region rim scale + Shift+M)" << std::endl;
+    }
+
+    // 2. AppContext / allMeshes の再ポイント（上で delete したため必須）
+    gApp.liver = liverMesh3D; gApp.portal = portalMesh3D; gApp.vein = veinMesh3D;
+    gApp.tumor = tumorMesh3D; gApp.segment = segmentMesh3D; gApp.gb = gbMesh3D;
+    allMeshes = { liverMesh3D, portalMesh3D, veinMesh3D,
+                  tumorMesh3D, segmentMesh3D, gbMesh3D };
+    gApp.all = allMeshes;
+
+    // 3. 新規はCT空間そのまま: 直前の変換とラベルを破棄。
+    g_lastOrganTransform    = glm::mat4(1.0f);
+    g_hasLastOrganTransform = false;
+    g_lastOrganOffset       = glm::vec3(0.0f);
+    g_liverRegion = LiverRegionLabel::Result();
+    g_liverLR     = LiverLeftRightLabel::Result();
+    g_liverCC     = LiverCranioCaudalLabel::Result();
+    //  ★ターゲット雲キャッシュは絶対にクリアしない★
+    //  ターゲット雲(=深度 screenMesh 由来の ~28万点 + boundaryDist/normals)は臓器とは
+    //  独立で、臓器スワップでは一切変化しない。ここで clearCachedTargetCloud() すると
+    //  注入済みフル解像度ターゲットが消え、Ctrl+G が front-face フォールバック(~1267点)に
+    //  落ちて全くフィットしなくなる(レジストレーションが合わない症状の原因)。
+    //  setupObjScene / rebuild はクリア直後に setupOBJTarget で必ず再構築するが、スワップは
+    //  screenMesh を作り直さないので、クリアせずキャッシュを温存するのが正しい。
+
+    // 4. 新セットを既存ターゲットへ prealign。
+    //    スケール=肝臓(最初の非空、必須なので必ず肝臓)基準、中心=存在臓器の重心平均。
+    //    screenMesh は不変なので g_sceneDiag / voxel は変わらない。
+    std::vector<mCutMesh*> organs = { liverMesh3D, portalMesh3D, veinMesh3D,
+                                      tumorMesh3D, segmentMesh3D, gbMesh3D };
+    g_lastOrganTransform    = Reg3DCustom::prealignSourceToTarget(organs, *screenMesh);
+    g_hasLastOrganTransform = true;
+    for (auto* m : organs) if (m) setUp(*m);
+
+    // 4b. 初期姿勢スナップショットを撮り直す（重要）。
+    //     Apply Init Pose / Reset は g_initOrganVertices から頂点を復元するため、
+    //     撮り直さないと旧トポロジ(頂点数)の snapshot を新メッシュに上書きし、
+    //     "Index out of range" / "region.labels size mismatch" を起こす。
+    //     prealign 済みの現在姿勢を基準として保存（起動時 4486 と同じ）。
+    snapshotInitialPose();
+
+    // 5. 差し替えが見えるように: 現在ロード中の臓器が1つも表示されていなければ
+    //    肝臓(必ず存在)を表示する。
+    bool anyVisible = false;
+    for (auto& s : specs) {
+        if (*s.ptr && !(*s.ptr)->mVertices.empty() && g_meshAlpha[s.role] > 0.01f) {
+            anyVisible = true; break;
+        }
+    }
+    if (!anyVisible) g_meshAlpha[0] = 0.8f;
+
+    Reg3DCustom::printMeshBBox(*liverMesh3D, "liver (organ-drop, aligned)");
+    std::cout << "[OrganDrop] swapped organ set (" << loaded
+              << " organ(s) loaded); prealigned to existing target. "
+                 "sceneDiag/voxel unchanged." << std::endl;
+    return true;
+}
+
 // FileDropHandler.hのglfw_onFileDropを使用するように変更
 static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
     if (count <= 0 || !paths) return;
@@ -2736,6 +3089,26 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
 
     const std::string filePath = paths[0];
     std::cout << "[FileDrop] Attempting to load: " << filePath << std::endl;
+
+    // -------------------------------------------------------------------
+    //  臓器セットのドロップ（CTモデル差し替え）。フォルダ内の臓器OBJが下の
+    //  bin-folder スキャンに吸われないよう Reconstruct/画像より「先」に判定。
+    //  liver.obj 必須。無いセット(門脈単独など)は拒否。
+    // -------------------------------------------------------------------
+    {
+        OrganDropScan organScan = scanOrganDrop(count, paths);
+        if (organScan.anyOrgan) {
+            if (!organScan.hasLiver()) {
+                std::cerr << "[OrganDrop] REJECTED: the dropped set has no liver.obj. "
+                             "liver.obj が必須です(セット一式、または liver.obj を含む"
+                             "フォルダをドロップしてください)。非肝臓OBJ単独は不可。"
+                          << std::endl;
+                return;   // 無効なセット → 何もしない
+            }
+            swapOrganSetFromDrop(organScan.path);
+            return;       // 処理済み(or ターゲット無しで拒否)。下に流さない
+        }
+    }
 
     // FEATURE Task 4: route Reconstruct-from-BIN inputs (depth_metric.bin /
     // segmentation_mask.png / original.jpg, or a depth_output/ folder) to the
@@ -2986,7 +3359,7 @@ static bool setupObjScene() {
             { &portalMesh3D,  "portal.obj", glm::vec3(0.2f, 0.2f, 0.8f) },
             { &veinMesh3D,    "vein.obj",   glm::vec3(0.2f, 0.5f, 0.5f) },
             { &tumorMesh3D,   "tumor.obj",  glm::vec3(0.8f, 0.5f, 0.5f) },
-            { &segmentMesh3D, "res.obj",    glm::vec3(0.2f, 0.8f, 0.5f) },
+            { &segmentMesh3D, "segment.obj", glm::vec3(0.2f, 0.8f, 0.5f) },
             { &gbMesh3D,      "gb.obj",     glm::vec3(0.2f, 0.8f, 0.2f) },
         };
         for (auto& s : specs) {
@@ -3199,18 +3572,39 @@ static bool setupObjScene() {
         std::string fullObjPath;
         {
             const std::string& src = g_objSourcePath;
-            auto pos = src.find("pc_metric_pinhole_masked_");
-            if (pos != std::string::npos) {
-                std::string head = src.substr(0, pos);
-                std::string tail = src.substr(pos + std::string("pc_metric_pinhole_masked_").size());
-                // tail is e.g. "custom.obj" or "k4a.obj"
+            // Build an ordered list of candidate "full" OBJ paths and pick the
+            // first that actually exists on disk. The source mesh name comes in
+            // two flavours and the old code only handled the tagged one:
+            //   (a) tagged:   pc_metric_pinhole_masked_<tag>.obj
+            //                  -> pc_metric_pinhole_full_<tag>_light.obj
+            //   (b) tagless:  pc_metric_pinhole_masked.obj   (current depth export)
+            //                  -> pc_metric_pinhole_full_light.obj
+            // Falling back to a hard-coded "_k4a_light.obj" left the tagless
+            // export (the common case now) with no board mesh at all.
+            std::vector<std::string> candidates;
+
+            auto posT = src.find("pc_metric_pinhole_masked_");   // tagged form
+            if (posT != std::string::npos) {
+                std::string head = src.substr(0, posT);
+                std::string tail = src.substr(posT + std::string("pc_metric_pinhole_masked_").size());
                 auto dotPos = tail.find(".obj");
-                std::string tag = (dotPos != std::string::npos)
-                                      ? tail.substr(0, dotPos) : tail;
-                fullObjPath = head + "pc_metric_pinhole_full_" + tag + "_light.obj";
-            } else {
-                // Fallback to legacy path if g_objSourcePath wasn't set as expected
-                fullObjPath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_k4a_light.obj";
+                std::string tag = (dotPos != std::string::npos) ? tail.substr(0, dotPos) : tail;
+                candidates.push_back(head + "pc_metric_pinhole_full_" + tag + "_light.obj");
+            }
+
+            auto posU = src.find("pc_metric_pinhole_masked.obj"); // tagless form
+            if (posU != std::string::npos) {
+                std::string head = src.substr(0, posU);
+                candidates.push_back(head + "pc_metric_pinhole_full_light.obj");
+            }
+
+            // Generic fallbacks rooted at DEPTH_OUTPUT_PATH (cover both names).
+            candidates.push_back(DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_light.obj");
+            candidates.push_back(DEPTH_OUTPUT_PATH + "pc_metric_pinhole_full_k4a_light.obj");
+
+            fullObjPath = candidates.empty() ? std::string() : candidates.front();
+            for (const auto& c : candidates) {
+                if (std::filesystem::exists(c)) { fullObjPath = c; break; }
             }
         }
         std::string texPath = DEPTH_OUTPUT_PATH + "texture.png";
@@ -4025,7 +4419,7 @@ int main(int argc, char** argv) {
     tumorMesh3D->mColor = glm::vec3(0.8f, 0.5f, 0.5f);
     setUp(*tumorMesh3D);
 
-    segmentMesh3D = new mCutMesh(segmentMesh3D->loadMeshFromFile((MODEL_PATH + "res.obj").c_str()));
+    segmentMesh3D = new mCutMesh(segmentMesh3D->loadMeshFromFile((MODEL_PATH + "segment.obj").c_str()));
     segmentMesh3D->mColor = glm::vec3(0.2f, 0.8f, 0.5f);
     setUp(*segmentMesh3D);
 
@@ -4226,6 +4620,21 @@ int main(int argc, char** argv) {
         if (NormalRefineLive::pendingSave) {
             poseSaveToLibrary(SaveCriterion::EITHER, NormalRefineLive::mask);
             NormalRefineLive::pendingSave = false;
+        }
+
+        // [LIVE] CPD + soft-ICP frame-driven replay (same pattern as above).
+        //   When a live session is active, replay one batch of trajectory
+        //   entries per frame; finish() flags pendingSave, consumed here.
+        tickCpdLive();
+        if (CpdLive::pendingSave) {
+            poseSaveToLibrary(SaveCriterion::RMSE);
+            CpdLive::pendingSave = false;
+            if (!g_cpdCanRevert) g_cpdStageDone[5] = false; // session reverted it
+        }
+        tickSoftIcpLive();
+        if (SoftIcpLive::pendingSave) {
+            poseSaveToLibrary(SaveCriterion::RMSE);
+            SoftIcpLive::pendingSave = false;
         }
 
         // Phase 7b Step 3c — Contour Sweep tick.
@@ -4736,6 +5145,1204 @@ int main(int argc, char** argv) {
                                   "Increase if instrument outline leaks into the\n"
                                   "RIM band (visible as purple dots in Shift+W).");
             }
+
+            // ===============================================================
+            //  Alt+P  Silhouette Align (2D-IoU BIPOP-CMA-ES, was Shift+E)
+            // ---------------------------------------------------------------
+            //  Migrated into the G tab because runShiftE is algorithmically a
+            //  BIPOP-CMA-ES sibling of Ctrl+G / Ctrl+Shift+G (it maximises 2D
+            //  silhouette IoU). The button reproduces the Alt+P key dispatch
+            //  byte-identically (poseAutoSaveBeforeRegistration -> runShiftE
+            //  -> poseSaveToLibrary(IOU)). N_STARTS / raster step are now
+            //  global (g_shiftE_*) so these sliders actually take effect.
+            // ===============================================================
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                               "Alt+P  Silhouette Align (2D-IoU BIPOP)");
+
+            ImGui::SliderInt("restarts N (Alt+P)", &g_shiftE_NStarts, 1, 20);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("runShiftE outer restarts (was hardcoded 5).\n"
+                                  "run 0 = baseline, 1-2 = local, 3+ = global jitter.");
+            }
+            ImGui::SliderInt("raster step (Alt+P)", &g_shiftE_RasterStep, 1, 16);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("2D-IoU rasterization step (was hardcoded 8).\n"
+                                  "Drives BOTH the IoU readout and the CMA-ES\n"
+                                  "objective (linked). Lower = finer / slower.");
+            }
+
+            // --- occluded-gate trap (the Alt+P PoseLibrary rejection bug) ---
+            //  runShiftE never fills g_lastSilOccludedIoU2D (only Ctrl+Shift+G
+            //  Phase E does), so it stays 0. If the accept gate is set to use
+            //  occluded IoU, every Alt+P result is rejected (0 vs 0). Surface
+            //  the same global here so it can be turned OFF in one place.
+            ImGui::Checkbox("Pose accept uses occluded IoU",
+                            &g_poseLibraryUseOccludedForAccept);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Same global as the Pose Library panel.\n"
+                                  "Alt+P evaluates FULL 2D IoU only and leaves\n"
+                                  "occluded IoU = 0. If this is ON, Alt+P saves\n"
+                                  "are rejected by the occluded gate (0 vs 0).\n"
+                                  "Turn OFF for IoU-only methods like Alt+P.");
+            }
+            if (g_poseLibraryUseOccludedForAccept) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f),
+                                   "(Alt+P will be rejected!)");
+            }
+
+            if (ImGui::Button("Run Silhouette Align (Alt+P)")) {
+                // byte-identical to the Alt+P branch in the GLFW_KEY_P case
+                std::cout << "[Alt+P] dispatching Silhouette Align (button)..."
+                          << std::endl;
+                g_stepStartTime = std::chrono::steady_clock::now();
+                poseAutoSaveBeforeRegistration();
+                runShiftE();
+                g_sessionSilhouetteN++;
+                gUI.state.regMethod = 5;
+                poseSaveToLibrary(SaveCriterion::IOU);
+            }
+
+            // [PERF TOGGLE] Alt+P fast path (default OFF = legacy baseline).
+            ImGui::Checkbox("Alt+P fast path (perf; OFF = legacy baseline)",
+                            &CmaesRefine::g_silFastPath);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "OFF (default): original Alt+P (serial RMSE, per-eval\n"
+                    "target mask rebuild, serial IoU) -- legacy baseline.\n"
+                    "ON: parallel fastComputeRMSE + cached target mask +\n"
+                    "parallel IoU. Result-invariant, ~2-3x faster/eval.\n"
+                    "Re-run Alt+P from the same start pose to verify the\n"
+                    "final IoU matches.");
+
+            // [EXPERIMENT] Alt+P accept gate -- the reason it found 0.96 but
+            // reverted to ~0.72. OFF/1.20 = legacy.
+            ImGui::Checkbox("Alt+P: pure IoU (ignore RMSE accept cap)",
+                            &CmaesRefine::g_silAcceptIgnoreRmse);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "OFF (default): legacy gate -- keep found pose only if\n"
+                    "compRMSE < before * cap (below). Reverts IoU-optimal\n"
+                    "poses that raise 3D RMSE (the 0.96->revert behaviour).\n"
+                    "ON: accept on IoU gain alone. Test whether Alt+P keeps\n"
+                    "the 0.96 it already finds.");
+            if (!CmaesRefine::g_silAcceptIgnoreRmse) {
+                ImGui::SliderFloat("Alt+P RMSE accept cap (x before)",
+                                   &CmaesRefine::g_silAcceptRmseCap,
+                                   1.0f, 5.0f, "%.2f");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "accept needs compRMSE_after < compRMSE_before * this.\n"
+                        "1.20 = legacy (20%% worsening; old comment said 50%%).\n"
+                        "The IoU=0.96 poses need ~2.3x here.");
+            }
+
+            ImGui::Checkbox("Alt+P: capture found poses -> F9 (per run)",
+                            &g_shiftECaptureFound);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "ON: runShiftE snapshots each run's inner-loop best pose\n"
+                    "into an F9 Run slot BEFORE the gate reverts it, applied\n"
+                    "pose -> Final. SEE the 0.96 poses the gate discards.\n"
+                    "Squash-raster scored at the step below (16 = Ctrl+I /\n"
+                    "SilCompare yardstick; panel IoU != full-mesh on purpose).\n"
+                    "OFF (default): no capture (runShiftE byte-identical).");
+            if (g_shiftECaptureFound) {
+                ImGui::SliderInt("Alt+P found capture step",
+                                 &g_shiftECaptureStep, 1, 32);
+            }
+
+            // --- Silhouette method compare (A/B/C -> F9) ----------------
+            //  Runs the EXISTING runShiftE (legacy Alt+P = method 1) and/or
+            //  runBipopCmaesV3RS (methods 2/3) from the same start pose,
+            //  scores each with the same 2D-IoU yardstick, captures each to
+            //  F9 Run 1/2/3. Non-destructive. Alt+P controls above untouched.
+            SilCompare::drawSection();
+
+            // --- [PARALLEL] Run-loop parallelization toggle -------------
+            //  One switch governs BOTH BIPOP engines' run loops:
+            //    - V3RS (Ctrl+I, Ctrl+Shift+G): silhouette engine
+            //    - V3R  (Ctrl+G)              : region-aware ICP engine
+            //  Parallelizes the 10 restarts across CPU cores (one thread
+            //  per run). Determinism is preserved (same poses / IoU /
+            //  best-run), so it's a pure speed lever -- toggle OFF to
+            //  reproduce the legacy serial timing for A/B comparison.
+            ImGui::Separator();
+            ImGui::Checkbox("Parallel runs (Ctrl+I / Ctrl+G / Ctrl+Shift+G)",
+                            &CmaesRefineV3RS::g_v3rsParallelRuns);
+            // Mirror the single UI switch onto the V3R engine's toggle so
+            // one checkbox controls both run loops.
+            CmaesRefineV3R::g_v3rParallelRuns = CmaesRefineV3RS::g_v3rsParallelRuns;
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "OFF = legacy serial run loops (byte-identical results).\n"
+                    "ON  = run the 10 BIPOP restarts concurrently, one OpenMP\n"
+                    "      thread per run.\n"
+                    "  - V3RS (Ctrl+I / Ctrl+Shift+G): inner raster forced\n"
+                    "    serial so there's no nested-parallel overhead.\n"
+                    "  - V3R (Ctrl+G): no inner OpenMP, so runs fork cleanly.\n"
+                    "Same poses / IoU / best-run as serial (jitter is\n"
+                    "pre-generated in run order), so only wall-clock changes.\n"
+                    "Run a method once each way and compare the\n"
+                    "'runs loop wall-clock' console line.");
+            }
+            // Per-engine last-run readouts (compare without the console).
+            if (CmaesRefineV3RS::g_v3rsLastRunLoopMs > 0.0) {
+                ImGui::TextDisabled("  V3RS (Ctrl+I / Ctrl+Shift+G) last: %.0f ms  (%s x%d)",
+                    CmaesRefineV3RS::g_v3rsLastRunLoopMs,
+                    CmaesRefineV3RS::g_v3rsParallelRuns ? "par" : "ser",
+                    CmaesRefineV3RS::g_v3rsLastRunThreads);
+            }
+            if (CmaesRefineV3R::g_v3rLastRunLoopMs > 0.0) {
+                ImGui::TextDisabled("  V3R  (Ctrl+G)     last: %.0f ms  (%s x%d)",
+                    CmaesRefineV3R::g_v3rLastRunLoopMs,
+                    CmaesRefineV3R::g_v3rParallelRuns ? "par" : "ser",
+                    CmaesRefineV3R::g_v3rLastRunThreads);
+            }
+
+            ImGui::Checkbox("Show RIM pairs",
+                            &g_ctrlgShowRimPairs);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Visualize the rim sets used by beta "
+                                  "weighting:\n  orange = source RIM (mesh-intrinsic)\n"
+                                  "  magenta = target RIM (image boundary).\n"
+                                  "Buffers are populated at next Ctrl+G press.");
+            }
+
+            // 状態表示: viz バッファの中身が分かるとデバッグしやすい
+            if (g_ctrlgRimVizAvailable) {
+                ImGui::Text("RimViz buffers: src=%d  tgt=%d",
+                            (int)g_ctrlgRimSrcVertIdx.size(),
+                            (int)g_ctrlgRimTgtPos.size());
+            } else if (g_ctrlgShowRimPairs) {
+                ImGui::TextDisabled(
+                    "RimViz: press Ctrl+G to populate");
+            }
+
+            // -----------------------------------------------------------
+            // REDGE (稜線) — experimental  [1][2]  ※表示のみ
+            //   RIM とは別に、ドームのオクルーディング輪郭を可視化。
+            //   source = 境界 ∩ ANTERIOR_CORE (非RIM・非後面) の grazing 帯。
+            //   target = 境界の上半分 (RIM=下半分の対)。
+            //   レジストレーション [3] は別途追加予定。
+            // -----------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f, 0.95f, 1.0f, 1.0f),
+                               "REDGE (稜線) — experimental");
+
+            // [1] target ridge (upper half) — yellow
+            if (ImGui::Checkbox("[1] Show target REDGE (upper half)",
+                                &g_showDebugTargetRidge)) {
+                if (g_showDebugTargetRidge) {
+                    if (!populateDebugTargetRidge()) g_showDebugTargetRidge = false;
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "yellow = target ridge = boundary UPPER half\n"
+                    "(p.y <= 2D centroid.y; RIM is the lower half).\n"
+                    "Splits g_debugTargetBoundaryPoints; auto-runs\n"
+                    "Shift+W populate if empty. Re-toggle to refresh.");
+            }
+
+            // [1] outlier removal sub-controls (debug-only, target 稜線のみ)
+            ImGui::Indent(16);
+            {
+                bool changed = false;
+                changed |= ImGui::Checkbox("split by bbox long edge (PCA, 横長対応)",
+                                           &g_ridgeTgtSplitLongEdge);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "OFF = simple up/down (p.y <= centroid.y).\n"
+                        "ON  = split parallel to the 2D long axis (PCA):\n"
+                        "the dividing line follows the elongated silhouette,\n"
+                        "so a wide/tilted liver splits into upper(ridge) /\n"
+                        "lower(RIM) sensibly. Reduces to up/down when the\n"
+                        "long axis is horizontal.");
+                }
+                changed |= ImGui::Checkbox("remove outliers (target ridge)",
+                                           &g_ridgeTgtRemoveOutliers);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Drop geometric outliers (e.g. the depth-surface\n"
+                        "tail that slips through the 2D boundary band).\n"
+                        "Applies ONLY to the yellow target ridge; the\n"
+                        "purple RIM band / beta weighting are untouched.\n"
+                        "Default OFF so raw stays the baseline.");
+                }
+                if (g_ridgeTgtRemoveOutliers) {
+                    changed |= ImGui::RadioButton("SOR", &g_ridgeTgtOutlierMode, 0);
+                    ImGui::SameLine();
+                    changed |= ImGui::RadioButton("largest CC", &g_ridgeTgtOutlierMode, 1);
+                    if (g_ridgeTgtOutlierMode == 0) {
+                        ImGui::SetNextItemWidth(140);
+                        changed |= ImGui::SliderInt("SOR k", &g_ridgeTgtSorK, 4, 48);
+                        ImGui::SetNextItemWidth(140);
+                        changed |= ImGui::SliderFloat("SOR std x sigma",
+                                                      &g_ridgeTgtSorStd, 0.5f, 4.0f, "%.2f");
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Larger = more permissive (drops fewer).\n"
+                                              "Smaller = aggressive (drops the tail harder).");
+                        }
+                    } else {
+                        ImGui::SetNextItemWidth(140);
+                        changed |= ImGui::SliderFloat("CC radius (0=auto)",
+                                                      &g_ridgeTgtCcRadius, 0.0f, 5.0f, "%.3f");
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Neighbor radius for Euclidean clustering.\n"
+                                              "0 = auto (median NN dist * 2.5).");
+                        }
+                        ImGui::SetNextItemWidth(140);
+                        changed |= ImGui::SliderInt("CC min pts", &g_ridgeTgtCcMinPts, 1, 500);
+                    }
+                }
+                // live 反映: [1] が ON のとき変更で即再 populate (切替を見やすく)
+                if (changed && g_showDebugTargetRidge) {
+                    populateDebugTargetRidge();
+                }
+            }
+            ImGui::Unindent(16);
+
+            // [2] source ridge (occluding contour, non-RIM/non-posterior) — cyan
+            if (ImGui::Checkbox("[2] Show source REDGE (boundary, non-RIM/non-posterior)",
+                                &g_showDebugSourceRidge)) {
+                if (g_showDebugSourceRidge) {
+                    if (!populateDebugSourceRidge()) g_showDebugSourceRidge = false;
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "cyan = source ridge = ANTERIOR_CORE verts whose\n"
+                    "normal is grazing to the AR camera (|cos|<band) =\n"
+                    "the dome's occluding contour. Excludes RIM and\n"
+                    "POSTERIOR by label. View-dependent: computed at\n"
+                    "toggle for the current pose; re-toggle after moving.");
+            }
+            ImGui::SetNextItemWidth(160);
+            if (ImGui::SliderFloat("REDGE cos band", &g_ctrlgRidgeCosBand,
+                                   0.05f, 0.60f, "%.2f")) {
+                if (g_showDebugSourceRidge) populateDebugSourceRidge();  // live 反映
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Source silhouette band width:\n"
+                                  "|cos(normal, -view)| < band counts as ridge.\n"
+                                  "Larger = thicker ridge band.");
+            }
+
+            if (g_showDebugSourceRidge || g_showDebugTargetRidge) {
+                ImGui::Text("REDGE buffers: src=%d  tgt=%d",
+                            (int)g_debugSourceRidge.size(),
+                            (int)g_debugTargetRidgePoints.size());
+            }
+
+            // [3] REDGE -> registration weight (Ctrl+G / V3R).
+            //   w_i = 1 + beta*(rim_src & rim_tgt) + gamma*(redge_src & rim_tgt)
+            //   gamma=0 -> 従来の Ctrl+G と完全一致。次の Ctrl+G から反映。
+            ImGui::SetNextItemWidth(180);
+            ImGui::SliderFloat("[3] REDGE weight gamma (Ctrl+G)",
+                               &g_ctrlgGammaRedgeWeight, 0.0f, 10.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Ridge-ridge weight added to Ctrl+G (V3R) on top of\n"
+                    "beta. 0 = OFF (registration byte-identical to before).\n"
+                    "Source = ANTERIOR_CORE grazing contour (uses REDGE cos\n"
+                    "band above); target = same boundary band as the rim term.\n"
+                    "Source rim/redge are disjoint, so each correspondence\n"
+                    "gets at most ONE boost (no double counting). Takes effect\n"
+                    "on the NEXT Ctrl+G. Log: [Ctrl+G/rim] beta=.. gamma=..\n"
+                    "src_redge=..  and  [V3R-W] weighting: ...");
+            }
+
+            // [3b] bidirectional (symmetric) matching for rim/redge ((B)方式).
+            ImGui::Checkbox("bidirectional rim/redge matching (Ctrl+G)",
+                            &g_ctrlgBidirMatching);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Add the reverse term (source -> nearest target) for\n"
+                    "RIM/REDGE source points ONLY, so those classes are\n"
+                    "constrained BOTH ways. Resists the source ballooning up\n"
+                    "in scale to cover the target (one-directional matching\n"
+                    "only rewards coverage, never penalizes overshoot).\n"
+                    "Plain (non rim/redge) points stay one-directional.\n"
+                    "OFF = byte-identical. Needs beta>0 or gamma>0.\n"
+                    "Takes effect on the NEXT Ctrl+G. Log: [V3R] bidir\n"
+                    "src_to_eval: N reverse corr ...");
+            }
+            if (g_ctrlgBidirMatching) {
+                ImGui::Indent(16);
+                ImGui::Checkbox("...also non rim/redge points ((A) full symmetric)",
+                                &g_ctrlgBidirAllPoints);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "(A) Extend the reverse term to ALL subset source\n"
+                        "points, not just rim/redge. Penalizes the whole\n"
+                        "surface's overshoot (closer to symmetric ICP), so\n"
+                        "the source should shrink further toward 1.0x.\n"
+                        "Unchecked = (B) rim/redge only (current behavior).");
+                }
+                ImGui::Unindent(16);
+            }
+
+            // -----------------------------------------------------------
+            // [Phase D] Colored RIM pairs (K representatives).
+            //   Independent from Show RIM pairs above. Shows K paired
+            //   source+target spheres in matching HSV colors so the
+            //   operator can see WHICH rim vertex maps to WHICH target
+            //   point at the current pose. Pairs are sampled from the
+            //   ~20k captured at Ctrl+G Phase F.5 (or restored from a
+            //   PoseLibrary entry after Apply). 4 sampling modes:
+            //     - ArcUniform: even spacing around tgt centroid (default)
+            //     - WorstK    : K longest src-tgt distances (diagnostic)
+            //     - BestK     : K shortest distances
+            //     - Random    : seeded uniform (reshufflable)
+            // -----------------------------------------------------------
+            ImGui::Checkbox("Show colored pairs (K)",
+                            &g_ctrlgShowColoredRimPairs);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Overlay K representative rim-rim pairs "
+                                  "drawn in matching HSV colors so each "
+                                  "src↔tgt mapping is visually identifiable.\n"
+                                  "Data source: g_lastRimPair* (set by "
+                                  "Ctrl+G / Ctrl+Shift+G Phase F.5; restored "
+                                  "by Pose Library Apply).\n"
+                                  "Pairs follow the mesh through subsequent "
+                                  "ICP/Apply (source is a full-mesh vertex "
+                                  "index; target is fixed world coords).\n"
+                                  "Independent from Show RIM pairs above — "
+                                  "leave both ON for max info.");
+            }
+            if (g_ctrlgShowColoredRimPairs) {
+                ImGui::Indent();
+                ImGui::SliderInt("K pairs", &g_ctrlgColoredRimN, 5, 30);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How many representative pairs to draw "
+                                      "(5–30). 10 is the sweet spot — small "
+                                      "enough to differentiate by HSV hue, "
+                                      "large enough to span the rim.");
+                }
+                const char* modeItems =
+                    "ArcUniform\0WorstK\0BestK\0Random\0";
+                ImGui::Combo("Sample mode",
+                             &g_ctrlgColoredRimMode, modeItems);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "ArcUniform : evenly spaced around tgt centroid "
+                        "(stable across runs — default).\n"
+                        "WorstK     : K longest src↔tgt distances "
+                        "(diagnostic: where is the rim misaligned?).\n"
+                        "BestK      : K shortest distances "
+                        "(sanity check).\n"
+                        "Random     : seeded uniform sample. Use the "
+                        "Reshuffle button to draw a new sample.");
+                }
+                // Reshuffle only affects Random mode (other modes are
+                // deterministic). Disable the button outside Random so
+                // the UI signals this clearly instead of accepting clicks
+                // that produce no visible change.
+                const bool reshuffleActive =
+                    (g_ctrlgColoredRimMode ==
+                     (int)RimPairSampling::Mode::Random);
+                if (!reshuffleActive) ImGui::BeginDisabled();
+                if (ImGui::Button("Reshuffle")) {
+                    g_ctrlgColoredRimSeed++;
+                }
+                if (!reshuffleActive) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered()) {
+                    if (reshuffleActive) {
+                        ImGui::SetTooltip(
+                            "Draw a new K-sample with a fresh seed.\n"
+                            "Active only in Random mode.");
+                    } else {
+                        ImGui::SetTooltip(
+                            "Reshuffle is only available in Random mode.\n"
+                            "ArcUniform / WorstK / BestK are deterministic — "
+                            "pressing this button would have no effect.");
+                    }
+                }
+                ImGui::SameLine();
+                if (!g_lastRimPairSrcVertIdx.empty()) {
+                    ImGui::TextDisabled("(%d pairs avail.)",
+                                        (int)g_lastRimPairSrcVertIdx.size());
+                } else {
+                    ImGui::TextDisabled("(no pairs — press Ctrl+G)");
+                }
+                ImGui::Unindent();
+            }
+
+            // -----------------------------------------------------------
+            //  Ctrl+Shift+G (V3-RS, silhouette anchor) - inline section.
+            //  Placed inside the Ctrl+G panel so it is always visible
+            //  alongside beta / AR-vis / Caudal. These controls are
+            //  read only when Ctrl+Shift+G is pressed; plain Ctrl+G
+            //  ignores them entirely.
+            // -----------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.5f, 1.0f),
+                               "Ctrl+Shift+G silhouette anchor");
+
+            ImGui::SliderFloat("lambda_sil",
+                               &g_ctrlgsLambdaSil, 0.0f, 1.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Silhouette anchor strength for Ctrl+Shift+G.\n"
+                    "  0.00 : V3R-W behaviour (use Ctrl+G instead).\n"
+                    "  0.10 : weak.\n"
+                    "  0.30 : recommended starting point.\n"
+                    "  1.00 : silhouette-dominant.\n"
+                    "Plain Ctrl+G ignores this slider.");
+            }
+
+            // ----- [NEW UI-1a] Asymmetric outside-ratio penalty -------
+            ImGui::Checkbox("Asymmetric outside-ratio penalty (mask-expansion brake)",
+                            &g_ctrlgsUseOutsideRatio);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Add an ASYMMETRIC penalty to the Ctrl+Shift+G cost:\n"
+                    "  cost += lambda_out * (source AND NOT target) / source\n"
+                    "\n"
+                    "Symmetric (1-IoU) penalises source-contains-target only\n"
+                    "weakly: a fully-containing source has IoU < 1 but the\n"
+                    "gradient toward shrinking is small. This term directly\n"
+                    "measures the FRACTION of source raster outside the\n"
+                    "target, putting a one-sided pull toward source-in-target.\n"
+                    "  0   : source is inside target (no penalty).\n"
+                    "  1   : no overlap (max penalty).\n"
+                    "\n"
+                    "Default OFF -- byte-identical to pre-feature behaviour.\n"
+                    "Recommended when Ctrl+G has drifted into mask expansion.");
+            }
+            ImGui::SliderFloat("lambda_out",
+                               &g_ctrlgsLambdaOut, 0.0f, 2.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Weight for the asymmetric outside-ratio penalty.\n"
+                    "  0.0  : no effect (same as checkbox OFF).\n"
+                    "  0.3  : weak brake on mask expansion.\n"
+                    "  0.5  : recommended starting point.\n"
+                    "  1.0+ : aggressive shrink toward source inside target.\n"
+                    "Only active when the checkbox above is ON.");
+            }
+
+            // ----- [NEW UI-1b] RIM silhouette penalty ----------------
+            ImGui::Checkbox("RIM silhouette penalty (boundary-to-boundary)",
+                            &g_ctrlgsUseRimSil);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Add a boundary-alignment penalty to the cost:\n"
+                    "  cost += lambda_rim_sil * mean(dist_to_target_boundary)\n"
+                    "\n"
+                    "Evaluated only at SOURCE-BOUNDARY raster cells (source\n"
+                    "cells with at least one non-source 4-neighbour). For\n"
+                    "each such cell:\n"
+                    "  outside target mask -> contribute 1.0 (max).\n"
+                    "  inside target mask  -> contribute min(d/max_px, 1.0)\n"
+                    "where d is the image-pixel distance to the target\n"
+                    "silhouette boundary, from the SAM2 distance map.\n"
+                    "\n"
+                    "Silhouette-space analogue of Ctrl+G's beta-rim weighting:\n"
+                    "forces source RIM to target RIM coincidence rather than\n"
+                    "mere area overlap. Catches drift patterns where source\n"
+                    "covers target area well but with bulges/dents at the rim.\n"
+                    "\n"
+                    "Default OFF.");
+            }
+            ImGui::SliderFloat("lambda_rim_sil",
+                               &g_ctrlgsLambdaRimSil, 0.0f, 2.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Weight for the RIM silhouette penalty.\n"
+                    "  0.0  : no effect.\n"
+                    "  0.2  : weak.\n"
+                    "  0.3  : recommended starting point.\n"
+                    "  1.0+ : boundary-dominant.\n"
+                    "Only active when 'RIM silhouette penalty' is ON.");
+            }
+            ImGui::SliderFloat("rim_sil_max_px",
+                               &g_ctrlgsRimSilMaxPx, 10.0f, 300.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Image-pixel normalisation cap for the RIM penalty.\n"
+                    "Source-boundary cells AT the target boundary contribute\n"
+                    "0; cells >= max_px away from the boundary saturate to 1.\n"
+                    "  50  : tight (small drift heavily penalised).\n"
+                    "  100 : recommended starting point.\n"
+                    "  200 : loose (only large drift penalised).\n"
+                    "Only active when 'RIM silhouette penalty' is ON.");
+            }
+
+            // [NEW UI-RIM-ANAT] Anatomic-mode toggle
+            ImGui::Checkbox("Use anatomical RIM (vs. raster boundary)",
+                            &g_ctrlgsRimSilAnatomic);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Switch the source-rim definition between two modes:\n"
+                    "\n"
+                    "OFF (legacy raster boundary):\n"
+                    "  Source RIM = every cell on the rasterised silhouette\n"
+                    "  outline (4-neighbour test on the source hitmap).\n"
+                    "  Includes the outlines of detached blobs / artefacts;\n"
+                    "  doesn't know anything about anatomy. Pure geometric.\n"
+                    "\n"
+                    "ON (anatomical RIM):\n"
+                    "  Source RIM = vertices labelled LiverRegionLabel::RIM,\n"
+                    "  filtered by quadrant + AR-vis + Caudal the SAME way\n"
+                    "  the Ctrl+G 'Show RIM pairs' checkbox filters them.\n"
+                    "  These are exactly the orange spheres you see in the\n"
+                    "  AR view when RimViz is enabled. rim_sil is the mean\n"
+                    "  distance from each VISIBLE projected RIM vertex to\n"
+                    "  the target silhouette boundary.\n"
+                    "\n"
+                    "F9 viz: in anatomic mode, panels 4 & 6 highlight cells\n"
+                    "where any anatomical RIM vertex projected, NOT the full\n"
+                    "silhouette outline. Lets you check whether the rim\n"
+                    "Ctrl+G already cares about coincides with the SAM2\n"
+                    "boundary.\n"
+                    "\n"
+                    "Only active when 'RIM silhouette penalty' is ON.\n"
+                    "Default OFF -- legacy behaviour.");
+            }
+            if (g_ctrlgsRimSilAnatomic && !g_ctrlgsUseRimSil) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  NOTE: anatomic toggle ON but rim_sil penalty OFF -- has no effect");
+            }
+
+            // ----- [NEW UI-1c] Dynamic RMSE cap for Phase E ----------
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                               "Phase E RMSE acceptance cap");
+            ImGui::Checkbox("Dynamic cap (loosen on IoU gain)",
+                            &g_ctrlgsUseDynamicCap);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Layer 3 (Phase E) rejects candidates whose RMSE exceeds\n"
+                    "rmse_before * cap_factor. The legacy fixed cap (1.05x)\n"
+                    "can block silhouette-improving candidates whose RMSE\n"
+                    "rose 6-10%% while IoU jumped 0.05-0.10 -- exactly the\n"
+                    "recovery move we WANT after Ctrl+G mask expansion.\n"
+                    "\n"
+                    "OFF: cap = RmseCapBase (legacy 1.05x behaviour).\n"
+                    "ON : cap interpolates linearly between RmseCapBase\n"
+                    "     (at diou=0) and RmseCapMax (at diou>=DiouFull).\n"
+                    "     diou is the IoU gain reported in the ACCEPTED /\n"
+                    "     REJECTED log line.\n"
+                    "\n"
+                    "Default OFF -- preserves legacy behaviour.");
+            }
+            ImGui::SliderFloat("RmseCapBase",
+                               &g_ctrlgsRmseCapBase, 1.00f, 1.20f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Cap factor with no IoU improvement (and the only one\n"
+                    "used when Dynamic cap is OFF).\n"
+                    "  1.00 : strict (RMSE cannot increase at all).\n"
+                    "  1.05 : legacy default (5%% tolerance).\n"
+                    "  1.20 : very lenient.\n"
+                    "Always active.");
+            }
+            ImGui::SliderFloat("RmseCapMax",
+                               &g_ctrlgsRmseCapMax, 1.00f, 1.50f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Cap factor when IoU gain saturates (diou>=DiouFull).\n"
+                    "  1.05 : same as base (no loosening).\n"
+                    "  1.15 : recommended starting point.\n"
+                    "  1.30 : aggressive recovery from mask expansion.\n"
+                    "Only effective when 'Dynamic cap' is ON.");
+            }
+            ImGui::SliderFloat("RmseCapDiouFull",
+                               &g_ctrlgsRmseCapDiouFull, 0.00f, 0.20f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "IoU gain at which the dynamic cap reaches RmseCapMax.\n"
+                    "Linear interpolation: (diou=0, cap=Base) to\n"
+                    "(diou>=DiouFull, cap=Max).\n"
+                    "  0.02 : aggressive loosening on tiny IoU gains.\n"
+                    "  0.05 : recommended starting point.\n"
+                    "  0.10 : conservative -- only big IoU gains relax cap.\n"
+                    "Only effective when 'Dynamic cap' is ON.");
+            }
+            ImGui::Separator();
+
+            // Target-mask squash toggle. When ON, the SAM2 target mask
+            // is rasterized through the same triangle-bbox + 1-cell halo
+            // system the source mesh uses, so IoU compares equally-
+            // inflated shapes (fair). When OFF, target uses legacy
+            // per-cell centre sample (asymmetric -- the diagnostic
+            // path for A/B comparison). Default ON.
+            ImGui::Checkbox("Target squash (source-parity raster)",
+                            &CmaesRefineV3RS::g_silTargetSquashEnabled);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Rasterize the SAM2 target mask through the SAME\n"
+                    "raster system the source mesh uses (step x step OR\n"
+                    "coverage + 1-cell halo). Removes the asymmetric bias\n"
+                    "that was capping IoU around 0.63.\n"
+                    "\n"
+                    "  ON  (default): fair, cached app-wide.\n"
+                    "  OFF          : legacy centre-sample (A/B reference).\n"
+                    "\n"
+                    "Cache survives across Ctrl+Shift+G presses and is\n"
+                    "rebuilt only when the SAM2 mask changes.");
+            }
+
+            // Instrument occlusion filter (NEW). When ON, grid cells
+            // covered by instruments (per g_instrumentDistMap) are
+            // excluded from BOTH union and intersection of the IoU
+            // computation. Fixes the asymmetric error where the source
+            // mesh extends behind an instrument occluder but the SAM2
+            // target mask correctly has no liver there. Default OFF so
+            // pre-feature behaviour is preserved byte-for-byte.
+            ImGui::Checkbox("Ignore instrument-occluded pixels",
+                            &g_ctrlgsIgnoreInstrument);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Exclude IoU grid cells that lie under an instrument\n"
+                    "(rasterized through g_instrumentDistMap).\n"
+                    "\n"
+                    "Why: when the source mesh projects onto an area\n"
+                    "covered by a tool, SAM2 correctly has NO liver mask\n"
+                    "there. Without this filter, the source overshoot in\n"
+                    "that occluded area is counted as IoU loss, biasing\n"
+                    "the optimiser toward poses that shrink the mesh\n"
+                    "behind tools (containment failure variant).\n"
+                    "\n"
+                    "Requires instrument_segmentation_mask.png to exist\n"
+                    "and match the liver-mask dimensions. If unavailable,\n"
+                    "the filter is silently disabled for that session.\n"
+                    "\n"
+                    "Default OFF -- pre-feature behaviour preserved.");
+            }
+
+            ImGui::SliderFloat("instrument ignore thresh [px]",
+                               &g_ctrlgsInstrumentThreshPx,
+                               3.0f, 20.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Pixel-distance threshold for the instrument filter.\n"
+                    "Cells whose centre pixel has inst_dist < thresh are\n"
+                    "excluded.\n"
+                    "\n"
+                    "  0.0  : exclude only INSIDE the instrument region.\n"
+                    "  5.0  : also exclude within 5 px of the boundary\n"
+                    "         (compensates for SAM2 mask edge slop).\n"
+                    "         Recommended starting point.\n"
+                    " 10.0+ : aggressive; risk of dropping legitimate\n"
+                    "         silhouette near tools.\n"
+                    "\n"
+                    "Only active when the checkbox above is ON.");
+            }
+            if (g_ctrlgsIgnoreInstrument && !g_instrumentDistMap.valid) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  WARNING: instrument mask not loaded -- filter inactive");
+            }
+
+            ImGui::Checkbox("Show sil projection (after Ctrl+Shift+G)",
+                            &g_silProjShow);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Draw the rim ∩ quadrant subset (the points the\n"
+                    "silhouette loss actually evaluates) as coloured\n"
+                    "spheres in the AR view. No subsampling -- you see\n"
+                    "every point the optimiser was scored against.\n"
+                    "Colour scale by 2D boundary distance:\n"
+                    "  RED  : projection OUTSIDE the SAM mask\n"
+                    "         -> contributes image-diagonal penalty.\n"
+                    "  GREEN  (< 5 px)   : on the silhouette boundary\n"
+                    "  YELLOW (5-30 px)  : near the boundary\n"
+                    "  BLUE   (>= 30 px) : inside the mask\n"
+                    "                       (rim voxel that drifted in)\n"
+                    "Captured once per Ctrl+Shift+G press.");
+            }
+
+            if (g_silProjDebug.valid) {
+                const int n_in  = g_silProjDebug.n_with_signal;
+                const int n_tot = g_silProjDebug.n_visible;
+                const int n_out = std::max(0, n_tot - n_in);
+                const float pct_out = (n_tot > 0)
+                    ? 100.0f * (float)n_out / (float)n_tot : 0.0f;
+                ImGui::Text("  sil viz: %d pts  mean_dist=%.1f px (%.3f norm)",
+                            (int)g_silProjDebug.pts.size(),
+                            g_silProjDebug.mean_dist_px,
+                            g_silProjDebug.mean_dist_norm);
+                ImGui::Text("  out-of-mask: %d / %d (%.1f%%)  in-mask: %d",
+                            n_out, n_tot, pct_out, n_in);
+            } else {
+                ImGui::TextDisabled(
+                    "  sil viz: (press Ctrl+Shift+G to populate)");
+            }
+
+            if (g_silProjShow && !g_boundaryDistMap.valid) {
+                ImGui::TextColored(
+                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                    "  WARNING: g_boundaryDistMap invalid - sil will be skipped");
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Press Ctrl+G to run V3-R with this selection");
+            ImGui::TextDisabled("Press Ctrl+Shift+G to run V3-RS (silhouette anchor)");
+            ImGui::TextDisabled("Press Shift+N / Ctrl+Shift+N for Normal-Compat / SRT polish");
+
+            // [PHASE-5] F9 silhouette IoU toggle — also available from W tab.
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.85f, 1.0f, 0.7f, 1.0f),
+                               "Silhouette IoU diagnostic:");
+            if (ImGui::Button("F9: Toggle Silhouette IoU window##g_f9")) {
+                SilOverlay::g_silOverlay.showWindow =
+                    !SilOverlay::g_silOverlay.showWindow;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(SilOverlay::g_silOverlay.showWindow
+                                    ? "(currently open)"
+                                    : "(currently closed)");
+
+        };  // end g_debugPanel.drawGBody (migrated Ctrl+G Quadrant Selector)
+
+        // ----------------------------------------------------------------
+        //  Normal-Compatible Refine (Shift+N) panel
+        //  -------------------------------------------------------------
+        //  Companion panel to "Ctrl+G Quadrant Selector". Configures the
+        //  finishing-pass refinement that runs after Ctrl+G:
+        //    Apply Init Pose → Ctrl+P → Ctrl+G → Shift+N (polish)
+        //                                       ↘ Ctrl+Shift+N (SRT-Variance polish)
+        //
+        //  Source/target filters are SHARED with Ctrl+G (AR-vis / Caudal /
+        //  Quadrant globals are read by the wrapper directly). Only the
+        //  rim weights (Phase 2 L1) and anchor controls (Phase 3 L2) live
+        //  here, plus per-iteration solver knobs.
+        // ----------------------------------------------------------------
+        // [PHASE-4] Normal-Compatible Refine content relocated into Debug Panel
+        // > N tab. Registered as a hook (lambda capturing frame-loop locals by
+        // reference); rendered by DebugPanel::draw() under the same guard.
+        g_debugPanel.drawNBody = [&]() {
+
+            ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
+                               "Finishing-pass refinement after Ctrl+G");
+            ImGui::Spacing();
+
+            // Master enable.
+            ImGui::Checkbox("Enabled", &g_normRefineEnabled);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Master switch. When OFF, pressing Shift+N or "
+                    "Ctrl+Shift+N logs the abort and does not touch the\n"
+                    "pose. Useful for quickly disabling the feature\n"
+                    "without unbinding the key.");
+            }
+
+            // ---- Live mode toggle (Phase 6) -----------------------------
+            //   ON  : object-tracking-style visualisation — mesh moves
+            //         frame-by-frame as the optimisation progresses.
+            //   OFF : blocking wrapper — mesh snaps to final pose at
+            //         the end of a 4-8s pause. Same math either way.
+            ImGui::SameLine();
+            ImGui::Checkbox("Live mode", &g_normRefineLiveMode);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON  (default): frame-driven refinement.\n"
+                    "  Each render frame runs refineStep, the mesh\n"
+                    "  visibly moves toward the target. Like an SRT-3D\n"
+                    "  object tracker. Press Shift+N again to stop.\n"
+                    "\n"
+                    "OFF: blocking wrapper.\n"
+                    "  The whole loop runs in one frame; the mesh moves\n"
+                    "  once at the end. Faster total wall-clock but no\n"
+                    "  intermediate visualisation. Useful when you only\n"
+                    "  care about the final pose.");
+            }
+            // [Phase 6 UX] Steps/frame slider — directly controls
+            //   animation speed. Only meaningful when Live is ON.
+            if (g_normRefineLiveMode) {
+                ImGui::SliderInt("Steps/frame",
+                                 &g_normRefineLiveStepsPerFrame, 1, 10);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "How many refineStep calls per render frame in\n"
+                        "Live mode. Each refineStep does itersPerFrame\n"
+                        "internal sub-iterations (default 2).\n"
+                        "  1  : slowest, most dramatic animation.\n"
+                        "  3-5: faster but motion still visible.\n"
+                        "  10 : effectively blocking spread over frames.");
+                }
+            }
+
+            // ---- LIVE running banner + Cancel button --------------------
+            if (g_normRefineLiveActive) {
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                                   "● LIVE TRACKING — iter %d / %d",
+                                   g_normRefineLastIter,
+                                   g_normRefineMaxIter);
+                if (g_normRefineLiveCurrentRMSE >= 0.0f) {
+                    ImGui::Text("  current RMSE = %.5f   best = %.5f",
+                                g_normRefineLiveCurrentRMSE,
+                                g_normRefineLastBestRMSE);
+                }
+                ImGui::Text("  initial RMSE = %.5f   gain = %.1f%%",
+                            g_normRefineLastInitialRMSE,
+                            g_normRefineLastInitialRMSE > 0.0f
+                                ? 100.0f * (1.0f - g_normRefineLastBestRMSE
+                                                 / g_normRefineLastInitialRMSE)
+                                : 0.0f);
+                if (g_normRefineLiveAnchorPhase == 1) {
+                    ImGui::TextColored(ImVec4(0.96f, 0.82f, 0.30f, 1.0f),
+                                       "  anchor phase ACTIVE");
+                } else if (g_normRefineLiveAnchorPhase == 0) {
+                    ImGui::TextDisabled("  anchor phase ended (pure NN)");
+                }
+                ImGui::TextDisabled("  (press Shift+N to stop early)");
+                if (ImGui::Button("Cancel (revert)", ImVec2(-1, 0))) {
+                    cancelNormalCompatRefineLive("user-cancel-button");
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Force-abort the live session, revert the mesh\n"
+                        "to its pre-press pose, and save a REJECTED\n"
+                        "entry to the Pose Library.");
+                }
+            }
+
+            // ---- Source filter mirror (read-only status, lives in Ctrl+G panel) ----
+            ImGui::Separator();
+            ImGui::TextDisabled("Source filter (shared with Ctrl+G panel):");
+            {
+                const auto maskStr = LiverLeftRightLabel::quadrantMaskString(
+                    g_activeQuadrantMask);
+                ImGui::Text("  quadrant = %s  (0x%X)",
+                            maskStr.c_str(), (unsigned)g_activeQuadrantMask);
+                ImGui::Text("  AR-vis = %s,  Caudal-only = %s",
+                            g_ctrlgUseArVisFilter ? "ON" : "OFF",
+                            g_ctrlgUseCaudalOnly  ? "ON" : "OFF");
+                if (g_ctrlgUseArVisFilter && g_ctrlgUseCaudalOnly) {
+                    ImGui::Text("  combine = %s",
+                                g_ctrlgArvisCaudalCombine == 1 ? "OR" : "AND");
+                }
+            }
+
+            // ---- Per-iteration solver knobs ----
+            ImGui::Separator();
+            ImGui::TextDisabled("Solver");
+            ImGui::SliderFloat("distanceThreshold",
+                               &g_normRefineDistThresh, 0.01f, 0.50f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Sigmoid centre for the per-correspondence weight.\n"
+                    "Larger -> more far points contribute (good when ICP\n"
+                    "needs long-range attraction). Scales with scene size.\n"
+                    "Header default 0.15.");
+            }
+            ImGui::SliderFloat("minNormalCos",
+                               &g_normRefineMinNormalCos, 0.0f, 0.9f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Annealed start cosine threshold. NormalCompat\n"
+                    "(Shift+N) ignores this; SRT_Variance (Ctrl+Shift+N)\n"
+                    "uses it to reject correspondences whose normals\n"
+                    "disagree more than acos(this) radians at iter 0.\n"
+                    "Header default 0.30 (~72.5° accepted at iter 0).");
+            }
+            ImGui::SliderInt("maxIter", &g_normRefineMaxIter, 20, 500);
+            ImGui::SliderInt("itersPerFrame", &g_normRefineItersPerFrame, 1, 5);
+
+            // ---- Phase 7a: Pure RIM mode -----------------------------
+            //   HARD filter (vs L1's soft weight). When ON, only rim-to-rim
+            //   correspondences are used. Source = liver verts AND
+            //   LiverRegionLabel::RIM (intersected with current quadrant
+            //   / AR-vis / Caudal selection). Target = boundaryDist <
+            //   g_ctrlgRimTgtThreshPx (instrument-aware).
+            //
+            //   Recommended workflow: enable AFTER Ctrl+M (Shape Match,
+            //   Phase 7b) has aligned the rims globally, then Shift+N
+            //   polishes the residual using rim-only ICP.
+            ImGui::Separator();
+            ImGui::Checkbox("RIM-only mode (hard filter)", &g_normRefinePureRim);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Phase 7a: restrict refinement to RIM-to-RIM matches.\n"
+                    "\n"
+                    "Source = liver verts AND LiverRegionLabel::RIM\n"
+                    "         (intersected with current Ctrl+G filters)\n"
+                    "Target = boundaryDist < g_ctrlgRimTgtThreshPx\n"
+                    "         (instrument-aware)\n"
+                    "\n"
+                    "Pros: 4-5x faster, focuses on the curve we care about.\n"
+                    "Cons: rim is roughly 1D, so in-plane rotation is\n"
+                    "      under-constrained — works best AFTER a good\n"
+                    "      initial alignment (Ctrl+G or Ctrl+M).\n"
+                    "\n"
+                    "Independent of beta_rim_src/tgt (L1 weight). L1 betas\n"
+                    "still apply AMONG the rim points that survive the\n"
+                    "filter when both are on.");
+            }
+            if (g_normRefinePureRim) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "[ACTIVE]");
+            }
+
+            // ---- Phase 2 L1: Rim multiplicative weights ----
+            ImGui::Separator();
+            ImGui::TextDisabled("L1: Rim weight (Phase 2)");
+            ImGui::SliderFloat("beta_rim_src",
+                               &g_normRefineBetaRimSrc, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Multiplicative boost for source-rim correspondences.\n"
+                    "  0.0  : source-rim points get the same weight as\n"
+                    "         interior points (header byte-identical).\n"
+                    "  1.0  : rim points contribute DOUBLE.\n"
+                    "  3.0  : rim points contribute 4x.\n"
+                    "Source rim = LiverRegionLabel::RIM (mesh-intrinsic),\n"
+                    "available iff g_liverRegion is computed.");
+            }
+            ImGui::SliderFloat("beta_rim_tgt",
+                               &g_normRefineBetaRimTgt, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Multiplicative boost for target-rim correspondences.\n"
+                    "Target rim = boundaryDist < g_ctrlgRimTgtThreshPx\n"
+                    "(image-side rim membership; same threshold the\n"
+                    "Ctrl+G panel uses, so changing the slider there\n"
+                    "also changes what counts as 'rim' here).");
+            }
+            ImGui::TextDisabled("Tgt rim threshold (Ctrl+G panel): %.1f px",
+                                g_ctrlgRimTgtThreshPx);
+
+            // ---- Phase 3 L2: Anchor pair carry-over from last Ctrl+G ----
+            ImGui::Separator();
+            ImGui::TextDisabled("L2: Anchor pair (Phase 3)");
+
+            const bool anchorAvail =
+                !g_lastRimPairSrcVertIdx.empty() &&
+                (g_lastRimPairSrcVertIdx.size() == g_lastRimPairTgtPos.size());
+            if (anchorAvail) {
+                ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
+                                   "  %d anchor pairs available",
+                                   (int)g_lastRimPairSrcVertIdx.size());
+            } else {
+                ImGui::TextColored(ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
+                                   "  No anchor pairs (run Ctrl+G first)");
+            }
+
+            ImGui::Checkbox("Use anchor pairs", &g_normRefineUseAnchor);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Use the rim-pair correspondences captured by the\n"
+                    "most-recent Ctrl+G / Ctrl+Shift+G (Phase F.5) as a\n"
+                    "warm start. During the first anchorPhaseIter outer\n"
+                    "iterations, anchored vertices use the anchor target\n"
+                    "instead of the runtime KDTree nearest neighbour.\n"
+                    "After the phase ends, anchors are silently dropped\n"
+                    "and the loop converges via pure NN.\n"
+                    "\n"
+                    "When NO anchors are available (e.g. fresh session),\n"
+                    "this toggle has no effect — the wrapper passes empty\n"
+                    "anchor arrays and runs in pure-NN mode.");
+            }
+            ImGui::SliderInt("anchorPhaseIter",
+                             &g_normRefineAnchorPhaseIter, 0, 100);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Number of outer iterations during which anchors\n"
+                    "override KDTree NN for vertices that own an anchor.\n"
+                    "0 = effectively disable anchors; 20 = default;\n"
+                    "100 = run anchored to the very end (rarely useful).");
+            }
+            ImGui::SliderFloat("anchorBlend",
+                               &g_normRefineAnchorBlend, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Blend factor inside the anchor phase:\n"
+                    "  1.0 : pure anchor (target = anchor position).\n"
+                    "  0.5 : midpoint between anchor and current NN.\n"
+                    "  0.0 : ignore anchor entirely (= toggle OFF).");
+            }
+
+            // ---- Last-session status ----
+            ImGui::Separator();
+            ImGui::TextDisabled("Status (last session)");
+            if (g_normRefineLastInitialRMSE >= 0.0f) {
+                const char* methodName =
+                    (g_normRefineLastMethod == 1)
+                        ? "SRT_VARIANCE" : "NORMAL_COMPAT";
+                ImGui::Text("  method: %s", methodName);
+                ImGui::Text("  iter: %d / %d   initialRMSE: %.5f",
+                            g_normRefineLastIter, g_normRefineMaxIter,
+                            g_normRefineLastInitialRMSE);
+                ImGui::Text("  bestRMSE: %.5f   %s   %s",
+                            g_normRefineLastBestRMSE,
+                            g_normRefineLastConverged ? "converged" : "max-iter",
+                            g_normRefineLastAccepted  ? "ACCEPTED"  : "REJECTED");
+            } else {
+                ImGui::TextDisabled("  (no session yet — press Shift+N)");
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Shift+N: Normal-Compat   |   "
+                                "Ctrl+Shift+N: SRT-Variance");
+
+        };  // end g_debugPanel.drawNBody (migrated Normal-Compatible Refine)
+
+        // [PHASE-7] ScreenMesh Display content relocated into Debug Panel > Viz
+        // tab (rendered after the Phase-2 Cluster/CorresPoints section).
+        // Registered as a hook; also surfaces the B/N-key visualization toggles.
+        // Standalone floating window removed.
+        g_debugPanel.drawVizExtra = [&]() {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Other markers:");
+            ImGui::Checkbox("Boundary candidates (was B)##viz_b",
+                            &g_showBoundaryCandidates);
+            ImGui::Checkbox("Source visualization (was N)##viz_n",
+                            &g_showSourceVisualization);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Screen mesh rendering:");
+            ImGui::Checkbox("Draw as points (lightweight)", &g_screenMeshAsPoints);
+            if (g_screenMeshAsPoints) {
+                ImGui::SliderFloat("Point size [px]",
+                                   &g_screenMeshPointSize,
+                                   1.0f, 8.0f, "%.1f");
+                ImGui::SliderFloat("Density [%]",
+                                   &g_screenMeshDensity,
+                                   1.0f, 100.0f, "%.0f");
+                if (ImGui::Button("Reshuffle")) {
+                    g_screenMeshPC.requestReshuffle();
+                }
+                // 表示中の頂点数の情報
+                const size_t total = g_screenMeshPC.totalVerts;
+                if (total > 0) {
+                    const size_t drawn = std::max<size_t>(
+                        1, (size_t)((double)total
+                                  * (double)g_screenMeshDensity / 100.0));
+                    ImGui::SameLine();
+                    ImGui::Text("(%zu / %zu pts)", drawn, total);
+                }
+            }
+            ImGui::Separator();
+            ImGui::Checkbox("Show debug AABB (red=target, green=source)",
+                            &g_showDebugBB);
+            if (g_showDebugBB) {
+                ImGui::TextDisabled("Source AABB is post-Apply state");
+                if (g_dbgSourceBB_valid && g_targetAabbFull.valid) {
+                    glm::vec3 err = g_dbgSourceBB_center - g_targetAabbFull.center;
+                    float d = glm::length(err);
+                    ImGui::Text("|err| = %.4f m  (%.1f mm)", d, d * 1000.0f);
+                }
+            }
+
+            // ---- [Phase 1] viz toggles migrated from keyboard ---------------
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                               "Visualization toggles (formerly keyboard):");
+
+            // [Phase 5.5] Cluster viz (was V) already exists above as
+            // drawTabViz's "Cluster markers" (onToggleClusterVis). Duplicate
+            // checkbox removed to avoid two toggles for the same global.
+
+            // B key family (cyclic correspondence: pure toggle; needs Shift+P
+            // to have run first to have pairs to show).
+            ImGui::Checkbox("Cyclic Correspondence - Shift+P pairs (was Shift+B)##viz_cyclic",
+                            &g_showCyclicCorrespondence);
+
+            // W key family — enabling must POPULATE the overlay data (mirror the
+            // old plain-W / Shift+W keys), otherwise the flag is on but nothing
+            // is drawn. On populate failure the toggle is reverted.
+            if (ImGui::Checkbox("Debug Source Rim Chain - green dots (was W)##viz_rim_src",
+                                &g_showDebugSourceRimChain)) {
+                if (g_showDebugSourceRimChain) {
+                    if (!g_liverRegion.valid()) recomputeLiverRegion();
+                    if (!g_liverLR.valid())     recomputeLiverLR();
+                    if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) recomputeLiverCC();
+                    if (!populateDebugSourceRimChain()) g_showDebugSourceRimChain = false;
+                }
+            }
+            if (ImGui::Checkbox("Debug Target Boundary - purple dots (was Shift+W)##viz_rim_tgt",
+                                &g_showDebugTargetBoundary)) {
+                if (g_showDebugTargetBoundary) {
+                    if (!populateDebugTargetBoundary()) g_showDebugTargetBoundary = false;
+                }
+            }
+
+            // Liver label viz
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Liver labels:");
+            if (ImGui::Checkbox("Liver Region (anterior/rim/posterior) - was Shift+R##viz_region",
+                                &g_showLiverRegion)) {
+                if (g_showLiverRegion && !g_liverRegion.valid()) recomputeLiverRegion();
+            }
+            if (ImGui::Checkbox("Liver Left/Right - was Y##viz_lr",
+                                &g_showLiverLR)) {
+                if (g_showLiverLR && !g_liverLR.valid()) recomputeLiverLR();
+            }
+            if (ImGui::Checkbox("Liver Cranio/Caudal - was Shift+H##viz_cc",
+                                &g_showLiverCC)) {
+                if (g_showLiverCC && !g_liverCC.valid()) recomputeLiverCC();
+            }
+            if (ImGui::Checkbox("Liver 4-Quadrant overlay - was H##viz_quad",
+                                &g_showLiverQuad)) {
+                if (g_showLiverQuad &&
+                    g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
+                    g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty()) {
+                    recomputeLiverQuad();
+                }
+            }
+
+            // Recompute buttons (formerly Shift+T / Shift+Y)
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Recompute labels:");
+            if (ImGui::Button("Recompute Region  (was Shift+T)##btn_recompute_region")) {
+                std::cout << "[Region] recomputing with target_rim_mm = "
+                          << g_rimTargetMm << std::endl;
+                recomputeLiverRegion();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Recompute LR  (was Shift+Y)##btn_recompute_lr")) {
+                std::cout << "[LR] recomputing  right_pure_fraction = "
+                          << g_lrPureFrac << "  right_full_fraction = "
+                          << g_lrFullFrac << std::endl;
+                recomputeLiverLR();
+            }
+
+            // Debug dumps (formerly Shift+I / F10)
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Debug dumps:");
+            if (ImGui::Button("Dump IoU debug PNG  (was Shift+I)##btn_iou_dump")) {
+                if (gApp.mode == AppMode::kRegistration) {
+                    glm::mat4 silView = buildSilhouetteView();
+                    glm::mat4 silProj = buildSilhouetteProj();
+                    int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+                    int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+                    IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
+                                   liverMesh3D, silView, silProj, silW, silH, 8);
+                } else {
+                    std::cout << "[IoU dump] requires Registration mode" << std::endl;
+                }
+            }
+            if (ImGui::Button("Vertex-Squash diagnose  (was F10)##btn_vsq_diag")) {
+                diagnoseVertexSquashV3RS(g_activeQuadrantMask);
+            }
+            // [key-reorg Phase 11] F9 -> checkbox for the Silhouette IoU window.
+            ImGui::Checkbox("Show Silhouette Overlay window  (was F9)##viz_sil_overlay",
+                            &SilOverlay::g_silOverlay.showWindow);
+            // ---- end Phase 1 migration -------------------------------------
+        };  // end g_debugPanel.drawVizExtra (migrated ScreenMesh Display + B/N viz)
+
+        g_debugPanel.drawWExtra = [&]() {
+            // Migrated from drawGBody (G/W split): Shape Match parameters for
+            // Ctrl+W / Alt+W / Ctrl+Shift+W / Ctrl+Alt+W. Same [&] capture
+            // scope as drawGBody, so every g_shapeMatch* / g_silhouetteSweep* /
+            // g_ctrlgRim* / g_debugShapeMatch* symbol resolves identically.
+            // Includes the Shape Match CollapsingHeader (Steps 3a-3d) AND the
+            // rot / sign / ICP / rim-axis-sweep params that used to sit below it.
 
             // ===============================================================
             // Phase 7b Step 3a/3b — Shape Match (Ctrl+W / Alt+W) panel
@@ -5657,876 +7264,7 @@ int main(int argc, char** argv) {
                                   "OFF = Variant A only (~700ms faster).");
             }
 
-            ImGui::Checkbox("Show RIM pairs",
-                            &g_ctrlgShowRimPairs);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Visualize the rim sets used by beta "
-                                  "weighting:\n  orange = source RIM (mesh-intrinsic)\n"
-                                  "  magenta = target RIM (image boundary).\n"
-                                  "Buffers are populated at next Ctrl+G press.");
-            }
-
-            // 状態表示: viz バッファの中身が分かるとデバッグしやすい
-            if (g_ctrlgRimVizAvailable) {
-                ImGui::Text("RimViz buffers: src=%d  tgt=%d",
-                            (int)g_ctrlgRimSrcVertIdx.size(),
-                            (int)g_ctrlgRimTgtPos.size());
-            } else if (g_ctrlgShowRimPairs) {
-                ImGui::TextDisabled(
-                    "RimViz: press Ctrl+G to populate");
-            }
-
-            // -----------------------------------------------------------
-            // [Phase D] Colored RIM pairs (K representatives).
-            //   Independent from Show RIM pairs above. Shows K paired
-            //   source+target spheres in matching HSV colors so the
-            //   operator can see WHICH rim vertex maps to WHICH target
-            //   point at the current pose. Pairs are sampled from the
-            //   ~20k captured at Ctrl+G Phase F.5 (or restored from a
-            //   PoseLibrary entry after Apply). 4 sampling modes:
-            //     - ArcUniform: even spacing around tgt centroid (default)
-            //     - WorstK    : K longest src-tgt distances (diagnostic)
-            //     - BestK     : K shortest distances
-            //     - Random    : seeded uniform (reshufflable)
-            // -----------------------------------------------------------
-            ImGui::Checkbox("Show colored pairs (K)",
-                            &g_ctrlgShowColoredRimPairs);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Overlay K representative rim-rim pairs "
-                                  "drawn in matching HSV colors so each "
-                                  "src↔tgt mapping is visually identifiable.\n"
-                                  "Data source: g_lastRimPair* (set by "
-                                  "Ctrl+G / Ctrl+Shift+G Phase F.5; restored "
-                                  "by Pose Library Apply).\n"
-                                  "Pairs follow the mesh through subsequent "
-                                  "ICP/Apply (source is a full-mesh vertex "
-                                  "index; target is fixed world coords).\n"
-                                  "Independent from Show RIM pairs above — "
-                                  "leave both ON for max info.");
-            }
-            if (g_ctrlgShowColoredRimPairs) {
-                ImGui::Indent();
-                ImGui::SliderInt("K pairs", &g_ctrlgColoredRimN, 5, 30);
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("How many representative pairs to draw "
-                                      "(5–30). 10 is the sweet spot — small "
-                                      "enough to differentiate by HSV hue, "
-                                      "large enough to span the rim.");
-                }
-                const char* modeItems =
-                    "ArcUniform\0WorstK\0BestK\0Random\0";
-                ImGui::Combo("Sample mode",
-                             &g_ctrlgColoredRimMode, modeItems);
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(
-                        "ArcUniform : evenly spaced around tgt centroid "
-                        "(stable across runs — default).\n"
-                        "WorstK     : K longest src↔tgt distances "
-                        "(diagnostic: where is the rim misaligned?).\n"
-                        "BestK      : K shortest distances "
-                        "(sanity check).\n"
-                        "Random     : seeded uniform sample. Use the "
-                        "Reshuffle button to draw a new sample.");
-                }
-                // Reshuffle only affects Random mode (other modes are
-                // deterministic). Disable the button outside Random so
-                // the UI signals this clearly instead of accepting clicks
-                // that produce no visible change.
-                const bool reshuffleActive =
-                    (g_ctrlgColoredRimMode ==
-                     (int)RimPairSampling::Mode::Random);
-                if (!reshuffleActive) ImGui::BeginDisabled();
-                if (ImGui::Button("Reshuffle")) {
-                    g_ctrlgColoredRimSeed++;
-                }
-                if (!reshuffleActive) ImGui::EndDisabled();
-                if (ImGui::IsItemHovered()) {
-                    if (reshuffleActive) {
-                        ImGui::SetTooltip(
-                            "Draw a new K-sample with a fresh seed.\n"
-                            "Active only in Random mode.");
-                    } else {
-                        ImGui::SetTooltip(
-                            "Reshuffle is only available in Random mode.\n"
-                            "ArcUniform / WorstK / BestK are deterministic — "
-                            "pressing this button would have no effect.");
-                    }
-                }
-                ImGui::SameLine();
-                if (!g_lastRimPairSrcVertIdx.empty()) {
-                    ImGui::TextDisabled("(%d pairs avail.)",
-                                        (int)g_lastRimPairSrcVertIdx.size());
-                } else {
-                    ImGui::TextDisabled("(no pairs — press Ctrl+G)");
-                }
-                ImGui::Unindent();
-            }
-
-            // -----------------------------------------------------------
-            //  Ctrl+Shift+G (V3-RS, silhouette anchor) - inline section.
-            //  Placed inside the Ctrl+G panel so it is always visible
-            //  alongside beta / AR-vis / Caudal. These controls are
-            //  read only when Ctrl+Shift+G is pressed; plain Ctrl+G
-            //  ignores them entirely.
-            // -----------------------------------------------------------
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.5f, 1.0f),
-                               "Ctrl+Shift+G silhouette anchor");
-
-            ImGui::SliderFloat("lambda_sil",
-                               &g_ctrlgsLambdaSil, 0.0f, 1.0f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Silhouette anchor strength for Ctrl+Shift+G.\n"
-                    "  0.00 : V3R-W behaviour (use Ctrl+G instead).\n"
-                    "  0.10 : weak.\n"
-                    "  0.30 : recommended starting point.\n"
-                    "  1.00 : silhouette-dominant.\n"
-                    "Plain Ctrl+G ignores this slider.");
-            }
-
-            // ----- [NEW UI-1a] Asymmetric outside-ratio penalty -------
-            ImGui::Checkbox("Asymmetric outside-ratio penalty (mask-expansion brake)",
-                            &g_ctrlgsUseOutsideRatio);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Add an ASYMMETRIC penalty to the Ctrl+Shift+G cost:\n"
-                    "  cost += lambda_out * (source AND NOT target) / source\n"
-                    "\n"
-                    "Symmetric (1-IoU) penalises source-contains-target only\n"
-                    "weakly: a fully-containing source has IoU < 1 but the\n"
-                    "gradient toward shrinking is small. This term directly\n"
-                    "measures the FRACTION of source raster outside the\n"
-                    "target, putting a one-sided pull toward source-in-target.\n"
-                    "  0   : source is inside target (no penalty).\n"
-                    "  1   : no overlap (max penalty).\n"
-                    "\n"
-                    "Default OFF -- byte-identical to pre-feature behaviour.\n"
-                    "Recommended when Ctrl+G has drifted into mask expansion.");
-            }
-            ImGui::SliderFloat("lambda_out",
-                               &g_ctrlgsLambdaOut, 0.0f, 2.0f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Weight for the asymmetric outside-ratio penalty.\n"
-                    "  0.0  : no effect (same as checkbox OFF).\n"
-                    "  0.3  : weak brake on mask expansion.\n"
-                    "  0.5  : recommended starting point.\n"
-                    "  1.0+ : aggressive shrink toward source inside target.\n"
-                    "Only active when the checkbox above is ON.");
-            }
-
-            // ----- [NEW UI-1b] RIM silhouette penalty ----------------
-            ImGui::Checkbox("RIM silhouette penalty (boundary-to-boundary)",
-                            &g_ctrlgsUseRimSil);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Add a boundary-alignment penalty to the cost:\n"
-                    "  cost += lambda_rim_sil * mean(dist_to_target_boundary)\n"
-                    "\n"
-                    "Evaluated only at SOURCE-BOUNDARY raster cells (source\n"
-                    "cells with at least one non-source 4-neighbour). For\n"
-                    "each such cell:\n"
-                    "  outside target mask -> contribute 1.0 (max).\n"
-                    "  inside target mask  -> contribute min(d/max_px, 1.0)\n"
-                    "where d is the image-pixel distance to the target\n"
-                    "silhouette boundary, from the SAM2 distance map.\n"
-                    "\n"
-                    "Silhouette-space analogue of Ctrl+G's beta-rim weighting:\n"
-                    "forces source RIM to target RIM coincidence rather than\n"
-                    "mere area overlap. Catches drift patterns where source\n"
-                    "covers target area well but with bulges/dents at the rim.\n"
-                    "\n"
-                    "Default OFF.");
-            }
-            ImGui::SliderFloat("lambda_rim_sil",
-                               &g_ctrlgsLambdaRimSil, 0.0f, 2.0f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Weight for the RIM silhouette penalty.\n"
-                    "  0.0  : no effect.\n"
-                    "  0.2  : weak.\n"
-                    "  0.3  : recommended starting point.\n"
-                    "  1.0+ : boundary-dominant.\n"
-                    "Only active when 'RIM silhouette penalty' is ON.");
-            }
-            ImGui::SliderFloat("rim_sil_max_px",
-                               &g_ctrlgsRimSilMaxPx, 10.0f, 300.0f, "%.0f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Image-pixel normalisation cap for the RIM penalty.\n"
-                    "Source-boundary cells AT the target boundary contribute\n"
-                    "0; cells >= max_px away from the boundary saturate to 1.\n"
-                    "  50  : tight (small drift heavily penalised).\n"
-                    "  100 : recommended starting point.\n"
-                    "  200 : loose (only large drift penalised).\n"
-                    "Only active when 'RIM silhouette penalty' is ON.");
-            }
-
-            // [NEW UI-RIM-ANAT] Anatomic-mode toggle
-            ImGui::Checkbox("Use anatomical RIM (vs. raster boundary)",
-                            &g_ctrlgsRimSilAnatomic);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Switch the source-rim definition between two modes:\n"
-                    "\n"
-                    "OFF (legacy raster boundary):\n"
-                    "  Source RIM = every cell on the rasterised silhouette\n"
-                    "  outline (4-neighbour test on the source hitmap).\n"
-                    "  Includes the outlines of detached blobs / artefacts;\n"
-                    "  doesn't know anything about anatomy. Pure geometric.\n"
-                    "\n"
-                    "ON (anatomical RIM):\n"
-                    "  Source RIM = vertices labelled LiverRegionLabel::RIM,\n"
-                    "  filtered by quadrant + AR-vis + Caudal the SAME way\n"
-                    "  the Ctrl+G 'Show RIM pairs' checkbox filters them.\n"
-                    "  These are exactly the orange spheres you see in the\n"
-                    "  AR view when RimViz is enabled. rim_sil is the mean\n"
-                    "  distance from each VISIBLE projected RIM vertex to\n"
-                    "  the target silhouette boundary.\n"
-                    "\n"
-                    "F9 viz: in anatomic mode, panels 4 & 6 highlight cells\n"
-                    "where any anatomical RIM vertex projected, NOT the full\n"
-                    "silhouette outline. Lets you check whether the rim\n"
-                    "Ctrl+G already cares about coincides with the SAM2\n"
-                    "boundary.\n"
-                    "\n"
-                    "Only active when 'RIM silhouette penalty' is ON.\n"
-                    "Default OFF -- legacy behaviour.");
-            }
-            if (g_ctrlgsRimSilAnatomic && !g_ctrlgsUseRimSil) {
-                ImGui::TextColored(
-                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
-                    "  NOTE: anatomic toggle ON but rim_sil penalty OFF -- has no effect");
-            }
-
-            // ----- [NEW UI-1c] Dynamic RMSE cap for Phase E ----------
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
-                               "Phase E RMSE acceptance cap");
-            ImGui::Checkbox("Dynamic cap (loosen on IoU gain)",
-                            &g_ctrlgsUseDynamicCap);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Layer 3 (Phase E) rejects candidates whose RMSE exceeds\n"
-                    "rmse_before * cap_factor. The legacy fixed cap (1.05x)\n"
-                    "can block silhouette-improving candidates whose RMSE\n"
-                    "rose 6-10%% while IoU jumped 0.05-0.10 -- exactly the\n"
-                    "recovery move we WANT after Ctrl+G mask expansion.\n"
-                    "\n"
-                    "OFF: cap = RmseCapBase (legacy 1.05x behaviour).\n"
-                    "ON : cap interpolates linearly between RmseCapBase\n"
-                    "     (at diou=0) and RmseCapMax (at diou>=DiouFull).\n"
-                    "     diou is the IoU gain reported in the ACCEPTED /\n"
-                    "     REJECTED log line.\n"
-                    "\n"
-                    "Default OFF -- preserves legacy behaviour.");
-            }
-            ImGui::SliderFloat("RmseCapBase",
-                               &g_ctrlgsRmseCapBase, 1.00f, 1.20f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Cap factor with no IoU improvement (and the only one\n"
-                    "used when Dynamic cap is OFF).\n"
-                    "  1.00 : strict (RMSE cannot increase at all).\n"
-                    "  1.05 : legacy default (5%% tolerance).\n"
-                    "  1.20 : very lenient.\n"
-                    "Always active.");
-            }
-            ImGui::SliderFloat("RmseCapMax",
-                               &g_ctrlgsRmseCapMax, 1.00f, 1.50f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Cap factor when IoU gain saturates (diou>=DiouFull).\n"
-                    "  1.05 : same as base (no loosening).\n"
-                    "  1.15 : recommended starting point.\n"
-                    "  1.30 : aggressive recovery from mask expansion.\n"
-                    "Only effective when 'Dynamic cap' is ON.");
-            }
-            ImGui::SliderFloat("RmseCapDiouFull",
-                               &g_ctrlgsRmseCapDiouFull, 0.00f, 0.20f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "IoU gain at which the dynamic cap reaches RmseCapMax.\n"
-                    "Linear interpolation: (diou=0, cap=Base) to\n"
-                    "(diou>=DiouFull, cap=Max).\n"
-                    "  0.02 : aggressive loosening on tiny IoU gains.\n"
-                    "  0.05 : recommended starting point.\n"
-                    "  0.10 : conservative -- only big IoU gains relax cap.\n"
-                    "Only effective when 'Dynamic cap' is ON.");
-            }
-            ImGui::Separator();
-
-            // Target-mask squash toggle. When ON, the SAM2 target mask
-            // is rasterized through the same triangle-bbox + 1-cell halo
-            // system the source mesh uses, so IoU compares equally-
-            // inflated shapes (fair). When OFF, target uses legacy
-            // per-cell centre sample (asymmetric -- the diagnostic
-            // path for A/B comparison). Default ON.
-            ImGui::Checkbox("Target squash (source-parity raster)",
-                            &CmaesRefineV3RS::g_silTargetSquashEnabled);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Rasterize the SAM2 target mask through the SAME\n"
-                    "raster system the source mesh uses (step x step OR\n"
-                    "coverage + 1-cell halo). Removes the asymmetric bias\n"
-                    "that was capping IoU around 0.63.\n"
-                    "\n"
-                    "  ON  (default): fair, cached app-wide.\n"
-                    "  OFF          : legacy centre-sample (A/B reference).\n"
-                    "\n"
-                    "Cache survives across Ctrl+Shift+G presses and is\n"
-                    "rebuilt only when the SAM2 mask changes.");
-            }
-
-            // Instrument occlusion filter (NEW). When ON, grid cells
-            // covered by instruments (per g_instrumentDistMap) are
-            // excluded from BOTH union and intersection of the IoU
-            // computation. Fixes the asymmetric error where the source
-            // mesh extends behind an instrument occluder but the SAM2
-            // target mask correctly has no liver there. Default OFF so
-            // pre-feature behaviour is preserved byte-for-byte.
-            ImGui::Checkbox("Ignore instrument-occluded pixels",
-                            &g_ctrlgsIgnoreInstrument);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Exclude IoU grid cells that lie under an instrument\n"
-                    "(rasterized through g_instrumentDistMap).\n"
-                    "\n"
-                    "Why: when the source mesh projects onto an area\n"
-                    "covered by a tool, SAM2 correctly has NO liver mask\n"
-                    "there. Without this filter, the source overshoot in\n"
-                    "that occluded area is counted as IoU loss, biasing\n"
-                    "the optimiser toward poses that shrink the mesh\n"
-                    "behind tools (containment failure variant).\n"
-                    "\n"
-                    "Requires instrument_segmentation_mask.png to exist\n"
-                    "and match the liver-mask dimensions. If unavailable,\n"
-                    "the filter is silently disabled for that session.\n"
-                    "\n"
-                    "Default OFF -- pre-feature behaviour preserved.");
-            }
-
-            ImGui::SliderFloat("instrument ignore thresh [px]",
-                               &g_ctrlgsInstrumentThreshPx,
-                               3.0f, 20.0f, "%.1f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Pixel-distance threshold for the instrument filter.\n"
-                    "Cells whose centre pixel has inst_dist < thresh are\n"
-                    "excluded.\n"
-                    "\n"
-                    "  0.0  : exclude only INSIDE the instrument region.\n"
-                    "  5.0  : also exclude within 5 px of the boundary\n"
-                    "         (compensates for SAM2 mask edge slop).\n"
-                    "         Recommended starting point.\n"
-                    " 10.0+ : aggressive; risk of dropping legitimate\n"
-                    "         silhouette near tools.\n"
-                    "\n"
-                    "Only active when the checkbox above is ON.");
-            }
-            if (g_ctrlgsIgnoreInstrument && !g_instrumentDistMap.valid) {
-                ImGui::TextColored(
-                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
-                    "  WARNING: instrument mask not loaded -- filter inactive");
-            }
-
-            ImGui::Checkbox("Show sil projection (after Ctrl+Shift+G)",
-                            &g_silProjShow);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Draw the rim ∩ quadrant subset (the points the\n"
-                    "silhouette loss actually evaluates) as coloured\n"
-                    "spheres in the AR view. No subsampling -- you see\n"
-                    "every point the optimiser was scored against.\n"
-                    "Colour scale by 2D boundary distance:\n"
-                    "  RED  : projection OUTSIDE the SAM mask\n"
-                    "         -> contributes image-diagonal penalty.\n"
-                    "  GREEN  (< 5 px)   : on the silhouette boundary\n"
-                    "  YELLOW (5-30 px)  : near the boundary\n"
-                    "  BLUE   (>= 30 px) : inside the mask\n"
-                    "                       (rim voxel that drifted in)\n"
-                    "Captured once per Ctrl+Shift+G press.");
-            }
-
-            if (g_silProjDebug.valid) {
-                const int n_in  = g_silProjDebug.n_with_signal;
-                const int n_tot = g_silProjDebug.n_visible;
-                const int n_out = std::max(0, n_tot - n_in);
-                const float pct_out = (n_tot > 0)
-                    ? 100.0f * (float)n_out / (float)n_tot : 0.0f;
-                ImGui::Text("  sil viz: %d pts  mean_dist=%.1f px (%.3f norm)",
-                            (int)g_silProjDebug.pts.size(),
-                            g_silProjDebug.mean_dist_px,
-                            g_silProjDebug.mean_dist_norm);
-                ImGui::Text("  out-of-mask: %d / %d (%.1f%%)  in-mask: %d",
-                            n_out, n_tot, pct_out, n_in);
-            } else {
-                ImGui::TextDisabled(
-                    "  sil viz: (press Ctrl+Shift+G to populate)");
-            }
-
-            if (g_silProjShow && !g_boundaryDistMap.valid) {
-                ImGui::TextColored(
-                    ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
-                    "  WARNING: g_boundaryDistMap invalid - sil will be skipped");
-            }
-
-            ImGui::Separator();
-            ImGui::TextDisabled("Press Ctrl+G to run V3-R with this selection");
-            ImGui::TextDisabled("Press Ctrl+Shift+G to run V3-RS (silhouette anchor)");
-            ImGui::TextDisabled("Press Shift+N / Ctrl+Shift+N for Normal-Compat / SRT polish");
-
-            // [PHASE-5] F9 silhouette IoU toggle — also available from W tab.
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.85f, 1.0f, 0.7f, 1.0f),
-                               "Silhouette IoU diagnostic:");
-            if (ImGui::Button("F9: Toggle Silhouette IoU window##g_f9")) {
-                SilOverlay::g_silOverlay.showWindow =
-                    !SilOverlay::g_silOverlay.showWindow;
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled(SilOverlay::g_silOverlay.showWindow
-                                    ? "(currently open)"
-                                    : "(currently closed)");
-
-        };  // end g_debugPanel.drawGBody (migrated Ctrl+G Quadrant Selector)
-
-        // ----------------------------------------------------------------
-        //  Normal-Compatible Refine (Shift+N) panel
-        //  -------------------------------------------------------------
-        //  Companion panel to "Ctrl+G Quadrant Selector". Configures the
-        //  finishing-pass refinement that runs after Ctrl+G:
-        //    Apply Init Pose → Ctrl+P → Ctrl+G → Shift+N (polish)
-        //                                       ↘ Ctrl+Shift+N (SRT-Variance polish)
-        //
-        //  Source/target filters are SHARED with Ctrl+G (AR-vis / Caudal /
-        //  Quadrant globals are read by the wrapper directly). Only the
-        //  rim weights (Phase 2 L1) and anchor controls (Phase 3 L2) live
-        //  here, plus per-iteration solver knobs.
-        // ----------------------------------------------------------------
-        // [PHASE-4] Normal-Compatible Refine content relocated into Debug Panel
-        // > N tab. Registered as a hook (lambda capturing frame-loop locals by
-        // reference); rendered by DebugPanel::draw() under the same guard.
-        g_debugPanel.drawNBody = [&]() {
-
-            ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
-                               "Finishing-pass refinement after Ctrl+G");
-            ImGui::Spacing();
-
-            // Master enable.
-            ImGui::Checkbox("Enabled", &g_normRefineEnabled);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Master switch. When OFF, pressing Shift+N or "
-                    "Ctrl+Shift+N logs the abort and does not touch the\n"
-                    "pose. Useful for quickly disabling the feature\n"
-                    "without unbinding the key.");
-            }
-
-            // ---- Live mode toggle (Phase 6) -----------------------------
-            //   ON  : object-tracking-style visualisation — mesh moves
-            //         frame-by-frame as the optimisation progresses.
-            //   OFF : blocking wrapper — mesh snaps to final pose at
-            //         the end of a 4-8s pause. Same math either way.
-            ImGui::SameLine();
-            ImGui::Checkbox("Live mode", &g_normRefineLiveMode);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "ON  (default): frame-driven refinement.\n"
-                    "  Each render frame runs refineStep, the mesh\n"
-                    "  visibly moves toward the target. Like an SRT-3D\n"
-                    "  object tracker. Press Shift+N again to stop.\n"
-                    "\n"
-                    "OFF: blocking wrapper.\n"
-                    "  The whole loop runs in one frame; the mesh moves\n"
-                    "  once at the end. Faster total wall-clock but no\n"
-                    "  intermediate visualisation. Useful when you only\n"
-                    "  care about the final pose.");
-            }
-            // [Phase 6 UX] Steps/frame slider — directly controls
-            //   animation speed. Only meaningful when Live is ON.
-            if (g_normRefineLiveMode) {
-                ImGui::SliderInt("Steps/frame",
-                                 &g_normRefineLiveStepsPerFrame, 1, 10);
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(
-                        "How many refineStep calls per render frame in\n"
-                        "Live mode. Each refineStep does itersPerFrame\n"
-                        "internal sub-iterations (default 2).\n"
-                        "  1  : slowest, most dramatic animation.\n"
-                        "  3-5: faster but motion still visible.\n"
-                        "  10 : effectively blocking spread over frames.");
-                }
-            }
-
-            // ---- LIVE running banner + Cancel button --------------------
-            if (g_normRefineLiveActive) {
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
-                                   "● LIVE TRACKING — iter %d / %d",
-                                   g_normRefineLastIter,
-                                   g_normRefineMaxIter);
-                if (g_normRefineLiveCurrentRMSE >= 0.0f) {
-                    ImGui::Text("  current RMSE = %.5f   best = %.5f",
-                                g_normRefineLiveCurrentRMSE,
-                                g_normRefineLastBestRMSE);
-                }
-                ImGui::Text("  initial RMSE = %.5f   gain = %.1f%%",
-                            g_normRefineLastInitialRMSE,
-                            g_normRefineLastInitialRMSE > 0.0f
-                                ? 100.0f * (1.0f - g_normRefineLastBestRMSE
-                                                 / g_normRefineLastInitialRMSE)
-                                : 0.0f);
-                if (g_normRefineLiveAnchorPhase == 1) {
-                    ImGui::TextColored(ImVec4(0.96f, 0.82f, 0.30f, 1.0f),
-                                       "  anchor phase ACTIVE");
-                } else if (g_normRefineLiveAnchorPhase == 0) {
-                    ImGui::TextDisabled("  anchor phase ended (pure NN)");
-                }
-                ImGui::TextDisabled("  (press Shift+N to stop early)");
-                if (ImGui::Button("Cancel (revert)", ImVec2(-1, 0))) {
-                    cancelNormalCompatRefineLive("user-cancel-button");
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(
-                        "Force-abort the live session, revert the mesh\n"
-                        "to its pre-press pose, and save a REJECTED\n"
-                        "entry to the Pose Library.");
-                }
-            }
-
-            // ---- Source filter mirror (read-only status, lives in Ctrl+G panel) ----
-            ImGui::Separator();
-            ImGui::TextDisabled("Source filter (shared with Ctrl+G panel):");
-            {
-                const auto maskStr = LiverLeftRightLabel::quadrantMaskString(
-                    g_activeQuadrantMask);
-                ImGui::Text("  quadrant = %s  (0x%X)",
-                            maskStr.c_str(), (unsigned)g_activeQuadrantMask);
-                ImGui::Text("  AR-vis = %s,  Caudal-only = %s",
-                            g_ctrlgUseArVisFilter ? "ON" : "OFF",
-                            g_ctrlgUseCaudalOnly  ? "ON" : "OFF");
-                if (g_ctrlgUseArVisFilter && g_ctrlgUseCaudalOnly) {
-                    ImGui::Text("  combine = %s",
-                                g_ctrlgArvisCaudalCombine == 1 ? "OR" : "AND");
-                }
-            }
-
-            // ---- Per-iteration solver knobs ----
-            ImGui::Separator();
-            ImGui::TextDisabled("Solver");
-            ImGui::SliderFloat("distanceThreshold",
-                               &g_normRefineDistThresh, 0.01f, 0.50f, "%.3f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Sigmoid centre for the per-correspondence weight.\n"
-                    "Larger -> more far points contribute (good when ICP\n"
-                    "needs long-range attraction). Scales with scene size.\n"
-                    "Header default 0.15.");
-            }
-            ImGui::SliderFloat("minNormalCos",
-                               &g_normRefineMinNormalCos, 0.0f, 0.9f, "%.2f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Annealed start cosine threshold. NormalCompat\n"
-                    "(Shift+N) ignores this; SRT_Variance (Ctrl+Shift+N)\n"
-                    "uses it to reject correspondences whose normals\n"
-                    "disagree more than acos(this) radians at iter 0.\n"
-                    "Header default 0.30 (~72.5° accepted at iter 0).");
-            }
-            ImGui::SliderInt("maxIter", &g_normRefineMaxIter, 20, 500);
-            ImGui::SliderInt("itersPerFrame", &g_normRefineItersPerFrame, 1, 5);
-
-            // ---- Phase 7a: Pure RIM mode -----------------------------
-            //   HARD filter (vs L1's soft weight). When ON, only rim-to-rim
-            //   correspondences are used. Source = liver verts AND
-            //   LiverRegionLabel::RIM (intersected with current quadrant
-            //   / AR-vis / Caudal selection). Target = boundaryDist <
-            //   g_ctrlgRimTgtThreshPx (instrument-aware).
-            //
-            //   Recommended workflow: enable AFTER Ctrl+M (Shape Match,
-            //   Phase 7b) has aligned the rims globally, then Shift+N
-            //   polishes the residual using rim-only ICP.
-            ImGui::Separator();
-            ImGui::Checkbox("RIM-only mode (hard filter)", &g_normRefinePureRim);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Phase 7a: restrict refinement to RIM-to-RIM matches.\n"
-                    "\n"
-                    "Source = liver verts AND LiverRegionLabel::RIM\n"
-                    "         (intersected with current Ctrl+G filters)\n"
-                    "Target = boundaryDist < g_ctrlgRimTgtThreshPx\n"
-                    "         (instrument-aware)\n"
-                    "\n"
-                    "Pros: 4-5x faster, focuses on the curve we care about.\n"
-                    "Cons: rim is roughly 1D, so in-plane rotation is\n"
-                    "      under-constrained — works best AFTER a good\n"
-                    "      initial alignment (Ctrl+G or Ctrl+M).\n"
-                    "\n"
-                    "Independent of beta_rim_src/tgt (L1 weight). L1 betas\n"
-                    "still apply AMONG the rim points that survive the\n"
-                    "filter when both are on.");
-            }
-            if (g_normRefinePureRim) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "[ACTIVE]");
-            }
-
-            // ---- Phase 2 L1: Rim multiplicative weights ----
-            ImGui::Separator();
-            ImGui::TextDisabled("L1: Rim weight (Phase 2)");
-            ImGui::SliderFloat("beta_rim_src",
-                               &g_normRefineBetaRimSrc, 0.0f, 3.0f, "%.2f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Multiplicative boost for source-rim correspondences.\n"
-                    "  0.0  : source-rim points get the same weight as\n"
-                    "         interior points (header byte-identical).\n"
-                    "  1.0  : rim points contribute DOUBLE.\n"
-                    "  3.0  : rim points contribute 4x.\n"
-                    "Source rim = LiverRegionLabel::RIM (mesh-intrinsic),\n"
-                    "available iff g_liverRegion is computed.");
-            }
-            ImGui::SliderFloat("beta_rim_tgt",
-                               &g_normRefineBetaRimTgt, 0.0f, 3.0f, "%.2f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Multiplicative boost for target-rim correspondences.\n"
-                    "Target rim = boundaryDist < g_ctrlgRimTgtThreshPx\n"
-                    "(image-side rim membership; same threshold the\n"
-                    "Ctrl+G panel uses, so changing the slider there\n"
-                    "also changes what counts as 'rim' here).");
-            }
-            ImGui::TextDisabled("Tgt rim threshold (Ctrl+G panel): %.1f px",
-                                g_ctrlgRimTgtThreshPx);
-
-            // ---- Phase 3 L2: Anchor pair carry-over from last Ctrl+G ----
-            ImGui::Separator();
-            ImGui::TextDisabled("L2: Anchor pair (Phase 3)");
-
-            const bool anchorAvail =
-                !g_lastRimPairSrcVertIdx.empty() &&
-                (g_lastRimPairSrcVertIdx.size() == g_lastRimPairTgtPos.size());
-            if (anchorAvail) {
-                ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.7f, 1.0f),
-                                   "  %d anchor pairs available",
-                                   (int)g_lastRimPairSrcVertIdx.size());
-            } else {
-                ImGui::TextColored(ImVec4(0.96f, 0.72f, 0.28f, 1.0f),
-                                   "  No anchor pairs (run Ctrl+G first)");
-            }
-
-            ImGui::Checkbox("Use anchor pairs", &g_normRefineUseAnchor);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Use the rim-pair correspondences captured by the\n"
-                    "most-recent Ctrl+G / Ctrl+Shift+G (Phase F.5) as a\n"
-                    "warm start. During the first anchorPhaseIter outer\n"
-                    "iterations, anchored vertices use the anchor target\n"
-                    "instead of the runtime KDTree nearest neighbour.\n"
-                    "After the phase ends, anchors are silently dropped\n"
-                    "and the loop converges via pure NN.\n"
-                    "\n"
-                    "When NO anchors are available (e.g. fresh session),\n"
-                    "this toggle has no effect — the wrapper passes empty\n"
-                    "anchor arrays and runs in pure-NN mode.");
-            }
-            ImGui::SliderInt("anchorPhaseIter",
-                             &g_normRefineAnchorPhaseIter, 0, 100);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Number of outer iterations during which anchors\n"
-                    "override KDTree NN for vertices that own an anchor.\n"
-                    "0 = effectively disable anchors; 20 = default;\n"
-                    "100 = run anchored to the very end (rarely useful).");
-            }
-            ImGui::SliderFloat("anchorBlend",
-                               &g_normRefineAnchorBlend, 0.0f, 1.0f, "%.2f");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Blend factor inside the anchor phase:\n"
-                    "  1.0 : pure anchor (target = anchor position).\n"
-                    "  0.5 : midpoint between anchor and current NN.\n"
-                    "  0.0 : ignore anchor entirely (= toggle OFF).");
-            }
-
-            // ---- Last-session status ----
-            ImGui::Separator();
-            ImGui::TextDisabled("Status (last session)");
-            if (g_normRefineLastInitialRMSE >= 0.0f) {
-                const char* methodName =
-                    (g_normRefineLastMethod == 1)
-                        ? "SRT_VARIANCE" : "NORMAL_COMPAT";
-                ImGui::Text("  method: %s", methodName);
-                ImGui::Text("  iter: %d / %d   initialRMSE: %.5f",
-                            g_normRefineLastIter, g_normRefineMaxIter,
-                            g_normRefineLastInitialRMSE);
-                ImGui::Text("  bestRMSE: %.5f   %s   %s",
-                            g_normRefineLastBestRMSE,
-                            g_normRefineLastConverged ? "converged" : "max-iter",
-                            g_normRefineLastAccepted  ? "ACCEPTED"  : "REJECTED");
-            } else {
-                ImGui::TextDisabled("  (no session yet — press Shift+N)");
-            }
-
-            ImGui::Separator();
-            ImGui::TextDisabled("Shift+N: Normal-Compat   |   "
-                                "Ctrl+Shift+N: SRT-Variance");
-
-        };  // end g_debugPanel.drawNBody (migrated Normal-Compatible Refine)
-
-        // [PHASE-7] ScreenMesh Display content relocated into Debug Panel > Viz
-        // tab (rendered after the Phase-2 Cluster/CorresPoints section).
-        // Registered as a hook; also surfaces the B/N-key visualization toggles.
-        // Standalone floating window removed.
-        g_debugPanel.drawVizExtra = [&]() {
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Other markers:");
-            ImGui::Checkbox("Boundary candidates (was B)##viz_b",
-                            &g_showBoundaryCandidates);
-            ImGui::Checkbox("Source visualization (was N)##viz_n",
-                            &g_showSourceVisualization);
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Screen mesh rendering:");
-            ImGui::Checkbox("Draw as points (lightweight)", &g_screenMeshAsPoints);
-            if (g_screenMeshAsPoints) {
-                ImGui::SliderFloat("Point size [px]",
-                                   &g_screenMeshPointSize,
-                                   1.0f, 8.0f, "%.1f");
-                ImGui::SliderFloat("Density [%]",
-                                   &g_screenMeshDensity,
-                                   1.0f, 100.0f, "%.0f");
-                if (ImGui::Button("Reshuffle")) {
-                    g_screenMeshPC.requestReshuffle();
-                }
-                // 表示中の頂点数の情報
-                const size_t total = g_screenMeshPC.totalVerts;
-                if (total > 0) {
-                    const size_t drawn = std::max<size_t>(
-                        1, (size_t)((double)total
-                                  * (double)g_screenMeshDensity / 100.0));
-                    ImGui::SameLine();
-                    ImGui::Text("(%zu / %zu pts)", drawn, total);
-                }
-            }
-            ImGui::Separator();
-            ImGui::Checkbox("Show debug AABB (red=target, green=source)",
-                            &g_showDebugBB);
-            if (g_showDebugBB) {
-                ImGui::TextDisabled("Source AABB is post-Apply state");
-                if (g_dbgSourceBB_valid && g_targetAabbFull.valid) {
-                    glm::vec3 err = g_dbgSourceBB_center - g_targetAabbFull.center;
-                    float d = glm::length(err);
-                    ImGui::Text("|err| = %.4f m  (%.1f mm)", d, d * 1000.0f);
-                }
-            }
-
-            // ---- [Phase 1] viz toggles migrated from keyboard ---------------
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
-                               "Visualization toggles (formerly keyboard):");
-
-            // [Phase 5.5] Cluster viz (was V) already exists above as
-            // drawTabViz's "Cluster markers" (onToggleClusterVis). Duplicate
-            // checkbox removed to avoid two toggles for the same global.
-
-            // B key family (cyclic correspondence: pure toggle; needs Shift+P
-            // to have run first to have pairs to show).
-            ImGui::Checkbox("Cyclic Correspondence - Shift+P pairs (was Shift+B)##viz_cyclic",
-                            &g_showCyclicCorrespondence);
-
-            // W key family — enabling must POPULATE the overlay data (mirror the
-            // old plain-W / Shift+W keys), otherwise the flag is on but nothing
-            // is drawn. On populate failure the toggle is reverted.
-            if (ImGui::Checkbox("Debug Source Rim Chain - green dots (was W)##viz_rim_src",
-                                &g_showDebugSourceRimChain)) {
-                if (g_showDebugSourceRimChain) {
-                    if (!g_liverRegion.valid()) recomputeLiverRegion();
-                    if (!g_liverLR.valid())     recomputeLiverLR();
-                    if (g_ctrlgUseCaudalOnly && !g_liverCC.valid()) recomputeLiverCC();
-                    if (!populateDebugSourceRimChain()) g_showDebugSourceRimChain = false;
-                }
-            }
-            if (ImGui::Checkbox("Debug Target Boundary - purple dots (was Shift+W)##viz_rim_tgt",
-                                &g_showDebugTargetBoundary)) {
-                if (g_showDebugTargetBoundary) {
-                    if (!populateDebugTargetBoundary()) g_showDebugTargetBoundary = false;
-                }
-            }
-
-            // Liver label viz
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Liver labels:");
-            if (ImGui::Checkbox("Liver Region (anterior/rim/posterior) - was Shift+R##viz_region",
-                                &g_showLiverRegion)) {
-                if (g_showLiverRegion && !g_liverRegion.valid()) recomputeLiverRegion();
-            }
-            if (ImGui::Checkbox("Liver Left/Right - was Y##viz_lr",
-                                &g_showLiverLR)) {
-                if (g_showLiverLR && !g_liverLR.valid()) recomputeLiverLR();
-            }
-            if (ImGui::Checkbox("Liver Cranio/Caudal - was Shift+H##viz_cc",
-                                &g_showLiverCC)) {
-                if (g_showLiverCC && !g_liverCC.valid()) recomputeLiverCC();
-            }
-            if (ImGui::Checkbox("Liver 4-Quadrant overlay - was H##viz_quad",
-                                &g_showLiverQuad)) {
-                if (g_showLiverQuad &&
-                    g_quadVizIdxAR.empty() && g_quadVizIdxAL.empty() &&
-                    g_quadVizIdxPR.empty() && g_quadVizIdxPL.empty()) {
-                    recomputeLiverQuad();
-                }
-            }
-
-            // Recompute buttons (formerly Shift+T / Shift+Y)
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Recompute labels:");
-            if (ImGui::Button("Recompute Region  (was Shift+T)##btn_recompute_region")) {
-                std::cout << "[Region] recomputing with target_rim_mm = "
-                          << g_rimTargetMm << std::endl;
-                recomputeLiverRegion();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Recompute LR  (was Shift+Y)##btn_recompute_lr")) {
-                std::cout << "[LR] recomputing  right_pure_fraction = "
-                          << g_lrPureFrac << "  right_full_fraction = "
-                          << g_lrFullFrac << std::endl;
-                recomputeLiverLR();
-            }
-
-            // Debug dumps (formerly Shift+I / F10)
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Debug dumps:");
-            if (ImGui::Button("Dump IoU debug PNG  (was Shift+I)##btn_iou_dump")) {
-                if (gApp.mode == AppMode::kRegistration) {
-                    glm::mat4 silView = buildSilhouetteView();
-                    glm::mat4 silProj = buildSilhouetteProj();
-                    int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
-                    int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
-                    IoUDebug::dump(DEPTH_OUTPUT_PATH, "iou_debug",
-                                   liverMesh3D, silView, silProj, silW, silH, 8);
-                } else {
-                    std::cout << "[IoU dump] requires Registration mode" << std::endl;
-                }
-            }
-            if (ImGui::Button("Vertex-Squash diagnose  (was F10)##btn_vsq_diag")) {
-                diagnoseVertexSquashV3RS(g_activeQuadrantMask);
-            }
-            // [key-reorg Phase 11] F9 -> checkbox for the Silhouette IoU window.
-            ImGui::Checkbox("Show Silhouette Overlay window  (was F9)##viz_sil_overlay",
-                            &SilOverlay::g_silOverlay.showWindow);
-            // ---- end Phase 1 migration -------------------------------------
-        };  // end g_debugPanel.drawVizExtra (migrated ScreenMesh Display + B/N viz)
+        };  // end g_debugPanel.drawWExtra (migrated Shape Match params from G tab)
 
         // Consolidated Debug Panel (Ctrl+D). Same registration / non-Umeyama
         // guard as the legacy floating panels above.
@@ -6659,6 +7397,14 @@ int main(int argc, char** argv) {
                                        glm::vec3(0.0f, 1.0f, 0.0f));
                 }
 
+                // ★ライティング用カメラ位置: ARモードでは固定AR視点(原点)に合わせる。
+                //   上で view を AR視点(eye=原点, look +Z)に上書きしているのに、ライティング
+                //   (lightPos/viewPos = ヘッドライト)に orbit のカメラ位置を渡すと、オービット
+                //   回転後の位置から照らされて照明が破綻する。view と光源を一致させる。
+                const glm::vec3 lightCamPos = gApp.arMode
+                                                  ? glm::vec3(0.0f, 0.0f, 0.0f)
+                                                  : OrbitCam.cameraPos;
+
                 if (gApp.arMode) gApp.arBg.draw();
 
                 std::vector<mCutMesh*> meshesToDraw;
@@ -6700,7 +7446,7 @@ int main(int argc, char** argv) {
                 }
 
                 draw_AllmCutMeshes(meshesToDraw, shaderProgram, shaderProgramCube,
-                                   OrbitCam.cameraPos, dynamicColors,
+                                   lightCamPos, dynamicColors,
                                    model, view, projection, textureMeshIdx);
 
                 // screenMesh を点群として描画（フラグが立っている場合）
@@ -6709,7 +7455,7 @@ int main(int argc, char** argv) {
                 if (g_screenMeshAsPoints && g_meshAlpha[7] > 0.01f && screenMesh) {
                     drawScreenMeshAsPoints(
                         screenMesh, shaderProgram,
-                        model, view, projection, OrbitCam.cameraPos,
+                        model, view, projection, lightCamPos,
                         glm::vec4(0.3f, 0.6f, 0.9f, g_meshAlpha[7]),
                         g_screenMeshPointSize);
                 }
@@ -6727,19 +7473,19 @@ int main(int argc, char** argv) {
                     for (size_t i = 0; i < g_cluster1Points.size(); i++) {
                         g_sphereMarker.draw(shaderProgram, g_cluster1Points[i],
                                             glm::vec3(0.30f, 1.00f, 0.20f),  // bright green
-                                            rSrc, view, projection, OrbitCam.cameraPos);
+                                            rSrc, view, projection, lightCamPos);
                     }
                     // TARGET interior (cluster2) — dim blue, small (rare; only when used as interior cloud)
                     for (size_t i = 0; i < g_cluster2Points.size(); i++) {
                         g_sphereMarker.draw(shaderProgram, g_cluster2Points[i],
                                             glm::vec3(0.05f, 0.20f, 0.45f),  // very dim blue
-                                            rInt, view, projection, OrbitCam.cameraPos);
+                                            rInt, view, projection, lightCamPos);
                     }
                     // TARGET accepted boundary — dim yellow, small (massive count)
                     for (size_t i = 0; i < g_targetPoints.size(); i++) {
                         g_sphereMarker.draw(shaderProgram, g_targetPoints[i],
                                             glm::vec3(0.55f, 0.50f, 0.05f),  // dim yellow / mustard
-                                            rTgt, view, projection, OrbitCam.cameraPos);
+                                            rTgt, view, projection, lightCamPos);
                     }
                 }
 
@@ -6749,12 +7495,12 @@ int main(int argc, char** argv) {
                     for (const auto& p : g_targetPoints) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(0.0f, 1.0f, 0.2f),
-                                            rTarget, view, projection, OrbitCam.cameraPos);
+                                            rTarget, view, projection, lightCamPos);
                     }
                     for (const auto& p : g_rejectedBoundaryPoints) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(1.0f, 0.1f, 0.1f),
-                                            rTarget, view, projection, OrbitCam.cameraPos);
+                                            rTarget, view, projection, lightCamPos);
                     }
                 }
 
@@ -6767,12 +7513,54 @@ int main(int argc, char** argv) {
                     for (const auto& p : g_visibleSourcePoints) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(0.0f, 0.8f, 1.0f),  // cyan
-                                            rVis, view, projection, OrbitCam.cameraPos);
+                                            rVis, view, projection, lightCamPos);
                     }
                     for (const auto& p : g_silhouetteSourcePoints) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(1.0f, 0.2f, 0.9f),  // magenta
-                                            rSil, view, projection, OrbitCam.cameraPos);
+                                            rSil, view, projection, lightCamPos);
+                    }
+                }
+
+                // ---- Phase U-1: soft partition heatmap (g_sphereMarker 再利用) ----
+                if (g_softShowHeatmap && g_softPartReady) {
+                    // ターゲットは数十万頂点なので draw 数を ~6k/~4k に自動間引き。
+                    // 本格的には per-vertex color VBO 化 (Phase U-1.5)。
+                    const float kRadius = 0.004f * g_sceneDiag;
+
+                    if (screenMesh && g_softTgtField.valid) {
+                        const int numV = SoftPartition::vertexCount(*screenMesh);
+                        if ((int)g_softTgtField.probs.size() == numV) {
+                            const int stride = std::max(1, numV / 6000);
+                            for (int v = 0; v < numV; v += stride) {
+                                glm::vec4 col = SoftPartition::blendVertexColor(
+                                    g_softTgtField.probs[v], g_softTgtField.numGroups);
+                                if (!softHeatmapVertexVisible(
+                                        g_softTgtField.probs[v], g_softTgtField.numGroups))
+                                    continue;   // per-group + show-groups filter
+                                glm::vec3 wp = SoftPartition::vertexAt(*screenMesh, v);
+                                g_sphereMarker.draw(shaderProgram, wp, glm::vec3(col),
+                                                    kRadius, view, projection,
+                                                    lightCamPos);
+                            }
+                        }
+                    }
+                    if (liverMesh3D && g_softSrcField.valid) {
+                        const int numV = SoftPartition::vertexCount(*liverMesh3D);
+                        if ((int)g_softSrcField.probs.size() == numV) {
+                            const int stride = std::max(1, numV / 4000);
+                            for (int v = 0; v < numV; v += stride) {
+                                glm::vec4 col = SoftPartition::blendVertexColor(
+                                    g_softSrcField.probs[v], g_softSrcField.numGroups);
+                                if (!softHeatmapVertexVisible(
+                                        g_softSrcField.probs[v], g_softSrcField.numGroups))
+                                    continue;   // per-group + show-groups filter
+                                glm::vec3 wp = SoftPartition::vertexAt(*liverMesh3D, v);
+                                g_sphereMarker.draw(shaderProgram, wp, glm::vec3(col),
+                                                    kRadius, view, projection,
+                                                    lightCamPos);
+                            }
+                        }
                     }
                 }
 
@@ -6792,7 +7580,24 @@ int main(int argc, char** argv) {
                         glm::vec3 p(V[idx*3], V[idx*3+1], V[idx*3+2]);
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(0.2f, 1.0f, 0.2f),  // green
-                                            rRim, view, projection, OrbitCam.cameraPos);
+                                            rRim, view, projection, lightCamPos);
+                    }
+                }
+
+                // Phase 7c (REDGE/稜線): source ridge overlay (cyan).
+                //   頂点 index 保持 → mVertices から fetch して mesh 追従。
+                if (g_showDebugSourceRidge && liverMesh3D &&
+                    !g_debugSourceRidge.empty())
+                {
+                    const float rRdg = RegRatios::markerCluster() * 1.0f;
+                    const auto& V = liverMesh3D->mVertices;
+                    const int nV3 = (int)V.size();
+                    for (int idx : g_debugSourceRidge) {
+                        if (idx < 0 || idx * 3 + 2 >= nV3) continue;
+                        glm::vec3 p(V[idx*3], V[idx*3+1], V[idx*3+2]);
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(0.10f, 0.90f, 1.0f),  // cyan
+                                            rRdg, view, projection, lightCamPos);
                     }
                 }
 
@@ -6807,7 +7612,20 @@ int main(int argc, char** argv) {
                     for (const auto& p : g_debugTargetBoundaryPoints) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(0.7f, 0.2f, 1.0f),  // purple
-                                            rTgt, view, projection, OrbitCam.cameraPos);
+                                            rTgt, view, projection, lightCamPos);
+                    }
+                }
+
+                // Phase 7c (REDGE/稜線): target ridge overlay (yellow, upper half).
+                //   3D 直接保持 (target は静止)。
+                if (g_showDebugTargetRidge &&
+                    !g_debugTargetRidgePoints.empty())
+                {
+                    const float rRdg = RegRatios::markerCluster() * 0.9f;
+                    for (const auto& p : g_debugTargetRidgePoints) {
+                        g_sphereMarker.draw(shaderProgram, p,
+                                            glm::vec3(1.0f, 0.85f, 0.10f),  // yellow
+                                            rRdg, view, projection, lightCamPos);
                     }
                 }
 
@@ -6824,7 +7642,7 @@ int main(int argc, char** argv) {
                     for (const auto& p : g_debugShapeMatchBestSrc) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(1.0f, 0.15f, 0.15f),  // red
-                                            rRed, view, projection, OrbitCam.cameraPos);
+                                            rRed, view, projection, lightCamPos);
                     }
                 }
 
@@ -6839,7 +7657,7 @@ int main(int argc, char** argv) {
                     for (const auto& p : g_contourSweepTrialSrc) {
                         g_sphereMarker.draw(shaderProgram, p,
                                             glm::vec3(1.0f, 0.95f, 0.15f),  // yellow
-                                            rYel, view, projection, OrbitCam.cameraPos);
+                                            rYel, view, projection, lightCamPos);
                     }
                 }
 
@@ -6864,7 +7682,7 @@ int main(int argc, char** argv) {
                             g_contourSweepTgtAnchors3D[i],
                             hi ? colHi : colGray,
                             hi ? rLarge : rSmall,
-                            view, projection, OrbitCam.cameraPos);
+                            view, projection, lightCamPos);
                     }
                     // Source pivots (transformed to trial pose)
                     for (size_t j = 0; j < g_contourSweepSrcPivotsTrial.size(); j++) {
@@ -6873,7 +7691,7 @@ int main(int argc, char** argv) {
                             g_contourSweepSrcPivotsTrial[j],
                             hi ? colHi : colGray,
                             hi ? rLarge : rSmall,
-                            view, projection, OrbitCam.cameraPos);
+                            view, projection, lightCamPos);
                     }
                 }
 
@@ -6979,7 +7797,7 @@ int main(int argc, char** argv) {
                         const float r_use = inside ? rPrev : (rPrev * 0.55f);
                         g_sphereMarker.draw(shaderProgram,
                             preview_tgt_3D[i], col, r_use,
-                            view, projection, OrbitCam.cameraPos);
+                            view, projection, lightCamPos);
                     }
 
                     // Render source pivots with LR-label tint (rainbow
@@ -7010,7 +7828,7 @@ int main(int argc, char** argv) {
                         const float r_use = rPrev;
                         g_sphereMarker.draw(shaderProgram,
                             preview_src_3D[i], col, r_use,
-                            view, projection, OrbitCam.cameraPos);
+                            view, projection, lightCamPos);
                     }
                 }
 
@@ -7038,13 +7856,13 @@ int main(int argc, char** argv) {
                         if (vIdx >= 0 && (size_t)vIdx * 3 + 2 < V.size()) {
                             glm::vec3 srcPos(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
                             g_sphereMarker.draw(shaderProgram, srcPos, col, rSrc,
-                                                view, projection, OrbitCam.cameraPos);
+                                                view, projection, lightCamPos);
                         }
 
                         // Target: 不変なので保存済み 3D 位置を使用
                         g_sphereMarker.draw(shaderProgram, g_cyclicPairTgtPos[i],
                                             col, rTgt,
-                                            view, projection, OrbitCam.cameraPos);
+                                            view, projection, lightCamPos);
                     }
                 }
 
@@ -7072,12 +7890,12 @@ int main(int argc, char** argv) {
                         glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
                         g_sphereMarker.draw(shaderProgram, p, colSrc, rSrc,
                                             view, projection,
-                                            OrbitCam.cameraPos);
+                                            lightCamPos);
                     }
                     for (const auto& p : g_ctrlgRimTgtPos) {
                         g_sphereMarker.draw(shaderProgram, p, colTgt, rTgt,
                                             view, projection,
-                                            OrbitCam.cameraPos);
+                                            lightCamPos);
                     }
                 }
 
@@ -7145,14 +7963,14 @@ int main(int argc, char** argv) {
                                              V[vIdx*3+2]);
                             g_sphereMarker.draw(shaderProgram, srcPos, col, rSrc,
                                                 view, projection,
-                                                OrbitCam.cameraPos);
+                                                lightCamPos);
                         }
 
                         // Target: immutable world coord from the capture.
                         const glm::vec3& tgtPos = g_lastRimPairTgtPos[i];
                         g_sphereMarker.draw(shaderProgram, tgtPos, col, rTgt,
                                             view, projection,
-                                            OrbitCam.cameraPos);
+                                            lightCamPos);
                     }
                     (void)nV;   // silence unused-warn if compiler complains
                 }
@@ -7210,7 +8028,7 @@ int main(int argc, char** argv) {
                         g_sphereMarker.draw(shaderProgram, pt.world_pos,
                                             col, radius,
                                             view, projection,
-                                            OrbitCam.cameraPos);
+                                            lightCamPos);
                     }
                 }
 
@@ -7235,7 +8053,7 @@ int main(int argc, char** argv) {
                             glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
                             g_sphereMarker.draw(shaderProgram, p, col, r,
                                                 view, projection,
-                                                OrbitCam.cameraPos);
+                                                lightCamPos);
                         }
                     };
 
@@ -7271,7 +8089,7 @@ int main(int argc, char** argv) {
                             glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
                             g_sphereMarker.draw(shaderProgram, p, col, r,
                                                 view, projection,
-                                                OrbitCam.cameraPos);
+                                                lightCamPos);
                         }
                     };
 
@@ -7312,7 +8130,7 @@ int main(int argc, char** argv) {
                             glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
                             g_sphereMarker.draw(shaderProgram, p, col, r,
                                                 view, projection,
-                                                OrbitCam.cameraPos);
+                                                lightCamPos);
                         }
                     };
 
@@ -7353,7 +8171,7 @@ int main(int argc, char** argv) {
                             glm::vec3 p(V[vIdx*3], V[vIdx*3+1], V[vIdx*3+2]);
                             g_sphereMarker.draw(shaderProgram, p, col, r,
                                                 view, projection,
-                                                OrbitCam.cameraPos);
+                                                lightCamPos);
                         }
                     };
 
@@ -7374,12 +8192,12 @@ int main(int argc, char** argv) {
                         for (size_t i = 0; i < registrationHandle.boardPoints.size(); i++) {
                             glm::vec3 color = getPointColor(i, true);
                             g_sphereMarker.draw(shaderProgram, registrationHandle.boardPoints[i],
-                                                color, rCorr, view, projection, OrbitCam.cameraPos);
+                                                color, rCorr, view, projection, lightCamPos);
                         }
                         for (size_t i = 0; i < registrationHandle.objectPoints.size(); i++) {
                             glm::vec3 color = getPointColor(i, false);
                             g_sphereMarker.draw(shaderProgram, registrationHandle.objectPoints[i],
-                                                color, rCorr, view, projection, OrbitCam.cameraPos);
+                                                color, rCorr, view, projection, lightCamPos);
                         }
                     }
                 }
@@ -7409,12 +8227,12 @@ int main(int argc, char** argv) {
                         for (int i = 0; i < 8; i++) {
                             g_sphereMarker.draw(shaderProgram, corners[i],
                                                 corner_color, r_marker,
-                                                view, projection, OrbitCam.cameraPos);
+                                                view, projection, lightCamPos);
                         }
                         // center は少し大きく目立たせる
                         g_sphereMarker.draw(shaderProgram, ctr,
                                             center_color, r_marker * r_center_scale,
-                                            view, projection, OrbitCam.cameraPos);
+                                            view, projection, lightCamPos);
                     };
 
                     if (g_targetAabbFull.valid) {
@@ -10197,7 +11015,8 @@ static void setupUICallbacks() {
     };
 
     a.onStartUmeyama = []() {
-        gUmeyama.start(registrationHandle, OrbitCam, gWindowWidth, gWindowHeight);
+        gUmeyama.start(registrationHandle, OrbitCam, gWindowWidth, gWindowHeight,
+                       gUI.state.umeyamaPtCount);
         gUI.state.regMethod = 2;
     };
 
@@ -10213,6 +11032,255 @@ static void setupUICallbacks() {
 
     a.onUndoUmeyamaPoint = []() {
         gUmeyama.undoPoint(registrationHandle);
+    };
+
+    // Phase U-1: Soft Partition controls live in the Debug Panel (Ctrl+D) "U" tab.
+    // Body uses only globals + runSoftPartitionCompute, so a no-capture lambda is
+    // safe; assigned once here, rendered by DebugPanel::draw() via the drawUExtra hook.
+    g_debugPanel.drawUExtra = []() {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
+                           "Soft Partition (U-1)  [Shift+U]");
+
+        // --- Step 1: Umeyama anchors ---
+        const int  n           = g_softAnchors.count();
+        const bool haveAnchors = g_softAnchors.valid();
+        ImGui::TextColored(haveAnchors ? ImVec4(0.4f, 0.9f, 0.4f, 1)
+                                       : ImVec4(0.9f, 0.6f, 0.3f, 1),
+                           "1. Anchors: %d  (need >=%d)",
+                           n, SoftPartition::MIN_GROUPS);
+        ImGui::Text("   s_ume = %.4f", g_softUmeyamaScale);
+
+        // --- Step 2: compute ---
+        if (!haveAnchors) ImGui::BeginDisabled();
+        if (ImGui::Button("2. Compute Soft Partition")) runSoftPartitionCompute();
+        if (!haveAnchors) ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextColored(g_softPartReady ? ImVec4(0.4f, 0.9f, 0.4f, 1)
+                                           : ImVec4(0.6f, 0.6f, 0.6f, 1),
+                           g_softPartReady ? "ready" : "not ready");
+
+        // --- params ---
+        ImGui::Checkbox("auto sigma_tgt", &g_softPartParams.autoSigma);
+        if (g_softPartParams.autoSigma)
+            ImGui::SliderFloat("sigma factor",
+                               &g_softPartParams.sigmaTgtAutoFactor, 0.2f, 1.5f);
+        else
+            ImGui::SliderFloat("sigma manual",
+                               &g_softPartParams.sigmaTgtManual, 0.001f, 1.0f, "%.4f");
+        ImGui::SliderFloat("baseline none",
+                           &g_softPartParams.baselineNone, 0.05f, 0.95f);
+        ImGui::SliderFloat("radius %tile",
+                           &g_softPartParams.groupRadiusPercentile, 0.5f, 0.95f);
+
+        // --- Step 3: recompute + show ---
+        if (!g_softPartReady) ImGui::BeginDisabled();
+        if (ImGui::Button("Recompute")) runSoftPartitionCompute();
+        ImGui::SameLine();
+        ImGui::Checkbox("3. Show heatmap", &g_softShowHeatmap);
+        ImGui::SameLine();
+        ImGui::Checkbox("show groups", &g_softShowGroups);
+        if (!g_softPartReady) ImGui::EndDisabled();
+
+        // --- group radii readout ---
+        if (g_softPartReady && !g_softGroupRadii.empty()) {
+            ImGui::Spacing();
+            ImGui::Text("group radii (world units):");
+            for (size_t i = 0; i < g_softGroupRadii.size(); ++i) {
+                glm::vec3 c = SoftPartition::paletteColor((int)i);
+                if (i < (size_t)SoftPartition::MAX_GROUPS) {
+                    ImGui::Checkbox(("##gv" + std::to_string(i)).c_str(),
+                                    &g_softGroupVisible[i]);   // toggle this group's heatmap points
+                    ImGui::SameLine();
+                }
+                ImGui::ColorButton(("##rad" + std::to_string(i)).c_str(),
+                                   ImVec4(c.r, c.g, c.b, 1.0f),
+                                   ImGuiColorEditFlags_NoTooltip |
+                                   ImGuiColorEditFlags_NoPicker,
+                                   ImVec2(14, 14));
+                ImGui::SameLine();
+                ImGui::Text("G%d : %.4f", (int)i, g_softGroupRadii[i]);
+            }
+            // "none" row: source points not belonging to any group (none-mass
+            // > 0.5). Uncheck to hide them; the swatch is the neutral none grey.
+            ImGui::Checkbox("##gvnone", &g_softShowNone);
+            ImGui::SameLine();
+            ImGui::ColorButton("##radnone",
+                               ImVec4(0.35f, 0.35f, 0.38f, 1.0f),
+                               ImGuiColorEditFlags_NoTooltip |
+                               ImGuiColorEditFlags_NoPicker,
+                               ImVec2(14, 14));
+            ImGui::SameLine();
+            ImGui::Text("none (no group)");
+        }
+
+        // --- Step 4: Soft-weighted ICP (Ctrl+U) ---
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
+                           "Step 4: Soft-weighted ICP  [Ctrl+U]");
+        if (!g_softPartReady) ImGui::BeginDisabled();
+        ImGui::SliderInt("ICP iters", &g_softIcpParams.maxIters, 1, 80);
+        ImGui::SliderFloat("max corr (xDiag)",
+                           &g_softIcpParams.maxCorrDistFac, 0.005f, 0.2f, "%.3f");
+        ImGui::SliderFloat("none skip", &g_softIcpParams.noneSkip, 0.1f, 0.95f);
+        ImGui::SliderFloat("min weight", &g_softIcpParams.minWeight, 0.0f, 0.3f, "%.3f");
+        ImGui::Checkbox("uniform weight (ablation / plain ICP)",
+                        &g_softIcpParams.uniformWeight);
+        ImGui::Checkbox("downsample target (large-scale)",
+                        &g_softIcpParams.downsampleTarget);
+        if (g_softIcpParams.downsampleTarget)
+            ImGui::SliderFloat("voxel (xDiag)",
+                               &g_softIcpParams.voxelFac, 0.002f, 0.05f, "%.3f");
+        if (ImGui::Button("4. Run Soft-weighted ICP")) {
+            if (g_regLiveMode) {
+                poseAutoSaveBeforeRegistration();
+                startSoftIcpLive();          // animates; render loop saves on finish
+            } else {
+                runSoftWeightedICP();
+                poseSaveToLibrary(SaveCriterion::RMSE);
+            }
+        }
+        if (!g_softPartReady) ImGui::EndDisabled();
+        ImGui::SameLine();
+        // Capture the disabled state in a local: revertSoftICP() flips
+        // g_softIcpCanRevert mid-frame, so testing the global twice would call
+        // EndDisabled() without a matching BeginDisabled() (imgui assert).
+        const bool icpRevDisabled = !g_softIcpCanRevert;
+        if (icpRevDisabled) ImGui::BeginDisabled();
+        if (ImGui::Button("Revert ICP")) { revertSoftICP(); poseSyncSessionBestToCurrent(); }
+        if (icpRevDisabled) ImGui::EndDisabled();
+        if (g_softIcpLastIters > 0) {
+            ImGui::Text("  iters = %d", g_softIcpLastIters);
+            ImGui::Text("  RMSE  %.5f -> %.5f",
+                        g_softIcpRmseBefore, g_softIcpRmseAfter);
+            ImGui::Text("  IoU   %.4f -> %.4f",
+                        g_softIcpIoUBefore, g_softIcpIoUAfter);
+        }
+
+        // --- Phase U-CPD: method selector + pure rigid CPD (anchor-free) ---
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+                           "Registration method  (Ctrl+U; both from Umeyama init)");
+        ImGui::RadioButton("Soft-weighted ICP (U-2, uses anchor)", &g_regMethod, METHOD_SOFT_ICP);
+        ImGui::RadioButton("Pure rigid CPD (no anchor)",           &g_regMethod, METHOD_CPD);
+
+        if (g_regMethod == METHOD_CPD) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f), "[CPD] parameters");
+            ImGui::SliderInt  ("CPD max iters",      &g_cpdParams.maxIters,   1, 150);
+            ImGui::SliderFloat("CPD outlier w",      &g_cpdParams.w_outlier,  0.0f, 0.5f, "%.3f");
+            ImGui::Checkbox   ("CPD solve scale",    &g_cpdParams.solveScale);
+            ImGui::Checkbox   ("CPD downsample tgt", &g_cpdParams.downsample);
+            if (g_cpdParams.downsample)
+                ImGui::SliderFloat("CPD tgt voxel (xDiag)", &g_cpdParams.tgtVoxelFac, 0.005f, 0.05f, "%.3f");
+            ImGui::SliderFloat("CPD src voxel (xDiag, 0=off)", &g_cpdParams.srcVoxelFac, 0.0f, 0.05f, "%.3f");
+            // Robustness (stops the sigma^2 -> 0 collapse on a too-good init):
+            ImGui::SliderFloat("CPD sigma2 floor (xSpacing, 0=off)", &g_cpdParams.sigmaFloorFac, 0.0f, 3.0f, "%.2f");
+            ImGui::SliderFloat("CPD N_P collapse frac (0=off)",      &g_cpdParams.npCollapseFrac, 0.0f, 0.9f, "%.2f");
+
+            // [LIVE] Shared by CPD and soft-ICP (mirrors Shift+N's "Live mode").
+            ImGui::Separator();
+            ImGui::Checkbox("Live animate (CPD + soft-ICP)", &g_regLiveMode);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON (default): Ctrl+U / 'Run all CPD' / 'Run Soft-weighted ICP'\n"
+                    "  replay the solve frame-by-frame and the mesh visibly\n"
+                    "  converges, like the Shift+N tracker. Watch CPD (now\n"
+                    "  floored) barely move on a good init while soft-ICP\n"
+                    "  drifts off it.\n"
+                    "OFF: blocking one-shot (mesh jumps to the final pose).");
+            }
+            if (g_regLiveMode)
+                ImGui::SliderInt("Live steps/frame", &g_regLiveStepsPerFrame, 1, 10);
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f),
+                               "CPD pipeline — check 1 -> 5 in order:");
+
+            const char* cpdStageLabels[6] = {
+                "",
+                "1. Extract target cloud",
+                "2. Downsample target",
+                "3. Build source + before-metrics",
+                "4. Run CPD (EM)",
+                "5. Apply + after-metrics"
+            };
+            for (int i = 1; i <= 5; ++i) {
+                const bool enabled = (i == 1) || g_cpdStageDone[i - 1];
+                if (!enabled) ImGui::BeginDisabled();
+                bool v = g_cpdStageDone[i];
+                if (ImGui::Checkbox(cpdStageLabels[i], &v)) {
+                    if (v && !g_cpdStageDone[i]) {
+                        switch (i) {
+                            case 1: cpdStage1_extractTarget(); break;
+                            case 2: cpdStage2_downsample();    break;
+                            case 3: cpdStage3_buildSource();   break;
+                            case 4: cpdStage4_runEM();         break;
+                            case 5: cpdStage5_apply();
+                                    if (g_cpdStageDone[5]) {
+                                        poseSaveToLibrary(SaveCriterion::RMSE);
+                                        // session may have rejected & reverted it
+                                        if (!g_cpdCanRevert) g_cpdStageDone[5] = false;
+                                    }
+                                    break;
+                        }
+                    } else if (!v && g_cpdStageDone[i]) {
+                        cpdUncheckFrom(i);   // cascades: unchecks >= i (5 also reverts)
+                    }
+                }
+                if (!enabled) ImGui::EndDisabled();
+
+                // per-stage readout
+                if (i == 1 && g_cpdStageDone[1])
+                    ImGui::Text("      target: %d pts", g_cpdTgtCountRaw);
+                if (i == 2 && g_cpdStageDone[2])
+                    ImGui::Text("      -> %d pts (solve size)", g_cpdTgtCountDS);
+                if (i == 3 && g_cpdStageDone[3]) {
+                    ImGui::Text("      source: %d pts   sigma2_init: %.5g",
+                                g_cpdSrcCount, g_cpdSigma2Init);
+                    ImGui::Text("      RMSE before %.5f   IoU before %.4f",
+                                g_cpdRmseBefore, g_cpdIoUBefore);
+                }
+                if (i == 4 && g_cpdStageDone[4])
+                    ImGui::Text("      iters=%d  sigma2=%.5g (floor %.5g)  scale=%.4f  N_P=%.1f/%d",
+                                g_cpdResult.iters, g_cpdResult.sigma2, g_cpdResult.sigma2Floor,
+                                g_cpdResult.finalScale, g_cpdResult.N_P, g_cpdTgtCountDS);
+                if (i == 5 && g_cpdStageDone[5]) {
+                    ImGui::Text("      RMSE %.5f -> %.5f", g_cpdRmseBefore, g_cpdRmseAfter);
+                    ImGui::Text("      IoU  %.4f -> %.4f", g_cpdIoUBefore,  g_cpdIoUAfter);
+                }
+            }
+
+            ImGui::Spacing();
+            if (ImGui::Button("Run all CPD (1 -> 5)")) {
+                if (g_regLiveMode) {
+                    poseAutoSaveBeforeRegistration();
+                    startCpdLive();          // animates; render loop saves on finish
+                } else {
+                    poseAutoSaveBeforeRegistration();
+                    runCpdRegistration();
+                    poseSaveToLibrary(SaveCriterion::RMSE);
+                    if (!g_cpdCanRevert) g_cpdStageDone[5] = false; // session reverted it
+                }
+            }
+            ImGui::SameLine();
+            const bool cpdRevDisabled = !g_cpdCanRevert;
+            if (cpdRevDisabled) ImGui::BeginDisabled();
+            if (ImGui::Button("Revert CPD")) { revertCpd(); poseSyncSessionBestToCurrent(); }
+            if (cpdRevDisabled) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Reset CPD pipeline")) cpdResetPipeline();
+        }
+
+        // --- Step 5: Soft BIPOP (Ctrl+Shift+U) — U-3, not yet ---
+        ImGui::Spacing();
+        ImGui::BeginDisabled();
+        ImGui::Button("5. Soft BIPOP          (Ctrl+Shift+U)");
+        ImGui::EndDisabled();
     };
 
     a.onResetRegistration = []() {
@@ -10258,12 +11326,16 @@ static void setupUICallbacks() {
         g_debugSourceRimChain.clear();           // Phase 7b Step 1 (Plain W)
         g_debugTargetBoundaryPoints.clear();     // Phase 7b Step 2 (Shift+W)
         g_debugShapeMatchBestSrc.clear();        // Phase 7b Step 3 (Ctrl+W)
+        g_debugSourceRidge.clear();              // Phase 7c (REDGE/稜線)
+        g_debugTargetRidgePoints.clear();        // Phase 7c (REDGE/稜線)
         g_showClusterVisualization = false;
         g_showBoundaryCandidates   = false;
         g_showSourceVisualization  = false;
         g_showDebugSourceRimChain  = false;      // Phase 7b Step 1 (Plain W)
         g_showDebugTargetBoundary  = false;      // Phase 7b Step 2 (Shift+W)
         g_showDebugShapeMatch      = false;      // Phase 7b Step 3 (Ctrl+W)
+        g_showDebugSourceRidge     = false;      // Phase 7c (REDGE/稜線)
+        g_showDebugTargetRidge     = false;      // Phase 7c (REDGE/稜線)
         g_showCorrespondencePoints = false;
         g_showCyclicCorrespondence = false;
         g_cyclicAvailable          = false;

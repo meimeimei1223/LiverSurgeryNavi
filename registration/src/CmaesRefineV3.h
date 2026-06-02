@@ -218,6 +218,19 @@ struct ParamsV3 {
     bool parallel_population = false;
     bool parallel_runs       = false;
     int  max_threads         = 0;   // 0 = omp_get_max_threads()
+
+    // ----- [Phase 7c] bidirectional (symmetric) matching, opt-in ----
+    // false (既定) -> 従来の片方向 (target -> source) のみ = byte-identical。
+    // true         -> 逆方向 (source -> target) の対応 (src_to_eval) も構築。
+    //   ※ 実際に逆方向項を足すのは rim/redge 重み付き評価器のみで、しかも
+    //     識別クラス (RIM/REDGE) を持つ source 点に限定 ((B) 方式)。無印点は
+    //     片方向のまま。詳細は evaluate_one_v3r_weighted を参照。
+    bool bidirectional_matching = false;
+
+    // [Phase 7c] (A) 全点対称: bidirectional_matching が ON のとき、逆方向項
+    //   を RIM/REDGE だけでなく subset の全 source 点に適用する。false なら
+    //   (B) のまま (識別クラスのみ)。bidirectional_matching=false なら無効。
+    bool bidirectional_all_points = false;
 };
 
 // =====================================================================
@@ -275,6 +288,16 @@ struct EvalContextStaticV3 {
     // Refreshed by rebuild_correspondences_v3 at UPDATE_INTERVAL
     // boundaries against the current best pose.
     std::vector<int> tgt_to_eval;
+
+    // [Phase 7c] src[k] -> nearest target index (reverse correspondence).
+    // Parallel to base_positions; size == base_positions.size() when
+    // bidirectional matching is on, EMPTY otherwise (= one-directional,
+    // byte-identical). Populated only for SUBSET source points (others
+    // stay -1). Built/refreshed by build_eval_context_v3r /
+    // rebuild_correspondences_v3r when params.bidirectional_matching.
+    // The (B) class restriction (only RIM/REDGE source points contribute)
+    // is applied later, in evaluate_one_v3r_weighted.
+    std::vector<int> src_to_eval;
 
     // Target point cloud, captured once at build time and held constant
     // for the entire CMA-ES run. V3-1: full cloud. V3-2: voxel-downsampled.

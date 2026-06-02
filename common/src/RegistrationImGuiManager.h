@@ -215,6 +215,7 @@ struct RegUIState {
     int  depthModelIdx = 0;
     bool depthModelAvail[3] = {false, false, false};
     int boardPtCount = 0, objPtCount = 0, targetPtCount = 5;
+    int umeyamaPtCount = 3;   // [3-of-5] slider value, read at start()
     bool splitScreen = false;
     bool depthSplitScreen = false;
 
@@ -565,7 +566,7 @@ private:
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(c.x*0.07f,c.y*0.07f,c.z*0.07f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(c.x*0.14f,c.y*0.14f,c.z*0.14f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(c.x*0.22f,c.y*0.22f,c.z*0.22f,1));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c.x*0.7f,c.y*0.7f,c.z*0.7f,1));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c.x*0.92f,c.y*0.92f,c.z*0.92f,1));
         }
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
         char paddedLabel[128];
@@ -1788,6 +1789,37 @@ private:
         // --- Manual Registration: Umeyama ---
         if(methodButton("Umeyama Manual", "", state.regMethod==2, state.regState, anyP && state.regMethod!=2, state.btnIconTex[RegUIState::ICON_UMEYAMA])) {
             state.regMethod = 2; if(actions.onStartUmeyama) actions.onStartUmeyama();
+        }
+        // [3-of-5] point-count selector, placed BELOW the Umeyama Manual button.
+        // Read by onStartUmeyama -> start(). Locked while the 2-screen session is
+        // live so the count can't desync boardPoints mid-pick. Label is orange
+        // (colReg) by default to tie it into the Umeyama workflow. Dot preview =
+        // group palette: first N filled, the rest grey/hollow.
+        {
+            ImGui::TextColored(colReg(), "Umeyama points");
+            if (state.splitScreen) ImGui::BeginDisabled();
+            ImGui::SliderInt("##umepts", &state.umeyamaPtCount, 3, 5);
+            if (state.splitScreen) ImGui::EndDisabled();
+
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 pp = ImGui::GetCursorScreenPos();
+            const float r = 7.0f, gap = 9.0f;
+            const float cy = pp.y + r + 2.0f;
+            for (int i = 0; i < 5; ++i) {
+                const float cx = pp.x + r + i * (r * 2 + gap);
+                ImVec4 c = pointColor(i);
+                const bool on = (i < state.umeyamaPtCount);
+                if (on)
+                    dl->AddCircleFilled(ImVec2(cx, cy), r,
+                                        IM_COL32((int)(c.x*255),(int)(c.y*255),(int)(c.z*255),255));
+                else
+                    dl->AddCircle(ImVec2(cx, cy), r, IM_COL32(110,110,110,180), 0, 1.5f);
+                char num[4]; snprintf(num, sizeof(num), "%d", i + 1);
+                ImVec2 ts = ImGui::CalcTextSize(num);
+                dl->AddText(ImVec2(cx - ts.x*0.5f, cy - ts.y*0.5f),
+                            on ? IM_COL32(255,255,255,230) : IM_COL32(160,160,160,120), num);
+            }
+            ImGui::Dummy(ImVec2(0, r * 2 + 8.0f));
         }
         if (state.regMethod == 2 && state.regState >= 1 && state.regState <= 3 && !state.splitScreen) {
             ImGui::Spacing();

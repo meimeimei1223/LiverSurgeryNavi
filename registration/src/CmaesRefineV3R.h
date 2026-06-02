@@ -953,8 +953,37 @@ Step 2: Preprocessing (voxel size: 0.0682947)...
 #include <cstdint>
 #include <unordered_set>
 #include <algorithm>   // std::count (rim diagnostics)
+#ifdef _OPENMP
+#include <omp.h>       // [V3R-PARALLEL] run-loop parallelization (Ctrl+G)
+#endif
 
 namespace CmaesRefineV3R {
+
+// =====================================================================
+// [V3R-PARALLEL] Run-loop parallelization toggle (Ctrl+G).
+//
+// When true, runBipopCmaesV3R executes its N_STARTS independent BIPOP
+// restarts CONCURRENTLY -- one OpenMP thread per run. V3R has NO inner
+// per-eval OpenMP (its cost is point-to-point RMSE over a KD-tree, not a
+// raster), so there is no nested-parallel concern: each run simply runs
+// on its own thread. Default OFF = the legacy serial run loop, which is
+// byte-identical to the pre-change behaviour.
+//
+// Determinism is preserved in BOTH modes: per-run jitter and sigma0 are
+// pre-generated from the outer RNG in run order (the exact 8-draw-per-run
+// sequence, with mask_jitter_for_mode applied identically) BEFORE the
+// loop, so the RNG consumption is independent of run execution order, and
+// each run's CMA-ES is seeded by cma_base+run (RNG-independent). The
+// post-loop top-K full-RMSE screening reads the same all_summaries[]
+// array and is unchanged, so best_run / RMSE / accept decision are
+// identical to serial; only wall-clock and per-run log ordering differ.
+//
+// Set from the UI (same Debug-Panel checkbox that drives V3RS); read once
+// at the top of the run loop. This is the Ctrl+G analogue of
+// CmaesRefineV3RS::g_v3rsParallelRuns.
+inline bool   g_v3rParallelRuns   = false;
+inline int    g_v3rLastRunThreads  = 1;     // threads actually used last time
+inline double g_v3rLastRunLoopMs   = 0.0;   // run-loop wall-clock last time
 
 // =====================================================================
 // [NEW V3R/SearchMode] Reduced-DoF search modes (additive, opt-in).
@@ -1132,6 +1161,18 @@ struct ParamsV3R : public CmaesRefine::ParamsV3 {
     // beta=1 -> rim-rim pairs counted twice; beta=3 -> 4x; etc.
     float beta_rim_weight = 0.0f;
 
+    // ----- [Phase 7c] REDGE (稜線) weighting, opt-in -----------------
+    // is_redge_orig[i] = 1 iff original vertex i is a SOURCE ridge vertex
+    //   = ANTERIOR_CORE のオクルーディング輪郭 (境界 ∩ 非RIM ∩ 非後面)。
+    //   排他: RIM ラベルとは別物なので is_rim_orig と同時に 1 にならない
+    //   → 1 対応あたり boost は rim/redge いずれか高々 1 個 (二重計上なし)。
+    // 重み: w_i = 1 + beta * (rim_src & rim_tgt) + gamma * (redge_src & rim_tgt)
+    //   target 側は RIM と同じ全境界帯 (is_rim_tgt_voxel) を流用。source 側
+    //   の排他性が ridge/rim を分けるので target を上半分に絞る必要はない。
+    // gamma=0 -> redge 項なし (byte-identical 維持)。
+    std::vector<uint8_t> is_redge_orig;
+    float gamma_redge_weight = 0.0f;
+
     // ----- Session-derived (filled by runBipopCmaesV3R) --------------
     // arvis_voxel[k] = arvis_orig[voxel_to_orig[k]] (or 1 if filter off).
     // Size == session_voxel_liver.size() when filter on; empty otherwise.
@@ -1141,6 +1182,11 @@ struct ParamsV3R : public CmaesRefine::ParamsV3 {
     // is_rim_orig empty). Size == session_voxel_liver.size() when rim
     // weighting on; empty otherwise.
     std::vector<uint8_t> is_rim_src_voxel;
+
+    // [Phase 7c] is_redge_src_voxel[k] = is_redge_orig[voxel_to_orig[k]].
+    // Session-derived (same map as is_rim_src_voxel). Empty when gamma==0
+    // or is_redge_orig empty.
+    std::vector<uint8_t> is_redge_src_voxel;
 
     // is_rim_tgt_voxel[i] = (boundary_dist_at_voxel_tgt[i] <
     // rim_tgt_threshold_px). Size == session_voxel_tgt.size() when rim
@@ -1625,7 +1671,13 @@ inline float evaluate_one_v3r_weighted(
     const std::vector<uint8_t>&             is_rim_src_voxel,
     const std::vector<uint8_t>&             is_rim_tgt_voxel,
     float                                    beta,
-    int&                                     matched_out)
+    int&                                     matched_out,
+    // [Phase 7c] redge 項は末尾にデフォルト付きで追加。既存の 7 引数
+    // 呼び出し (V3RS など) はそのまま gamma=0 / redge 空 = byte-identical。
+    const std::vector<uint8_t>&             is_redge_src_voxel = {},
+    float                                    gamma = 0.0f,
+    // [Phase 7c] (A) true なら逆方向項を全 subset 点へ。false=(B) 識別クラスのみ。
+    bool                                     bidir_all_points = false)
 {
     using namespace CmaesRefine;
 
@@ -1648,17 +1700,48 @@ inline float evaluate_one_v3r_weighted(
         if (sq < S.max_dist_sq) {
             // 乗算 AND: source も target も rim のときだけ重み加算。
             // 配列サイズ不一致があれば 0 倍 (= w=1) にフォールバック。
-            float boost = 0.0f;
-            if ((size_t)j < is_rim_src_voxel.size() &&
-                i           < is_rim_tgt_voxel.size())
-            {
-                boost = (float)(is_rim_src_voxel[(size_t)j] &
-                                 is_rim_tgt_voxel[i]);
+            // target 側は rim/redge 共通 (is_rim_tgt_voxel = 全境界帯)。
+            // source 側 rim/redge は排他なので boost は高々一方のみ発火。
+            float boost_rim   = 0.0f;
+            float boost_redge = 0.0f;
+            if (i < is_rim_tgt_voxel.size()) {
+                const uint8_t tgt_b = is_rim_tgt_voxel[i];
+                if ((size_t)j < is_rim_src_voxel.size())
+                    boost_rim = (float)(is_rim_src_voxel[(size_t)j] & tgt_b);
+                if ((size_t)j < is_redge_src_voxel.size())
+                    boost_redge = (float)(is_redge_src_voxel[(size_t)j] & tgt_b);
             }
-            const float w = 1.0f + beta * boost;
+            const float w = 1.0f + beta * boost_rim + gamma * boost_redge;
             sumSq_w += w * sq;
             w_sum   += w;
             count++;
+        }
+    }
+
+    // [Phase 7c bidir] (B) 逆方向項: source -> target、識別クラスを持つ
+    //   subset source 点だけ。無印点はこの枝に入らず片方向のまま。
+    //   src_to_eval 空 (flag OFF) なら丸ごとスキップ = 従来一致。
+    //   matched_out (ゲート) には加算しない (= tgt->src の数を保持)。
+    if (!S.src_to_eval.empty()) {
+        const size_t NS = W.work_positions.size();
+        for (size_t k = 0; k < NS; k++) {
+            const bool k_rim   = (k < is_rim_src_voxel.size())   && (is_rim_src_voxel[k]   != 0);
+            const bool k_redge = (k < is_redge_src_voxel.size()) && (is_redge_src_voxel[k] != 0);
+            if (!bidir_all_points && !k_rim && !k_redge) continue;  // (B): 識別クラスのみ / (A): 全subset点
+            if (k >= S.src_to_eval.size()) break;
+            const int t = S.src_to_eval[k];
+            if (t < 0) continue;                        // subset 外 / 未対応
+            const glm::vec3 d  = W.work_positions[k] - S.tgt_points[(size_t)t];
+            const float     sq = glm::dot(d, d);
+            if (sq < S.max_dist_sq) {
+                const uint8_t tgt_b = ((size_t)t < is_rim_tgt_voxel.size())
+                                          ? is_rim_tgt_voxel[(size_t)t] : (uint8_t)0;
+                const float boost_rim   = (float)((uint8_t)(k_rim   ? 1 : 0) & tgt_b);
+                const float boost_redge = (float)((uint8_t)(k_redge ? 1 : 0) & tgt_b);
+                const float w = 1.0f + beta * boost_rim + gamma * boost_redge;
+                sumSq_w += w * sq;
+                w_sum   += w;
+            }
         }
     }
 
@@ -1799,6 +1882,36 @@ inline CmaesRefine::EvalContextStaticV3 build_eval_context_v3r(
                                    / (float)post_jitter_matched);
     }
 
+    // ----- E2. [Phase 7c bidir] reverse correspondence src_to_eval ----
+    //   subset source -> nearest target (static target tree). 部分集合の
+    //   source 点だけ対応を作る (それ以外 -1)。クラス絞り ((B): RIM/REDGE
+    //   のみ) は重み付き評価器側で行う。flag OFF -> 空 -> 評価器が枝を飛ばし
+    //   片方向 (byte-identical)。
+    if (params.bidirectional_matching) {
+        S.src_to_eval.assign(S.base_positions.size(), -1);
+        Reg3DCustom::NanoflannAdaptor tgt_adaptor(S.tgt_points);
+        auto tgt_tree = Reg3DCustom::buildKDTree(tgt_adaptor);
+        int n_src_corr = 0;
+        for (int vi : subset_idx_voxel) {
+            if (vi < 0 || (size_t)vi >= S.base_positions.size()) continue;
+            size_t nn_t;
+            float  dist_sq;
+            if (Reg3DCustom::searchKNN1(*tgt_tree, S.base_positions[(size_t)vi],
+                                        nn_t, dist_sq)
+                && dist_sq < S.max_dist_sq) {
+                S.src_to_eval[(size_t)vi] = (int)nn_t;
+                n_src_corr++;
+            }
+        }
+        if (params.verbose) {
+            std::cout << "[V3R] bidir src_to_eval: " << n_src_corr
+                      << " reverse corr  (subset=" << subset_idx_voxel.size()
+                      << ", tgt=" << S.tgt_points.size() << ")" << std::endl;
+        }
+    } else {
+        S.src_to_eval.clear();
+    }
+
     // ----- F. matched_min_required (verbatim from V3) ------------------
     (void)init_matched;
     int min_ok = (int)(post_jitter_matched * params.min_match_ratio);
@@ -1889,6 +2002,25 @@ inline void rebuild_correspondences_v3r(
             S.tgt_to_eval[i] = subset_idx_voxel[nn_local];
         } else {
             S.tgt_to_eval[i] = -1;
+        }
+    }
+
+    // [Phase 7c bidir] refresh reverse correspondence (subset src -> tgt).
+    //   `transformed` (= 全 base_positions を cur_best で変換) を vi で直接
+    //   引くので subset 整列の心配なし。flag OFF -> 何もしない。
+    if (params.bidirectional_matching) {
+        S.src_to_eval.assign(S.base_positions.size(), -1);
+        Reg3DCustom::NanoflannAdaptor tgt_adaptor(S.tgt_points);
+        auto tgt_tree = Reg3DCustom::buildKDTree(tgt_adaptor);
+        for (int vi : subset_idx_voxel) {
+            if (vi < 0 || (size_t)vi >= transformed.size()) continue;
+            size_t nn_t;
+            float  dist_sq;
+            if (Reg3DCustom::searchKNN1(*tgt_tree, transformed[(size_t)vi],
+                                        nn_t, dist_sq)
+                && dist_sq < S.max_dist_sq) {
+                S.src_to_eval[(size_t)vi] = (int)nn_t;
+            }
         }
     }
 }
@@ -2131,9 +2263,9 @@ inline void run_one_bipop_v3r(
             //     matched count as V3; only the RMSE reduction uses
             //     w_i = 1 + beta * is_rim_src[j] * is_rim_tgt[i].
             const bool weighted_path =
-                (params.beta_rim_weight > 0.0f) &&
-                !params.is_rim_src_voxel.empty() &&
-                !params.is_rim_tgt_voxel.empty();
+                (((params.beta_rim_weight   > 0.0f) && !params.is_rim_src_voxel.empty()) ||
+                 ((params.gamma_redge_weight > 0.0f) && !params.is_redge_src_voxel.empty()))
+                && !params.is_rim_tgt_voxel.empty();
             float rmse;
             if (weighted_path) {
                 rmse = evaluate_one_v3r_weighted(
@@ -2141,7 +2273,10 @@ inline void run_one_bipop_v3r(
                     params.is_rim_src_voxel,
                     params.is_rim_tgt_voxel,
                     params.beta_rim_weight,
-                    matched);
+                    matched,
+                    params.is_redge_src_voxel,
+                    params.gamma_redge_weight,
+                    params.bidirectional_all_points);
             } else {
                 rmse = evaluate_one_v3(rc.ctx, scratch_pool[0],
                                        srt, matched);
@@ -2374,22 +2509,34 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
         params.arvis_voxel.clear();
     }
 
-    if (params.beta_rim_weight > 0.0f) {
-        params.is_rim_src_voxel = derive_is_rim_src_voxel(
-            params.is_rim_orig, params.voxel_to_orig);
+    const bool rim_on   = (params.beta_rim_weight    > 0.0f) && !params.is_rim_orig.empty();
+    const bool redge_on = (params.gamma_redge_weight > 0.0f) && !params.is_redge_orig.empty();
+    if (rim_on || redge_on) {
+        // target 全境界帯は rim/redge 共有 (source 側が排他なので衝突なし)。
         params.is_rim_tgt_voxel = derive_is_rim_tgt_voxel(
             tgt_points, params.tgt_boundary_dist_full,
             session_voxel_tgt, params.rim_tgt_threshold_px);
+        // source 側は同じ map (voxel_to_orig) で別々に写像。
+        params.is_rim_src_voxel = rim_on
+            ? derive_is_rim_src_voxel(params.is_rim_orig, params.voxel_to_orig)
+            : std::vector<uint8_t>{};
+        params.is_redge_src_voxel = redge_on
+            ? derive_is_rim_src_voxel(params.is_redge_orig, params.voxel_to_orig)
+            : std::vector<uint8_t>{};
         if (params.verbose) {
             int n_rim_src = 0;
             for (uint8_t v : params.is_rim_src_voxel) if (v) n_rim_src++;
-            int n_rim_tgt = 0;
-            for (uint8_t v : params.is_rim_tgt_voxel) if (v) n_rim_tgt++;
-            std::cout << "[V3R-W] rim weighting: beta="
-                      << params.beta_rim_weight
+            int n_redge_src = 0;
+            for (uint8_t v : params.is_redge_src_voxel) if (v) n_redge_src++;
+            int n_tgt = 0;
+            for (uint8_t v : params.is_rim_tgt_voxel) if (v) n_tgt++;
+            std::cout << "[V3R-W] weighting: beta=" << params.beta_rim_weight
+                      << " gamma=" << params.gamma_redge_weight
                       << "  src_rim=" << n_rim_src
                       << "/" << params.is_rim_src_voxel.size()
-                      << "  tgt_rim=" << n_rim_tgt
+                      << "  src_redge=" << n_redge_src
+                      << "/" << params.is_redge_src_voxel.size()
+                      << "  tgt_band=" << n_tgt
                       << "/" << params.is_rim_tgt_voxel.size()
                       << "  thresh=" << params.rim_tgt_threshold_px << "px"
                       << std::endl;
@@ -2397,6 +2544,7 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
     } else {
         params.is_rim_src_voxel.clear();
         params.is_rim_tgt_voxel.clear();
+        params.is_redge_src_voxel.clear();
     }
 
     // Caudal voxel mask (R-feat-2). Independent of arvis. Empty input
@@ -2520,28 +2668,23 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
     };
     std::vector<RunSummaryD> all_summaries(N_STARTS);
 
+    // ===== [V3R-PARALLEL] Pre-generate per-run jitter / sigma0 ========
+    // Consume the outer RNG (rng) HERE in run order -- the exact
+    // 8-draw-per-run sequence the legacy in-loop code used, with
+    // mask_jitter_for_mode applied identically for run>0. This makes the
+    // run body RNG-free so it can execute in any order (parallel) yet
+    // produce byte-identical jitter to serial. Runs in BOTH modes, so the
+    // legacy serial results are unchanged. cma_seed = cma_base+run is
+    // RNG-independent.
+    std::vector<double>      pre_sigma0(N_STARTS, 0.0);
+    std::vector<SRTParamsV3> pre_jitter(N_STARTS);
+    std::vector<bool>        pre_is_local(N_STARTS, false);
     for (int run = 0; run < N_STARTS; run++) {
-        const auto t_one_run_t0 = sess_now();
-        RunContext rc;
-        rc.run_index             = run;
-        rc.is_local_regime       = (run % 2 == 0);
-        rc.cma_seed              = cma_base + (uint32_t)run;
-        rc.rmse_before           = rmse_before;
-        rc.init_matched          = init_matched;
-        rc.max_dist_sq           = max_dist_sq_session;
-        rc.liver_full_positions  = &start_liver_verts;
-        rc.liver_full_normals    = &start_liver_normals;
-        rc.liver_voxel_positions = &session_voxel_liver;
-        rc.tgt_full_points       = &tgt_points;
-        rc.tgt_voxel_points      = &session_voxel_tgt;
-
-        // ----- Generate sigma0 + jitter (V1 d01 consumption order) ---
-        // [V3R] IDENTICAL to V3: 8 d01 draws per Run, exact same order
-        // (sigma0, tx, ty, tz, rx, ry, rz, sc), so the rng state
-        // sequence matches V3 byte-for-byte.
+        const bool is_local = (run % 2 == 0);
+        pre_is_local[run] = is_local;
         SRTParamsV3 jitter;
-        if (rc.is_local_regime) {
-            rc.sigma0     = 0.3 + d01(rng) * 0.4;
+        if (is_local) {
+            pre_sigma0[run] = 0.3 + d01(rng) * 0.4;
             const float lt = params.jitter_local_t;
             jitter.tx     = (d01(rng) * 2.0f - 1.0f) * lt;
             jitter.ty     = (d01(rng) * 2.0f - 1.0f) * lt;
@@ -2551,7 +2694,7 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
             jitter.rz_deg = (d01(rng) * 2.0f - 1.0f) * 10.0f;
             jitter.scale  = 0.95f + d01(rng) * 0.10f;
         } else {
-            rc.sigma0     = 0.5 + d01(rng) * 0.5;
+            pre_sigma0[run] = 0.5 + d01(rng) * 0.5;
             const float gt = params.jitter_global_t;
             jitter.tx     = (d01(rng) * 2.0f - 1.0f) * gt;
             jitter.ty     = (d01(rng) * 2.0f - 1.0f) * gt;
@@ -2561,37 +2704,41 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
             jitter.rz_deg = (d01(rng) * 2.0f - 1.0f) * 30.0f;
             jitter.scale  = 0.90f + d01(rng) * 0.20f;
         }
+        // run 0 = identity jitter; run>0 = DoF-masked (SEVEN_DOF=pass).
+        pre_jitter[run] = (run == 0)
+                            ? SRTParamsV3{}
+                            : mask_jitter_for_mode(jitter, params.search_mode);
+    }
 
-        if (run == 0) {
-            rc.jitter = SRTParamsV3{};
-        } else {
-            // [NEW V3R/SearchMode] Mask inactive jitter components for
-            // reduced-DoF modes. The 8-draw d01() sequence above is
-            // intentionally executed in full regardless of search_mode
-            // so the rng state matches V3R(7-DoF) byte-for-byte for the
-            // same outer_seed; only the VALUES stored in rc.jitter
-            // differ. SEVEN_DOF: pass-through.
-            rc.jitter = mask_jitter_for_mode(jitter, params.search_mode);
-        }
+    // Per-run wall-clock slots (the run results go straight into
+    // all_summaries[run], which each run owns exclusively -> no races).
+    std::vector<double> pr_wall(N_STARTS, 0.0);
 
-        if (params.verbose) {
-            std::cout << "[V3R] Run " << (run+1) << "/" << N_STARTS
-                      << "  " << (rc.is_local_regime ? "Local " : "Global")
-                      << "  sigma0=" << std::fixed << std::setprecision(4)
-                      << rc.sigma0
-                      << "  cma_seed=" << rc.cma_seed
-                      << std::defaultfloat << std::setprecision(6)
-                      << std::endl;
-        }
+    // Execute one run into all_summaries[run]. run_params lets the
+    // parallel path pass a verbose=false copy so the per-run inner logs
+    // don't interleave. All state here is a fresh local (RunContext rc +
+    // the scratch_pool/KDTree built inside run_one_bipop_v3r) or the
+    // disjoint all_summaries[run]/pr_wall[run] slot -> safe to call
+    // concurrently for distinct run.
+    auto exec_run = [&](int run, const ParamsV3R& run_params) {
+        const auto t0 = sess_now();
+        RunContext rc;
+        rc.run_index             = run;
+        rc.is_local_regime       = pre_is_local[run];
+        rc.cma_seed              = cma_base + (uint32_t)run;
+        rc.rmse_before           = rmse_before;
+        rc.init_matched          = init_matched;
+        rc.max_dist_sq           = max_dist_sq_session;
+        rc.liver_full_positions  = &start_liver_verts;
+        rc.liver_full_normals    = &start_liver_normals;
+        rc.liver_voxel_positions = &session_voxel_liver;
+        rc.tgt_full_points       = &tgt_points;
+        rc.tgt_voxel_points      = &session_voxel_tgt;
+        rc.sigma0                = pre_sigma0[run];
+        rc.jitter                = pre_jitter[run];
 
-        // ----- Execute one Run ([V3R] dispatch target) ----------------
-        run_one_bipop_v3r(rc, params);
+        run_one_bipop_v3r(rc, run_params);
 
-        // ----- Save Run summary for post-loop top-K screening (案D') --
-        // Store only the minimal fields needed: jitter (SRTParamsV3 for
-        // compute_full_rmse_local centroid alignment), best_srt (the
-        // CMA-ES result), best_rmse_inner (for top-K sort), and
-        // bookkeeping. The heavy EvalContext (KDTree) is NOT saved.
         all_summaries[run].jitter          = rc.jitter;
         all_summaries[run].best_srt        = rc.best_srt;
         all_summaries[run].best_rmse_inner = rc.best_rmse_inner;
@@ -2599,13 +2746,77 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
         all_summaries[run].improved        = false;              // deferred
         all_summaries[run].stop_reason     = rc.stop_reason;
         all_summaries[run].generations     = rc.generations;
-        total_generations += rc.generations;
+        pr_wall[run]                        = sess_ms(sess_now() - t0).count();
+    };
 
-        const auto t_one_run_t1 = sess_now();
-        t_run_outer_wall_sum   += sess_ms(t_one_run_t1 - t_one_run_t0).count();
+    auto print_run_header = [&](int run) {
+        if (!params.verbose) return;
+        std::cout << "[V3R] Run " << (run+1) << "/" << N_STARTS
+                  << "  " << (pre_is_local[run] ? "Local " : "Global")
+                  << "  sigma0=" << std::fixed << std::setprecision(4)
+                  << pre_sigma0[run]
+                  << "  cma_seed=" << (cma_base + (uint32_t)run)
+                  << std::defaultfloat << std::setprecision(6)
+                  << std::endl;
+    };
+
+#ifdef _OPENMP
+    const int n_run_threads = g_v3rParallelRuns
+        ? std::max(1, std::min(N_STARTS, omp_get_max_threads()))
+        : 1;
+#else
+    const int n_run_threads = 1;
+#endif
+    g_v3rLastRunThreads = n_run_threads;
+
+    if (g_v3rParallelRuns && n_run_threads > 1) {
+        // ---- PARALLEL run loop -------------------------------------
+        if (params.verbose) {
+            std::cout << "[V3R] run loop mode: PARALLEL  ("
+                      << n_run_threads << " threads x " << N_STARTS
+                      << " runs; per-run logs deferred to after the loop)"
+                      << std::endl;
+        }
+        ParamsV3R params_quiet = params;
+        params_quiet.verbose = false;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(n_run_threads)
+#endif
+        for (int run = 0; run < N_STARTS; run++) {
+            exec_run(run, params_quiet);
+        }
+        // Serial post-pass: deferred per-run headers + total_generations.
+        for (int run = 0; run < N_STARTS; run++) {
+            print_run_header(run);
+            if (params.verbose) {
+                std::cout << "[V3R] Run " << (run+1)
+                          << "  inner=" << std::fixed << std::setprecision(6)
+                          << all_summaries[run].best_rmse_inner
+                          << "  gens=" << all_summaries[run].generations
+                          << "  (" << std::setprecision(1) << pr_wall[run]
+                          << " ms)  stop=" << all_summaries[run].stop_reason
+                          << std::defaultfloat << std::setprecision(6)
+                          << std::endl;
+            }
+            total_generations    += all_summaries[run].generations;
+            t_run_outer_wall_sum += pr_wall[run];
+        }
+    } else {
+        // ---- SERIAL run loop (legacy; byte-identical results) ------
+        if (params.verbose && g_v3rParallelRuns) {
+            std::cout << "[V3R] run loop mode: SERIAL  (parallel requested "
+                         "but <=1 thread/run available)" << std::endl;
+        }
+        for (int run = 0; run < N_STARTS; run++) {
+            print_run_header(run);
+            exec_run(run, params);   // inner logs print live here
+            total_generations    += all_summaries[run].generations;
+            t_run_outer_wall_sum += pr_wall[run];
+        }
     }
 
     auto t_sess_runs1 = sess_now();
+    g_v3rLastRunLoopMs = sess_ms(t_sess_runs1 - t_sess_runs0).count();
     if (params.verbose) {
         std::cout << "[V3R session/Time] runs loop wall-clock : "
                   << std::fixed << std::setprecision(1)
@@ -2613,6 +2824,8 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3R(
                   << " ms"
                   << "  (sum of per-run outer = "
                   << t_run_outer_wall_sum << " ms)"
+                  << "  [" << (g_v3rParallelRuns ? "PARALLEL x" : "SERIAL x")
+                  << g_v3rLastRunThreads << "]"
                   << std::defaultfloat << std::endl;
     }
 

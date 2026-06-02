@@ -153,6 +153,17 @@ struct State {
     // When a slot has has_alt=false (no instrument data captured), the
     // checkbox is greyed out and the no-occ variant is shown regardless.
     bool    showWithOcc      = true;
+    // ----- [COMPARE] Side-by-side A|B compare view ----------------------
+    // Toggled by the F9 "Compare A|B" checkbox or set by the SilCompare
+    // checkpoint button. compareSlotA/B index into slots[] (0-based:
+    // 0..9 = Run 1..10, kFinalSlot = Final). The squash IoU printed is
+    // slot.iou -- the score of the very composite displayed, identical
+    // yardstick for both rows. Full-mesh IoU is in the console per method.
+    bool        compareMode   = false;
+    int         compareSlotA  = 0;     // top row  (e.g. Alt+P)
+    int         compareSlotB  = 1;     // bottom row (e.g. Ctrl+I)
+    std::string compareLabelA = "A";
+    std::string compareLabelB = "B";
 };
 
 // -----------------------------------------------------------------------------
@@ -990,6 +1001,99 @@ inline void reset(State& st) {
 //  ImGui preview window. Call once per frame in main.cpp inside the
 //  ImGui frame, after all other windows. Honors `st.showWindow`.
 // -----------------------------------------------------------------------------
+// =====================================================================
+// [COMPARE] One row of the side-by-side view: a method's triptych
+// ([Source | Target | Overlay]) drawn aspect-correct and capped to
+// row_h_budget, with a coloured title + its squash IoU above it.
+// =====================================================================
+inline void drawCompareRow(const RunSlot& slot, const char* title,
+                           const ImVec4& title_col, float row_h_budget) {
+    ImGui::PushID(title);
+    ImGui::TextColored(title_col, "%s", title);
+    ImGui::SameLine();
+    if (!slot.has_data || slot.tex == 0) {
+        ImGui::TextDisabled("  (no data -- run the checkpoint)");
+        ImGui::PopID();
+        return;
+    }
+    ImGui::Text("  squash IoU = %.4f   |   inter %d / union %d px",
+                slot.iou, slot.inter_px, slot.union_px);
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const int tex_h_px = slot.has_rim_row ? (2 * slot.h + kPanelSep) : slot.h;
+    float iw = avail.x;
+    float ih = (slot.w > 0) ? iw * (float)tex_h_px / (float)slot.w : row_h_budget;
+    if (ih > row_h_budget) {
+        ih = row_h_budget;
+        iw = (tex_h_px > 0) ? ih * (float)slot.w / (float)tex_h_px : avail.x;
+    }
+    float off = (avail.x - iw) * 0.5f;
+    if (off < 0) off = 0;
+
+    // per-panel column headers (Source | Target | Overlay), same idiom as
+    // the single-slot view so the labels line up over each third.
+    const float scale_disp = (slot.w > 0) ? (iw / (float)slot.w) : 1.0f;
+    const float panel_px   = scale_disp *
+        (float)((slot.w - (kPanelCount + 1) * kPanelSep) / kPanelCount);
+    const float sep_px     = scale_disp * (float)kPanelSep;
+    const float region_x   = ImGui::GetCursorPosX() + off;
+    auto drawHeader = [&](float left_local, const char* txt) {
+        float tw = ImGui::CalcTextSize(txt).x;
+        float cx = left_local + (panel_px - tw) * 0.5f;
+        if (cx < left_local) cx = left_local;
+        ImGui::SetCursorPosX(cx);
+        ImGui::TextUnformatted(txt);
+    };
+    drawHeader(region_x + sep_px, "Source");
+    ImGui::SameLine();
+    drawHeader(region_x + sep_px + panel_px + sep_px, "Target");
+    ImGui::SameLine();
+    drawHeader(region_x + sep_px + (panel_px + sep_px) * 2.0f, "Overlay");
+
+    if (off > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + off);
+    ImGui::Image((ImTextureID)(intptr_t)slot.tex, ImVec2(iw, ih));
+    ImGui::PopID();
+}
+
+// =====================================================================
+// [COMPARE] The full side-by-side body: header + delta + two stacked
+// rows (A on top, B below) + the GREEN/RED/BLUE legend. Rendered in
+// place of the single-slot view when st.compareMode is on.
+// =====================================================================
+inline void drawCompareBody(State& st) {
+    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                       "Checkpoint compare  (same start pose, same squash yardstick)");
+    ImGui::TextDisabled("Top = A, bottom = B.  Full-mesh IoU prints to the console "
+                        "([Shift+E] / [Ctrl+Shift+G]).");
+    ImGui::Separator();
+
+    const RunSlot& A = st.slots[std::clamp(st.compareSlotA, 0, kNumSlots - 1)];
+    const RunSlot& B = st.slots[std::clamp(st.compareSlotB, 0, kNumSlots - 1)];
+
+    if (A.has_data && B.has_data) {
+        ImGui::Text("squash IoU:   A = %.4f    B = %.4f    (B - A = %+.4f)",
+                    A.iou, B.iou, B.iou - A.iou);
+        ImGui::Separator();
+    }
+
+    float avail_y = ImGui::GetContentRegionAvail().y;
+    float row_h   = std::max(80.0f, (avail_y - 90.0f) * 0.5f);
+
+    drawCompareRow(A, st.compareLabelA.empty() ? "A" : st.compareLabelA.c_str(),
+                   ImVec4(0.5f, 1.0f, 0.5f, 1.0f), row_h);
+    ImGui::Spacing();
+    drawCompareRow(B, st.compareLabelB.empty() ? "B" : st.compareLabelB.c_str(),
+                   ImVec4(1.0f, 0.8f, 0.4f, 1.0f), row_h);
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.30f, 1.0f), "[GREEN]");
+    ImGui::SameLine(); ImGui::Text("match");
+    ImGui::SameLine(); ImGui::TextColored(ImVec4(0.85f, 0.30f, 0.30f, 1.0f), "  [RED]");
+    ImGui::SameLine(); ImGui::Text("target only (miss)");
+    ImGui::SameLine(); ImGui::TextColored(ImVec4(0.30f, 0.40f, 0.95f, 1.0f), "  [BLUE]");
+    ImGui::SameLine(); ImGui::Text("source only (overshoot)");
+}
+
 inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
     if (!st.showWindow) return;
 
@@ -1008,6 +1112,29 @@ inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
     if (ImGui::Begin("V3RS Silhouette IoU [F9]", &st.showWindow,
                      ImGuiWindowFlags_NoCollapse))
     {
+        // [COMPARE] Side-by-side A|B view. When ON we render two stacked
+        // triptychs and skip the single-slot combo path entirely. Set by
+        // the SilCompare "Checkpoint" button, or toggled manually here.
+        ImGui::Checkbox("Compare A|B side-by-side", &st.compareMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show two captured slots stacked for direct mask\n"
+                              "comparison (top = A, bottom = B). Driven by the\n"
+                              "'Checkpoint: Alt+P vs Ctrl+I' button, or pick\n"
+                              "slots manually below (0-based: 0..9 = Run 1..10).");
+        if (st.compareMode) {
+            int a = st.compareSlotA, b = st.compareSlotB;
+            ImGui::SetNextItemWidth(90);
+            if (ImGui::InputInt("A slot", &a)) st.compareSlotA = std::clamp(a, 0, kNumSlots - 1);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90);
+            if (ImGui::InputInt("B slot", &b)) st.compareSlotB = std::clamp(b, 0, kNumSlots - 1);
+            drawCompareBody(st);
+            ImGui::End();
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor();
+            return;
+        }
+
         // Slot selector: "Run 1" ... "Run 10", "Final", "Diagnostic (F10)".
         std::string label_storage[kNumComboEntries];
         const char* labels[kNumComboEntries];

@@ -93,6 +93,8 @@ struct State {
     std::function<void()> drawGBody;    // Phase 3: full Ctrl+G panel body
     std::function<void()> drawNBody;    // Phase 4: Normal-Compatible Refine panel
     std::function<void()> drawVizExtra; // Phase 7: ScreenMesh Display + B/N viz
+    std::function<void()> drawUExtra;   // Phase U-1: Soft Partition controls
+    std::function<void()> drawWExtra;   // G/W split: Shape Match (Ctrl+W/Alt+W) params, migrated from drawGBody
 };
 
 // Internal tab draw functions (later phases populate these).
@@ -133,12 +135,14 @@ inline void draw(State& st, RegistrationImGuiManager& gUI) {
             }
             if (ImGui::BeginTabItem("W")) {
                 st.activeTab = TAB_W;
-                drawTabW(gUI.state, gUI.actions);
+                drawTabW(gUI.state, gUI.actions);     // existing: RIM 2D-projection debug popups
+                if (st.drawWExtra) st.drawWExtra();   // G/W split: migrated Shape Match params (from main.cpp)
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("U")) {
                 st.activeTab = TAB_U;
                 drawTabU(gUI.state, gUI.actions);
+                if (st.drawUExtra) st.drawUExtra();   // Phase U-1: Soft Partition
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Viz")) {

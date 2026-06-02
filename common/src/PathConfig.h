@@ -224,23 +224,23 @@ inline void initPaths() {
 
     REG_EXE_PATH = findExe("REG_EXE_PATH", {
 #ifdef _WIN32
-        "./lsn_registration.exe",
-        "lsn_registration.exe",
+                                               "./lsn_registration.exe",
+                                               "lsn_registration.exe",
 #else
-        "./lsn_registration",
-        "lsn_registration",
+                                               "./lsn_registration",
+                                               "lsn_registration",
 #endif
-    });
+                                           });
 
     DEFORM_EXE_PATH = findExe("DEFORM_EXE_PATH", {
 #ifdef _WIN32
-        "./lsn_deform.exe",
-        "lsn_deform.exe",
+                                                     "./lsn_deform.exe",
+                                                     "lsn_deform.exe",
 #else
-        "./lsn_deform",
-        "lsn_deform",
+                                                     "./lsn_deform",
+                                                     "lsn_deform",
 #endif
-    });
+                                                 });
 
     std::cout << "========================================" << std::endl;
     std::cout << "Final paths:" << std::endl;
@@ -263,21 +263,21 @@ inline void initFilePaths() {
     PORTAL_FILE_PATH  = MODEL_PATH + "portal.obj";
     VEIN_FILE_PATH    = MODEL_PATH + "vein.obj";
     TUMOR_FILE_PATH   = MODEL_PATH + "tumor.obj";
-    SEGMENT_FILE_PATH = MODEL_PATH + "res.obj";
+    SEGMENT_FILE_PATH = MODEL_PATH + "segment.obj";
     GB_FILE_PATH      = MODEL_PATH + "gb.obj";
 
     PreReg_TARGET_FILE_PATH  = REG_MODEL_PATH + "preReg_liver.obj";
     PreReg_PORTAL_FILE_PATH  = REG_MODEL_PATH + "preReg_portal.obj";
     PreReg_VEIN_FILE_PATH    = REG_MODEL_PATH + "preReg_vein.obj";
     PreReg_TUMOR_FILE_PATH   = REG_MODEL_PATH + "preReg_tumor.obj";
-    PreReg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "preReg_res.obj";
+    PreReg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "preReg_segment.obj";
     PreReg_GB_FILE_PATH      = REG_MODEL_PATH + "preReg_gb.obj";
 
     Reg_TARGET_FILE_PATH  = REG_MODEL_PATH + "reg_liver.obj";
     Reg_PORTAL_FILE_PATH  = REG_MODEL_PATH + "reg_portal.obj";
     Reg_VEIN_FILE_PATH    = REG_MODEL_PATH + "reg_vein.obj";
     Reg_TUMOR_FILE_PATH   = REG_MODEL_PATH + "reg_tumor.obj";
-    Reg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "reg_res.obj";
+    Reg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "reg_segment.obj";
     Reg_GB_FILE_PATH      = REG_MODEL_PATH + "reg_gb.obj";
 
     gDepthInputImage = INPUT_IMAGE_PATH + "target.jpg";

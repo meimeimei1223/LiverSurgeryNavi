@@ -15,6 +15,9 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <chrono>     // AR save: timestamp 生成
+#include <cstring>    // AR save: memcpy (行反転)
+#include <vector>     // AR save: pixel buffer
 
 #define GLEW_STATIC
 #include <GL/glew.h>
@@ -50,6 +53,7 @@
 #include "imgui.h"
 #include "AppImGuiBoot.h"
 #include "RegistrationImGuiManager.h"
+#include "AutoDeformDebugPanel.h"   // AutoDeform 専用デバッグサブパネル(フローティング)
 
 // ============================================================================
 // グローバル(RayCast.h / Grabber.h が extern で要求するもの)
@@ -64,6 +68,30 @@ glm::vec3    objPos(0.0f);
 bool         isDragging   = false;
 int          hit_index    = -1;
 glm::vec3    hit_position(0.0f);
+
+// RIGID_MODE のマウス押下時、クリックがオブジェクト(肝臓メッシュ)に当たったかを
+// 記録するフラグ。押下 (onMouseButton) でセットし、ドラッグ (onMouseMove) 中
+// 参照する。
+//   true  : オブジェクト上 → 左=肝臓回転 / 右=肝臓平行移動
+//   false : 何もない所     → 左=カメラオービット / 右=カメラパン
+// 左右どちらのボタンでも使うため isDragging とは別管理。
+static bool  g_rigidHitObject = false;
+
+// ============================================================================
+// Fine-tune モード (AUTO DEFORM 後の手動微調整)
+//   モード ON/OFF フラグ gFineTuneMode は DeformGlobals.h で定義し、サブパネル
+//   と共有する。ここ (main.cpp) ではグラブの一時状態だけ保持する。
+//   ON のとき DEFORM_MODE の通常メッシュグラブを止め、AUTO move 球
+//   (gAutoCtrl の move handle) を直接クリックして掴み、カメラ平面内で
+//   ドラッグできる。各 handle の manualOffset を更新し、毎フレーム物理を回す。
+// ============================================================================
+static int       g_fineGrabIdx     = -1;      // 掴み中の move handle idx (-1=なし)
+static glm::vec3 g_fineGrabStartOffset(0.0f); // 掴んだ瞬間の manualOffset
+static glm::vec3 g_fineGrabAnchor(0.0f);      // 掴んだ瞬間のマウスレイ上の点 (depth 固定面上)
+                                              //   ドラッグ中はこの点からの移動量を offset に積む。
+                                              //   クリック位置と球中心のズレで飛ばないための基準点。
+static float     g_fineGrabDepth   = 1.0f;    // 掴んだ点のカメラからの距離 (射影距離)
+                                              //   (これを固定 = カメラ平面内ドラッグ)
 
 FullSphereCamera OrbitCam;
 
@@ -81,6 +109,11 @@ RegistrationImGuiManager gUI;
 static AR::Background g_arBg;
 static bool           g_arMode = false;
 
+// AR Save Image 用: メインループ内のローカル shaderProgram / shaderProgramCube を
+// onSaveAR ラムダから参照するためのポインタ。main() の shader 初期化直後にセットする。
+static ShaderProgram* g_shaderPtr     = nullptr;
+static ShaderProgram* g_shaderCubePtr = nullptr;
+
 // QCR Tuning globals (REG-only feature). RegistrationImGuiManager.h's
 // QCR slider panel short-returns before referencing these when
 // state.mainMode==1, so the values are never read in DEFORM; but the
@@ -93,6 +126,158 @@ float g_qcrMaxTotalRotDeg = 90.0f;
 // Forward decls for the two functions that wire / sync the shared UI.
 static void setupUICallbacks();
 static void syncUIState();
+
+// ============================================================================
+// AR Save Image (DEFORM 版)
+// ----------------------------------------------------------------------------
+// REG 側の ARSave::capture (AR.h) は organMeshes (mCutMesh*) を描く専用なので
+// DEFORM の SoftBody VisMesh には使えない。ここでは DEFORM の実描画関数
+// DeformPipeline::updateAndDraw() を FBO 内で呼び、メッシュ + ハンドル +
+// auto handle を丸ごと入力画像サイズでキャプチャして PNG 保存する。
+//
+//   - 画像サイズ: AR 背景テクスチャ (original.jpg) の texW/texH を使用。
+//     未ロードならウィンドウサイズにフォールバック。
+//   - view: AR overlay と同じ「原点 → +Z」固定 (g_arMode の有無に関わらず、
+//     保存画像は常に AR 視点で出す。これが intrinsics と整合する唯一の視点)。
+//   - projection: OrbitCam.fx/fy/cx/cy から入力画像サイズ基準で構築。
+//   - 背景: original.jpg を必ず合成 (AR 画像として意味があるのは背景つき)。
+//
+// 戻り値: 保存成功なら true。
+static bool saveDeformARImage() {
+    if (!g_shaderPtr || !g_shaderCubePtr) {
+        std::cerr << "[ARSave/DEFORM] shaders not ready" << std::endl;
+        return false;
+    }
+
+    // --- 画像サイズ決定 ---
+    int imgW = (g_arBg.texW > 0) ? g_arBg.texW : gWindowWidth;
+    int imgH = (g_arBg.texH > 0) ? g_arBg.texH : gWindowHeight;
+    if (imgW <= 0 || imgH <= 0) {
+        std::cerr << "[ARSave/DEFORM] invalid image size " << imgW << "x" << imgH << std::endl;
+        return false;
+    }
+
+    // --- FBO セットアップ (color tex + depth rbo) ---
+    GLuint fbo = 0, colorTex = 0, depthRbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+    glGenTextures(1, &colorTex);
+    glBindTexture(GL_TEXTURE_2D, colorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, imgW, imgH, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, colorTex, 0);
+
+    glGenRenderbuffers(1, &depthRbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, depthRbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, imgW, imgH);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                              GL_RENDERBUFFER, depthRbo);
+
+    bool ok = false;
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        // viewport を画像サイズに
+        GLint prevVp[4];
+        glGetIntegerv(GL_VIEWPORT, prevVp);
+        glViewport(0, 0, imgW, imgH);
+
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // --- AR view (原点 → +Z) ---
+        glm::mat4 arView = glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f),
+                                       glm::vec3(0.0f, 0.0f, 1.0f),
+                                       glm::vec3(0.0f, 1.0f, 0.0f));
+
+        // --- intrinsics projection (入力画像サイズ基準) ---
+        glm::mat4 arProj(0.0f);
+        arProj[0][0] =  2.0f * OrbitCam.fx / imgW;
+        arProj[1][1] =  2.0f * OrbitCam.fy / imgH;
+        arProj[2][0] =  1.0f - 2.0f * OrbitCam.cx / imgW;
+        arProj[2][1] =  2.0f * OrbitCam.cy / imgH - 1.0f;
+        arProj[2][2] = -(OrbitCam.farPlane + OrbitCam.nearPlane)
+                       / (OrbitCam.farPlane - OrbitCam.nearPlane);
+        arProj[2][3] = -1.0f;
+        arProj[3][2] = -2.0f * OrbitCam.farPlane * OrbitCam.nearPlane
+                       / (OrbitCam.farPlane - OrbitCam.nearPlane);
+
+        // 1) 背景画像
+        g_arBg.draw();
+
+        // 2) DEFORM 実描画 (メッシュ + ハンドル + auto handle)
+        //    camPos は AR 視点 = 原点。
+        //
+        //    ★ 重要: updateAndDraw は内部で物理 step を回す (preSolve/solve/postSolve)。
+        //      solveEdges は alpha=compliance/(dt*dt)、postSolve は velocity=diff/dt
+        //      を計算するので dt=0 を渡すとゼロ除算で NaN → メッシュ破壊。
+        //      そこで gInspectMode=true にして物理 step 自体をスキップさせる
+        //      (updateAndDraw の `if (!gInspectMode)` ガードを利用)。
+        //      描画のみ実行され、物理状態は一切変化しない。
+        const bool savedInspect = gInspectMode;
+        gInspectMode = true;
+        DeformPipeline::updateAndDraw(
+            0.0f, *g_shaderPtr, *g_shaderCubePtr,
+            arView, arProj, glm::vec3(0.0f));
+        gInspectMode = savedInspect;
+
+        // --- pixel 読み取り + 上下反転 ---
+        std::vector<unsigned char> pixels(static_cast<size_t>(imgW) * imgH * 3);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, imgW, imgH, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+
+        const int stride = imgW * 3;
+        std::vector<unsigned char> flipped(pixels.size());
+        for (int y = 0; y < imgH; y++) {
+            std::memcpy(&flipped[y * stride],
+                        &pixels[(imgH - 1 - y) * stride], stride);
+        }
+
+        // --- timestamp ---
+        auto nowc = std::chrono::system_clock::now();
+        auto tt   = std::chrono::system_clock::to_time_t(nowc);
+        struct tm lt;
+#ifdef _WIN32
+        localtime_s(&lt, &tt);
+#else
+        localtime_r(&tt, &lt);
+#endif
+        char stamp[64];
+        std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d_%02d%02d%02d",
+                      lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+                      lt.tm_hour, lt.tm_min, lt.tm_sec);
+
+        std::string saveDir = DEPTH_OUTPUT_PATH;
+        if (!saveDir.empty() && saveDir.back() != '/') saveDir += "/";
+        saveDir += "deform_screenshots/";
+        std::filesystem::create_directories(saveDir);
+
+        std::string path = saveDir + "deform_ar_" + stamp + ".png";
+        if (stbi_write_png(path.c_str(), imgW, imgH, 3, flipped.data(), stride)) {
+            std::cout << "[ARSave/DEFORM] " << imgW << "x" << imgH << " -> "
+                      << std::filesystem::absolute(path).string() << std::endl;
+            ok = true;
+        } else {
+            std::cerr << "[ARSave/DEFORM] stbi_write_png failed: " << path << std::endl;
+        }
+
+        glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+    } else {
+        std::cerr << "[ARSave/DEFORM] FBO incomplete" << std::endl;
+    }
+
+    // --- cleanup ---
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (colorTex) glDeleteTextures(1, &colorTex);
+    if (depthRbo) glDeleteRenderbuffers(1, &depthRbo);
+    if (fbo)      glDeleteFramebuffers(1, &fbo);
+
+    return ok;
+}
+
 
 // ============================================================================
 // GLFW コールバック
@@ -119,26 +304,129 @@ static void onKey(GLFWwindow* win, int key, int, int action, int mods) {
     //   API（DeformPipeline.h）には手を加えず、ここで先取りして return。
     if (key == GLFW_KEY_A) {
         g_arMode = !g_arMode;
+        // AR を ON にした瞬間、グローバル view を即 AR 視点に切り替える。
+        //   hitTest / grab は glfwPollEvents 内 (= updateAndDraw より前) で
+        //   グローバル view を参照するため、ここで先にセットしておかないと
+        //   「AR ON 直後の最初のクリック」が 1 フレーム前のオービット view で
+        //   レイを飛ばしてしまい、AR 表示とマウス位置がズレる。
+        if (g_arMode) {
+            view = glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f),
+                               glm::vec3(0.0f, 0.0f, 1.0f),
+                               glm::vec3(0.0f, 1.0f, 0.0f));
+        }
         std::cout << "[AR] background overlay: "
                   << (g_arMode ? "ON" : "OFF") << std::endl;
         return;
     }
 
-    // Mode-dispatch scaffold. Phase 1 only fires DEFORM_MODE; the
-    // REGISTRATION_MODE branch is a placeholder for the Phase 3 unified app.
-    switch (currentMainMode) {
-    case DEFORM_MODE:
-        DeformPipeline::onKey(key, mods);
-        break;
-    case REGISTRATION_MODE:
-        // Phase 3: dispatch to REG-side handlers here.
-        break;
-    }
+    // [Phase 2] DeformPipeline::onKey へのディスパッチを停止。
+    //   旧 R/H/D/C/V/T/B/1〜7/N/P/0/-/=/Bksp の各 KEY は全て GUI に
+    //   移行済み:
+    //     - sub-mode (R/H/D), reset (C), visibility (V/T/B) → side panel
+    //     - AutoDeform (1-7/N/P/0/-/=/Bksp/SHIFT+1)        → AutoDeformDebugPanel
+    //   DeformPipeline::onKey() 自体は GUI(AutoDeformDebugPanel::tapKey)から
+    //   呼ばれてロジックを共有しているため関数定義は残す。ここからの
+    //   キーボード由来の呼び出しのみを止める。
+    //
+    //   将来 KEY を復活させたい場合はこのコメントごと差し替える形で、
+    //   下記のような dispatch を再導入できる:
+    //     switch (currentMainMode) {
+    //     case DEFORM_MODE:        DeformPipeline::onKey(key, mods); break;
+    //     case REGISTRATION_MODE:  /* TODO Phase 3 */                  break;
+    //     }
+    (void)key;
+    (void)mods;
 }
 
 static void onMouseButton(GLFWwindow* win, int button, int action, int) {
     if (ImGui::GetIO().WantCaptureMouse) return;
     double x, y; glfwGetCursorPos(win, &x, &y);
+
+    using S = DeformHandlPlaceData;
+
+    // RIGID_MODE は左右ボタン両方を肝臓操作に使う (左=回転 / 右=平行移動)。
+    //   DeformPipeline::onMousePress は LEFT しか処理しない作りなので、
+    //   RIGID のオブジェクト命中判定はここで左右まとめて行う。
+    //     命中  → isDragging=true, g_rigidHitObject=true (肝臓を操作)
+    //     非命中→ isDragging=false (onMouseMove のカメラ分岐へ流れる)
+    if (deformHandlPlace.state == S::RIGID_MODE && multiBody && gGrabber) {
+        if (action == GLFW_PRESS &&
+            (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            bool hit = gGrabber->hitTest((float)x, (float)y);
+            g_rigidHitObject = hit;
+            isDragging       = hit;   // 命中時のみドラッグ開始 (非命中はカメラ操作)
+            if (button == GLFW_MOUSE_BUTTON_RIGHT && hit) {
+                // 肝臓を右クリックで平行移動するためにグラブ起点を記録。
+                // (左クリック回転は rigidRotateAroundCenter を使うので不要)
+                gGrabber->startGrab((float)x, (float)y);
+            }
+        } else if (action == GLFW_RELEASE) {
+            if (g_rigidHitObject) gGrabber->endGrab();
+            isDragging       = false;
+            g_rigidHitObject = false;
+            hit_index        = -1;
+        }
+        return;
+    }
+
+    // Fine-tune モード (DEFORM_MODE 中、パネルで ON):
+    //   通常メッシュグラブの代わりに AUTO ハンドル球 (fix + move 両方) を直接
+    //   クリックして掴む。fix/move は区別しない (通常グラブが種類を区別しないのと
+    //   同様)。左ボタンのみ。球に当たれば通し番号 (unifiedIdx) と起点を記録し、
+    //   カメラ平面内ドラッグのために「掴んだ center のカメラ距離」を固定保存する。
+    if (gFineTuneMode && deformHandlPlace.state == S::DEFORM_MODE && multiBody) {
+        if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT) {
+            RayCast::Ray ray = RayCast::screenToRay(
+                (float)x, (float)y, view, projection,
+                glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+
+            // 全ハンドル (fix+move を通し番号で) について、レイ上の最近接点で当たり判定。
+            //   レイ上で handle center に最も近い点を求め、球内かどうかで判定する。
+            int   bestIdx = -1;
+            float bestT   = 1e30f;
+            for (int i = 0; i < gAutoCtrl.numHandles(); i++) {
+                glm::vec3 c = gAutoCtrl.unifiedHandleCenter(i);
+                float t = glm::dot(c - ray.origin, ray.direction);   // レイ上の射影距離
+                if (t <= 0.0f) continue;
+                glm::vec3 closest = ray.origin + ray.direction * t;
+                float d2 = glm::dot(c - closest, c - closest);
+                float r  = gAutoCtrl.unifiedHandleRadius(i);
+                if (d2 <= r * r && t < bestT) {
+                    bestT   = t;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx >= 0) {
+                g_fineGrabIdx         = bestIdx;
+                g_fineGrabStartOffset = gAutoCtrl.unifiedManualOffset(bestIdx);
+                // カメラ距離 = 球 center をレイに射影した距離 bestT で固定。
+                // これを保つことで「カメラ平面内」(奥行き固定) ドラッグになる。
+                g_fineGrabDepth       = bestT;
+                // アンカー = レイ上で bestT の点 (= レイ上で球 center に最も近い点)。
+                // クリック位置は球中心から少しずれるが、ドラッグ量は「現在のレイ上
+                // の点 − このアンカー」で測るので、掴んだ瞬間は差分ゼロ → 飛ばない。
+                g_fineGrabAnchor      = ray.origin + ray.direction * bestT;
+                bool isFix = gAutoCtrl.isUnifiedFix(bestIdx);
+                std::cout << "[FineTune] grabbed " << (isFix ? "fix=" : "move=")
+                          << (isFix ? bestIdx : bestIdx - gAutoCtrl.numFix())
+                          << "  depth=" << g_fineGrabDepth
+                          << "  startOffset=(" << g_fineGrabStartOffset.x << ","
+                          << g_fineGrabStartOffset.y << "," << g_fineGrabStartOffset.z << ")"
+                          << std::endl;
+            } else {
+                g_fineGrabIdx = -1;   // 球を外した → 何もしない (カメラは別途固定)
+            }
+        } else if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_LEFT) {
+            if (g_fineGrabIdx >= 0) {
+                std::cout << "[FineTune] released handle uIdx=" << g_fineGrabIdx << std::endl;
+            }
+            g_fineGrabIdx = -1;
+        }
+        return;   // Fine-tune 中は通常グラブに渡さない
+    }
+
+    // RIGID 以外 (HANDLE_PLACE / DEFORM) は従来通り DeformPipeline に委譲。
     if (action == GLFW_PRESS)        DeformPipeline::onMousePress(button, x, y);
     else if (action == GLFW_RELEASE) DeformPipeline::onMouseRelease(button);
 }
@@ -158,26 +446,71 @@ static void onMouseMove(GLFWwindow* win, double x, double y) {
     bool L = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT)  == GLFW_PRESS;
     bool R = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
 
-    // RIGID_MODE drag: move the whole rigid body. Ported from the legacy
-    // unified main.cpp's glfw_onMouseMoveOrbit DEFORM_MODE block.
-    //   L+R : translate along camera depth (Z)
-    //   L   : rotate around camera right/up
-    //   R   : translate in the screen plane (pan-like)
-    if (isDragging && deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE && multiBody) {
-        if (L && R) {
-            glm::vec3 mv = OrbitCam.cameraDirection * (-dy) * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
-            multiBody->rigidTranslate(mv);
-        } else if (L && !R) {
+    // RIGID_MODE drag:
+    //   オブジェクト命中時 (g_rigidHitObject):
+    //     L : 肝臓を回転 (rigidRotateAroundCenter, camera right/up 軸まわり)
+    //     R : 肝臓を平行移動 (grab した点がカーソルを追従)
+    //   非命中時は下のカメラ操作 (オービット / パン) に流れる。
+    if (deformHandlPlace.state == DeformHandlPlaceData::RIGID_MODE
+        && multiBody && g_rigidHitObject) {
+        // 回転軸・奥行き軸は通常 / AR とも OrbitCam の右・上・視線ベクトルを使う。
+        //   登録 pose が 180°Y 回転のため cameraRight≈(-1,0,0), cameraDir≈(0,0,-1)。
+        //   AR 中も OrbitCam はフリーズしているだけで値は同じ向きを保持しているので、
+        //   ここで AR 用の固定軸 (+X/+Y/+Z) に差し替えると右と視線の符号が反転し、
+        //   通常モードと AR モードで回転方向が逆になってしまう。OrbitCam の軸で
+        //   統一すれば通常 / AR で同じ操作感になる。
+        const glm::vec3 axisRight = OrbitCam.cameraRight;
+        const glm::vec3 axisUp    = OrbitCam.cameraUp;
+        const glm::vec3 axisFwd   = OrbitCam.cameraDirection;
+
+        if (L && !R) {
             float rotX = dy * 0.01f;
             float rotY = dx * 0.01f;
-            if (std::abs(rotX) > 1e-5f) multiBody->rigidRotateAroundCenter(OrbitCam.cameraRight, rotX);
-            if (std::abs(rotY) > 1e-5f) multiBody->rigidRotateAroundCenter(OrbitCam.cameraUp,    rotY);
+            if (std::abs(rotX) > 1e-5f) multiBody->rigidRotateAroundCenter(axisRight, rotX);
+            if (std::abs(rotY) > 1e-5f) multiBody->rigidRotateAroundCenter(axisUp,    rotY);
         } else if (R && !L) {
-            float tdx =  dx * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
-            float tdy = -dy * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
-            glm::vec3 mv = OrbitCam.cameraRight * tdx + OrbitCam.cameraUp * tdy;
+            // 右クリックで startGrab 済み。grab 点をカーソルに追従させる。
+            if (gGrabber) gGrabber->moveGrab((float)x, (float)y, 1.0f / 60.0f);
+        } else if (L && R) {
+            // 左右同時: カメラ奥行き方向に平行移動
+            glm::vec3 mv = axisFwd * (-dy) * OrbitCam.LIGHT_MOUSE_SENSITIVITY;
             multiBody->rigidTranslate(mv);
         }
+        return;
+    }
+
+    // Fine-tune ドラッグ: 掴んだ move 球をカメラ平面内で動かす。
+    //   掴んだ center のカメラ距離 (g_fineGrabDepth) を固定し、現在のマウス
+    //   レイ上でその距離の点を新しい目標 center とする。これがカメラ平面内
+    //   ドラッグ (奥行き固定) になる。カメラを回せば別角度から、Key A 中なら
+    //   AR 視点平面で動く (view が AR に切替わっているため自動対応)。
+    //   差分を manualOffset に積み、毎フレーム物理を回してリアルタイム反映。
+    if (gFineTuneMode && g_fineGrabIdx >= 0
+        && deformHandlPlace.state == DeformHandlPlaceData::DEFORM_MODE
+        && multiBody && (L && !R)) {
+        RayCast::Ray ray = RayCast::screenToRay(
+            (float)x, (float)y, view, projection,
+            glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+
+        // 掴んだ深度の点 = レイ起点 + 方向 * 固定距離。
+        glm::vec3 targetCenter = ray.origin + ray.direction * g_fineGrabDepth;
+        // 掴んだ瞬間のアンカー (レイ上の点) からの移動量を、起点 offset に加算。
+        //   掴み直後は targetCenter == g_fineGrabAnchor なので delta=0 → 飛ばない。
+        glm::vec3 deltaWorld   = targetCenter - g_fineGrabAnchor;
+        glm::vec3 newOffset    = g_fineGrabStartOffset + deltaWorld;
+
+        gAutoCtrl.setUnifiedManualOffset(multiBody, g_fineGrabIdx, newOffset);
+
+        // ★ FPS 対策: ここでは solve を呼ばない。
+        //   setUnifiedManualOffset 内の applyProgress/applyFixHandle が handle 頂点を
+        //   目標位置に固定 (position=prev=目標, velocity=0) するので、あとは
+        //   メインループの updateAndDraw が毎フレーム回す通常 solve (重力ゼロ・1 回)
+        //   が周囲を馴染ませる。通常のメッシュグラブ (moveGrab) と全く同じ構造。
+        //
+        //   以前はここで runBoost(15) を呼んでいたが、onMouseMove は 1 フレーム
+        //   内にマウスイベントの数だけ複数回呼ばれるため、1 フレームで
+        //   15 iter × 数回 + updateAndDraw の solve = 100+ iter となり激重だった。
+        //   位置を書くだけにすれば通常グラブ同様に軽い。
         return;
     }
 
@@ -188,12 +521,21 @@ static void onMouseMove(GLFWwindow* win, double x, double y) {
     }
 
     // それ以外はカメラ操作(回転 / パン)
+    //   RIGID で非命中の場合もここに来る → ボード中心オービット / パン。
+    //   ★ ただし AR モード中はカメラを固定する(視点を intrinsics に合わせて
+    //     背景画像に重ねるのが目的なので、オブジェクト外ドラッグでカメラを
+    //     動かさない)。OrbitCam を回すと cameraPos が変わり、AR を抜けたとき
+    //     視点が飛ぶ・ライティングが変わる原因になるため、ここで抑止する。
+    if (g_arMode) return;
     if (L && !R) OrbitCam.Rotate(dx, dy);
     else if (R && !L) OrbitCam.Pan(dx, -dy);
 }
 
 static void onMouseScroll(GLFWwindow*, double, double dy) {
     if (ImGui::GetIO().WantCaptureMouse) return;
+    // AR モード中はカメラ固定 (ズームで radius が変わると intrinsics 視点が
+    // ずれて背景と合わなくなるため抑止)。
+    if (g_arMode) return;
     OrbitCam.Zoom(dy);
 }
 
@@ -298,8 +640,20 @@ static void setupUICallbacks() {
             multiBody->setRigidMode(true);
             multiBody->initPhysics();
         }
+        // ★ AutoHandleController が掴んでいた auto handles (fix/move スフィア) も消去。
+        //   multiBody->fullReset() で invMass を含む particle 状態は既に initial に
+        //   戻っているので、ここでは body=nullptr を渡して「saved invMass 書き戻し」
+        //   をスキップし、内部 handle 配列だけ空にする。
+        //   描画は gAutoCtrl.numFix()/numMove() を走査しているのでスフィアも消える。
+        gAutoCtrl.clear(nullptr);
+        // AutoDeform の Step 進捗も初期化 (再度 Stage 1 から走らせ直す前提)。
+        gAutoDeform.stage = 0;
+        // AutoOpt の表示キャッシュも消去 (古い RMSE 履歴が残らないように)
+        AutoDeformOpt::gLastSingle = AutoDeformOpt::SingleResult{};
+        AutoDeformOpt::gLastAll    = AutoDeformOpt::AllResult{};
+
         deformHandlPlace.state = DeformHandlPlaceData::HANDLE_PLACE_MODE;
-        std::cout << "[UI] Full Reset" << std::endl;
+        std::cout << "[UI] Full Reset (incl. auto handles & stage)" << std::endl;
     };
 
     a.onHandleRadiusChanged = [](float r) {
@@ -324,15 +678,23 @@ static void setupUICallbacks() {
         }
     };
 
-    // AR snapshot save: not yet ported to DEFORM, no-op for now.
+    // AR snapshot save (DEFORM 版): FBO に AR 視点で描画して PNG 保存。
     a.onSaveAR = []{
-        std::cout << "[UI] Save AR Image (not yet implemented in DEFORM)" << std::endl;
+        if (currentMainMode != DEFORM_MODE) return;
+        bool ok = saveDeformARImage();
+        std::cout << "[UI] Save AR Image (DEFORM) "
+                  << (ok ? "OK" : "FAILED") << std::endl;
     };
 
     a.onResetCamera = []{
         if (gOrbitCamPtr) {
+            // resetToInitialState() は rotation=identity に戻すだけで、起動時に
+            // applyRegistrationCameraPose() が設定した「180度Y回転 + TARGET_TEXTURE」
+            // を捨ててしまう。そのため reset 後に同じ pose を再適用し、
+            // 「起動直後とまったく同じ見た目」に戻す。
             gOrbitCamPtr->resetToInitialState();
-            std::cout << "[UI] Camera reset" << std::endl;
+            DeformPipeline::applyRegistrationCameraPose(*gOrbitCamPtr);
+            std::cout << "[UI] Camera reset (restored registration pose)" << std::endl;
         }
     };
 
@@ -420,6 +782,10 @@ int main(int argc, char** argv) {
     shaderProgramCube.loadShaders((SHADERS_PATH + "texture.vert").c_str(),
                                   (SHADERS_PATH + "texture.frag").c_str());
 
+    // AR Save Image 用に shader をグローバル公開 (onSaveAR ラムダから参照)
+    g_shaderPtr     = &shaderProgram;
+    g_shaderCubePtr = &shaderProgramCube;
+
     // AR背景の初期化（レジストレーション側 main.cpp と同じ運用）
     //   loadTexture が失敗してもアプリは継続。draw() は ready=false のとき no-op。
     g_arBg.initGL();
@@ -471,30 +837,12 @@ int main(int argc, char** argv) {
     gGrabber->setPhysicsObject(multiBody);
 
     std::cout << "\n=== Ready ==="
-              << "\n  R/H/D = Rigid / HandlePlace / Deform"
-              << "\n  C     = reset handles & shape"
-              << "\n  V     = Organs visibility cycle (ON / 50% / OFF)"
-              << "\n  T     = Target  visibility cycle (ON / 50% / OFF)"
-              << "\n  B     = Board   visibility cycle (ON / 50% / OFF)"
-              << "\n  --- AUTO Step 1-4 ---"
-              << "\n  1     = classify Src visibility (visible/hidden)"
-              << "\n  2     = extract correspondences"
-              << "\n  3     = classify (INLIER/MOVER/OUTLIER)"
-              << "\n  4     = compute field on vis mesh"
-              << "\n  --- AUTO Step 5 ---"
-              << "\n  5     = generate handles + auto-switch to DEFORM_MODE"
-              << "\n  --- HEMI drive (after key 5) ---"
-              << "\n  6     = step active move +gMoveScale"
-              << "\n  Bksp  = step active move -gMoveScale"
-              << "\n  N     = select next move handle"
-              << "\n  A     = toggle AR background overlay (camera intrinsics view)"
-              << "\n  - / = = decrease / increase gMoveScale (0.1..2.0)"
-              << "\n  --- Inspect ---"
-              << "\n  7     = BEFORE/AFTER snapshot toggle"
-              << "\n  0     = TetMesh wireframe toggle"
-              << "\n  --- Preset (cycle P0->P1->P2->P3->P4) ---"
-              << "\n  P     = next preset (then press 5 to regenerate handles)"
-              << "\n  ESC   = quit"
+              << "\n  Mouse  = orbit / pan / zoom (RIGID_MODE: drag = move rigid body)"
+              << "\n  A      = toggle AR background overlay"
+              << "\n  ESC    = quit"
+              << "\n  --- All other ops moved to GUI ---"
+              << "\n  Side panel       : Rigid / Handle / Deform, Sphere Radius, Visibility, Reset"
+              << "\n  AutoDeform panel : Stages 1-5, HEMI drive, Inspect, Preset, Wireframe"
               << std::endl;
 
     // メインループ
@@ -523,18 +871,27 @@ int main(int argc, char** argv) {
         //     2) 背景画像（original.jpg）を NDC z=0.999 で描画
         //   ※ updateAndDraw に渡す view 参照はグローバル `view` を指しているため、
         //     ここでグローバルを書き換えれば後段の描画にそのまま反映される。
+        //
+        //   ★ camPos も AR 視点の原点 (0,0,0) に固定する。
+        //     updateAndDraw 内で camPos は lightPos (ライティング光源) に使われる。
+        //     view だけ固定して camPos を OrbitCam.cameraPos のままにすると、
+        //     マウスでカメラを回した際に「視点は固定なのに光源だけ動く」
+        //     → ライティングだけ変化する不具合になる。AR save 関数とも揃える。
+        glm::vec3 renderCamPos = OrbitCam.cameraPos;
         if (g_arMode) {
             view = glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f),
                                glm::vec3(0.0f, 0.0f, 1.0f),
                                glm::vec3(0.0f, 1.0f, 0.0f));
+            renderCamPos = glm::vec3(0.0f, 0.0f, 0.0f);
             g_arBg.draw();
         }
 
         DeformPipeline::updateAndDraw(
             dt, shaderProgram, shaderProgramCube,
-            view, projection, OrbitCam.cameraPos);
+            view, projection, renderCamPos);
 
         gUI.draw(gWindowWidth, gWindowHeight);
+        AutoDeformDebugPanel::draw();   // AutoDeform 専用デバッグサブパネル
 
         AppImGuiBoot::endFrame();
         glfwSwapBuffers(gWindow);

@@ -382,6 +382,79 @@ inline float computeSilhouette2DObjective(
    互換性: 既存 computeSilhouette2DObjective は無改変、同じシグネチャの
    Fast 版を別関数として提供。比較実験用。
    ========================================================================== */
+
+// ===========================================================================
+// [PERF TOGGLE] g_silFastPath
+//   シルエット最適化 (CmaesRefine::run の use_silhouette_2d 経路) の高速化を
+//   ON/OFF するランタイムフラグ。**既定 false = 旧挙動そのまま**(レガシー基準)。
+//   true のときだけ次の3つが有効化される。どれも結果 (IoU 軌跡・最終姿勢) を
+//   変えない無駄取りなので、OFF と ON で最終 IoU は一致するはず:
+//     (1) fastComputeRMSE の OpenMP 並列リダクション (sil時のみ)
+//     (2) ターゲット mask をループ前に1回構築して使い回し (毎eval再構築を省略)
+//     (3) IoU 集計 (Step 4) の OpenMP 並列リダクション
+//   G タブのチェックボックスから main.cpp 経由でトグルする。Ctrl+G(V3R)/
+//   Ctrl+Shift+G(V3RS) は別ファイル・別関数なので、このフラグと完全に無関係。
+//   OFF=基準, ON=高速版 を同じ開始姿勢で回して最終 IoU 一致を確認できる。
+// ===========================================================================
+inline bool g_silFastPath = false;
+
+// ===========================================================================
+// [EXPERIMENT TOGGLE] Alt+P final accept gate (silhouette mode).
+//   CmaesRefine::run's silhouette branch keeps the inner-loop best (found)
+//   pose only if BOTH IoU improved AND compRMSE didn't worsen past a cap.
+//   That cap reverts IoU-optimal poses whose 3D RMSE rises (inner loop hits
+//   IoU 0.96 but compRMSE ~2x -> reverted). These knobs expose it.
+//     g_silAcceptIgnoreRmse : true -> accept on IoU gain ALONE (cap bypassed).
+//                             Mirrors Ctrl+I pure_iou_mode for the V1 engine.
+//     g_silAcceptRmseCap    : multiplier used when the cap is active.
+//                             accepted needs rmse_after < rmse_before * cap.
+//                             Default 1.2 == legacy byte-for-byte. (Old code
+//                             hardcoded 1.2f; its comment wrongly said 50%.)
+// ===========================================================================
+inline bool  g_silAcceptIgnoreRmse = false;
+inline float g_silAcceptRmseCap    = 1.2f;
+
+// ---------------------------------------------------------------------------
+// [PERF] buildSilhouetteTargetMaskFast
+//   computeSilhouette2DObjectiveFast の Step 3 (ターゲット mask 構築) を
+//   そのまま切り出した関数。中身・分岐・丸めは Step 3 と完全に同一なので、
+//   ここで作った mask を渡しても IoU はビット単位で一致する。
+//   ターゲット mask は最適化ループ中ずっと不変 (カメラ + SAM2 mask 固定、
+//   動くのはメッシュ姿勢だけ) なので、CmaesRefine::run はこれを 1 回だけ
+//   呼んで computeSilhouette2DObjectiveFast に渡し、毎 eval の再構築を省く。
+//   既存の単発呼び出し側は precomputedTargetMask=nullptr のままなので無影響。
+// ---------------------------------------------------------------------------
+inline void buildSilhouetteTargetMaskFast(std::vector<uint8_t>& targetMask,
+                                          int imgW, int imgH, int step)
+{
+    const int mw = g_boundaryDistMap.width;
+    const int mh = g_boundaryDistMap.height;
+    const int gw = (imgW+step-1)/step;
+    const int gh = (imgH+step-1)/step;
+    targetMask.assign((size_t)gw*gh, 0);
+    const bool useProjected = (g_projectedLiverMask.valid &&
+                               g_projectedLiverMask.width  == imgW &&
+                               g_projectedLiverMask.height == imgH);
+    if (useProjected) {
+        const auto& pm = g_projectedLiverMask.data;   /* top-left origin, imgW × imgH */
+        for (int gy = 0; gy < gh; gy++)
+            for (int gx = 0; gx < gw; gx++) {
+                int ipx = gx*step + step/2, ipy = gy*step + step/2;
+                ipx = std::clamp(ipx, 0, imgW - 1);
+                ipy = std::clamp(ipy, 0, imgH - 1);
+                targetMask[gy*gw + gx] = pm[ipy * imgW + ipx] ? 1 : 0;
+            }
+    } else {
+        for (int gy=0;gy<gh;gy++)
+            for (int gx=0;gx<gw;gx++) {
+                int ipx=gx*step+step/2, ipy=gy*step+step/2;
+                int mx=std::clamp(ipx*mw/imgW,0,mw-1);
+                int my=std::clamp(ipy*mh/imgH,0,mh-1);
+                targetMask[gy*gw+gx] = (g_boundaryDistMap.data[my*mw+mx]<9000.f)?1:0;
+            }
+    }
+}
+
 inline float computeSilhouette2DObjectiveFast(
     const mCutMesh*  liver,
     const glm::mat4& viewMat,
@@ -390,15 +463,16 @@ inline float computeSilhouette2DObjectiveFast(
     int* outInter = nullptr,
     int* outUnion = nullptr,
     double* outMs = nullptr,
-    float* outHausdorff2D = nullptr)
+    float* outHausdorff2D = nullptr,
+    // [PERF] 事前構築済みターゲット mask (size==gw*gh のとき Step 3 を skip)。
+    //   nullptr (既定) のとき従来どおり内部で構築 → 既存呼び出しはバイト一致。
+    const std::vector<uint8_t>* precomputedTargetMask = nullptr)
 {
     if (!liver || !g_boundaryDistMap.valid) return 9.9f;
 
     auto t0 = std::chrono::steady_clock::now();
 
     const int imgW = gWindowWidth, imgH = gWindowHeight;
-    const int mw   = g_boundaryDistMap.width;
-    const int mh   = g_boundaryDistMap.height;
     const int gw   = (imgW+step-1)/step;
     const int gh   = (imgH+step-1)/step;
 
@@ -511,36 +585,43 @@ inline float computeSilhouette2DObjectiveFast(
              破綻しない。
        fallback: 旧 shortcut — g_boundaryDistMap を画面全体に線形引き伸ばし。
                  初期カメラで screenMesh が画面フィルする前提でのみ valid。
-                 Shift+E 以外 (直接 metric 計算等) ではこちらが使われる。 */
-    std::vector<uint8_t> targetMask(gw*gh, 0);
-    const bool useProjected = (g_projectedLiverMask.valid &&
-                               g_projectedLiverMask.width  == imgW &&
-                               g_projectedLiverMask.height == imgH);
-    if (useProjected) {
-        const auto& pm = g_projectedLiverMask.data;   /* top-left origin, imgW × imgH */
-        for (int gy = 0; gy < gh; gy++)
-            for (int gx = 0; gx < gw; gx++) {
-                int ipx = gx*step + step/2, ipy = gy*step + step/2;
-                ipx = std::clamp(ipx, 0, imgW - 1);
-                ipy = std::clamp(ipy, 0, imgH - 1);
-                targetMask[gy*gw + gx] = pm[ipy * imgW + ipx] ? 1 : 0;
-            }
+                 Shift+E 以外 (直接 metric 計算等) ではこちらが使われる。
+       [PERF] 事前構築済み mask が渡され size が一致するならそれを使う
+              (CmaesRefine::run のループから渡される)。値は下の構築と同一。
+              渡されない単発呼び出しは buildSilhouetteTargetMaskFast で従来同様に構築。 */
+    std::vector<uint8_t> targetMaskStorage;
+    const std::vector<uint8_t>* targetMaskPtr;
+    if (precomputedTargetMask &&
+        (int)precomputedTargetMask->size() == gw*gh) {
+        targetMaskPtr = precomputedTargetMask;
     } else {
-        for (int gy=0;gy<gh;gy++)
-            for (int gx=0;gx<gw;gx++) {
-                int ipx=gx*step+step/2, ipy=gy*step+step/2;
-                int mx=std::clamp(ipx*mw/imgW,0,mw-1);
-                int my=std::clamp(ipy*mh/imgH,0,mh-1);
-                targetMask[gy*gw+gx] = (g_boundaryDistMap.data[my*mw+mx]<9000.f)?1:0;
-            }
+        buildSilhouetteTargetMaskFast(targetMaskStorage, imgW, imgH, step);
+        targetMaskPtr = &targetMaskStorage;
     }
+    const std::vector<uint8_t>& targetMask = *targetMaskPtr;
 
-    /* Step 4: IoU */
+    /* Step 4: IoU
+       [PERF] g_silFastPath ON のときだけ整数リダクション並列化。
+       inter/uni は順序非依存なので並列でも結果はビット一致。
+       OFF (既定) は従来の直列ループ。 */
     int inter=0, uni=0;
-    for (int i=0;i<gw*gh;i++){
-        bool s=hitmap[i], t=targetMask[i];
-        if(s||t) uni++;
-        if(s&&t) inter++;
+    const int nCells = gw*gh;
+#ifdef _OPENMP
+    if (g_silFastPath) {
+#pragma omp parallel for reduction(+:inter,uni) schedule(static)
+        for (int i=0;i<nCells;i++){
+            bool s=hitmap[i], t=targetMask[i];
+            if(s||t) uni++;
+            if(s&&t) inter++;
+        }
+    } else
+#endif
+    {
+        for (int i=0;i<nCells;i++){
+            bool s=hitmap[i], t=targetMask[i];
+            if(s||t) uni++;
+            if(s&&t) inter++;
+        }
     }
 
     /* Step 5: 2D Hausdorff (シルエット境界の双方向最大距離、グリッドピクセル単位を画像px換算)
@@ -1174,6 +1255,13 @@ struct Params {
      * applied externally via this parameter.
      * ------------------------------------------------------------ */
     unsigned rng_seed     = 0;
+
+    /* [Alt+P found-pose hook] Fired once per run the moment the inner-loop
+       best (found) pose is applied to the meshes, BEFORE the accept gate
+       possibly reverts it. Lets a caller snapshot the found pose (e.g. to
+       F9) even when the RMSE cap will discard it. Null = no-op = byte-
+       identical for every other caller. */
+    std::function<void()> on_best_candidate = nullptr;
 };
 
 struct Result {
@@ -1378,22 +1466,66 @@ inline Result run(
     /* 高速RMSE: キャッシュ済み対応インデックスで距離だけ再計算 O(tgt_size) */
     auto fastComputeRMSE = [&]() -> float {
         const auto& verts = liverMesh3D->mVertices;
+        const size_t vsz  = verts.size();
         float sumSq = 0.0f;
         int   count = 0;
-        for (size_t i = 0; i < tgt_size; i++) {
-            int j = corr_idx[i];
-            if (j < 0) continue;
-            size_t vi = (size_t)j * 3;
-            if (vi + 2 >= verts.size()) continue;
-            glm::vec3 srcPt(verts[vi], verts[vi+1], verts[vi+2]);
-            glm::vec3 d = srcPt - tgt_points_cache[i];
-            float sq = glm::dot(d, d);
-            if (sq < max_dist_sq_cache) { sumSq += sq; count++; }
+        const int n = (int)tgt_size;
+#ifdef _OPENMP
+        // [PERF] シルエットモード限定で並列リダクション。
+        //   - count は整数 → 加算順に依存せず厳密一致。
+        //   - sumSq は二乗距離(非負)の和なので、和が 0 になるのは全項 0 のとき
+        //     だけ。よって return 値が 0 か否か (= bad ゲートの rmse==0 判定) は
+        //     加算順に依存しない。sil モードでは rmse の値自体は使われない
+        //     (computeSilhouette2DObjectiveFast の結果が fval になる) ため、
+        //     CMA-ES が見る値の列はビット単位で従来と一致する。
+        //   非 sil モード (fval=rmse) では値が効くので従来の直列のまま。
+        //   [PERF TOGGLE] g_silFastPath OFF のときも直列 (レガシー基準)。
+        if (params.use_silhouette_2d && g_silFastPath) {
+#pragma omp parallel for reduction(+:sumSq,count) schedule(static)
+            for (int i = 0; i < n; i++) {
+                int j = corr_idx[i];
+                if (j < 0) continue;
+                size_t vi = (size_t)j * 3;
+                if (vi + 2 >= vsz) continue;
+                glm::vec3 srcPt(verts[vi], verts[vi+1], verts[vi+2]);
+                glm::vec3 d = srcPt - tgt_points_cache[i];
+                float sq = glm::dot(d, d);
+                if (sq < max_dist_sq_cache) { sumSq += sq; count++; }
+            }
+        } else
+#endif
+        {
+            for (int i = 0; i < n; i++) {
+                int j = corr_idx[i];
+                if (j < 0) continue;
+                size_t vi = (size_t)j * 3;
+                if (vi + 2 >= vsz) continue;
+                glm::vec3 srcPt(verts[vi], verts[vi+1], verts[vi+2]);
+                glm::vec3 d = srcPt - tgt_points_cache[i];
+                float sq = glm::dot(d, d);
+                if (sq < max_dist_sq_cache) { sumSq += sq; count++; }
+            }
         }
         if (count == 0) return 9.9f;
         registrationHandle.compCount = count;
         return std::sqrt(sumSq / count);
     };
+
+    /* [PERF] sil ターゲット mask はループ中不変。1 回だけ構築して毎 eval の
+       computeSilhouette2DObjectiveFast に渡し、Step 3 の再構築 (gw*gh セル) を
+       省く。imgW/imgH/step は関数内と同じ (gWindowWidth/Height, silhouette_step)
+       なので mask の値は内部構築と完全一致 → 結果不変。
+       [PERF TOGGLE] g_silFastPath OFF のときは null のまま渡す → 各 eval が
+       内部で従来どおり Step 3 を構築する (レガシー基準)。 */
+    std::vector<uint8_t> precompTargetMask;
+    const std::vector<uint8_t>* precompTargetPtr = nullptr;
+    if (params.use_silhouette_2d && g_silFastPath) {
+        buildSilhouetteTargetMaskFast(precompTargetMask,
+                                      gWindowWidth, gWindowHeight,
+                                      params.silhouette_step);
+        precompTargetPtr = &precompTargetMask;
+    }
+
 
     /* 4. CMA-ES loop */
     const char* stop = nullptr;
@@ -1446,7 +1578,9 @@ inline Result run(
                     fval[k] = params.use_silhouette_2d_fast
                                   ? (double)computeSilhouette2DObjectiveFast(
                                         organs[0], view, projection,
-                                        params.silhouette_step)
+                                        params.silhouette_step,
+                                        nullptr, nullptr, nullptr, nullptr,
+                                        precompTargetPtr)
                                   : (double)computeSilhouette2DObjective(
                                         organs[0], g_sed, view, projection,
                                         params.silhouette_step);
@@ -1591,6 +1725,10 @@ inline Result run(
         computeUnifiedMetrics();
         float rmse_after_uniform = registrationHandle.compRmse;
 
+        /* [Alt+P found-pose hook] meshes are at the found pose right now;
+           let the caller snapshot it BEFORE the accept gate may revert it. */
+        if (params.on_best_candidate) params.on_best_candidate();
+
         /* シルエットモード: fvalが改善していれば無条件採用
            (fval = 1-IoU のみ。alpha_3dは最適化には使わない)
            compRMSEが大幅悪化(50%超)の場合のみ安全ガードとしてリバート */
@@ -1605,13 +1743,21 @@ inline Result run(
                                                 organs.empty() ? nullptr : organs[0],
                                                 g_sed, view, projection, params.silhouette_step));
             bool iou_ok  = (iou_after > iou_before * 1.05f);
-            bool rmse_ok = (rmse_after_uniform < result.rmse_before * 1.2f);
+            bool rmse_ok = g_silAcceptIgnoreRmse
+                         ? true
+                         : (rmse_after_uniform
+                                < result.rmse_before * g_silAcceptRmseCap);
             accepted = iou_ok && rmse_ok;
             if (params.verbose)
                 std::cout << "[CMA-ES] best candidate:"
                           << "  compRMSE=" << rmse_after_uniform
                           << "  IoU=" << iou_before << "->" << iou_after
-                          << "  accepted=" << (accepted ? "YES" : "NO") << std::endl;
+                          << "  accepted=" << (accepted ? "YES" : "NO")
+                          << (g_silAcceptIgnoreRmse ? "  [pure-IoU: cap OFF]"
+                                       : (rmse_ok ? "  [rmse cap OK]"
+                                                  : "  [rmse cap HIT]"))
+                          << "  (cap=" << result.rmse_before * g_silAcceptRmseCap
+                          << ")" << std::endl;
         } else {
             if (params.use_boundary_weight) {
                 float contour_after = computeContourPairRMSE(

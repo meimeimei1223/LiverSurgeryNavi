@@ -1489,7 +1489,9 @@ struct mCutMesh {
 inline void setUp(mCutMesh& srcMesh) {
     while (glGetError() != GL_NO_ERROR) {}
     if (srcMesh.mVertices.empty() || srcMesh.mIndices.empty()) {
-        std::cerr << "Error: Empty mesh data" << std::endl;
+        // 空メッシュは「描画対象なし」の正当な状態（ドロップセットに無い臓器を
+        // クリアした場合など）。VBOは作らず静かに no-op する。毎フレーム全臓器を
+        // setUp する呼び出し元からのログスパム（旧 "Error: Empty mesh data"）を抑止。
         return;
     }
 

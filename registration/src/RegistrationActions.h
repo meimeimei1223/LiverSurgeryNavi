@@ -3,6 +3,14 @@
 // HemiAuto / BIPOP-CMA-ES / Shift+E (SilhouetteAlign) / Metrics
 // main.cppのグローバル変数をexternで参照する。
 
+// [COMPILE-CONTEXT SENTINEL] Dependent headers that rely on this file's
+// globals (e.g. SilComparePanel.h, which uses liverMesh3D / g_ctrlgs* /
+// runShiftE and is meant to be #included only AFTER this one inside
+// main.cpp) test for this macro to compile to an empty TU when an IDE or
+// build system feeds them in isolation. Defining it here is the single
+// source of truth that "RegistrationActions.h has been seen in this TU".
+#define REGISTRATION_ACTIONS_H_INCLUDED 1
+
 #include <vector>
 #include <iostream>
 #include <sstream>
@@ -36,6 +44,8 @@
 #include "LiverCranioCaudalLabel.h" // V3R-W: g_liverCC 参照のため (CRANIAL/CAUDAL, Ctrl+G Only-Caudal filter)
 #include "FullSphereCameraWithTarget.h"
 #include "NormalCompatibleRefine.h" // Shift+N / Ctrl+Shift+N: Normal-Compatible refine (Phase 0/2/3 L1+L2)
+#include "SoftPartition.h"          // Phase U-1
+#include "CpdRigid.h"               // Phase U-CPD: anchor-free pure rigid CPD
 
 // =========================================================
 //  main.cpp のグローバル変数への extern 参照
@@ -47,6 +57,64 @@ extern mCutMesh* tumorMesh3D;
 extern mCutMesh* segmentMesh3D;
 extern mCutMesh* gbMesh3D;
 extern mCutMesh* screenMesh;
+
+// Phase U-1: main.cpp で定義
+extern SoftPartition::AnchorSet       g_softAnchors;
+extern SoftPartition::PartitionField  g_softTgtField;
+extern SoftPartition::PartitionField  g_softSrcField;
+extern SoftPartition::PartitionParams g_softPartParams;
+extern std::vector<float>             g_softGroupRadii;
+extern float                          g_softUmeyamaScale;
+extern bool                           g_softPartReady;
+
+// Phase U-2: soft-weighted ICP state (main.cpp で定義)
+extern SoftPartition::SoftICPParams   g_softIcpParams;
+extern int                            g_softIcpLastIters;
+extern float                          g_softIcpRmseBefore;
+extern float                          g_softIcpRmseAfter;
+extern float                          g_softIcpIoUBefore;
+extern float                          g_softIcpIoUAfter;
+extern glm::dmat4                     g_softIcpAppliedT;
+extern bool                           g_softIcpCanRevert;
+extern bool                           g_softShowGroups;
+
+// =========================================================
+//  Phase U-CPD: pure rigid CPD (anchor-free).
+//  ALL CPD state is defined INLINE here (not split into main.cpp
+//  globals + extern). RegistrationActions.h is included into main.cpp
+//  at line ~664, and every CPD reference in main.cpp (the Ctrl+U
+//  dispatch and the U-tab UI) is AFTER that include, so these inline
+//  variables are visible there with no extra #include and no extern
+//  split. Matches the existing `inline g_fgrSeed` pattern in
+//  NoOpen3DRegistration.h and keeps the CPD logic + state co-located.
+// =========================================================
+enum RegMethod { METHOD_SOFT_ICP = 0, METHOD_CPD = 1 };
+inline int               g_regMethod = METHOD_SOFT_ICP;   // which method Ctrl+U runs
+inline CpdRigid::Params  g_cpdParams;                     // tunables (see UI)
+
+// [LIVE] Frame-driven convergence animation for CPD and soft-ICP, mirroring
+//   g_normRefineLiveMode (Shift+N). When ON, the one-shot run paths (Ctrl+U,
+//   "Run all CPD", "Run Soft-weighted ICP") record the per-iteration transform
+//   during the (fast) solve and then replay it frame-by-frame so the mesh
+//   visibly converges. OFF = the original blocking one-shot behaviour.
+inline bool g_regLiveMode           = true;   // animate CPD / soft-ICP
+inline int  g_regLiveStepsPerFrame  = 1;      // trajectory entries replayed per render frame
+
+// Staged pipeline state — checkbox 1 -> 5 advance in order.
+inline std::shared_ptr<Reg3DCustom::PointCloud> g_cpdTgtCloud; // stage 1 output (raw front-face cloud)
+inline std::vector<glm::dvec3> g_cpdSrcD;                 // source (liver) points fed to the solver
+inline std::vector<glm::dvec3> g_cpdTgtD;                 // target points fed to the solver (post stage 2)
+inline CpdRigid::Result  g_cpdResult;                     // stage 4 output
+inline bool              g_cpdStageDone[6] = { false, false, false, false, false, false }; // index 1..5
+inline double            g_cpdSigma2Init = 0.0;           // stage 3 preview
+inline int               g_cpdSrcCount = 0, g_cpdTgtCountRaw = 0, g_cpdTgtCountDS = 0;
+inline int               g_cpdLastIters = 0;
+
+// Before/after metrics + applied transform (for revert).
+inline float             g_cpdRmseBefore = 0.0f, g_cpdRmseAfter = 0.0f;
+inline float             g_cpdIoUBefore  = 0.0f, g_cpdIoUAfter  = 0.0f;
+inline glm::dmat4        g_cpdAppliedT   = glm::dmat4(1.0);
+inline bool              g_cpdCanRevert  = false;
 
 extern FullSphereCamera OrbitCam;
 extern RegistrationData registrationHandle;
@@ -130,6 +198,24 @@ extern double    g_debugSourceRimPlanarity;
 //   なったときに source 同様 PCA 角度 sort で行う想定。
 extern std::vector<glm::vec3> g_debugTargetBoundaryPoints;
 extern bool                   g_showDebugTargetBoundary;
+
+// Phase 7c (REDGE/稜線) overlays — defined in main.cpp.
+//   source ridge = 境界(silhouette) ∩ ANTERIOR_CORE (非RIM・非後面)。
+//   頂点 index 保持 (rim chain と同じ、mesh 追従)。
+//   target ridge = g_debugTargetBoundaryPoints の上半分 (3D 直接保持)。
+extern std::vector<int>       g_debugSourceRidge;
+extern bool                   g_showDebugSourceRidge;
+extern std::vector<glm::vec3> g_debugTargetRidgePoints;
+extern bool                   g_showDebugTargetRidge;
+extern float                  g_ctrlgRidgeCosBand;
+// Phase 7c — target ridge outlier removal (debug).
+extern bool  g_ridgeTgtRemoveOutliers;
+extern int   g_ridgeTgtOutlierMode;     // 0=SOR, 1=largest connected component
+extern int   g_ridgeTgtSorK;
+extern float g_ridgeTgtSorStd;
+extern float g_ridgeTgtCcRadius;        // 0 → auto
+extern int   g_ridgeTgtCcMinPts;
+extern bool  g_ridgeTgtSplitLongEdge;   // false=up/down, true=bbox長辺(PCA)
 
 // Phase 7b Step 3 (Ctrl+W): Shape Match coarse search results.
 //   `g_debugShapeMatchBestSrc` は best 候補の R, t を source RIM の現在
@@ -782,6 +868,9 @@ inline float g_silhouetteSrcCosThresh = 0.40f;
 // =========================================================
 inline bool  g_ctrlgUseArVisFilter   = false;
 inline float g_ctrlgBetaRimWeight    = 5.0f;
+inline float g_ctrlgGammaRedgeWeight = 0.0f;   // [Phase 7c] REDGE 稜線重み (0=OFF, 従来一致)
+inline bool  g_ctrlgBidirMatching    = false;  // [Phase 7c] 双方向(対称)マッチング (B方式: RIM/REDGEのみ, OFF=従来一致)
+inline bool  g_ctrlgBidirAllPoints   = false;  // [Phase 7c] (A) 双方向を全subset点へ (要 g_ctrlgBidirMatching=ON)
 inline float g_ctrlgRimTgtThreshPx   = 12.0f;   // matches Shift+P kBoundaryPxTh
 inline bool  g_ctrlgShowRimPairs     = true;
 
@@ -1013,6 +1102,18 @@ inline int   g_normRefineLiveStepsPerFrame = 1;
 // HANDOVER_V3RS_silhouette_pivot_to_2D_IoU.md.
 // =========================================================
 inline float g_ctrlgsLambdaSil          = 0.2f;
+
+// =========================================================
+//  [V3I / Ctrl+I] Pure-IoU mode flag.
+//  When true, the V3RS engine optimizes cost = (1 - IoU2D)
+//  ONLY (no RMSE_W / outside / rim_sil), the Run selector
+//  decides by IoU2D, and the wrapper accept gate skips the
+//  RMSE cap and accepts on IoU gain. This is the
+//  "Ctrl+G mechanism, objective = squash-IoU" experiment.
+//  runBipopCmaesV3I() flips this on for one call; Ctrl+Shift+G
+//  leaves it false => byte-identical V3RS behaviour.
+// =========================================================
+inline bool g_ctrlgsPureIoUMode         = false;
 
 // =========================================================
 //  [NEW] Asymmetric outside-ratio penalty for Ctrl+Shift+G.
@@ -6196,34 +6297,68 @@ inline void runBipopCmaesV3R(uint8_t quadrant_mask) {
         stamp("C2a. AR visibility (raycast+rim rescue)");
     }
 
-    // ----- Phase C2b: rim-flag arrays (opt-in; needed iff beta>0) ---
-    if (p.beta_rim_weight > 0.0f) {
-        // Source: per-original-vertex RIM flag from LiverRegionLabel.
+    // ----- Phase C2b: rim/redge-flag arrays (opt-in; beta>0 or gamma>0) ---
+    p.gamma_redge_weight = std::max(0.0f, g_ctrlgGammaRedgeWeight);  // [Phase 7c]
+    p.bidirectional_matching = g_ctrlgBidirMatching;                 // [Phase 7c] (V3R only)
+    p.bidirectional_all_points = g_ctrlgBidirAllPoints;              // [Phase 7c] (A)
+    if (p.beta_rim_weight > 0.0f || p.gamma_redge_weight > 0.0f) {
+        // Source RIM flag (mesh-intrinsic, LiverRegionLabel::RIM).
         p.is_rim_orig.assign(g_liverRegion.labels.size(), 0);
         for (size_t i = 0; i < g_liverRegion.labels.size(); i++) {
             if (g_liverRegion.labels[i] == LiverRegionLabel::RIM) {
                 p.is_rim_orig[i] = 1;
             }
         }
-        // Target: copy boundaryDist from the cached cloud parallel to
-        // tgt_points. May be empty if the target was extracted via the
-        // legacy grid path; in that case the V3R driver will see empty
-        // tgt_boundary_dist_full and skip rim weighting silently.
+
+        // [Phase 7c] Source REDGE flag: ANTERIOR_CORE のオクルーディング
+        //   輪郭 = 境界(grazing) ∩ 非RIM ∩ 非後面。populateDebugSourceRidge
+        //   と同じ判定を run 開始ポーズで一度計算 (固定)。RIM とは排他なので
+        //   is_rim_orig と同時に 1 にならない → 重みで二重計上しない。
+        int n_redge_src = 0;
+        if (p.gamma_redge_weight > 0.0f) {
+            if (liverMesh3D->mNormals.size() != liverMesh3D->mVertices.size()) {
+                Reg3DCustom::computeVertexNormalsFromFaces(*liverMesh3D);
+            }
+            const float rdiag = (g_liverRegion.bbox_diag > 0.0f)
+                                   ? g_liverRegion.bbox_diag : g_sceneDiag;
+            const glm::vec3 rcam(0.0f, 0.0f, -0.2f * rdiag);
+            const float rband = std::max(0.02f, g_ctrlgRidgeCosBand);
+            p.is_redge_orig.assign(g_liverRegion.labels.size(), 0);
+            const auto& RV = liverMesh3D->mVertices;
+            const auto& RN = liverMesh3D->mNormals;
+            for (size_t i = 0; i < g_liverRegion.labels.size(); i++) {
+                if (g_liverRegion.labels[i] != LiverRegionLabel::ANTERIOR_CORE) continue;
+                if (i*3+2 >= RV.size() || i*3+2 >= RN.size()) continue;
+                const glm::vec3 pv(RV[i*3], RV[i*3+1], RV[i*3+2]);
+                const glm::vec3 nv(RN[i*3], RN[i*3+1], RN[i*3+2]);
+                const glm::vec3 vv = pv - rcam;
+                const float lv = glm::length(vv), ln = glm::length(nv);
+                if (lv < 1e-6f || ln < 1e-6f) continue;
+                const float cos_nv = glm::dot(nv, -vv) / (ln * lv);
+                if (std::fabs(cos_nv) < rband) { p.is_redge_orig[i] = 1; n_redge_src++; }
+            }
+        }
+
+        // Target band (rim/redge 共有): boundaryDist from cached cloud.
+        // May be empty if extracted via the legacy grid path; the V3R
+        // driver then sees empty tgt and skips weighting silently.
         if (targetCloud->hasBoundaryDist() &&
             targetCloud->boundaryDist.size() == tgt_points.size())
         {
             p.tgt_boundary_dist_full = targetCloud->boundaryDist;
         } else {
             std::cout << "[Ctrl+G/rim] target cloud has no boundaryDist "
-                         "(legacy path?). Rim weighting will be inactive."
+                         "(legacy path?). Rim/redge weighting will be inactive."
                       << std::endl;
             p.tgt_boundary_dist_full.clear();
         }
         int n_rim_src = 0;
         for (uint8_t v : p.is_rim_orig) if (v) n_rim_src++;
         std::cout << "[Ctrl+G/rim] beta=" << p.beta_rim_weight
+                  << " gamma=" << p.gamma_redge_weight
                   << "  src_rim=" << n_rim_src
                   << "/" << p.is_rim_orig.size()
+                  << "  src_redge=" << n_redge_src
                   << "  tgt_bdist_avail="
                   << (p.tgt_boundary_dist_full.empty() ? "NO" : "YES")
                   << "  thresh=" << p.rim_tgt_threshold_px << "px"
@@ -7328,6 +7463,11 @@ inline void runBipopCmaesV3RS(uint8_t quadrant_mask) {
     // silhouette for this run rather than failing -- V3R-W result is
     // still useful.
     p.lambda_sil = std::max(0.0f, g_ctrlgsLambdaSil);
+    // [V3I] Pure-IoU mode pass-through. When ON, the engine ignores
+    //   RMSE in the cost; lambda_sil is still used only to gate IoU
+    //   computation, so force it positive if the user left it at 0.
+    p.pure_iou_mode = g_ctrlgsPureIoUMode;
+    if (p.pure_iou_mode && p.lambda_sil <= 0.0f) p.lambda_sil = 1.0f;
     if (p.lambda_sil <= 0.0f) {
         std::cout << "[Ctrl+Shift+G/sil] lambda_sil=0; running V3RS as V3R-W "
                      "(use Ctrl+G for that; this is a courtesy fallback)."
@@ -8266,9 +8406,18 @@ inline void runBipopCmaesV3RS(uint8_t quadrant_mask) {
             : 0.0f;
         const float cap_factor = g_ctrlgsRmseCapBase
             + cap_t * (g_ctrlgsRmseCapMax - g_ctrlgsRmseCapBase);
-        const bool rmse_cap_ok = (rmse_cand < rmse_before * cap_factor);
+        // [V3I] Pure-IoU (Ctrl+I): no RMSE cap, and accept on IoU gain
+        //   rather than the RMSE-blended composite. Default path
+        //   (g_ctrlgsPureIoUMode == false) is the unchanged Ctrl+Shift+G
+        //   gate below.
+        const bool rmse_cap_ok = g_ctrlgsPureIoUMode
+            ? true
+            : (rmse_cand < rmse_before * cap_factor);
+        const bool score_improves = g_ctrlgsPureIoUMode
+            ? (iou_cand_occluded > init_iou_occluded)
+            : (score_after < score_before);
 
-        if (score_after < score_before && rmse_cap_ok) {
+        if (score_improves && rmse_cap_ok) {
             r.improved = true;
             // [Phase B fix] Publish iou_cand_occluded ONLY on accept.
             // The pose has been applied, so the candidate's IoU is the
@@ -8746,7 +8895,35 @@ inline void runBipopCmaesV3RS(uint8_t quadrant_mask) {
 
 
 // =========================================================
-//  diagnoseVertexSquashV3RS (F10) -- vertex-squash A/B raster diagnostic
+//  [V3I / Ctrl+I] runBipopCmaesV3I -- pure squash-IoU registration.
+//  ---------------------------------------------------------
+//  This is literally "Ctrl+Shift+G with the objective variable
+//  swapped to IoU-only": it reuses the ENTIRE V3RS pipeline
+//  (BIPOP, 10 restarts, sigma adaptation, SRT space, voxel prep,
+//  the rasterize_iou2d_v3rs squash/step16 silhouette) and only
+//  changes the cost from  RMSE_W + lambda*(1-IoU)  to  (1 - IoU).
+//
+//  Mechanism: flip the g_ctrlgsPureIoUMode global for the duration
+//  of one runBipopCmaesV3RS() call. The V3RS engine reads it via
+//  ParamsV3RS::pure_iou_mode (set in the wrapper) and:
+//    - inner cost            = (1 - IoU2D)        [no RMSE term]
+//    - Run selector decides  by IoU2D
+//    - wrapper accept gate    skips the RMSE cap, accepts on IoU gain
+//  Default (flag false) leaves Ctrl+Shift+G byte-identical, and
+//  Ctrl+G (V3R) is untouched entirely.
+//
+//  Bound to Ctrl+I in main.cpp.
+// =========================================================
+inline void runBipopCmaesV3I(uint8_t quadrant_mask) {
+    const bool prev = g_ctrlgsPureIoUMode;
+    g_ctrlgsPureIoUMode = true;
+    std::cout << "[Ctrl+I] pure squash-IoU mode ON (V3RS mechanism, "
+                 "cost = 1 - IoU2D)" << std::endl;
+    runBipopCmaesV3RS(quadrant_mask);   // engine reads the flag via params
+    g_ctrlgsPureIoUMode = prev;
+}
+
+
 //  ---------------------------------------------------------
 //  Measurement-only. Does NOT run CMA-ES, does NOT touch the optimiser
 //  or liverMesh3D's pose. Rasterizes the quadrant-filtered liver
@@ -8916,6 +9093,21 @@ inline void diagnoseVertexSquashV3RS(uint8_t quadrant_mask) {
 //  SAM2マスクのシルエットとソースメッシュのラスタライズ投影を
 //  Kカメラ固定行列でIoU最大化。buildProjectedLiverMaskは不要。
 // =========================================================
+// Alt+P (Silhouette Align / runShiftE) tunables — surfaced in Ctrl+D > G tab.
+// Were hardcoded locals (N_STARTS=5, raster step=8) before the G/W panel split.
+// raster step drives BOTH the IoU measurement and the CMA-ES objective (linked).
+inline int g_shiftE_NStarts    = 5;
+inline int g_shiftE_RasterStep = 8;
+
+// [Alt+P found-pose viz] ON -> runShiftE captures EACH run's inner-loop best
+// (found) pose into an F9 Run slot BEFORE the V1 accept gate reverts it, plus
+// the applied pose into Final. Lets F9 show the IoU-0.96 poses the gate throws
+// away. Scored with rasterize_iou2d_v3rs at g_shiftECaptureStep (16 = same
+// yardstick as SilCompare / Ctrl+I, so the panel IoU is comparable to method
+// 4 -- and != runShiftE's full-mesh IoU on purpose). OFF = byte-identical.
+inline bool g_shiftECaptureFound = false;
+inline int  g_shiftECaptureStep  = 16;
+
 inline void runShiftE() {
     std::cout << "\n=== 2D Silhouette BIPOP-CMA-ES (Shift+E) ===" << std::endl;
 
@@ -8945,7 +9137,7 @@ inline void runShiftE() {
         gWindowWidth = silW;  gWindowHeight = silH;
 
         float fval = CmaesRefine::computeSilhouette2DObjectiveFast(
-            liverMesh3D, view, projection, 8);
+            liverMesh3D, view, projection, g_shiftE_RasterStep);
 
         view = sv;  projection = sp;
         gWindowWidth = sw;  gWindowHeight = sh;
@@ -8967,7 +9159,7 @@ inline void runShiftE() {
     auto  best_v = start_v;
     auto  best_n = start_n;
 
-    const int N_STARTS = 5;
+    const int N_STARTS = g_shiftE_NStarts;
 
     // Phase 1: シード固定 (旧: rng(20260425u) 固定値)
     const uint32_t outer_seed = g_trialSeed + 1000u + g_callIdx * 97u;
@@ -8997,7 +9189,7 @@ inline void runShiftE() {
         p.use_silhouette_2d_fast = true;
         p.alpha_silhouette       = 1.0f;
         p.alpha_3d               = 0.3f;
-        p.silhouette_step        = 8;
+        p.silhouette_step        = g_shiftE_RasterStep;
         p.maxgen = 300;
         p.tolfun = 1e-4;
         // CMA-ES sampling range scaled by sceneDiag (was 1.0f)
@@ -9007,6 +9199,29 @@ inline void runShiftE() {
         p.scale_lo = 0.85f; p.scale_hi = 1.15f;
         // Phase 1: CMA-ES 内部 srand を固定
         p.rng_seed = cma_base + (uint32_t)run;
+
+        // [Alt+P found-pose viz] capture this run's found (pre-revert) pose.
+        if (g_shiftECaptureFound && g_boundaryDistMap.valid
+                                 && run < SilOverlay::kNumRuns) {
+            const int run_slot = run;
+            p.on_best_candidate = [run_slot]() {
+                if (!liverMesh3D || !g_boundaryDistMap.valid) return;
+                const int cw = g_boundaryDistMap.width;
+                const int ch = g_boundaryDistMap.height;
+                const glm::mat4 cv = buildSilhouetteView();
+                const glm::mat4 cp = buildSilhouetteProj();
+                std::vector<uint32_t> ctris(liverMesh3D->mIndices.begin(),
+                                            liverMesh3D->mIndices.end());
+                const float iou = SilOverlay::capture(
+                    SilOverlay::g_silOverlay, run_slot,
+                    liverMesh3D, ctris, cv, cp,
+                    g_boundaryDistMap.data, cw, ch,
+                    g_shiftECaptureStep, /*scale_value=*/1.0f);
+                std::cout << "[Shift+E/found] Run " << (run_slot + 1)
+                          << " found-pose -> F9 Run " << (run_slot + 1)
+                          << "  (squash IoU=" << iou << ")" << std::endl;
+            };
+        }
 
         float tx=0,ty=0,tz=0, rx=0,ry=0,rz=0, sc=1.0f;
         std::string regime;
@@ -9080,6 +9295,21 @@ inline void runShiftE() {
         }
     computeUnifiedMetrics();
     g_metricsValid = true;
+
+    // [Alt+P found-pose viz] capture the applied (kept) pose into Final.
+    if (g_shiftECaptureFound && g_boundaryDistMap.valid && liverMesh3D) {
+        const glm::mat4 cv = buildSilhouetteView();
+        const glm::mat4 cp = buildSilhouetteProj();
+        std::vector<uint32_t> ctris(liverMesh3D->mIndices.begin(),
+                                    liverMesh3D->mIndices.end());
+        SilOverlay::captureFinal(
+            SilOverlay::g_silOverlay, /*best_run_idx=*/-1,
+            liverMesh3D, ctris, cv, cp,
+            g_boundaryDistMap.data, g_boundaryDistMap.width,
+            g_boundaryDistMap.height, g_shiftECaptureStep, /*scale_value=*/1.0f);
+        SilOverlay::g_silOverlay.showWindow = true;
+        std::cout << "[Shift+E/found] applied (kept) pose -> F9 Final" << std::endl;
+    }
 
     std::cout << std::defaultfloat << std::setprecision(6);
     float iou_delta = best_iou - iou_before;
@@ -9257,6 +9487,103 @@ inline bool populateDebugSourceRimChain()
 
 
 // =====================================================================
+// Phase 7c (REDGE/稜線) — source ridge populate
+// =====================================================================
+//   populateDebugSourceRimChain の双子。RIM 帯のかわりに「ドームの
+//   オクルーディング輪郭」を集める。
+//     条件: 境界(silhouette) ∩ 非RIM ∩ 非後面
+//       - 非RIM・非後面  ⇔ label == ANTERIOR_CORE (3ラベルなので等価)
+//       - 境界(silhouette) ⇔ |cos(n, -view)| < g_ctrlgRidgeCosBand
+//   quadrant / caudal フィルタは rim chain と同じ (Q:* 選択を尊重)。
+//   AR-vis raycast は使わない (稜線は grazing なので raw raycast が自己
+//   遮蔽で落とす — RIM が rescue を要したのと同じ。grazing が可視判定代用)。
+//   view依存=動的 → 押下時点の現在ポーズで一度計算して固定。ポーズを
+//   動かしたら再 toggle でリフレッシュ (rim chain と同じ契約)。
+//
+inline bool populateDebugSourceRidge()
+{
+    g_debugSourceRidge.clear();
+
+    if (!liverMesh3D) {
+        std::cout << "[Ridge/src] no scene loaded (liverMesh3D == null)" << std::endl;
+        return false;
+    }
+    if (!g_liverRegion.valid()) {
+        std::cout << "[Ridge/src] g_liverRegion not yet computed" << std::endl;
+        return false;
+    }
+    if (!g_liverLR.valid()) {
+        std::cout << "[Ridge/src] g_liverLR not yet computed" << std::endl;
+        return false;
+    }
+    const size_t N = g_liverRegion.labels.size();
+    if (N == 0 || g_liverLR.labels.size() != N) {
+        std::cout << "[Ridge/src] label size mismatch" << std::endl;
+        return false;
+    }
+
+    // normals 必須 (grazing テスト)。無ければ面から計算 (AR-vis と同じ)。
+    if (liverMesh3D->mNormals.size() != liverMesh3D->mVertices.size()) {
+        std::cout << "[Ridge/src] normals missing — computing from faces..." << std::endl;
+        Reg3DCustom::computeVertexNormalsFromFaces(*liverMesh3D);
+    }
+
+    // quadrant subset (rim chain と同一)
+    auto quadAllowed = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+        g_liverRegion.labels, g_liverLR.labels, g_activeQuadrantMask);
+
+    // caudal-only (rim chain と同一、degradation-safe)
+    bool c_on = g_ctrlgUseCaudalOnly;
+    if (c_on && (!g_liverCC.valid() || g_liverCC.labels.size() != N)) {
+        std::cout << "[Ridge/src] WARN caudal-only requested but g_liverCC"
+                  << " missing — disabling for this call" << std::endl;
+        c_on = false;
+    }
+
+    // AR camera (rim chain / Ctrl+G と同一)
+    const float diag = (g_liverRegion.bbox_diag > 0.0f)
+                          ? g_liverRegion.bbox_diag : g_sceneDiag;
+    const glm::vec3 ar_cam_pos(0.0f, 0.0f, -0.2f * diag);
+    const float band = std::max(0.02f, g_ctrlgRidgeCosBand);
+
+    const auto& V  = liverMesh3D->mVertices;
+    const auto& Nr = liverMesh3D->mNormals;
+
+    int n_ant_in_quad = 0;
+    for (int idx : quadAllowed) {
+        if (idx < 0 || (size_t)idx >= N) continue;
+        if (g_liverRegion.labels[idx] != LiverRegionLabel::ANTERIOR_CORE) continue;
+        if (c_on && g_liverCC.labels[idx] != LiverCranioCaudalLabel::CAUDAL) continue;
+        n_ant_in_quad++;
+
+        const glm::vec3 p(V[idx*3], V[idx*3+1], V[idx*3+2]);
+        const glm::vec3 n(Nr[idx*3], Nr[idx*3+1], Nr[idx*3+2]);
+        const glm::vec3 viewv = p - ar_cam_pos;
+        const float lv = glm::length(viewv);
+        const float ln = glm::length(n);
+        if (lv < 1e-6f || ln < 1e-6f) continue;
+        const float cos_nv = glm::dot(n, -viewv) / (ln * lv);
+        if (std::fabs(cos_nv) < band) {
+            g_debugSourceRidge.push_back(idx);
+        }
+    }
+
+    std::cout << "[Ridge/src] quadrant=0x" << std::hex
+              << (int)g_activeQuadrantMask << std::dec
+              << "  caudal=" << (c_on ? "Y" : "N")
+              << "  ANTERIOR_in_quad=" << n_ant_in_quad
+              << "  ridge(|cos|<" << band << ")=" << g_debugSourceRidge.size()
+              << std::endl;
+
+    if (g_debugSourceRidge.empty()) {
+        std::cout << "[Ridge/src] no ridge verts — widen the cos band" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+
+// =====================================================================
 // Phase 7b Step 2 helper — Shift+W key wrapper
 // =====================================================================
 //
@@ -9391,6 +9718,294 @@ inline bool populateDebugTargetBoundary()
                   << " — Ctrl+W 2D mode unavailable" << std::endl;
     }
 
+    return true;
+}
+
+
+// =====================================================================
+// Phase 7c (REDGE/稜線) — target ridge outlier removal helpers
+// =====================================================================
+//   Debug-only / one-shot (toggle・スライダ変更時に再実行)。target 稜線
+//   (g_debugTargetRidgePoints) にだけ適用し、既存の purple/RIM 表示や
+//   beta 重み付けには一切触れない。深度復元面の「後ろに伸びる尻尾」など、
+//   2D 境界帯をすり抜ける幾何的外れ値を除く用。
+//   O(N^2) brute force (N~15k で one-shot なら可、SOR は OMP 込み)。
+//   ※ FLT_MAX は本ヘッダ未使用のため numeric_limits を使用。
+namespace RidgeOutlier {
+
+// SOR: 各点の k 近傍平均距離が (全体平均 + std_mul*σ) を超えたら除外。
+inline void statisticalOutlierRemoval(std::vector<glm::vec3>& pts,
+                                      int k, float std_mul,
+                                      std::ostream* log = nullptr)
+{
+    const int n = (int)pts.size();
+    if (n <= k + 1 || k < 1) return;
+
+    std::vector<float> meanKnn(n, 0.0f);
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        std::vector<float> d2buf;
+        d2buf.reserve(n);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < n; i++) {
+            d2buf.clear();
+            for (int j = 0; j < n; j++) {
+                if (j == i) continue;
+                const glm::vec3 d = pts[j] - pts[i];
+                d2buf.push_back(glm::dot(d, d));
+            }
+            const int kk = std::min(k, (int)d2buf.size());
+            std::nth_element(d2buf.begin(), d2buf.begin() + kk, d2buf.end());
+            double s = 0.0;
+            for (int t = 0; t < kk; t++) s += std::sqrt((double)d2buf[t]);
+            meanKnn[i] = (kk > 0) ? (float)(s / kk) : 0.0f;
+        }
+    }
+
+    double sum = 0.0, sum2 = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum  += meanKnn[i];
+        sum2 += (double)meanKnn[i] * meanKnn[i];
+    }
+    const double mean   = sum / n;
+    const double var    = std::max(0.0, sum2 / n - mean * mean);
+    const double sd     = std::sqrt(var);
+    const double thresh = mean + (double)std_mul * sd;
+
+    std::vector<glm::vec3> kept;
+    kept.reserve(n);
+    for (int i = 0; i < n; i++)
+        if (meanKnn[i] <= thresh) kept.push_back(pts[i]);
+
+    if (log) {
+        *log << "[Ridge/tgt/SOR] k=" << k << " std_mul=" << std_mul
+             << "  meanNN=" << mean << " sd=" << sd << " thresh=" << thresh
+             << "  kept=" << kept.size() << "/" << n
+             << " (dropped " << (n - (int)kept.size()) << ")" << std::endl;
+    }
+    pts.swap(kept);
+}
+
+// Euclidean clustering (union-find): 最大クラスタだけ残す。
+//   radius<=0 → auto = (最近傍距離の中央値) * 2.5。
+//   最大クラスタが min_pts 未満でも空にはしない (一番大きいものは残す)。
+inline void keepLargestCluster(std::vector<glm::vec3>& pts,
+                               float radius, int min_pts,
+                               std::ostream* log = nullptr)
+{
+    const int n = (int)pts.size();
+    if (n < 2) return;
+    const float kBig = std::numeric_limits<float>::max();
+
+    // radius<=0 → auto: 各点の最近傍距離の中央値 * 2.5
+    float r = radius;
+    if (r <= 0.0f) {
+        std::vector<float> nn(n, kBig);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int i = 0; i < n; i++) {
+            float best = kBig;
+            for (int j = 0; j < n; j++) {
+                if (j == i) continue;
+                const glm::vec3 d = pts[j] - pts[i];
+                const float d2 = glm::dot(d, d);
+                if (d2 < best) best = d2;
+            }
+            nn[i] = std::sqrt(best);
+        }
+        std::vector<float> tmp = nn;
+        std::nth_element(tmp.begin(), tmp.begin() + n / 2, tmp.end());
+        const float med = tmp[n / 2];
+        r = (med > 0.0f) ? med * 2.5f : 1e-3f;
+    }
+    const float r2 = r * r;
+
+    // union-find (path halving、std::function 不使用)
+    std::vector<int> parent(n);
+    for (int i = 0; i < n; i++) parent[i] = i;
+    auto findRoot = [&parent](int x) -> int {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    };
+    auto unite = [&parent, &findRoot](int a, int b) {
+        const int ra = findRoot(a), rb = findRoot(b);
+        if (ra != rb) parent[ra] = rb;
+    };
+
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            const glm::vec3 d = pts[j] - pts[i];
+            if (glm::dot(d, d) <= r2) unite(i, j);
+        }
+    }
+
+    std::vector<int> csize(n, 0);
+    for (int i = 0; i < n; i++) csize[findRoot(i)]++;
+    int best_root = 0, best_size = -1, n_clusters = 0;
+    for (int i = 0; i < n; i++) {
+        if (csize[i] > 0) n_clusters++;
+        if (csize[i] > best_size) { best_size = csize[i]; best_root = i; }
+    }
+
+    // min_pts 以上のクラスタを全部残す (尻尾=小クラスタを落とす)。
+    // それで空になるなら最大クラスタだけ残す (空回避)。
+    std::vector<glm::vec3> kept;
+    kept.reserve(n);
+    for (int i = 0; i < n; i++)
+        if (csize[findRoot(i)] >= min_pts) kept.push_back(pts[i]);
+    bool fellback = false;
+    if (kept.empty()) {
+        fellback = true;
+        for (int i = 0; i < n; i++)
+            if (findRoot(i) == best_root) kept.push_back(pts[i]);
+    }
+
+    if (log) {
+        *log << "[Ridge/tgt/CC] radius=" << r << " min_pts=" << min_pts
+             << "  clusters=" << n_clusters
+             << " largest=" << best_size << "/" << n
+             << "  kept=" << kept.size()
+             << (fellback ? " (all < min_pts; kept largest only)" : "")
+             << std::endl;
+    }
+    pts.swap(kept);
+}
+
+} // namespace RidgeOutlier
+
+
+// =====================================================================
+// Phase 7c (REDGE/稜線) — target ridge populate (upper half)
+// =====================================================================
+//   populateDebugTargetBoundary が作った g_debugTargetBoundaryPoints
+//   (= rim band 3D) を AR カメラへ投影し、2D centroid より上
+//   (screen +y=down なので p.y <= centroid.y) を上半分=稜線として 3D の
+//   まま抽出。silSwBuildTgtPreview の Step 1-3 と同じ投影・centroid。
+//   下半分 (p.y > centroid.y) は従来どおり RIM。target は静止なので
+//   3D 点を直接保持 (purple rim band と同じ流儀)。
+//   前提: 先に Shift+W で g_debugTargetBoundaryPoints が埋まっていること
+//   (空なら自動で populateDebugTargetBoundary を呼ぶ)。
+//
+inline bool populateDebugTargetRidge()
+{
+    g_debugTargetRidgePoints.clear();
+
+    if (g_debugTargetBoundaryPoints.empty()) {
+        std::cout << "[Ridge/tgt] g_debugTargetBoundaryPoints empty —"
+                  << " auto-running populateDebugTargetBoundary..." << std::endl;
+        if (!populateDebugTargetBoundary() || g_debugTargetBoundaryPoints.empty()) {
+            std::cout << "[Ridge/tgt] still empty — abort" << std::endl;
+            return false;
+        }
+    }
+
+    const glm::mat4 view_m = buildSilhouetteView();
+    const glm::mat4 proj_m = buildSilhouetteProj();
+    const int W_img = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1920;
+    const int H_img = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 1080;
+    const glm::mat4 M = proj_m * view_m;
+
+    // Step 1: 全点を 2D pixel へ投影 (parallel に元 index を保持)
+    std::vector<glm::vec2> all_2D;
+    std::vector<int>       all_src;
+    all_2D.reserve(g_debugTargetBoundaryPoints.size());
+    all_src.reserve(g_debugTargetBoundaryPoints.size());
+    for (int i = 0; i < (int)g_debugTargetBoundaryPoints.size(); i++) {
+        const glm::vec4 clip = M * glm::vec4(g_debugTargetBoundaryPoints[i], 1.0f);
+        if (clip.w < 1e-9f) continue;
+        const float ndcx = clip.x / clip.w;
+        const float ndcy = clip.y / clip.w;
+        if (ndcx < -1.5f || ndcx > 1.5f || ndcy < -1.5f || ndcy > 1.5f) continue;
+        all_2D.emplace_back((ndcx + 1.0f) * 0.5f * float(W_img),
+                            (1.0f - ndcy) * 0.5f * float(H_img));
+        all_src.push_back(i);
+    }
+    if (all_2D.size() < 10) {
+        std::cout << "[Ridge/tgt] too few on-screen boundary points (<10)" << std::endl;
+        return false;
+    }
+
+    // Step 2: 2D centroid
+    glm::dvec2 sum2d(0.0);
+    for (const auto& p : all_2D) sum2d += glm::dvec2(p);
+    const glm::vec2 centroid(sum2d / double(all_2D.size()));
+
+    // Step 3: 上半分=稜線 / 下半分=RIM を分ける軸を決める。
+    //   split_normal = 各点を射影して centroid と比較する「下方向ベクトル」
+    //                  (s = dot(p-centroid, split_normal); s<=0 → 上半分=稜線)。
+    //   - mode 0 (既定): screen +y (=下方向)。p.y<=centroid.y → 上半分。
+    //   - mode 1 (bbox長辺): 2D 点群の主軸(=長辺)を PCA で求め、その短軸を
+    //     分割法線にする。横長/やや傾いた肝臓でも長辺に平行な線で「上側の
+    //     長辺(稜線)/下側の長辺(RIM)」に割れる。向きは screen-up(-y) に合わせ
+    //     るので ridge=上 のまま。長辺が水平なら mode 0 に一致。
+    glm::vec2 split_normal(0.0f, 1.0f);   // mode0: +y(down)
+    if (g_ridgeTgtSplitLongEdge) {
+        double cxx = 0.0, cxy = 0.0, cyy = 0.0;
+        for (const auto& p : all_2D) {
+            const double dx = (double)p.x - centroid.x;
+            const double dy = (double)p.y - centroid.y;
+            cxx += dx * dx; cxy += dx * dy; cyy += dy * dy;
+        }
+        // 主軸(最大分散)角: theta = 0.5*atan2(2*cxy, cxx-cyy)
+        const double theta = 0.5 * std::atan2(2.0 * cxy, cxx - cyy);
+        // 短軸(=分割法線) = 主軸 + 90deg
+        glm::vec2 minor((float)(-std::sin(theta)), (float)(std::cos(theta)));
+        if (minor.y > 0.0f) minor = -minor;   // screen-up(-y) に向ける
+        split_normal = -minor;                 // 下方向に戻す (上=ridge を保つ)
+    }
+
+    int n_upper = 0, n_lower = 0;
+    g_debugTargetRidgePoints.reserve(all_2D.size() / 2);
+    for (size_t k = 0; k < all_2D.size(); k++) {
+        const glm::vec2 rel = all_2D[k] - centroid;
+        const float s = glm::dot(rel, split_normal);
+        if (s <= 0.0f) {   // 上半分 = 稜線
+            g_debugTargetRidgePoints.push_back(
+                g_debugTargetBoundaryPoints[all_src[k]]);
+            n_upper++;
+        } else {
+            n_lower++;
+        }
+    }
+
+    std::cout << "[Ridge/tgt] on_screen=" << all_2D.size()
+              << "  split=" << (g_ridgeTgtSplitLongEdge ? "bbox-long-edge" : "up/down")
+              << "  upper(ridge)=" << n_upper
+              << "  lower(rim)=" << n_lower << std::endl;
+
+    // ---- (Phase 7c) optional outlier removal (debug toggle) ----------
+    //   稜線(上半分)にだけ適用。purple RIM / beta 重み付けは不変。
+    if (g_ridgeTgtRemoveOutliers && g_debugTargetRidgePoints.size() > 4) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int n_before = (int)g_debugTargetRidgePoints.size();
+        if (g_ridgeTgtOutlierMode == 1) {
+            RidgeOutlier::keepLargestCluster(
+                g_debugTargetRidgePoints,
+                g_ridgeTgtCcRadius, g_ridgeTgtCcMinPts, &std::cout);
+        } else {
+            RidgeOutlier::statisticalOutlierRemoval(
+                g_debugTargetRidgePoints,
+                g_ridgeTgtSorK, g_ridgeTgtSorStd, &std::cout);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "[Ridge/tgt] outlier removal ("
+                  << (g_ridgeTgtOutlierMode == 1 ? "largest-CC" : "SOR")
+                  << "): " << n_before << " -> "
+                  << g_debugTargetRidgePoints.size()
+                  << "  (" << ms << " ms)" << std::endl;
+    }
+
+    if (g_debugTargetRidgePoints.empty()) {
+        std::cout << "[Ridge/tgt] upper half empty — abort" << std::endl;
+        return false;
+    }
     return true;
 }
 
@@ -12432,4 +13047,677 @@ inline bool tickSilhouetteSweep()
     }
 
     return true;
+}
+
+// =========================================================================
+//  Phase U-1: soft partition の計算ドライバ
+// =========================================================================
+inline void runSoftPartitionCompute() {
+    if (!g_softAnchors.valid()) {
+        std::cerr << "[Soft U-1] anchors invalid (need >="
+                  << SoftPartition::MIN_GROUPS << ", have "
+                  << g_softAnchors.count() << ")" << std::endl;
+        g_softPartReady = false; return;
+    }
+    if (!screenMesh || SoftPartition::vertexCount(*screenMesh) == 0 ||
+        screenMesh->mIndices.empty()) {
+        std::cerr << "[Soft U-1] screenMesh empty or has no triangles" << std::endl;
+        g_softPartReady = false; return;
+    }
+    if (!liverMesh3D || SoftPartition::vertexCount(*liverMesh3D) == 0 ||
+        liverMesh3D->mIndices.empty()) {
+        std::cerr << "[Soft U-1] liverMesh3D empty or has no triangles" << std::endl;
+        g_softPartReady = false; return;
+    }
+
+    std::cout << "[Soft U-1] Computing partition: N=" << g_softAnchors.count()
+              << " s_ume=" << g_softUmeyamaScale
+              << " sigma=" << (g_softPartParams.autoSigma ? "auto" : "manual")
+              << " baseline_none=" << g_softPartParams.baselineNone << std::endl;
+
+    bool okT = SoftPartition::computeTargetPartition(
+        *screenMesh, g_softAnchors, g_softPartParams,
+        g_softTgtField, g_softGroupRadii);
+    if (okT) {
+        std::cout << "[Soft U-1] Target OK: "
+                  << SoftPartition::vertexCount(*screenMesh) << " verts. group radii=";
+        for (size_t i = 0; i < g_softGroupRadii.size(); ++i)
+            std::cout << g_softGroupRadii[i]
+                      << (i + 1 < g_softGroupRadii.size() ? "," : "");
+        std::cout << std::endl;
+    } else {
+        std::cerr << "[Soft U-1] Target FAILED" << std::endl;
+    }
+
+    // U-1: registration 後は liver も world 単位なので s_ume=1 を渡して
+    // r_src == r_tgt にする (二重補正回避)。g_softUmeyamaScale は表示用に保持。
+    bool okS = SoftPartition::computeSourcePartition(
+        *liverMesh3D, g_softAnchors, g_softGroupRadii,
+        1.0f, g_softPartParams, g_softSrcField);
+    if (okS) {
+        std::cout << "[Soft U-1] Source OK: "
+                  << SoftPartition::vertexCount(*liverMesh3D) << " verts." << std::endl;
+    } else {
+        std::cerr << "[Soft U-1] Source FAILED" << std::endl;
+    }
+
+    g_softPartReady = okT && okS;
+}
+
+// =========================================================================
+//  Phase U-2: soft-weighted ICP  (Ctrl+U)
+//  Reuses: extractFrontFacePoints (target cloud), Reg3DCustom KDTree (NN),
+//          NormalRefine::solve6x6 / transformVector6dToMatrix4d (point-to-plane),
+//          NormalRefine::applyIncrementalTransform (apply to all organs),
+//          computeUnifiedMetrics (RMSE/IoU).
+//  New here: the soft per-correspondence weight  w = agree * (1 - p_none),
+//            agree = <p_src[j], p_tgt[k]>, and the target-cloud -> screenMesh
+//            probability mapping (PointCloud carries no screenMesh index).
+// =========================================================================
+inline void runSoftWeightedICP(std::vector<glm::dmat4>* outTraj = nullptr,
+                               bool applyResult = true) {
+    if (!g_softPartReady || !g_softSrcField.valid || !g_softTgtField.valid) {
+        std::cerr << "[Soft U-2] partition not ready — run Shift+U first" << std::endl;
+        return;
+    }
+    if (!screenMesh || !liverMesh3D) {
+        std::cerr << "[Soft U-2] screenMesh / liverMesh3D missing" << std::endl;
+        return;
+    }
+
+    // ----- target cloud (same path as Ctrl+G / Ctrl+N) -----
+    Reg3DCustom::NoOpen3DRegistration reg_extract;
+    const float zThresh = RegRatios::zThresh();
+    auto targetCloud = reg_extract.extractFrontFacePoints(
+        *screenMesh, gGridWidth, gGridHeight(), zThresh);
+    if (!targetCloud || targetCloud->size() < 6 || !targetCloud->hasNormals()) {
+        std::cerr << "[Soft U-2] target cloud invalid (need normals, >=6 pts)" << std::endl;
+        return;
+    }
+
+    // Optional voxel downsample (debug / large-scale). 1920x1080 dense clouds
+    // can exceed 300k points; reuse Ctrl+G's voxelDownSample (keeps normals).
+    if (g_softIcpParams.downsampleTarget) {
+        const float vox = std::max(1e-6f, g_softIcpParams.voxelFac * (float)g_sceneDiag);
+        auto ds = reg_extract.voxelDownSample(targetCloud, vox);
+        if (ds && ds->size() >= 6 && ds->hasNormals()) {
+            std::cout << "[Soft U-2] target downsampled "
+                      << targetCloud->size() << " -> " << ds->size()
+                      << "  (voxel=" << vox << ")" << std::endl;
+            targetCloud = ds;
+        } else {
+            std::cerr << "[Soft U-2] downsample gave too few/normless pts; "
+                         "using full cloud" << std::endl;
+        }
+    }
+
+    const int nT = (int)targetCloud->size();
+    std::vector<glm::dvec3> tgtD(nT);
+    for (int i = 0; i < nT; ++i) tgtD[i] = glm::dvec3(targetCloud->points[i]);
+    Reg3DCustom::NanoflannAdaptorD tgtAdaptor(tgtD);
+    auto tgtTree = Reg3DCustom::buildKDTreeD(tgtAdaptor);
+
+    // ----- NEW: target-cloud point -> nearest screenMesh vertex -> p_tgt -----
+    const int nSV = SoftPartition::vertexCount(*screenMesh);
+    if ((int)g_softTgtField.probs.size() != nSV) {
+        std::cerr << "[Soft U-2] target field size mismatch" << std::endl;
+        return;
+    }
+    std::vector<glm::dvec3> svD(nSV);
+    for (int v = 0; v < nSV; ++v)
+        svD[v] = glm::dvec3(SoftPartition::vertexAt(*screenMesh, v));
+    Reg3DCustom::NanoflannAdaptorD svAdaptor(svD);
+    auto svTree = Reg3DCustom::buildKDTreeD(svAdaptor);
+
+    const int G = g_softTgtField.numGroups;
+    std::vector<std::array<float, SoftPartition::MAX_GROUPS + 1>> tgtCloudProb(nT);
+    for (int k = 0; k < nT; ++k) {
+        size_t vidx = 0; double dsq = 0.0;
+        if (Reg3DCustom::searchKNN1D(*svTree, tgtD[k], vidx, dsq))
+            tgtCloudProb[k] = g_softTgtField.probs[vidx];
+        else
+            tgtCloudProb[k].fill(0.0f);
+    }
+
+    // ----- source = liver vertices (world coords) + normals -----
+    const int nS = SoftPartition::vertexCount(*liverMesh3D);
+    if ((int)g_softSrcField.probs.size() != nS) {
+        std::cerr << "[Soft U-2] source field size mismatch" << std::endl;
+        return;
+    }
+    const bool haveSrcN = ((int)(liverMesh3D->mNormals.size() / 3) == nS);
+    std::vector<glm::dvec3> srcD(nS), srcN(nS, glm::dvec3(0, 0, 1));
+    for (int j = 0; j < nS; ++j) {
+        srcD[j] = glm::dvec3(SoftPartition::vertexAt(*liverMesh3D, j));
+        if (haveSrcN) {
+            glm::dvec3 n(liverMesh3D->mNormals[j * 3],
+                         liverMesh3D->mNormals[j * 3 + 1],
+                         liverMesh3D->mNormals[j * 3 + 2]);
+            double l = glm::length(n);
+            if (l > 1e-12) srcN[j] = n / l;
+        }
+    }
+
+    // ----- before metrics -----
+    computeUnifiedMetrics();
+    g_softIcpRmseBefore = registrationHandle.compRmse;
+    g_softIcpIoUBefore  = registrationHandle.compIoU2D;
+
+    const double maxCorr2 =
+        std::pow((double)g_softIcpParams.maxCorrDistFac * (double)g_sceneDiag, 2.0);
+
+    std::cout << "[Soft U-2] start: src=" << nS << " tgt=" << nT
+              << " groups=" << G << " maxIters=" << g_softIcpParams.maxIters
+              << " mode=" << (g_softIcpParams.uniformWeight ? "UNIFORM(ablation)" : "SOFT")
+              << " RMSE_before=" << g_softIcpRmseBefore
+              << " IoU_before=" << g_softIcpIoUBefore << std::endl;
+
+    glm::dmat4 T_total(1.0);
+    int iter = 0;
+    for (; iter < g_softIcpParams.maxIters; ++iter) {
+        double JTJ[6][6] = {};
+        double JTr[6]    = {};
+        int    used = 0;
+        double wsum = 0.0, rawErr2 = 0.0;
+        int    rawN = 0;
+
+        const glm::dmat3 Rtot = glm::dmat3(T_total);
+        for (int j = 0; j < nS; ++j) {
+            const auto& ps = g_softSrcField.probs[j];
+            const float pnone = ps[SoftPartition::NONE_IDX];
+            if (pnone > g_softIcpParams.noneSkip) continue;
+
+            glm::dvec3 vs = glm::dvec3(T_total * glm::dvec4(srcD[j], 1.0));
+            size_t k = 0; double dsq = 0.0;
+            if (!Reg3DCustom::searchKNN1D(*tgtTree, vs, k, dsq)) continue;
+            rawErr2 += dsq; ++rawN;
+            if (dsq > maxCorr2) continue;
+
+            const auto& pt = tgtCloudProb[k];
+            double w;
+            if (g_softIcpParams.uniformWeight) {
+                // ablation: plain ICP. Same correspondence set (none-skip still
+                // applies above), but every match counts equally.
+                w = 1.0;
+            } else {
+                double agree = 0.0;
+                for (int g = 0; g < G; ++g) agree += (double)ps[g] * (double)pt[g];
+                w = agree * (1.0 - (double)pnone);
+                if (w < (double)g_softIcpParams.minWeight) continue;
+            }
+
+            glm::dvec3 vt = tgtD[k];
+            glm::dvec3 nt = glm::normalize(glm::dvec3(targetCloud->normals[k]));
+            if (haveSrcN) {
+                glm::dvec3 ns = glm::normalize(Rtot * srcN[j]);
+                if (glm::dot(ns, nt) < 0.0) nt = -nt;
+            }
+
+            const double r  = glm::dot(vs - vt, nt);
+            const double sw = std::sqrt(w);
+            double J[6];
+            J[0] = (vs.y * nt.z - vs.z * nt.y) * sw;
+            J[1] = (vs.z * nt.x - vs.x * nt.z) * sw;
+            J[2] = (vs.x * nt.y - vs.y * nt.x) * sw;
+            J[3] = nt.x * sw; J[4] = nt.y * sw; J[5] = nt.z * sw;
+            const double rr = r * sw;
+            for (int a = 0; a < 6; ++a) {
+                JTr[a] += J[a] * rr;
+                for (int b = 0; b < 6; ++b) JTJ[a][b] += J[a] * J[b];
+            }
+            ++used; wsum += w;
+        }
+
+        if (used < 6) {
+            std::cout << "[Soft U-2] iter=" << iter << " too few corr ("
+                      << used << "), stopping" << std::endl;
+            break;
+        }
+
+        for (int a = 0; a < 6; ++a) JTJ[a][a] += (double)g_softIcpParams.tikhonov;
+        double negJTr[6];
+        for (int a = 0; a < 6; ++a) negJTr[a] = -JTr[a];
+        double x[6] = {};
+        if (!NormalRefine::solve6x6(JTJ, negJTr, x)) {
+            std::cout << "[Soft U-2] iter=" << iter << " solve6x6 failed" << std::endl;
+            break;
+        }
+
+        glm::dmat4 dT = NormalRefine::transformVector6dToMatrix4d(x);
+        T_total = dT * T_total;
+        if (outTraj) outTraj->push_back(T_total);   // [LIVE] record for replay
+
+        const double dnorm = std::sqrt(x[0]*x[0] + x[1]*x[1] + x[2]*x[2] +
+                                       x[3]*x[3] + x[4]*x[4] + x[5]*x[5]);
+        const double rawRmse = rawN ? std::sqrt(rawErr2 / (double)rawN) : 0.0;
+        std::cout << "[Soft U-2] iter=" << iter << " used=" << used
+                  << " wsum=" << wsum << " rawRMSE=" << rawRmse
+                  << " |dx|=" << dnorm << std::endl;
+        if (dnorm < (double)g_softIcpParams.convergeEps) { ++iter; break; }
+    }
+
+    g_softIcpLastIters = iter;
+
+    if (!applyResult) {
+        // [LIVE record] caller will replay outTraj frame-by-frame and finalize
+        // (apply + metrics + revert-state) once the animation completes.
+        std::cout << "[Soft U-2] (live record) iters=" << iter
+                  << " frames=" << (outTraj ? outTraj->size() : 0) << std::endl;
+        return;
+    }
+
+    // ----- apply accumulated refinement to all organs -----
+    auto organs = getOrganList();
+    NormalRefine::applyIncrementalTransform(T_total, organs);
+    g_softIcpAppliedT  = T_total;   // remember so we can revert
+    g_softIcpCanRevert = true;
+
+    // ----- after metrics -----
+    computeUnifiedMetrics();
+    g_softIcpRmseAfter = registrationHandle.compRmse;
+    g_softIcpIoUAfter  = registrationHandle.compIoU2D;
+
+    std::cout << "[Soft U-2] DONE iters=" << iter
+              << "  RMSE " << g_softIcpRmseBefore << " -> " << g_softIcpRmseAfter
+              << "  IoU "  << g_softIcpIoUBefore  << " -> " << g_softIcpIoUAfter
+              << std::endl;
+}
+
+// =========================================================================
+//  Phase U-2: revert the last soft-weighted ICP (apply inverse of T_total)
+// =========================================================================
+inline void revertSoftICP() {
+    if (!g_softIcpCanRevert) {
+        std::cerr << "[Soft U-2] nothing to revert" << std::endl;
+        return;
+    }
+    glm::dmat4 inv = glm::inverse(g_softIcpAppliedT);
+    auto organs = getOrganList();
+    NormalRefine::applyIncrementalTransform(inv, organs);
+    g_softIcpCanRevert = false;
+    g_softIcpAppliedT  = glm::dmat4(1.0);
+    computeUnifiedMetrics();
+    g_softIcpRmseAfter = registrationHandle.compRmse;
+    g_softIcpIoUAfter  = registrationHandle.compIoU2D;
+    std::cout << "[Soft U-2] reverted to pre-ICP pose.  RMSE="
+              << g_softIcpRmseAfter << " IoU=" << g_softIcpIoUAfter << std::endl;
+}
+
+// =========================================================================
+//  Phase U-CPD: pure rigid CPD (anchor-free), staged so the U-tab UI can
+//  drive it as a sequential checklist (check 1 -> 5 to advance).
+//
+//  Stage 1  extract target cloud   (front-face points of screenMesh)
+//  Stage 2  downsample target      (voxel grid; the solve size)
+//  Stage 3  build source           (liver mVertices, read DIRECTLY — no
+//                                    SoftPartition / no anchor) + before-metrics
+//  Stage 4  run CPD EM             (CpdRigid::runRigidCPD)
+//  Stage 5  apply + after-metrics  (applyIncrementalTransform of the result)
+//
+//  Each stage sets g_cpdStageDone[i] on success. The drivers below
+//  (runCpdRegistration / revertCpd) and cpdUncheckFrom keep the staged
+//  state and the actually-applied transform consistent.
+// =========================================================================
+
+// Undo the applied transform (if any) and clear stages >= `stage`.
+inline void cpdUncheckFrom(int stage) {
+    if (stage <= 5 && g_cpdStageDone[5] && g_cpdCanRevert) {
+        glm::dmat4 inv = glm::inverse(g_cpdAppliedT);
+        auto organs = getOrganList();
+        NormalRefine::applyIncrementalTransform(inv, organs);
+        g_cpdCanRevert = false;
+        g_cpdAppliedT  = glm::dmat4(1.0);
+        computeUnifiedMetrics();
+        g_cpdRmseAfter = registrationHandle.compRmse;
+        g_cpdIoUAfter  = registrationHandle.compIoU2D;
+        std::cout << "[CPD] stage 5 apply reverted (RMSE=" << g_cpdRmseAfter
+                  << " IoU=" << g_cpdIoUAfter << ")" << std::endl;
+    }
+    for (int j = stage; j < 6; ++j) g_cpdStageDone[j] = false;
+    if (stage <= 1) { g_cpdTgtCloud.reset(); g_cpdTgtCountRaw = 0; }
+    if (stage <= 2) { g_cpdTgtD.clear();     g_cpdTgtCountDS  = 0; }
+    if (stage <= 3) { g_cpdSrcD.clear();     g_cpdSrcCount = 0; g_cpdSigma2Init = 0.0; }
+    if (stage <= 4) { g_cpdResult = CpdRigid::Result{}; g_cpdLastIters = 0; }
+}
+
+// Full reset (reverts apply too).
+inline void cpdResetPipeline() {
+    cpdUncheckFrom(1);
+    std::cout << "[CPD] pipeline reset" << std::endl;
+}
+
+// --- Stage 1: extract target front-face cloud --------------------------
+inline bool cpdStage1_extractTarget() {
+    if (!screenMesh || !liverMesh3D) {
+        std::cerr << "[CPD-1] screenMesh / liverMesh3D missing" << std::endl;
+        return false;
+    }
+    Reg3DCustom::NoOpen3DRegistration reg_extract;
+    const float zThresh = RegRatios::zThresh();
+    auto cloud = reg_extract.extractFrontFacePoints(
+        *screenMesh, gGridWidth, gGridHeight(), zThresh);
+    if (!cloud || cloud->size() < 10) {
+        std::cerr << "[CPD-1] target cloud invalid (>=10 pts needed)" << std::endl;
+        return false;
+    }
+    g_cpdTgtCloud    = cloud;
+    g_cpdTgtCountRaw = (int)cloud->size();
+    g_cpdStageDone[1] = true;
+    std::cout << "[CPD-1] target extracted: " << g_cpdTgtCountRaw << " pts" << std::endl;
+    return true;
+}
+
+// --- Stage 2: voxel downsample target ----------------------------------
+inline bool cpdStage2_downsample() {
+    if (!g_cpdTgtCloud) {
+        std::cerr << "[CPD-2] no target cloud (run stage 1 first)" << std::endl;
+        return false;
+    }
+    auto cloud = g_cpdTgtCloud;
+    if (g_cpdParams.downsample) {
+        const float vox = std::max(1e-6f, g_cpdParams.tgtVoxelFac * (float)g_sceneDiag);
+        Reg3DCustom::NoOpen3DRegistration reg_extract;
+        auto ds = reg_extract.voxelDownSample(cloud, vox);
+        if (ds && ds->size() >= 10) {
+            std::cout << "[CPD-2] target downsampled " << cloud->size()
+                      << " -> " << ds->size() << "  (voxel=" << vox << ")" << std::endl;
+            cloud = ds;
+        } else {
+            std::cerr << "[CPD-2] downsample gave too few pts; using full cloud" << std::endl;
+        }
+    } else {
+        std::cout << "[CPD-2] downsample OFF; using full target ("
+                  << cloud->size() << " pts)" << std::endl;
+    }
+    const int n = (int)cloud->size();
+    g_cpdTgtD.resize(n);
+    for (int i = 0; i < n; ++i) g_cpdTgtD[i] = glm::dvec3(cloud->points[i]);
+    g_cpdTgtCountDS = n;
+    g_cpdStageDone[2] = true;
+    return true;
+}
+
+// --- Stage 3: build source (anchor-free) + before-metrics + sigma2 -----
+inline bool cpdStage3_buildSource() {
+    if (!liverMesh3D) {
+        std::cerr << "[CPD-3] liverMesh3D missing" << std::endl;
+        return false;
+    }
+    // Source = liver vertices in world coords, read DIRECTLY from mVertices.
+    // (Deliberately NOT SoftPartition::vertexAt — keeps the CPD path free of
+    //  the U-1 anchor / probability fields, so this is a clean baseline.)
+    const int nV = (int)(liverMesh3D->mVertices.size() / 3);
+    if (nV < 10) {
+        std::cerr << "[CPD-3] liver has too few vertices" << std::endl;
+        return false;
+    }
+    std::vector<glm::dvec3> src(nV);
+    for (int j = 0; j < nV; ++j)
+        src[j] = glm::dvec3(liverMesh3D->mVertices[j * 3 + 0],
+                            liverMesh3D->mVertices[j * 3 + 1],
+                            liverMesh3D->mVertices[j * 3 + 2]);
+
+    // Optional source thinning (compute-only; the final T still applies to the
+    // full mesh). Off by default (srcVoxelFac == 0).
+    if (g_cpdParams.srcVoxelFac > 0.0f) {
+        auto sc = std::make_shared<Reg3DCustom::PointCloud>();
+        sc->points.reserve(nV);
+        for (const auto& p : src) sc->points.push_back(glm::vec3(p));
+        Reg3DCustom::NoOpen3DRegistration reg_extract;
+        const float vox = std::max(1e-6f, g_cpdParams.srcVoxelFac * (float)g_sceneDiag);
+        auto ds = reg_extract.voxelDownSample(sc, vox);
+        if (ds && ds->size() >= 10) {
+            std::cout << "[CPD-3] source downsampled " << src.size()
+                      << " -> " << ds->size() << "  (voxel=" << vox << ")" << std::endl;
+            src.resize(ds->size());
+            for (size_t i = 0; i < ds->size(); ++i) src[i] = glm::dvec3(ds->points[i]);
+        }
+    }
+
+    g_cpdSrcD     = std::move(src);
+    g_cpdSrcCount = (int)g_cpdSrcD.size();
+
+    // Before-metrics (current pose, = the shared Umeyama init).
+    computeUnifiedMetrics();
+    g_cpdRmseBefore = registrationHandle.compRmse;
+    g_cpdIoUBefore  = registrationHandle.compIoU2D;
+
+    if (!g_cpdTgtD.empty() && !g_cpdSrcD.empty())
+        g_cpdSigma2Init = CpdRigid::initialSigma2(g_cpdSrcD, g_cpdTgtD);
+
+    g_cpdStageDone[3] = true;
+    std::cout << "[CPD-3] source=" << g_cpdSrcCount
+              << "  sigma2_init=" << g_cpdSigma2Init
+              << "  RMSE_before=" << g_cpdRmseBefore
+              << "  IoU_before=" << g_cpdIoUBefore << std::endl;
+    return true;
+}
+
+// --- Stage 4: run the CPD EM -------------------------------------------
+inline bool cpdStage4_runEM(std::vector<glm::dmat4>* outTraj = nullptr) {
+    if (g_cpdSrcD.empty() || g_cpdTgtD.empty()) {
+        std::cerr << "[CPD-4] source/target empty (run stages 1-3 first)" << std::endl;
+        return false;
+    }
+    std::cout << "[CPD-4] start: src=" << g_cpdSrcD.size()
+              << " tgt=" << g_cpdTgtD.size()
+              << " w=" << g_cpdParams.w_outlier
+              << " solveScale=" << (g_cpdParams.solveScale ? 1 : 0)
+              << " maxIters=" << g_cpdParams.maxIters << std::endl;
+    g_cpdResult    = CpdRigid::runRigidCPD(g_cpdSrcD, g_cpdTgtD, g_cpdParams, outTraj);
+    g_cpdLastIters = g_cpdResult.iters;
+    if (!g_cpdResult.ok) {
+        if (g_cpdResult.collapsed) {
+            // N_P guard tripped: the GMM shrank onto a small subset of the
+            // target (overfit). With a good init this usually means the
+            // Umeyama pose is already at the data noise floor and there is no
+            // rigid move left to make. Keep the current pose.
+            std::cerr << "[CPD-4] REFUSED: N_P collapsed to " << g_cpdResult.N_P
+                      << " / " << g_cpdTgtD.size() << " ("
+                      << (g_cpdTgtD.empty() ? 0.0
+                            : 100.0 * g_cpdResult.N_P / (double)g_cpdTgtD.size())
+                      << "% explained) -- overfit; init likely already optimal. "
+                      << "Lower 'N_P collapse frac' or raise 'sigma2 floor' to override."
+                      << std::endl;
+        } else {
+            std::cerr << "[CPD-4] CPD failed (ok=false: too few correspondences)" << std::endl;
+        }
+        return false;
+    }
+    std::cout << "[CPD-4] done: iters=" << g_cpdResult.iters
+              << " sigma2=" << g_cpdResult.sigma2
+              << " (floor=" << g_cpdResult.sigma2Floor << ")"
+              << " scale=" << g_cpdResult.finalScale
+              << " N_P=" << g_cpdResult.N_P
+              << " / " << g_cpdTgtD.size() << std::endl;
+    g_cpdStageDone[4] = true;
+    return true;
+}
+
+// --- Stage 5: apply result + after-metrics -----------------------------
+inline bool cpdStage5_apply() {
+    if (!g_cpdStageDone[4] || !g_cpdResult.ok) {
+        std::cerr << "[CPD-5] no valid result (run stage 4 first)" << std::endl;
+        return false;
+    }
+    if (g_cpdCanRevert) {
+        std::cerr << "[CPD-5] already applied; revert first" << std::endl;
+        return false;
+    }
+    auto organs = getOrganList();
+    NormalRefine::applyIncrementalTransform(g_cpdResult.T, organs);
+    g_cpdAppliedT  = g_cpdResult.T;
+    g_cpdCanRevert = true;
+    computeUnifiedMetrics();
+    g_cpdRmseAfter = registrationHandle.compRmse;
+    g_cpdIoUAfter  = registrationHandle.compIoU2D;
+    g_cpdStageDone[5] = true;
+    std::cout << "[CPD-5] DONE  RMSE " << g_cpdRmseBefore << " -> " << g_cpdRmseAfter
+              << "  IoU " << g_cpdIoUBefore << " -> " << g_cpdIoUAfter << std::endl;
+    return true;
+}
+
+// --- One-shot driver: run stages 1 -> 5 (used by Ctrl+U and "Run all") --
+inline void runCpdRegistration() {
+    cpdResetPipeline();
+    if (!cpdStage1_extractTarget()) return;
+    if (!cpdStage2_downsample())    return;
+    if (!cpdStage3_buildSource())   return;
+    if (!cpdStage4_runEM())         return;
+    cpdStage5_apply();
+}
+
+// Revert the applied CPD transform (leaves stages 1-4 intact for re-apply).
+inline void revertCpd() { cpdUncheckFrom(5); }
+
+// =========================================================================
+//  [LIVE] Frame-driven convergence animation for CPD and soft-ICP.
+//
+//  Mirrors NormalRefineLive (Shift+N) but uses a record-then-replay scheme:
+//  the solver runs once (fast), recording the cumulative transform after every
+//  iteration; the main render loop then replays that trajectory one (or
+//  g_regLiveStepsPerFrame) entries per frame via applyIncrementalTransform, so
+//  the mesh visibly converges. The validated CPD/ICP math is untouched.
+//
+//  Lifecycle (parallels NormalRefineLive):
+//    caller: poseAutoSaveBeforeRegistration()  + startXxxLive()
+//    main loop: tickXxxLive() each frame  -> [last tick] finishXxxLive()
+//    finish sets pendingSave -> main.cpp consumes it and calls poseSaveToLibrary
+//
+//  Concurrency: a single live session at a time across all three (NormalRefine,
+//  CPD, soft-ICP). Starting one while another runs is refused.
+// =========================================================================
+namespace CpdLive {
+    inline bool                    active      = false;
+    inline bool                    pendingSave = false;
+    inline std::vector<glm::dmat4> traj;                 // per-iteration cumulative T
+    inline glm::dmat4              applied     = glm::dmat4(1.0); // T currently on the mesh
+    inline int                     pi          = 0;       // entries replayed so far
+}
+namespace SoftIcpLive {
+    inline bool                    active      = false;
+    inline bool                    pendingSave = false;
+    inline std::vector<glm::dmat4> traj;
+    inline glm::dmat4              applied     = glm::dmat4(1.0);
+    inline int                     pi          = 0;
+}
+
+inline void finishCpdLive();
+inline void finishSoftIcpLive();
+
+// True if any frame-driven session is currently animating.
+inline bool anyRegLiveActive() {
+    return NormalRefineLive::active || CpdLive::active || SoftIcpLive::active;
+}
+
+// Advance a replay by g_regLiveStepsPerFrame and apply the composite delta.
+// Returns true when the trajectory has been fully replayed.
+inline bool replayAdvance(std::vector<glm::dmat4>& traj, glm::dmat4& applied, int& pi) {
+    const int N = (int)traj.size();
+    if (N == 0) return true;
+    const int steps  = std::max(1, g_regLiveStepsPerFrame);
+    const int target = std::min(pi + steps, N);
+    if (target > pi) {
+        const glm::dmat4 Tt    = traj[target - 1];
+        const glm::dmat4 delta = Tt * glm::inverse(applied);
+        auto organs = getOrganList();
+        NormalRefine::applyIncrementalTransform(delta, organs);
+        applied = Tt;
+        pi      = target;
+    }
+    return pi >= N;
+}
+
+// ---- CPD live ----------------------------------------------------------
+inline bool startCpdLive() {
+    if (CpdLive::active) { finishCpdLive(); return false; } // press-to-stop -> jump to end
+    if (anyRegLiveActive()) {
+        std::cerr << "[CPD LIVE] another live session is active — stop it first" << std::endl;
+        return false;
+    }
+    // Run stages 1-4 (these do NOT move the mesh) with trajectory recording.
+    cpdResetPipeline();
+    if (!cpdStage1_extractTarget()) return false;
+    if (!cpdStage2_downsample())    return false;
+    if (!cpdStage3_buildSource())   return false;
+    CpdLive::traj.clear();
+    if (!cpdStage4_runEM(&CpdLive::traj)) return false;     // logs collapse/fail; sets g_cpdResult
+    if (CpdLive::traj.empty()) {
+        // Degenerate (0 iterations). Apply directly via the blocking stage 5.
+        std::cout << "[CPD LIVE] no trajectory (0 iters) — applying directly" << std::endl;
+        cpdStage5_apply();
+        return false;
+    }
+    CpdLive::applied     = glm::dmat4(1.0);
+    CpdLive::pi          = 0;
+    CpdLive::active      = true;
+    CpdLive::pendingSave = false;
+    std::cout << "[CPD LIVE] start: " << CpdLive::traj.size()
+              << " frames  RMSE_before=" << std::fixed << std::setprecision(5)
+              << g_cpdRmseBefore << std::defaultfloat << std::endl;
+    return true;
+}
+inline void tickCpdLive() {
+    if (!CpdLive::active) return;
+    if (replayAdvance(CpdLive::traj, CpdLive::applied, CpdLive::pi))
+        finishCpdLive();
+}
+inline void finishCpdLive() {
+    if (!CpdLive::active) return;
+    // Mesh now sits at the final CPD pose (= traj.back() == g_cpdResult.T).
+    g_cpdAppliedT  = CpdLive::traj.empty() ? g_cpdResult.T : CpdLive::traj.back();
+    g_cpdCanRevert = true;
+    computeUnifiedMetrics();
+    g_cpdRmseAfter = registrationHandle.compRmse;
+    g_cpdIoUAfter  = registrationHandle.compIoU2D;
+    g_cpdStageDone[5] = true;
+    std::cout << "[CPD LIVE] DONE  RMSE " << std::fixed << std::setprecision(5)
+              << g_cpdRmseBefore << " -> " << g_cpdRmseAfter
+              << "  IoU " << g_cpdIoUBefore << " -> " << g_cpdIoUAfter
+              << std::defaultfloat << std::endl;
+    CpdLive::pendingSave = true;
+    CpdLive::active      = false;
+}
+
+// ---- soft-ICP live -----------------------------------------------------
+inline bool startSoftIcpLive() {
+    if (SoftIcpLive::active) { finishSoftIcpLive(); return false; }
+    if (anyRegLiveActive()) {
+        std::cerr << "[Soft U-2 LIVE] another live session is active — stop it first" << std::endl;
+        return false;
+    }
+    SoftIcpLive::traj.clear();
+    runSoftWeightedICP(&SoftIcpLive::traj, /*applyResult=*/false); // records, does NOT move mesh
+    if (SoftIcpLive::traj.empty()) {
+        std::cerr << "[Soft U-2 LIVE] no iterations recorded (not started)" << std::endl;
+        return false;
+    }
+    SoftIcpLive::applied     = glm::dmat4(1.0);
+    SoftIcpLive::pi          = 0;
+    SoftIcpLive::active      = true;
+    SoftIcpLive::pendingSave = false;
+    std::cout << "[Soft U-2 LIVE] start: " << SoftIcpLive::traj.size()
+              << " frames  RMSE_before=" << std::fixed << std::setprecision(5)
+              << g_softIcpRmseBefore << std::defaultfloat << std::endl;
+    return true;
+}
+inline void tickSoftIcpLive() {
+    if (!SoftIcpLive::active) return;
+    if (replayAdvance(SoftIcpLive::traj, SoftIcpLive::applied, SoftIcpLive::pi))
+        finishSoftIcpLive();
+}
+inline void finishSoftIcpLive() {
+    if (!SoftIcpLive::active) return;
+    g_softIcpAppliedT  = SoftIcpLive::traj.empty() ? glm::dmat4(1.0)
+                                                   : SoftIcpLive::traj.back();
+    g_softIcpCanRevert = true;
+    computeUnifiedMetrics();
+    g_softIcpRmseAfter = registrationHandle.compRmse;
+    g_softIcpIoUAfter  = registrationHandle.compIoU2D;
+    std::cout << "[Soft U-2 LIVE] DONE  RMSE " << std::fixed << std::setprecision(5)
+              << g_softIcpRmseBefore << " -> " << g_softIcpRmseAfter
+              << "  IoU " << g_softIcpIoUBefore << " -> " << g_softIcpIoUAfter
+              << std::defaultfloat << std::endl;
+    SoftIcpLive::pendingSave = true;
+    SoftIcpLive::active      = false;
 }

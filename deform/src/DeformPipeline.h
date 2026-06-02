@@ -390,6 +390,72 @@ inline bool loadReferenceMeshes() {
     }
 
     // ============================================================================
+    // ★ ハンドル sphere 半径をシーンスケールから決める ★
+    //   旧 hardcode 0.5f は scale=10 時代のラフな値。実際は scene diag に対する
+    //   相対サイズで決めるのが自然。
+    //     gGroupRadius = gSceneDiag / 20  (= 5% of scene diag)
+    //   は手応えとして:
+    //     - scene diag = 7.36 (旧 kRef) のとき r = 0.368  ←旧 0.5 より少し細め
+    //     - scene diag = 1.0           のとき r = 0.050
+    //     - scene diag = 50.0          のとき r = 2.500
+    //   経験的に 1/20 はハンドルが「臓器の特徴サイズの 1/4〜1/5」になり、
+    //   触り心地が良い。粗くしたいときは UI の Sphere Radius スライダで動的調整。
+    // ============================================================================
+    if (gSceneDiag > 0.0f) {
+        gGroupRadius = gSceneDiag / 20.0f;
+        std::cout << "[Deform] gGroupRadius (initial) = " << gGroupRadius
+                  << "  (= sceneDiag / 20)" << std::endl;
+    }
+
+    // ============================================================================
+    // ★ Target cloud Voxel Downsample ★
+    // ----------------------------------------------------------------------------
+    // REG 側 Ctrl+G (CmaesRefineV3 / RegistrationActions::doShiftG) と同じ
+    // パターン: voxel_size = ratio * scene_diag を 1 回だけ適用して
+    // ターゲット点群を縮める。
+    //
+    //   ratio = 0.015 は REG 側 Ctrl+G が p.tgt_voxel_ratio で採用している値。
+    //   この比は CMA-ES の RMSE が ±5% で安定するという経験則の上限近く。
+    //
+    //   sceneDiag = 1.43 の本シーンで voxel ≈ 0.0214 → 778k → ~3-5k points。
+    //   AutoDeform Step 2-5 / RMSE 計測の全パスがこのキャッシュを使うので、
+    //   ここで 1 回 voxelize するだけで全 step がほぼ無料化される。
+    //
+    // Reg3DCustom::voxelDownSample (PointCloud 版) は positions のみならず
+    // normals (mean) / boundaryDist (min) / colors (mean) も保持するので、
+    // AutoDeform の bidir consistency check / silhouette filter も継続動作する。
+    //
+    // ※ Step 1 (classifySrcVisibility) は src 側を raycast するだけで
+    //    target cloud は読まないので、ここでの target 縮小は Step 1 には
+    //    影響しない。Step 2 以降と RMSE 計測だけが軽くなる。
+    // ============================================================================
+    {
+        auto origTgtCloud = Reg3DCustom::getCachedTargetCloud();
+        if (origTgtCloud && !origTgtCloud->empty() && gSceneDiag > 0.0f) {
+            constexpr float kTgtVoxelRatio = 0.015f;   // REG 側 Ctrl+G と一致
+            float voxel = kTgtVoxelRatio * gSceneDiag;
+            Reg3DCustom::NoOpen3DRegistration reg;
+            auto down = reg.voxelDownSample(origTgtCloud, voxel);
+            if (down && !down->empty()) {
+                Reg3DCustom::setCachedTargetCloud(down);
+                std::cout << "[Deform] target voxel downsample: "
+                          << origTgtCloud->size() << " -> " << down->size()
+                          << "  (voxel=" << voxel
+                          << ", ratio=" << kTgtVoxelRatio
+                          << ", sceneDiag=" << gSceneDiag << ")"
+                          << "  normals="
+                          << (down->hasNormals() ? "YES" : "NO")
+                          << "  boundaryDist="
+                          << (down->hasBoundaryDist() ? "YES" : "NO")
+                          << std::endl;
+            } else {
+                std::cerr << "[Deform] target voxelDownSample returned empty; "
+                             "keeping full-resolution cloud" << std::endl;
+            }
+        }
+    }
+
+    // ============================================================================
     // ★ 位置ズレ診断ログ ★ (registration が target と reg_liver を同じ
     //   座標フレームで保存できているかを実測で切り分けるためのもの)
     //
@@ -610,22 +676,29 @@ inline void drawAutoHandlesPhysical(
     static const glm::vec3 colActive  (1.00f, 0.55f, 0.00f);   // 橙  : アクティブ
     static const glm::vec3 colTgt     (1.00f, 0.10f, 0.10f);   // 赤  : ターゲット
 
-    // Fix ハンドル: 物理半径そのままで描画
+    // Fix ハンドル: 物理半径そのままで描画。Fine-tune の manualOffset を反映する
+    // (fix も手で動かせるため。center = initialCenter + manualOffset)。
+    static const glm::vec3 colFixEdited(0.10f, 0.85f, 0.30f);   // 緑: fix を手動補正済み
     for (int i = 0; i < ctrl.numFix(); i++) {
         const auto& h = ctrl.fixHandle(i);
-        sphere.draw(shader, h.initialCenter, colFix, fixRadius, view, proj, camPos);
+        glm::vec3 c = h.initialCenter + h.manualOffset;
+        bool edited = glm::dot(h.manualOffset, h.manualOffset) > 1e-10f;
+        sphere.draw(shader, c, edited ? colFixEdited : colFix, fixRadius, view, proj, camPos);
     }
 
     // Move ハンドル: 物理半径そのままで描画(色のみで状態区別)
     for (int i = 0; i < ctrl.numMove(); i++) {
         const auto& h = ctrl.moveHandle(i);
-        glm::vec3 curCenter = h.initialCenter + h.dirVec * h.progress;
+        // center = initialCenter + dirVec*progress + manualOffset (Fine-tune 補正込み)。
+        //   applyProgress と同じ式にして、メッシュ変形とスフィア描画位置を一致させる。
+        glm::vec3 curCenter = h.initialCenter + h.dirVec * h.progress + h.manualOffset;
         glm::vec3 tgtFinal  = h.initialCenter + h.dirVec;
         bool isActive = (i == ctrl.activeMoveIdx());
 
         glm::vec3 centerCol;
         if (isActive)                centerCol = colActive;     // 橙: 編集中
-        else if (h.progress > 1e-5f) centerCol = colEdit;        // 緑: 編集済み
+        else if (h.progress > 1e-5f || glm::dot(h.manualOffset, h.manualOffset) > 1e-10f)
+                                     centerCol = colEdit;        // 緑: 編集済み(progress or 手動)
         else                         centerCol = colUnt;         // 黄: 未編集
 
         // メイン中心球: 物理半径そのまま
@@ -1024,7 +1097,8 @@ inline void onKey(int key, int mods)
                 gAutoDeform, visVerts, visTriIds,
                 /*kNearest=*/8, /*gaussianSigma=*/0.0f,
                 /*useOnlyRatioOK=*/true,
-                /*smoothIterations=*/10, /*smoothAlpha=*/0.5f);
+                /*smoothIterations=*/10, /*smoothAlpha=*/0.5f,
+                /*dropOutlier=*/gUseTwoWayClassify);
         }
         break;
 
@@ -1047,7 +1121,7 @@ inline void onKey(int key, int mods)
                 const auto& visTriIds = multiBody->getVisSurfaceTriIds(0);
                 AutoDeform::computeFieldOnVisMesh(
                     gAutoDeform, visVerts, visTriIds,
-                    8, 0.0f, true, 10, 0.5f);
+                    8, 0.0f, true, 10, 0.5f, /*dropOutlier=*/gUseTwoWayClassify);
             }
 
             const auto& p = AutoDeform::getPresets()[gAutoDeformPresetIdx];
