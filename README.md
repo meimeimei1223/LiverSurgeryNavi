@@ -1,6 +1,13 @@
 # LiverSurgeryNavi
 Liver Surgery Navigation System — 3D Registration + Depth Estimation + Segmentation with **GPU Acceleration**
 
+The system is split into two apps that build from a shared `common/` core and run as independent processes:
+
+- **`lsn_registration`** — depth estimation, segmentation, and 3D registration (BIPOP-CMA-ES + ICP)
+- **`lsn_deform`** — soft-body deformation / AR overlay
+
+Helper tools `sam2_da3_lite` (Depth Anything V3 + SAM2 inference) and `calibration_tool` (camera calibration) are spawned as subprocesses.
+
 ## 🚀 GPU Acceleration for Depth Estimation
 
 The depth estimation module now supports **CUDA GPU acceleration**:
@@ -16,9 +23,9 @@ Download pre-built packages from [GitHub Actions](https://github.com/meimeimei12
 ```bash
 # Linux (GPU-enabled)
 cd LiverSurgeryNavi-Linux
-chmod +x LiverSurgeryNavi sam2_da3_lite
+chmod +x lsn_registration lsn_deform sam2_da3_lite
 export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
-./LiverSurgeryNavi
+./lsn_registration   # or ./lsn_deform
 ```
 
 The package includes:
@@ -149,8 +156,10 @@ cmake -B build -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-gpu-1.15.1 -DEN
 ```
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON
-make -j$(nproc)
+make -j$(nproc)   # builds lsn_registration + lsn_deform into build/bin/
 ```
+
+Pass `-DBUILD_DEFORM=OFF` or `-DBUILD_REG=OFF` to build only one app.
 
 ### Windows (Visual Studio 2022, with GPU support)
 ```
@@ -162,10 +171,16 @@ cmake --build . --config Release
 **Note:** Omit `-DENABLE_CUDA=ON` to build CPU-only version.
 
 ## Run
-```
+
+The build produces **two independent apps** (separate processes):
+
+```bash
 cd build/bin
-./LiverSurgeryNavi
+./lsn_registration   # Registration: depth estimation + segmentation + 3D registration
+./lsn_deform         # Deformation: soft-body deformation / AR overlay
 ```
+
+The two apps exchange data through exported files (e.g. `reg_*.obj`); launch whichever stage you need. Start with `lsn_registration` for a typical workflow.
 
 ## Model Sources
 
