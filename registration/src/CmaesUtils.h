@@ -386,8 +386,9 @@ inline float computeSilhouette2DObjective(
 // ===========================================================================
 // [PERF TOGGLE] g_silFastPath
 //   シルエット最適化 (CmaesRefine::run の use_silhouette_2d 経路) の高速化を
-//   ON/OFF するランタイムフラグ。**既定 false = 旧挙動そのまま**(レガシー基準)。
-//   true のときだけ次の3つが有効化される。どれも結果 (IoU 軌跡・最終姿勢) を
+//   ON/OFF するランタイムフラグ。**既定 true = 高速版**(Alt+P を既定で高速化)。
+//   OFF にするとレガシー(直列)基準に戻せる。true のときだけ次の3つが有効化さ
+//   れる。どれも結果 (IoU 軌跡・最終姿勢) を
 //   変えない無駄取りなので、OFF と ON で最終 IoU は一致するはず:
 //     (1) fastComputeRMSE の OpenMP 並列リダクション (sil時のみ)
 //     (2) ターゲット mask をループ前に1回構築して使い回し (毎eval再構築を省略)
@@ -396,7 +397,33 @@ inline float computeSilhouette2DObjective(
 //   Ctrl+Shift+G(V3RS) は別ファイル・別関数なので、このフラグと完全に無関係。
 //   OFF=基準, ON=高速版 を同じ開始姿勢で回して最終 IoU 一致を確認できる。
 // ===========================================================================
-inline bool g_silFastPath = false;
+inline bool g_silFastPath = true;
+
+// ===========================================================================
+// [PROFILE] computeSilhouette2DObjectiveFast の内訳プロファイラ。
+//   fval(IoU) 一括 (1 行) だった t_fval を、関数内部の 5 ステージに割って
+//   CmaesRefine::run の Time Breakdown で 1 回だけ出す。計測のみ＝結果不変
+//   (IoU 軌跡も最終姿勢も変わらない)。
+//     step1 : Step 1 全頂点 MVP 変換 (直列)
+//     alloc : Step 2 hitmap + per-thread local の確保 + ゼロ初期化
+//     rast  : Step 2 三角形ラスタライズ (OpenMP 並列領域 / 非OMP は直列全体)
+//     merge : Step 2 per-thread local → hitmap の直列 OR マージ (OMP のみ)
+//     iou   : Step 4 IoU 集計
+//   reset は run() の gen ループ直前、print は Time Breakdown 末尾。単発呼び
+//   出し (measureIoU / SilCompare / accept gate) は reset の後・print の前に
+//   走らないので、印字値は gen ループの中身だけを反映する。
+// ===========================================================================
+inline double g_silProf_step1 = 0.0;  // Step1 頂点変換
+inline double g_silProf_alloc = 0.0;  // Step2 確保+ゼロ初期化
+inline double g_silProf_rast  = 0.0;  // Step2 ラスタライズ
+inline double g_silProf_merge = 0.0;  // Step2 マージ(直列)
+inline double g_silProf_iou   = 0.0;  // Step4 IoU
+inline long   g_silProf_calls = 0;    // 目的関数を実際に計算した eval 数(bad は除外)
+inline void silProfReset() {
+    g_silProf_step1 = g_silProf_alloc = g_silProf_rast =
+        g_silProf_merge = g_silProf_iou = 0.0;
+    g_silProf_calls = 0;
+}
 
 // ===========================================================================
 // [EXPERIMENT TOGGLE] Alt+P final accept gate (silhouette mode).
@@ -511,6 +538,13 @@ inline float computeSilhouette2DObjectiveFast(
                      ndcZ > -1.0f && ndcZ <  1.0f) ? 1 : 0;
     }
 
+    // [PROFILE] 関数内ヘルパ + Step 1 (entry→頂点変換完了) を step1 に積む。
+    auto _msP = [](std::chrono::steady_clock::time_point a,
+                   std::chrono::steady_clock::time_point b){
+        return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto _tS2 = std::chrono::steady_clock::now();
+    g_silProf_step1 += _msP(t0, _tS2);
+
     /* Step 2: 三角形ラスタライズで hitmap を構築
        前面判定: スクリーン空間で 3頂点が CCW (signed area > 0) のものだけ描画。
        これは back-face culling と同等(view 依存は MVP 変換内で処理済み)。 */
@@ -521,6 +555,9 @@ inline float computeSilhouette2DObjectiveFast(
        を持ち、最後にマージする。hitmap は 0/1 のみなので OR でマージ。 */
     int nThreads = omp_get_max_threads();
     std::vector<std::vector<uint8_t>> local(nThreads, std::vector<uint8_t>(gw*gh, 0));
+    // [PROFILE] hitmap + per-thread local の確保/ゼロ初期化を alloc に積む。
+    auto _tAlloc = std::chrono::steady_clock::now();
+    g_silProf_alloc += _msP(_tS2, _tAlloc);
 #pragma omp parallel for schedule(dynamic, 64)
     for (int ti = 0; ti < nTris; ti++) {
         int tid = omp_get_thread_num();
@@ -566,14 +603,22 @@ inline float computeSilhouette2DObjectiveFast(
         }
 #ifdef _OPENMP
     }
+    // [PROFILE] 並列ラスタライズ実コストを rast に積む。
+    auto _tRast = std::chrono::steady_clock::now();
+    g_silProf_rast += _msP(_tAlloc, _tRast);
     /* マージ: OR 結合 */
     for (int t = 0; t < nThreads; t++) {
         const auto& src = local[t];
         for (int i = 0; i < gw*gh; i++) hitmap[i] |= src[i];
     }
+    // [PROFILE] per-thread → hitmap 直列マージを merge に積む。
+    auto _tMerge = std::chrono::steady_clock::now();
+    g_silProf_merge += _msP(_tRast, _tMerge);
 #else
             }
     }
+    // [PROFILE] 非OMP ビルドは Step 2 全体 (alloc 含む) を rast に積む。
+    g_silProf_rast += _msP(_tS2, std::chrono::steady_clock::now());
 #endif
 
     /* Step 3: Target mask を構築。
@@ -606,6 +651,7 @@ inline float computeSilhouette2DObjectiveFast(
        OFF (既定) は従来の直列ループ。 */
     int inter=0, uni=0;
     const int nCells = gw*gh;
+    auto _tIoU = std::chrono::steady_clock::now();   // [PROFILE]
 #ifdef _OPENMP
     if (g_silFastPath) {
 #pragma omp parallel for reduction(+:inter,uni) schedule(static)
@@ -623,6 +669,9 @@ inline float computeSilhouette2DObjectiveFast(
             if(s&&t) inter++;
         }
     }
+    // [PROFILE] Step 4 IoU を iou に積み、計算した eval をカウント。
+    g_silProf_iou += _msP(_tIoU, std::chrono::steady_clock::now());
+    g_silProf_calls++;
 
     /* Step 5: 2D Hausdorff (シルエット境界の双方向最大距離、グリッドピクセル単位を画像px換算)
        - source 境界 ∂S: hitmap[i]=1 で 4近傍に hitmap[j]=0 がある画素
@@ -1534,6 +1583,9 @@ inline Result run(
     double t_snapshot = 0, t_srt = 0, t_metrics = 0, t_fval = 0, t_best = 0;
     auto now = []{ return std::chrono::high_resolution_clock::now(); };
 
+    // [PROFILE] この RUN の fval 内訳を 0 クリア (gen ループ前の sil0 init を除外)。
+    silProfReset();
+
     for (int gen = 0; gen < params.maxgen && !stop; gen++) {
 
         double** pop = cmaes_SamplePopulation(evo);
@@ -1688,6 +1740,27 @@ inline Result run(
                   << " ms (" << (int)(100*t_best/t_total) << "%)" << std::endl;
         std::cout << "[CMA-ES]   per eval avg     : "
                   << std::setprecision(3) << (t_total/total_evals) << " ms" << std::endl;
+
+        // [PROFILE] fval(IoU) の中身を 5 ステージに分解 (sil モードのみ)。
+        // 合計 ≈ t_fval。差分 (~0) は Step 3 (precomp 時は mask ポインタ代入)。
+        if (params.use_silhouette_2d && g_silProf_calls > 0) {
+            const double f = (t_fval > 0.0) ? t_fval : 1.0;
+            auto _pf = [&](const char* name, double v){
+                std::cout << "[CMA-ES]       " << name << std::setw(7)
+                          << (int)v << " ms (" << (int)(100.0*v/f)
+                          << "% of fval)" << std::endl; };
+            const double sumP = g_silProf_step1 + g_silProf_alloc
+                                + g_silProf_rast  + g_silProf_merge
+                                + g_silProf_iou;
+            std::cout << "[CMA-ES]   - fval internal ("
+                      << g_silProf_calls << " objective calls, sum "
+                      << (int)sumP << " ms) ---" << std::endl;
+            _pf("Step1 transform :", g_silProf_step1);
+            _pf("Step2 alloc     :", g_silProf_alloc);
+            _pf("Step2 raster    :", g_silProf_rast);
+            _pf("Step2 merge     :", g_silProf_merge);
+            _pf("Step4 IoU       :", g_silProf_iou);
+        }
     }
 
     for (size_t m = 0; m < organs.size(); m++) {
@@ -1744,9 +1817,9 @@ inline Result run(
                                                 g_sed, view, projection, params.silhouette_step));
             bool iou_ok  = (iou_after > iou_before * 1.05f);
             bool rmse_ok = g_silAcceptIgnoreRmse
-                         ? true
-                         : (rmse_after_uniform
-                                < result.rmse_before * g_silAcceptRmseCap);
+                               ? true
+                               : (rmse_after_uniform
+                                  < result.rmse_before * g_silAcceptRmseCap);
             accepted = iou_ok && rmse_ok;
             if (params.verbose)
                 std::cout << "[CMA-ES] best candidate:"
@@ -1754,8 +1827,8 @@ inline Result run(
                           << "  IoU=" << iou_before << "->" << iou_after
                           << "  accepted=" << (accepted ? "YES" : "NO")
                           << (g_silAcceptIgnoreRmse ? "  [pure-IoU: cap OFF]"
-                                       : (rmse_ok ? "  [rmse cap OK]"
-                                                  : "  [rmse cap HIT]"))
+                                                    : (rmse_ok ? "  [rmse cap OK]"
+                                                               : "  [rmse cap HIT]"))
                           << "  (cap=" << result.rmse_before * g_silAcceptRmseCap
                           << ")" << std::endl;
         } else {

@@ -1059,6 +1059,22 @@ std::vector<int> g_quadVizIdxAL;   // ant_left  (紫)
 std::vector<int> g_quadVizIdxPR;   // pos_right (青)
 std::vector<int> g_quadVizIdxPL;   // pos_left  (橙)
 
+// [bugfix] Clear the liver-label visualization caches — the subsample
+// vertex-index arrays for the region / LR / CC / 4-quadrant marker
+// overlays. These hold indices into the CURRENT liver mesh; when the
+// mesh is swapped for one with a different vertex count (organ drop /
+// scene reload), the stale indices draw markers at wrong positions or
+// out of range. The label Result structs are reset alongside this; both
+// repopulate on the next recompute*. Call wherever liverMesh3D topology
+// may change.
+inline void clearLiverLabelVizCaches() {
+    g_regionVizIdxAnt.clear(); g_regionVizIdxRim.clear();  g_regionVizIdxPost.clear();
+    g_lrVizIdxR.clear();       g_lrVizIdxBoundary.clear(); g_lrVizIdxL.clear();
+    g_ccVizIdxCranial.clear(); g_ccVizIdxCaudal.clear();
+    g_quadVizIdxAR.clear();    g_quadVizIdxAL.clear();
+    g_quadVizIdxPR.clear();    g_quadVizIdxPL.clear();
+}
+
 // ----------------------------------------------------------------------
 //  Ctrl+G (V3-R) 用の 4象限選択ビットマスク
 //  ---------------------------------------------------------------------
@@ -1767,9 +1783,13 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             std::cout << "[Ctrl+I] quadrant_mask = " << maskStrI
                       << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
                       << std::dec << ")" << std::endl;
+            // [UI整理] Auto-compute labels on demand (no HemiAuto needed) so
+            // Ctrl+I runs straight from Apply Init Pose / after manual drag.
+            if (!g_liverRegion.valid()) recomputeLiverRegion();
+            if (!g_liverLR.valid())     recomputeLiverLR();
             if (!g_liverRegion.valid() || !g_liverLR.valid()) {
-                std::cerr << "[Ctrl+I] ERROR: labels not computed. "
-                             "Run HemiAuto (O) first." << std::endl;
+                std::cerr << "[Ctrl+I] ERROR: label computation failed "
+                             "(is the liver mesh loaded?)." << std::endl;
                 break;
             }
             auto subsetI = LiverLeftRightLabel::makeQuadrantSubsetIdx(
@@ -1785,6 +1805,28 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             poseAutoSaveBeforeRegistration();
             runBipopCmaesV3I(g_activeQuadrantMask);
             poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+        } else if ((mods & GLFW_MOD_SHIFT) && !(mods & GLFW_MOD_CONTROL)
+                                           && !(mods & GLFW_MOD_ALT)) {
+            // ----- Shift+I : silhouette-fixed dilation RMSE refine (stage 2) -----
+            //   Sequel to Alt+P / Ctrl+I. Those align the silhouette
+            //   (maximise 2D-IoU) but cannot constrain the one DOF the
+            //   pinhole projection is blind to: uniform dilation about the
+            //   optical center (depth <-> apparent size). Shift+I sweeps
+            //   exactly that 1-D ray to minimise the 3D RMSE against the
+            //   DA3 depth cloud, leaving the silhouette (IoU) fixed by
+            //   construction. Save by RMSE: IoU is invariant here, so an
+            //   IoU gate would see zero change and reject every result.
+            std::cout << "[Shift+I] dispatching Dilation RMSE refine..." << std::endl;
+            if (!registrationHandle.useRegistration) {
+                std::cerr << "[Shift+I] Run HemiAuto (O) + Alt+P / Ctrl+I first."
+                          << std::endl;
+                break;
+            }
+            g_stepStartTime = std::chrono::steady_clock::now();
+            poseAutoSaveBeforeRegistration();
+            runDilationRmseRefine();
+            gUI.state.regMethod = 3;   // refine lane (same as Ctrl+I / V3RS)
+            poseSaveToLibrary(SaveCriterion::RMSE, g_activeQuadrantMask);
         }
         break;
 
@@ -1886,11 +1928,15 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
                       << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
                       << std::dec << ")" << std::endl;
 
+            // [UI整理] Auto-compute labels on demand (no HemiAuto needed) so
+            // Ctrl+G runs straight from Apply Init Pose / after manual drag.
+            if (!g_liverRegion.valid()) recomputeLiverRegion();
+            if (!g_liverLR.valid())     recomputeLiverLR();
             if (!g_liverRegion.valid() || !g_liverLR.valid()) {
-                std::cerr << "[Ctrl+G] ERROR: labels not computed"
+                std::cerr << "[Ctrl+G] ERROR: label computation failed"
                           << " (Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
                           << ", LR.valid="    << (g_liverLR.valid() ? "Y" : "N")
-                          << "). Run HemiAuto (O) first to populate labels."
+                          << "). Is the liver mesh loaded?"
                           << std::endl;
                 break;
             }
@@ -3035,6 +3081,11 @@ static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
     g_liverRegion = LiverRegionLabel::Result();
     g_liverLR     = LiverLeftRightLabel::Result();
     g_liverCC     = LiverCranioCaudalLabel::Result();
+    // [bugfix] Also drop the marker viz caches — they index the OLD liver
+    // mesh, so a swapped-in model with a different vertex count would draw
+    // the 4-quadrant / region / LR / CC markers at stale positions until
+    // the next recompute. (Label Results above are cleared; this matches.)
+    clearLiverLabelVizCaches();
     //  ★ターゲット雲キャッシュは絶対にクリアしない★
     //  ターゲット雲(=深度 screenMesh 由来の ~28万点 + boundaryDist/normals)は臓器とは
     //  独立で、臓器スワップでは一切変化しない。ここで clearCachedTargetCloud() すると
@@ -3390,6 +3441,7 @@ static bool setupObjScene() {
         g_liverRegion = LiverRegionLabel::Result();
         g_liverLR     = LiverLeftRightLabel::Result();
         g_liverCC     = LiverCranioCaudalLabel::Result();
+        clearLiverLabelVizCaches();   // [bugfix] drop stale marker viz indices too
 
         std::cout << "[setupObjScene] Reloaded all 6 organ meshes from " << MODEL_PATH
                   << "  (CT space; all prior transforms discarded)" << std::endl;
@@ -5170,6 +5222,16 @@ int main(int argc, char** argv) {
                 ImGui::SetTooltip("2D-IoU rasterization step (was hardcoded 8).\n"
                                   "Drives BOTH the IoU readout and the CMA-ES\n"
                                   "objective (linked). Lower = finer / slower.");
+            }
+
+            ImGui::Checkbox("pure IoU (Alt+P)", &g_shiftE_pureIoU);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON (default): Alt+P is driven purely by the 2D-IoU\n"
+                    "silhouette match (alpha_3d = 0) -- same intent as Ctrl+I,\n"
+                    "but via the lighter / faster V1 silhouette path.\n"
+                    "OFF: restore the legacy alpha_3d = 0.3 blend (mixes a\n"
+                    "small 3D RMSE term into the silhouette objective).");
             }
 
             // --- occluded-gate trap (the Alt+P PoseLibrary rejection bug) ---
@@ -11498,11 +11560,15 @@ static void setupUICallbacks() {
                   << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
                   << std::dec << ")" << std::endl;
 
+        // [UI整理] Auto-compute labels on demand (no HemiAuto needed) so the
+        // button works from the default state / after Apply Init Pose / drag.
+        if (!g_liverRegion.valid()) recomputeLiverRegion();
+        if (!g_liverLR.valid())     recomputeLiverLR();
         if (!g_liverRegion.valid() || !g_liverLR.valid()) {
-            std::cerr << "[Ctrl+G/UI] ERROR: labels not computed"
+            std::cerr << "[Ctrl+G/UI] ERROR: label computation failed"
                       << " (Region.valid=" << (g_liverRegion.valid() ? "Y" : "N")
                       << ", LR.valid="    << (g_liverLR.valid() ? "Y" : "N")
-                      << "). Press Apply Init Pose first to populate labels."
+                      << "). Is the liver mesh loaded?"
                       << std::endl;
             return;
         }
@@ -11531,6 +11597,56 @@ static void setupUICallbacks() {
         gUI.state.regMethod = 3;   // BIPOP method (same slot as Shift+V/F/G)
         poseAutoSaveBeforeRegistration();
         runBipopCmaesV3R(g_activeQuadrantMask);
+        poseSaveToLibrary(SaveCriterion::RMSE, g_activeQuadrantMask);
+    };
+
+    // ----------------------------------------------------------------
+    //  onCtrlI : V3I pure squash-IoU (silhouette align via V3RS engine)
+    // ----------------------------------------------------------------
+    //  Mirrors the keyboard Ctrl+I dispatch (GLFW_KEY_I case). Pairs with
+    //  the "Silhouette (Ctrl+I)" Refine button. Parallel runs are ON by
+    //  default (g_v3rsParallelRuns); toggle in Tuning & Advanced.
+    a.onCtrlI = []() {
+        std::cout << "[Ctrl+I/UI] V3I pure squash-IoU session start" << std::endl;
+        // [UI整理] Auto-compute labels on demand (no HemiAuto needed).
+        if (!g_liverRegion.valid()) recomputeLiverRegion();
+        if (!g_liverLR.valid())     recomputeLiverLR();
+        if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+            std::cerr << "[Ctrl+I/UI] ERROR: label computation failed "
+                         "(is the liver mesh loaded?)." << std::endl;
+            return;
+        }
+        auto subsetI = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+            g_liverRegion.labels, g_liverLR.labels, g_activeQuadrantMask);
+        if (subsetI.empty()) {
+            std::cerr << "[Ctrl+I/UI] ERROR: subset is empty." << std::endl;
+            return;
+        }
+        g_stepStartTime = std::chrono::steady_clock::now();
+        g_sessionBipopN++;
+        gUI.state.regMethod = 3;
+        poseAutoSaveBeforeRegistration();
+        runBipopCmaesV3I(g_activeQuadrantMask);
+        poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+    };
+
+    // ----------------------------------------------------------------
+    //  onShiftI : silhouette-fixed dilation RMSE refine (depth post-step)
+    // ----------------------------------------------------------------
+    //  Mirrors the keyboard Shift+I dispatch. Pairs with the "Depth
+    //  Dilation (Shift+I)" Refine button. Save by RMSE: IoU is invariant
+    //  under the dilation, so an IoU gate would reject every result.
+    a.onShiftI = []() {
+        std::cout << "[Shift+I/UI] Dilation RMSE refine" << std::endl;
+        if (!registrationHandle.useRegistration) {
+            std::cerr << "[Shift+I/UI] Run HemiAuto (O) + Alt+P / Ctrl+I first."
+                      << std::endl;
+            return;
+        }
+        g_stepStartTime = std::chrono::steady_clock::now();
+        poseAutoSaveBeforeRegistration();
+        runDilationRmseRefine();
+        gUI.state.regMethod = 3;
         poseSaveToLibrary(SaveCriterion::RMSE, g_activeQuadrantMask);
     };
 

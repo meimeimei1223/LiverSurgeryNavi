@@ -74,6 +74,16 @@ struct RegUIActions {
     //   キーボードの Ctrl+G dispatch (main.cpp GLFW_KEY_G case) と
     //   結果 byte-identical になることが期待される。
     std::function<void()> onCtrlG;
+    // ---- Ctrl+I : V3I pure squash-IoU (silhouette align via the V3RS engine) ----
+    //   main.cpp mirrors the keyboard Ctrl+I dispatch:
+    //   labels-guard -> poseAutoSave -> runBipopCmaesV3I(mask) ->
+    //   poseSaveToLibrary(EITHER, mask).
+    std::function<void()> onCtrlI;
+    // ---- Shift+I : silhouette-fixed dilation RMSE refine (depth post-step) ----
+    //   Runs after Ctrl+I / Alt+P. main.cpp mirrors the keyboard Shift+I:
+    //   needs-reg-guard -> poseAutoSave -> runDilationRmseRefine() ->
+    //   poseSaveToLibrary(RMSE, mask).  Save MUST be RMSE (IoU is invariant).
+    std::function<void()> onShiftI;
     // onCtrlgLockScaleChanged: Ctrl+G の 6-DoF/7-DoF チェックボックス変更時。
     //   true  → main.cpp が g_ctrlgSearchMode = SIX_DOF_RIGID に
     //   false → main.cpp が g_ctrlgSearchMode = SEVEN_DOF に
@@ -1751,22 +1761,63 @@ private:
         //  使われないため REGISTRATION 末尾の Advanced CollapsingHeader
         //  に退避し、ここを Ctrl+G 専用とした。
         {
-            // 有効条件: registration phase 中で、quadrant ラベルが計算済み。
-            // useRegistration (= 既存 reg 完了済み) は問わない: Ctrl+G は
-            // Apply Init Pose 直後でも (refinement なしの状態から) 走らせる
-            // ことがある。
-            bool ctrlgDisabled = !state.quadLabelsReady
-                                 || state.activeQuadrantMask == 0x00;
+            // ============================================================
+            //  REFINE flow:  Ctrl+G -> Ctrl+I -> Alt+P -> Shift+I
+            // ------------------------------------------------------------
+            //  Two region-aware CMA-ES optimizers (top row) + a light
+            //  silhouette aligner & the depth post-step (bottom row). Each
+            //  button mirrors its keyboard shortcut via the matching
+            //  actions.* callback — the manager never touches the engine
+            //  globals, so the "Parallel runs" / "pure IoU" toggles (now
+            //  ON by default) live in the "Tuning & Advanced" header below.
+            //
+            //  Row 1 — runnable from the default state (region/LR labels are
+            //          auto-computed on first use; share the Parallel toggle):
+            //    Ctrl+G  3D Fit ......... region-aware BIPOP-CMA-ES, 3D RMSE_W
+            //    Ctrl+I  Silhouette ..... pure squash-IoU (V3I engine)
+            //  Row 2 — refine an existing pose:
+            //    Alt+P   Silhouette Fast  light V1 silhouette align (pure IoU)
+            //    Shift+I Depth Dilation   1-D dilation RMSE (silhouette fixed)
+            // ============================================================
+            ImGui::TextColored(colReg(), "Refine");
 
-            // AutoQCR と同じ 2/3 + 1/3 レイアウト: ボタン本体 (左) +
-            // 6-DoF チェックボックス (右)。
-            // [Phase 8] Ctrl+G full-width button (shorter label). The 6-DoF
-            // lock checkbox moved into the Advanced collapsing header below
-            // (the Debug Panel G tab covers the 4-DoF / search-dimension radio).
-            if (glowButton("Ctrl+G", colReg(), ctrlgDisabled, -1, 56))
-            {
-                state.regMethod = 3;   // BIPOP method (Shift+V/F/G と同じ slot)
+            const float gap    = 4.0f;
+            const float availW = ImGui::GetContentRegionAvail().x;
+            const float halfW  = (availW - gap) * 0.5f;
+
+            // ----- Row 1: Ctrl+G | Ctrl+I (region-aware CMA-ES) -----
+            // Pressable from the default state: the only requirement is at
+            // least one quadrant selected (mask default = QUAD_ALL). The
+            // region/LR labels are auto-computed on first use inside the
+            // action (no HemiAuto needed); useRegistration not required
+            // either, so these run straight after Apply Init Pose or after
+            // dragging the mesh by hand.
+            const bool refineLabelsDisabled =
+                state.activeQuadrantMask == 0x00;
+
+            if (glowButton("3D Fit (Ctrl+G)", colReg(),
+                           refineLabelsDisabled, halfW, 50)) {
+                state.regMethod = 3;   // BIPOP slot (same as Shift+V/F/G)
                 if (actions.onCtrlG) actions.onCtrlG();
+            }
+            ImGui::SameLine(0.0f, gap);
+            if (glowButton("Silhouette (Ctrl+I)", colReg(),
+                           refineLabelsDisabled, -1, 50)) {
+                state.regMethod = 3;
+                if (actions.onCtrlI) actions.onCtrlI();
+            }
+
+            // ----- Row 2: Alt+P | Shift+I (refine an existing pose) -----
+            const bool refineNeedsReg = !state.useRegistration;
+
+            if (glowButton("FullMesh Sil (Alt+P)", colReg(),
+                           refineNeedsReg, halfW, 46)) {
+                if (actions.onSilhouetteAlign) actions.onSilhouetteAlign();
+            }
+            ImGui::SameLine(0.0f, gap);
+            if (glowButton("3D Refine (Shift+I)", colReg(),
+                           refineNeedsReg, -1, 46)) {
+                if (actions.onShiftI) actions.onShiftI();
             }
         }
 

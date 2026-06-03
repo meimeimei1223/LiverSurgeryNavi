@@ -981,7 +981,9 @@ namespace CmaesRefineV3R {
 // Set from the UI (same Debug-Panel checkbox that drives V3RS); read once
 // at the top of the run loop. This is the Ctrl+G analogue of
 // CmaesRefineV3RS::g_v3rsParallelRuns.
-inline bool   g_v3rParallelRuns   = false;
+// [UI整理] Default ON: Ctrl+G / Ctrl+I run their restarts in parallel by
+// default (results are deterministic, so this is a pure speed lever).
+inline bool   g_v3rParallelRuns   = true;
 inline int    g_v3rLastRunThreads  = 1;     // threads actually used last time
 inline double g_v3rLastRunLoopMs   = 0.0;   // run-loop wall-clock last time
 

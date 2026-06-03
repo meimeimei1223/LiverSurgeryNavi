@@ -62,6 +62,10 @@ DatasetEchoLiver/
 # ImGui runtime state
 imgui.ini
 
+# Deform AR screenshots + runtime log
+depth_output/deform_screenshots/
+log.txt
+
 # Live calibration session captures + backups + test snapshots
 depth_output/chessboard_live_*/
 depth_output/*.bin

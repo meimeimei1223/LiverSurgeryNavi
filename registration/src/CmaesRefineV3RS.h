@@ -409,7 +409,8 @@ inline bool g_silTargetSquashEnabled = true;
 // Read once at the top of the run loop. Set from the UI (Debug Panel)
 // via CmaesRefineV3RS::g_v3rsParallelRuns. Applies to both Ctrl+I
 // (pure-IoU) and Ctrl+G since they share this engine.
-inline bool g_v3rsParallelRuns = false;
+// [UI整理] Default ON (deterministic, pure speed lever).
+inline bool g_v3rsParallelRuns = true;
 // Filled by runBipopCmaesV3RS so the UI can show what the last run did.
 inline int  g_v3rsLastRunThreads = 1;     // threads actually used last time
 inline double g_v3rsLastRunLoopMs = 0.0;  // run-loop wall-clock last time

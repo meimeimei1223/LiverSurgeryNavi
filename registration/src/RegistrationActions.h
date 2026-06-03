@@ -126,6 +126,14 @@ extern int   gGridWidth;
 extern float gDepthScale;
 extern float g_voxelSize;
 
+// CT-truth liver size reference (defined in main.cpp, set once at startup
+// from diag(liver.obj) in DICOM mm). Used by Shift+M for SCALE_RESTORE and
+// by Shift+I (runDilationRmseRefine) as the "implied_scale" diagnostic —
+// the ratio of the DA3-frame liver size to the CT-mm size. ~1 means the
+// DA3 metric depth and the CT model agree on absolute size.
+extern float g_originalLiverDiagMm;
+extern bool  g_hasOriginalDiags;
+
 // [Phase B] Forward declaration: actual definition lives in
 // PoseLibrary.h as an inline (C++17 inline variable). PoseLibrary.h is
 // included AFTER RegistrationActions.h in main.cpp, so this extern is
@@ -872,7 +880,10 @@ inline float g_ctrlgGammaRedgeWeight = 0.0f;   // [Phase 7c] REDGE 稜線重み 
 inline bool  g_ctrlgBidirMatching    = false;  // [Phase 7c] 双方向(対称)マッチング (B方式: RIM/REDGEのみ, OFF=従来一致)
 inline bool  g_ctrlgBidirAllPoints   = false;  // [Phase 7c] (A) 双方向を全subset点へ (要 g_ctrlgBidirMatching=ON)
 inline float g_ctrlgRimTgtThreshPx   = 12.0f;   // matches Shift+P kBoundaryPxTh
-inline bool  g_ctrlgShowRimPairs     = true;
+// [UI整理] Default OFF: the RIM correspondence-pair overlay is opt-in
+// (it draws orange/magenta spheres for every rim pair, which clutters the
+// default Ctrl+G / Ctrl+I view). Turn it on in the Debug Panel when needed.
+inline bool  g_ctrlgShowRimPairs     = false;
 
 // [Phase D] Colored RIM pairs viewer (the K-representative variant).
 //   g_ctrlgShowColoredRimPairs : tick to overlay K colored sphere pairs
@@ -1265,7 +1276,8 @@ struct SilProjDebug {
     float mean_dist_norm  = 0.0f;    // mean_dist_px / image_diagonal
 };
 inline SilProjDebug g_silProjDebug;
-inline bool         g_silProjShow = true;  // UI toggle (default ON)
+// [UI整理] Default OFF: the silhouette-projection debug overlay is opt-in.
+inline bool         g_silProjShow = false;  // UI toggle
 
 // [Phase A/F optimization] True when registrationHandle.{compRmse,compCount,compIoU}
 // reflect the CURRENT mesh pose. Set true after any computeUnifiedMetrics() call;
@@ -9099,6 +9111,14 @@ inline void diagnoseVertexSquashV3RS(uint8_t quadrant_mask) {
 inline int g_shiftE_NStarts    = 5;
 inline int g_shiftE_RasterStep = 8;
 
+// [UI整理] Alt+P "pure IoU" default. runShiftE blends a small 3D term
+// (alpha_3d) into the silhouette objective. ON (default) drops it
+// (alpha_3d = 0) so Alt+P is driven purely by the 2D-IoU silhouette
+// match — the same intent as Ctrl+I, but via the lighter/faster V1
+// CmaesRefine path (use_silhouette_2d_fast stays ON regardless). OFF
+// restores the legacy alpha_3d = 0.3 blend.
+inline bool g_shiftE_pureIoU   = true;
+
 // [Alt+P found-pose viz] ON -> runShiftE captures EACH run's inner-loop best
 // (found) pose into an F9 Run slot BEFORE the V1 accept gate reverts it, plus
 // the applied pose into Final. Lets F9 show the IoU-0.96 poses the gate throws
@@ -9186,9 +9206,10 @@ inline void runShiftE() {
         p.log_every              = 100;
         p.save_debug_jpg         = false;
         p.use_silhouette_2d      = true;
-        p.use_silhouette_2d_fast = true;
+        p.use_silhouette_2d_fast = true;        // fast raster path (always on)
         p.alpha_silhouette       = 1.0f;
-        p.alpha_3d               = 0.3f;
+        // [UI整理] pure IoU (default) -> drop the 3D blend term.
+        p.alpha_3d               = g_shiftE_pureIoU ? 0.0f : 0.3f;
         p.silhouette_step        = g_shiftE_RasterStep;
         p.maxgen = 300;
         p.tolfun = 1e-4;
@@ -9319,6 +9340,278 @@ inline void runShiftE() {
               << std::endl;
 
     g_callIdx++;  // Phase 1: 末尾でインクリメント
+}
+
+// =====================================================================
+//  Shift+I : Silhouette-fixed dilation 1-D RMSE refine ("stage 2")
+// ---------------------------------------------------------------------
+//  Runs AFTER Alt+P (runShiftE, 2D-IoU max) or Ctrl+I (V3I, 1-IoU2D)
+//  have aligned the silhouette. Those stages constrain everything the
+//  SAM2 mask can see — in-plane translation, in-plane rotation, apparent
+//  size — but they are blind to ONE direction: uniform dilation about
+//  the camera optical center C, i.e. p -> C + k(p - C). Under a pinhole
+//  projection that map moves every vertex along its own line of sight,
+//  so the projected pixel (hence the silhouette and the 2D-IoU) is
+//  EXACTLY invariant. k trades depth against scale. Alt+P / Ctrl+I
+//  therefore leave k undetermined (whatever value CMA-ES happened to
+//  stop at on that invariant ray); this step pins it down by minimising
+//  the 3D RMSE against the DA3 depth cloud.
+//
+//  Because the silhouette is held exactly fixed, the search is strictly
+//  1-D in k — not a 2-DOF (Z, scale) search (those would each move the
+//  silhouette and reduce to a soft IoU penalty, i.e. V3RS). A 1-D line
+//  search (coarse log bracket + golden section) is enough; no CMA-ES.
+//
+//  Fast eval (the key trick): the dilation maps source s -> C + k(s-C).
+//  For a fixed target q the squared distance obeys the identity
+//        | q - (C + k(s-C)) |^2  ==  k^2 * | (C + (q-C)/k) - s |^2
+//  so instead of dilating the source (which would force a KDTree rebuild
+//  per k) we INVERSE-dilate the query, q' = C + (q-C)/k, search the
+//  k=1 source tree once, and scale the squared distance by k^2. The NN
+//  index is preserved (scaling all distances by k^2 doesn't change the
+//  argmin), and the physical max_dist_sq gate is on the TRUE distance,
+//  so it is k-invariant:  k^2 * dsq' < max_dist_sq  <=>  dsq' < gate/k^2.
+//
+//  Source / target / gate / direction are IDENTICAL to computeUnified-
+//  Metrics (and Ctrl+G's F-phase): source = liver full mesh, target =
+//  extractFrontFacePoints (DA3 cloud), gate = (sceneDiag/7.36)^2,
+//  direction = tgt -> src (KDTree on src). So eval(1.0) equals the
+//  current registrationHandle.compRmse and the optimisation moves the
+//  same number the rest of the app reports.
+//
+//  Save criterion MUST be RMSE: IoU is invariant by construction, so an
+//  IoU gate would read zero change and reject every result (handled in
+//  the main.cpp Shift+I dispatch).
+//
+//  Operating flow:  O -> Alt+P or Ctrl+I (IoU) -> Shift+I (this).
+// =====================================================================
+inline void runDilationRmseRefine() {
+    std::cout << "\n=== Silhouette-fixed Dilation RMSE refine (Shift+I) ==="
+              << std::endl;
+
+    // ----- Preconditions (mirror runShiftE) --------------------------
+    if (!registrationHandle.useRegistration) {
+        std::cerr << "[Shift+I] Run HemiAuto (O) + Alt+P / Ctrl+I first."
+                  << std::endl;
+        return;
+    }
+    if (!liverMesh3D || liverMesh3D->mVertices.size() < 9) {
+        std::cerr << "[Shift+I] liver mesh empty; aborting." << std::endl;
+        return;
+    }
+    if (!screenMesh) {
+        std::cerr << "[Shift+I] no screen mesh; aborting." << std::endl;
+        return;
+    }
+
+    auto organs = getOrganList();
+
+    // ----- Optical center C (camera center in world) -----------------
+    // buildSilhouetteView() == lookAt(eye=(0,0,0), ...), so C == origin.
+    // We still derive C from the inverse view so the invariance assert
+    // below also validates that the silhouette camera really is centered
+    // where we assume (a non-origin eye would surface here as IoU drift).
+    const glm::mat4 silView = buildSilhouetteView();
+    const glm::vec3 C = glm::vec3(glm::inverse(silView)[3]);
+
+    // ----- IoU measure (same path as runShiftE.measureIoU) -----------
+    // computeSilhouette2DObjectiveFast reads the GLOBAL view/projection/
+    // gWindowWidth/Height, so they must be swapped to the AR fixed camera
+    // for the call and restored afterwards.
+    const glm::mat4 silProj = buildSilhouetteProj();
+    const int silW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : 1280;
+    const int silH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : 720;
+    auto measureIoU = [&]() -> float {
+        glm::mat4 sv = view;          glm::mat4 sp = projection;
+        int       sw = gWindowWidth;  int       sh = gWindowHeight;
+        view = silView;       projection = silProj;
+        gWindowWidth = silW;  gWindowHeight = silH;
+        bool wasQuiet = g_quietMetrics; g_quietMetrics = true;
+        float fval = CmaesRefine::computeSilhouette2DObjectiveFast(
+            liverMesh3D, view, projection, /*step=*/8);
+        g_quietMetrics = wasQuiet;
+        view = sv;             projection = sp;
+        gWindowWidth = sw;     gWindowHeight = sh;
+        return 1.0f - fval;   // fval is the cost (1 - IoU2D)
+    };
+    const float iou_before = measureIoU();
+
+    // ----- Target cloud (DA3), identical to computeUnifiedMetrics -----
+    Reg3DCustom::NoOpen3DRegistration reg_extract;
+    const float zThresh = std::max(0.001f, RegRatios::zThresh());
+    auto targetCloud = reg_extract.extractFrontFacePoints(
+        *screenMesh, gGridWidth, gGridHeight(), zThresh);
+    if (!targetCloud || targetCloud->empty()) {
+        std::cerr << "[Shift+I] empty target cloud; aborting." << std::endl;
+        return;
+    }
+    const std::vector<glm::vec3>& tgt_points = targetCloud->points;
+
+    // ----- Source cloud: liver full mesh (identical to compRmse) ------
+    // NanoflannAdaptor holds a REFERENCE to src_pts, so src_pts must
+    // outlive `tree`. Tree is built ONCE at k=1; eval() inverse-dilates
+    // the query rather than rebuilding (see header identity).
+    std::vector<glm::vec3> src_pts;
+    {
+        const auto& V = liverMesh3D->mVertices;
+        src_pts.reserve(V.size() / 3);
+        for (size_t i = 0; i + 2 < V.size(); i += 3)
+            src_pts.emplace_back(V[i], V[i + 1], V[i + 2]);
+    }
+    if (src_pts.empty()) {
+        std::cerr << "[Shift+I] source cloud empty; aborting." << std::endl;
+        return;
+    }
+    Reg3DCustom::NanoflannAdaptor src_adaptor(src_pts);
+    auto tree = Reg3DCustom::buildKDTree(src_adaptor);
+
+    const float max_dist_sq = RegRatios::maxDistSq();  // == (sceneDiag/7.36)^2
+
+    // ----- Fast eval: true RMSE of dilation-by-k, no tree rebuild -----
+    auto eval = [&](float k) -> float {
+        const float invk = 1.0f / k;
+        const float gate = max_dist_sq * invk * invk;   // gate / k^2
+        float sumSq = 0.0f;
+        int   cnt   = 0;
+        for (size_t i = 0; i < tgt_points.size(); ++i) {
+            const glm::vec3 qp = C + (tgt_points[i] - C) * invk;
+            size_t nn;  float dsq;
+            if (Reg3DCustom::searchKNN1(*tree, qp, nn, dsq) && dsq < gate) {
+                sumSq += dsq;   // dsq' ; true sq-dist = k^2 * dsq'
+                ++cnt;
+            }
+        }
+        // true RMSE = sqrt( mean( k^2 * dsq' ) ) = k * sqrt( mean dsq' ).
+        return cnt ? k * std::sqrt(sumSq / (float)cnt) : 9.9f;
+    };
+
+    const float rmse_before = eval(1.0f);
+
+    // ----- 1-D search: coarse log bracket, then golden section --------
+    constexpr float kLo = 0.5f, kHi = 2.0f;
+    constexpr int   kCoarse = 11;
+    int eval_count = 0;
+    auto evalC = [&](float k) -> float { ++eval_count; return eval(k); };
+
+    // Coarse scan (log-spaced) to bracket the minimum without assuming
+    // unimodality / sticking to an endpoint.
+    float gridK[kCoarse], gridF[kCoarse];
+    int   gridMin = 0;
+    const float lnLo = std::log(kLo), lnHi = std::log(kHi);
+    for (int i = 0; i < kCoarse; ++i) {
+        const float t = (float)i / (float)(kCoarse - 1);
+        gridK[i] = std::exp(lnLo + t * (lnHi - lnLo));
+        gridF[i] = evalC(gridK[i]);
+        if (gridF[i] < gridF[gridMin]) gridMin = i;
+    }
+
+    // Golden section in u = log(k) on the bracket around the coarse min.
+    const int   lo_i = (gridMin > 0)            ? gridMin - 1 : 0;
+    const int   hi_i = (gridMin < kCoarse - 1)  ? gridMin + 1 : kCoarse - 1;
+    double ulo = std::log(gridK[lo_i]);
+    double uhi = std::log(gridK[hi_i]);
+    const double gr = 0.6180339887498949;            // (sqrt(5)-1)/2
+    double u1 = uhi - gr * (uhi - ulo);
+    double u2 = ulo + gr * (uhi - ulo);
+    float  f1 = evalC((float)std::exp(u1));
+    float  f2 = evalC((float)std::exp(u2));
+    const double uTol = std::log(1.0 + 0.005);        // ~0.5% in k
+    int gs_iter = 0;
+    while ((uhi - ulo) > uTol && gs_iter < 40) {
+        if (f1 < f2) { uhi = u2; u2 = u1; f2 = f1;
+                       u1 = uhi - gr * (uhi - ulo); f1 = evalC((float)std::exp(u1)); }
+        else         { ulo = u1; u1 = u2; f1 = f2;
+                       u2 = ulo + gr * (uhi - ulo); f2 = evalC((float)std::exp(u2)); }
+        ++gs_iter;
+    }
+    const float kMid = (float)std::exp(0.5 * (ulo + uhi));
+    const float fMid = evalC(kMid);
+
+    // Pick the best candidate; seed with k=1 (no-op) so the refine can
+    // NEVER worsen the RMSE — at worst it leaves the pose untouched.
+    float kStar = 1.0f, rmse_after = rmse_before;
+    const float candK[] = { (float)std::exp(u1), (float)std::exp(u2),
+                            kMid, gridK[gridMin] };
+    const float candF[] = { f1, f2, fMid, gridF[gridMin] };
+    for (int i = 0; i < 4; ++i)
+        if (candF[i] < rmse_after) { rmse_after = candF[i]; kStar = candK[i]; }
+
+    // ----- Apply dilation s -> C + k*(s-C) to all organs --------------
+    // Uniform scale about C: normal DIRECTIONS are invariant, so only
+    // vertices change; setUp() refreshes the GL buffers. Skip the no-op
+    // at k==1 to avoid any reassociation rounding when C is non-origin.
+    if (std::fabs(kStar - 1.0f) > 1e-7f) {
+        for (auto* m : organs) {
+            if (!m) continue;
+            auto& V = m->mVertices;
+            for (size_t i = 0; i + 2 < V.size(); i += 3) {
+                V[i]     = C.x + kStar * (V[i]     - C.x);
+                V[i + 1] = C.y + kStar * (V[i + 1] - C.y);
+                V[i + 2] = C.z + kStar * (V[i + 2] - C.z);
+            }
+            setUp(*m);
+        }
+    }
+
+    // ----- Metrics (overwrites compRmse with the post-dilation value) -
+    computeUnifiedMetrics();
+    g_metricsValid = true;
+    const float iou_after = measureIoU();
+
+    // ----- implied_scale diagnostic (DA3-frame liver vs CT-mm) --------
+    // = current_liver_diag / g_originalLiverDiagMm (reciprocal of Shift+M
+    // SCALE_RESTORE). ~1 => DA3 metric depth and the CT model agree on
+    // absolute size; far from 1 => DA3 absolute-scale error, which rides
+    // on this very (projection-invariant) dilation ray and therefore is
+    // never visible in the overlay. This is a read-out of DA3 metric
+    // quality, NOT a correction applied during registration.
+    float cur_diag = 0.0f;
+    {
+        const auto& V = liverMesh3D->mVertices;
+        glm::vec3 mn(V[0], V[1], V[2]), mx = mn;
+        for (size_t i = 0; i + 2 < V.size(); i += 3) {
+            glm::vec3 v(V[i], V[i + 1], V[i + 2]);
+            mn = glm::min(mn, v);
+            mx = glm::max(mx, v);
+        }
+        cur_diag = glm::length(mx - mn);
+    }
+    const float implied_scale =
+        (g_hasOriginalDiags && g_originalLiverDiagMm > 1e-6f)
+            ? cur_diag / g_originalLiverDiagMm : -1.0f;
+
+    // ----- Log (Ctrl+G-style, plus the invariance assert) -------------
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "[Shift+I] k*=" << kStar
+              << "  (search [" << kLo << "," << kHi << "], evals=" << eval_count
+              << ", coarse_min_k=" << gridK[gridMin] << ")" << std::endl;
+
+    const float rmse_delta = rmse_before - rmse_after;
+    std::cout << "[Shift+I] RMSE: " << rmse_before << " -> " << rmse_after
+              << " (delta=" << rmse_delta << ")"
+              << (rmse_delta > 1e-6f ? "  [IMPROVED]" : "  [NO CHANGE]")
+              << std::endl;
+
+    if (implied_scale > 0.0f)
+        std::cout << "[Shift+I] implied_scale (DA3/CT-mm) = " << implied_scale
+                  << "  (current_liver_diag=" << cur_diag
+                  << ", g_originalLiverDiagMm=" << g_originalLiverDiagMm << ")"
+                  << std::endl;
+    else
+        std::cout << "[Shift+I] implied_scale: N/A "
+                     "(CT-mm reference not captured at startup)" << std::endl;
+
+    // Invariance assert: dilation about the optical center must leave the
+    // rasterized silhouette unchanged. A non-trivial delta means C / the
+    // silhouette view is off — a correctness bug, not a tuning knob.
+    const float iou_delta = std::fabs(iou_after - iou_before);
+    std::cout << "[Shift+I] IoU(invariance check): " << iou_before
+              << " -> " << iou_after << "  |delta|=" << iou_delta
+              << (iou_delta > 1e-3f ? "  [WARN: silhouette moved -- check C/view]"
+                                    : "  [OK: silhouette fixed]")
+              << std::endl;
+
+    g_callIdx++;  // match V1 / V3 / Shift+E: increment at the end
 }
 
 
