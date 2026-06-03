@@ -688,6 +688,18 @@ private:
 }
 
 struct RegistrationData {
+    // The Windows SDK #defines some of these names (notably REGISTERED) as
+    // macros, which corrupts the enum on MSVC ("missing '}' before constant").
+    // Undef them here so the enum parses regardless of include order. Undefining
+    // a name that isn't a macro is a harmless no-op.
+#ifdef _WIN32
+#undef IDLE
+#undef SELECTING_BOARD_POINTS
+#undef SELECTING_OBJECT_POINTS
+#undef READY_TO_REGISTER
+#undef REGISTERED
+#undef REFINING
+#endif
     enum State {
         IDLE,
         SELECTING_BOARD_POINTS,

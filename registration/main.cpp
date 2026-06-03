@@ -9874,7 +9874,7 @@ static void setupUICallbacks() {
                           + " 2>&1";
 
         std::cout << "[Calib] " << cmd << std::endl;
-        FILE* pipe = popen(cmd.c_str(), "r");
+        FILE* pipe = PLATFORM_POPEN(cmd.c_str(), "r");
         if (!pipe) {
             g_calibResult.message = "popen failed";
             std::cerr << "[Calib] " << g_calibResult.message << std::endl;
@@ -9882,7 +9882,7 @@ static void setupUICallbacks() {
         }
         char buf[512];
         while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
-        int exitCode = pclose(pipe);
+        int exitCode = PLATFORM_PCLOSE(pipe);
 
         if (exitCode != 0) {
             g_calibResult.message = "calibration_tool exit code " + std::to_string(exitCode);
