@@ -22,8 +22,8 @@
 
 extern "C" {
   #include "hansen_renames.h"             /* cmaes_* -> HANSEN_cmaes_* */
-  #include "src/cmaes_interface.h"        /* HANSEN_cmaes_* decls + HANSEN_cmaes_t */
-  #include "src/boundary_transformation.h"/* cmaes_boundary_* (NOT renamed) */
+  #include "upstream/src/cmaes_interface.h"         /* HANSEN_cmaes_* decls + HANSEN_cmaes_t */
+  #include "upstream/src/boundary_transformation.h" /* cmaes_boundary_* (NOT renamed) */
   /* cmaes_random_Start is declared inside cmaes.c, not in any header. Declare
    * the renamed symbol directly so cmaes_set_seed can reach it. */
   long HANSEN_cmaes_random_Start(HANSEN_cmaes_random_t *, long unsigned inseed);

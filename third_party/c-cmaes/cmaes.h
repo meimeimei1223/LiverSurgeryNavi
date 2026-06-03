@@ -5,7 +5,7 @@
  * for the per-run seeding call (srand -> cmaes_set_seed).
  *
  * The implementation lives in cmaes_adapter.cpp and forwards to the upstream
- * Hansen library compiled in hansen_cmaes_renamed.c (src/). The upstream API
+ * Hansen library compiled in hansen_cmaes_renamed.c (upstream/src/). The upstream API
  * (cmaes_init with inseed/filename, boundary_transformation.*, per-instance
  * RNG, ...) is hidden behind `impl`.
  *

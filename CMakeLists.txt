@@ -89,11 +89,11 @@ endif()
 # RNG makes Run-level OpenMP parallelism deterministic, so the old
 # cmaes_tls_wrapper.c and the self-made cmaes.c are no longer needed.
 set(CMAES_DIR "${CMAKE_SOURCE_DIR}/third_party/c-cmaes")
-if(EXISTS "${CMAES_DIR}/cmaes_adapter.cpp" AND EXISTS "${CMAES_DIR}/src/cmaes.c")
+if(EXISTS "${CMAES_DIR}/cmaes_adapter.cpp" AND EXISTS "${CMAES_DIR}/upstream/src/cmaes.c")
     list(APPEND LSN_TP_SOURCES
-        "${CMAES_DIR}/hansen_cmaes_renamed.c"           # upstream cmaes.c, HANSEN_-renamed (C)
-        "${CMAES_DIR}/src/boundary_transformation.c"    # box-constraint transform (C)
-        "${CMAES_DIR}/cmaes_adapter.cpp")               # engine-facing 6-arg API (C++)
+        "${CMAES_DIR}/hansen_cmaes_renamed.c"                # upstream cmaes.c, HANSEN_-renamed (C)
+        "${CMAES_DIR}/upstream/src/boundary_transformation.c" # box-constraint transform (C)
+        "${CMAES_DIR}/cmaes_adapter.cpp")                   # engine-facing 6-arg API (C++)
     message(STATUS "c-cmaes: upstream Hansen via adapter (${CMAES_DIR})")
 else()
     message(FATAL_ERROR "c-cmaes upstream/adapter not found at ${CMAES_DIR}")

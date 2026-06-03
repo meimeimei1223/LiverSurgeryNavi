@@ -1,13 +1,13 @@
 /* hansen_renames.h  — AUTO-GENERATED (do not hand-edit)
  *
  * Prefixes every external cmaes_* identifier of the upstream Hansen
- * c-cmaes (src/) with HANSEN_, so the upstream library can be compiled
+ * c-cmaes (upstream/src/) with HANSEN_, so the upstream library can be compiled
  * and linked alongside the thin engine-facing API in cmaes.h without
  * symbol clashes. cmaes_boundary_* is intentionally NOT renamed.
  *
  * Included only by hansen_cmaes_renamed.c (the C shim) and by the
  * upstream-include section of cmaes_adapter.cpp. Never by the engines.
- * Upstream src/ files are byte-identical to upstream; renaming is done
+ * Upstream upstream/src/ files are byte-identical to upstream; renaming is done
  * purely via these macros (HANDOFF v2 FIX3).
  *
  * Regenerate: see scripts note in README. Token count: 62
