@@ -1515,7 +1515,7 @@ inline void run_one_bipop(RunContext& rc, const ParamsV3& params)
     cmaes_t* evo = cmaes_init(DIM, xstart, rc.sigma0,
                               params.lambda, lb, ub);
     if (rc.cma_seed != 0) {
-        srand(rc.cma_seed);
+        cmaes_set_seed(evo, (unsigned int)rc.cma_seed);
         if (params.verbose) {
             std::cout << "[V3] Deterministic seed: " << rc.cma_seed
                       << std::endl;

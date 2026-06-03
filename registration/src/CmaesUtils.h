@@ -1390,15 +1390,15 @@ inline Result run(
     /* ------------------------------------------------------------
      * CMA-ES determinism hook (reproducibility protocol)
      * ------------------------------------------------------------
-     * cmaes_init() internally calls srand(time(NULL)). If the
-     * caller has specified a non-zero rng_seed, override that
-     * seed here so that subsequent rand() / randn() calls within
-     * this CMA-ES run are reproducible.
-     * cmaes.c / cmaes.h are NOT modified; this is the minimal
-     * external intervention required for determinism.
+     * The upstream Hansen c-cmaes uses a per-instance RNG. When the
+     * caller specifies a non-zero rng_seed, install it here via
+     * cmaes_set_seed() (upstream cmaes_random_Start) so this run's
+     * sampling is reproducible and identical whether runs execute
+     * serially or in parallel. Upstream sources are NOT modified;
+     * the seeding goes through the adapter (third_party/c-cmaes).
      * ------------------------------------------------------------ */
     if (params.rng_seed != 0) {
-        srand(params.rng_seed);
+        cmaes_set_seed(evo, (unsigned int)params.rng_seed);
         if (params.verbose) {
             std::cout << "[CMA-ES] Deterministic seed set: "
                       << params.rng_seed << std::endl;
