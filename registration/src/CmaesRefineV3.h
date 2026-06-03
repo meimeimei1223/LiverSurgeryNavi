@@ -104,7 +104,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 extern "C" {
-#include "third_party/c-cmaes/cmaes.h"
+#include "third_party/c-cmaes/wrapper/cmaes.h"
 }
 
 // PointCloud, voxelDownSample, NanoflannAdaptor, KDTree3D, searchKNN1.

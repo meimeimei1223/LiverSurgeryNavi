@@ -52,7 +52,7 @@ extern int stbi_write_png(const char*, int, int, int, const void*, int);
 #include "PathConfig.h"
 
 extern "C" {
-#include "third_party/c-cmaes/cmaes.h"
+#include "third_party/c-cmaes/wrapper/cmaes.h"
 }
 
 /* RegistrationData forward declaration - defined in RegistrationUI.h */

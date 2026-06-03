@@ -13,4 +13,4 @@
  * Do not add anything else here.
  */
 #include "hansen_renames.h"
-#include "upstream/src/cmaes.c"
+#include "../upstream/src/cmaes.c"

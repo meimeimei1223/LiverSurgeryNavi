@@ -1,9 +1,10 @@
 # AAA_LiverSurgeryNaviComb プロジェクト構造
 
-> 最終更新: 2026-05-28
+> 最終更新: 2026-06-03
 > 3プロジェクト構成（common / registration / deform）＋ Ctrl+D Debug Panel ＋ DEFORM 分離済み。
 > **DEFORM UI 統合 Phase 1 完了**（共有 `RegistrationImGuiManager` を `common/src/` に集約、DEFORM 側もサイドバー表示）。
 > **REG/DEFORM は独立プロセスのまま** — 互いの遷移ボタンは export + log のみで、ユーザが手動で他方を起動する運用。
+> **CMA-ES を本家 Hansen c-cmaes に置換**（`feature/cmaes-upstream`、未マージ）— 旧自作実装を削除し、アダプタ shim 経由で全 BIPOP エンジンが本家を使用。Run 並列が決定的（直列==並列ビット一致）。詳細は §8。
 
 ---
 
@@ -32,7 +33,8 @@ AAA_LiverSurgeryNaviComb/
 │   └── onnxruntime-linux-x64-gpu-1.15.1/  (CUDA/TensorRT)
 │
 ├── calibration_tool/           ← 外部ヘルパー(チェスボード カメラキャリブレーション)
-├── third_party/                ← imgui, glm, eigen, tinyobjloader, stb, nanoflann, c-cmaes, tinyfiledialogs
+├── third_party/                ← imgui, glm, eigen, tinyobjloader, stb, nanoflann, tinyfiledialogs
+│   └── c-cmaes/                ← upstream/(本家 Hansen 無改変)＋ wrapper/(我々のラッパ)(§8)
 ├── win_deps/                   ← Windowsビルド用依存(Linuxでは未使用)
 │
 ├── shaders/ data/ model/ input_image/ chessboard/   ← 共有リソース(ビルド時 bin/ へコピー)
@@ -93,6 +95,7 @@ OBJDistributionDiag, PoseLibrary, **ReconstructFromBin(.cpp/.h)**, RegistrationA
 RegistrationUI, RimPairSampling, RimShapeMatch, SilOverlayDebug, **StlExport.h**,
 UmeyamaController, Undistort
 - `DebugPanel.h`：Ctrl+D で開く統合デバッグパネル（6タブ G/O/N/W/U/Viz）。
+- `CmaesRefineV2/V3/V3R/V3RS.h` + `CmaesUtils.h`：BIPOP-CMA-ES エンジン群。本家 c-cmaes をアダプタ経由で使用（旧自作からの差分は per-run シード 1 行 `srand`→`cmaes_set_seed` のみ）。V3R/V3RS は Run レベル並列機構（`g_v3rParallelRuns`/`g_v3rsParallelRuns`、既定 OFF）を持つ。詳細 §8。
 - `StlExport.h`：旧 M/Shift+M キーの STL/OBJ export（宣言。定義は main.cpp）。Phase 1 で `exportRegisteredObjs()` が「Deform >>」ボタンからも呼ばれる。
 - **`ReconstructFromBin.h/cpp`** [reconstruct-bin]：過去/外部由来の `depth_metric.bin` から OBJ 再生成（経路 D。Section 5 参照）。
 - ※ `RegistrationImGuiManager.h` は Phase 1 で `common/src/` へ移動済み（rename なし、include 文も無修正）。
@@ -172,7 +175,48 @@ REG→DEFORM 連携は `registration_model/reg_liver.obj` 等。
 ## 7. ブランチ・リファクタ履歴メモ
 
 - **`main`**：直近のマージ済み実装（live-calibration 含む）。
-- **`feature/deform-ui-integration`**（未マージ）：Phase 1 (DEFORM UI 統合) の 8 commits。設計書 `IMPLEMENTATION_PLAN_DEFORM_UI_v2.md`、進捗 `memory/deform-ui-progress.md`。
+- **`feature/deform-ui-integration`**（未マージ）：Phase 1 (DEFORM UI 統合)。設計書 `IMPLEMENTATION_PLAN_DEFORM_UI_v2.md`、進捗 `memory/deform-ui-progress.md`。末尾に `3f12eb6 [wip]`（Run 並列機構＋本家 c-cmaes の vendoring を退避保存）。
+- **`feature/cmaes-upstream`**（未マージ、`3f12eb6` 基点）：CMA-ES を本家 Hansen c-cmaes に置換（§8）。`ef527ab` 置換＋旧削除＋決定性2修正 → `a43c773` 本家不要ファイル整理 → `bef1791` 本家を `upstream/` に隔離＋README。設計書 `HANDOFF_upstream_cmaes_migration_v2.md`、進捗 `memory/cmaes-upstream-migration.md`。残：GUI §7 検証後に main マージ判断。
 - **過去ブランチ**：feature/reconstruct-from-bin（Reconstruct from BIN、merge commit e84a63e）/ feature/live-calibration（Take Picture タブ、merge commit 895d230）/ intrinsics-refactor 系。
 
 **今後 (Phase 3)**：単一バイナリ `lsn_unified` への統合。`onSwitchToDeformMode`/`onStartFromDepth` を in-process `currentMainMode` switch に置換、AR モードグローバル統一、alpha state 統一（REG `g_meshAlpha[8]` ↔ DEFORM 単一値 3 個）、`MainMode` enum を `common/` へ、REG 側も `AppImGuiBoot` に移行、`RegistrationImGuiManager` を `AppImGuiManager` 等にリネーム。詳細は `IMPLEMENTATION_PLAN_DEFORM_UI_v2.md` Section 10 のチェックリスト。
+
+---
+
+## 8. CMA-ES（third_party/c-cmaes）[feature/cmaes-upstream]
+
+BIPOP-CMA-ES エンジン（registration/src の `CmaesRefineV2/V3/V3R/V3RS` + `CmaesUtils`）は、
+旧・自作 CMA-ES 実装を廃し、**本家 Hansen c-cmaes** をアダプタ shim 経由で使用する。
+
+**upstream/（本家無改変）と wrapper/（我々）にトップで二分**。GitHub 公開しやすい構成。
+
+```
+third_party/c-cmaes/
+├── README.md                 ← 出自・ライセンス・構成・決定性の説明
+├── upstream/                 ← 本家 Hansen c-cmaes を verbatim で vendoring（無改変・original names）
+│   ├── src/{cmaes.c, cmaes.h, cmaes_interface.h, boundary_transformation.c/h}
+│   └── CMakeLists.txt, LICENSE, README.md, compile, doc.txt, docfunctions.txt
+└── wrapper/                  ← 我々のラッパ（書いたものは全部ここ）
+    ├── cmaes.h               ← エンジンが #include する公開 API（旧自作と同一署名／gen,lambda,sigma + 不透明 impl）
+    ├── cmaes_adapter.cpp     ← アダプタ本体（公開 API を本家へ橋渡し）
+    ├── hansen_renames.h      ← 自動生成: cmaes_* → HANSEN_*（cmaes_boundary_* は除外）
+    ├── hansen_unrenames.h    ← 自動生成: 上記を打ち消す
+    └── hansen_cmaes_renamed.c ← C シム: renames + #include "../upstream/src/cmaes.c"
+```
+
+- **設計**：エンジンは 6 引数 `cmaes_init(N,xstart,sigma0,lambda,lb,ub)` のまま。本家のシンボルは
+  *コンパイル時のマクロ*で `HANSEN_*` に改名し公開 `cmaes_*` と共存（**本家ソース・関数名は無改変**）。
+  箱拘束は本家の smooth boundary transformation。CMake は `wrapper/hansen_cmaes_renamed.c` /
+  `upstream/src/boundary_transformation.c` / `wrapper/cmaes_adapter.cpp` のみコンパイル。
+  エンジンは `third_party/c-cmaes/wrapper/cmaes.h` を明示パスで include。`upstream/src/` は
+  include path に入らないので公開 `cmaes.h` と本家 `cmaes.h` は衝突しない。
+- **決定性（直列==並列ビット一致）**：①本家の per-instance RNG を `cmaes_set_seed`
+  （`cmaes_random_Start`）で再シード、②`cmaes_TestForTermination` の共有 static 戻りバッファを
+  `omp critical` で per-instance バッファへ退避、③**固有系更新の経過 CPU 時間ゲートを無効化**
+  （`updateCmode.maxtime=1.0`）— これを外さないと並列負荷で更新スケジュールがズレ軌道が発散する。
+  併せて `actparcmaes.par` の CWD 書き出しを抑止。
+- **検証**：スタンドアロンで収束・直列決定性・並列8スレッド全ビット一致・別シード差異・.par 非書き出しを確認、
+  `lsn_registration` のビルド/リンクも確認済み。**GUI 上の §（HANDOFF §7）検証は未実施**
+  （Ctrl+G=V3R で実ポーズの直列==並列、その後 V3RS/Ctrl+I/V3/V2/V1）。
+- 旧自作実装（旧 `third_party/自作のc-cmaes/`）と本家の不要ファイル（example_*.c, plotcmaesdat.*, *.par）は削除済み。
+- 進捗・経緯：`memory/cmaes-upstream-migration.md`、`HANDOFF_upstream_cmaes_migration_v2.md`。
