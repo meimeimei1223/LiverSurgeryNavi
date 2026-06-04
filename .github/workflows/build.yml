@@ -58,6 +58,8 @@ jobs:
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_cuda.so* package/LiverSurgeryNavi/ 2>/dev/null || true
           cp onnxruntime-linux-x64-gpu-1.15.1/lib/libonnxruntime_providers_shared.so* package/LiverSurgeryNavi/ 2>/dev/null || true
           cp -r shaders package/LiverSurgeryNavi/
+          mkdir -p package/LiverSurgeryNavi/model
+          cp model/gb.obj model/liver.obj model/portal.obj model/segment.obj model/tumor.obj model/vein.obj package/LiverSurgeryNavi/model/
           mkdir -p package/LiverSurgeryNavi/depth_output
           echo "# Output folder for depth estimation results" > package/LiverSurgeryNavi/depth_output/.gitkeep
           cp onnx_models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/onnx_models/
@@ -124,6 +126,8 @@ jobs:
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_cuda.dll package/LiverSurgeryNavi/ 2>/dev/null || true
           cp onnxruntime-win-x64-gpu-1.15.1/lib/onnxruntime_providers_shared.dll package/LiverSurgeryNavi/ 2>/dev/null || true
           cp -r shaders package/LiverSurgeryNavi/
+          mkdir -p package/LiverSurgeryNavi/model
+          cp model/gb.obj model/liver.obj model/portal.obj model/segment.obj model/tumor.obj model/vein.obj package/LiverSurgeryNavi/model/
           mkdir -p package/LiverSurgeryNavi/depth_output
           echo "# Output folder for depth estimation results" > package/LiverSurgeryNavi/depth_output/.gitkeep
           cp onnx_models/depth_anything_v3_small.onnx package/LiverSurgeryNavi/onnx_models/
