@@ -969,7 +969,7 @@ inline Result runV2(
     cmaes_t* evo = cmaes_init(DIM, xstart, params.sigma0,
                               params.lambda, lb, ub);
     if (params.rng_seed != 0) {
-        srand(params.rng_seed);
+        cmaes_set_seed(evo, (unsigned int)params.rng_seed);
         if (params.verbose) {
             std::cout << "[V2] Deterministic seed: "
                       << params.rng_seed << std::endl;

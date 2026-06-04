@@ -97,6 +97,17 @@ struct ParamsV3RS : public CmaesRefineV3R::ParamsV3R {
     // lambda_sil == 0.0f -> V3R-W behaviour (no silhouette term).
     float lambda_sil = 0.0f;
 
+    // [V3I] Pure-IoU mode (Ctrl+I). Default false => V3RS unchanged.
+    //   When true the inner cost becomes  cost = (1 - IoU2D)  ONLY
+    //   (RMSE_W / outside / rim_sil terms dropped), and the Run selector
+    //   decides by IoU2D instead of the RMSE-blended combo. This is the
+    //   "Ctrl+G mechanism, objective swapped to squash-IoU" experiment.
+    //   The wrapper (RegistrationActions.h) also skips the RMSE accept
+    //   cap when this is set, so an IoU-improving pose is never rejected
+    //   for raising 3D RMSE. Ctrl+Shift+G leaves this false => byte-
+    //   identical behaviour.
+    bool  pure_iou_mode = false;
+
     // AR-camera pinhole intrinsics. cam_pos = (0,0,0), look-at = +Z.
     //   u = sil_fx * p.x / p.z + sil_cx
     //   v = sil_fy * p.y / p.z + sil_cy
@@ -374,6 +385,35 @@ struct EvalTimingV3RS {
 // comparisons in the F9 overlay.
 // =====================================================================
 inline bool g_silTargetSquashEnabled = true;
+
+// =====================================================================
+// [V3RS-PARALLEL] Run-loop parallelization toggle.
+//
+// When true, runBipopCmaesV3RS executes its N_STARTS independent BIPOP
+// restarts CONCURRENTLY -- one OpenMP thread per run, each run doing a
+// SERIAL raster (the inner per-eval raster parallelism is suppressed via
+// omp_in_parallel() so we don't pay per-thread-hitmap alloc/reduce inside
+// an already-parallel region). Default OFF = the legacy serial run loop,
+// which is byte-identical to the pre-change behavior.
+//
+// Determinism is preserved in BOTH modes: per-run jitter and sigma0 are
+// pre-generated from the outer RNG in run order (the exact 8-draw-per-run
+// sequence the legacy in-loop code used) BEFORE the loop, so the RNG
+// consumption is identical regardless of run execution order, and each
+// run's CMA-ES is seeded by cma_base+run (RNG-independent). Result poses,
+// IoU, best-run selection, and the accept decision are therefore
+// identical to serial; only the wall-clock and the ordering of verbose
+// per-run log lines differ (in parallel mode the per-run logs are
+// suppressed during the loop and reprinted in run order afterward).
+//
+// Read once at the top of the run loop. Set from the UI (Debug Panel)
+// via CmaesRefineV3RS::g_v3rsParallelRuns. Applies to both Ctrl+I
+// (pure-IoU) and Ctrl+G since they share this engine.
+// [UI整理] Default ON (deterministic, pure speed lever).
+inline bool g_v3rsParallelRuns = true;
+// Filled by runBipopCmaesV3RS so the UI can show what the last run did.
+inline int  g_v3rsLastRunThreads = 1;     // threads actually used last time
+inline double g_v3rsLastRunLoopMs = 0.0;  // run-loop wall-clock last time
 
 struct SilTargetMaskCache {
     std::vector<uint8_t> data;   // gw * gh, squashed + 1-cell halo
@@ -825,7 +865,7 @@ inline float rasterize_iou2d_v3rs(
     std::vector<glm::vec3> screen(nVerts);
     std::vector<uint8_t>   inside(nVerts, 0);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (nVerts >= 2048)
+#pragma omp parallel for schedule(static) if (nVerts >= 2048 && !omp_in_parallel())
 #endif
     for (int i = 0; i < nVerts; ++i) {
         const glm::vec3& p = positions[i];
@@ -950,7 +990,14 @@ inline float rasterize_iou2d_v3rs(
     } else {
         // ---- Triangle-bbox splat (hot path, raster_mode == 0) ----------
 #ifdef _OPENMP
-        const int n_threads_splat = (n_tris >= 1024)
+        // [V3RS-PARALLEL] Also require NOT being inside an outer parallel
+        // region: when runBipopCmaesV3RS parallelizes across runs, each
+        // run should raster SERIALLY (one thread). Nested OpenMP is off by
+        // default, so the inner region would run on 1 thread anyway -- but
+        // without this guard we'd still allocate + zero + OR-reduce
+        // n_threads private hitmaps every eval for nothing. omp_in_parallel()
+        // makes the splat take the cheap serial path in that case.
+        const int n_threads_splat = (n_tris >= 1024 && !omp_in_parallel())
                                         ? std::max(1, omp_get_max_threads())
                                         : 1;
 #else
@@ -2667,7 +2714,11 @@ inline float evaluate_one_v3rs_silhouette(
     // is computed in ANATOMIC mode (over projected RIM vertices) rather
     // than the per-cell raster-boundary mode. Forwarded directly to
     // rasterize_iou2d_v3rs. Pass as nullptr (default) for legacy.
-    const std::vector<uint8_t>*              is_rim_anatomic_per_vertex_in = nullptr)
+    const std::vector<uint8_t>*              is_rim_anatomic_per_vertex_in = nullptr,
+    // [V3I] Pure-IoU mode. Default false => unchanged V3RS blend. When
+    // true the returned cost is exactly (1 - IoU2D); RMSE_W is still
+    // computed (matched gate / diagnostics) but excluded from the cost.
+    bool                                     pure_iou_mode = false)
 {
     using namespace CmaesRefine;
     using clk = std::chrono::high_resolution_clock;
@@ -2696,7 +2747,7 @@ inline float evaluate_one_v3rs_silhouette(
     const bool want_iou =
         (eval_interval > 0) &&
         (eval_index % (long long)eval_interval == 0) &&
-        (lambda_sil > 0.0f) &&
+        ((lambda_sil > 0.0f) || pure_iou_mode) &&
         !liver_full_positions.empty() &&
         !sil_indices.empty() &&
         !sil_dist_map_2d.empty() &&
@@ -2783,10 +2834,15 @@ inline float evaluate_one_v3rs_silhouette(
     //   + lambda_rim_sil_in * rim_sil_loss     (rim-to-rim alignment)
     // Each lambda is independent; both 0 → Phase 3 byte-identical.
     const auto t_pen_a = timing_acc ? clk::now() : clk::time_point{};
-    const float cost = rmse_w
-                     + lambda_sil         * (1.0f - iou)
-                     + lambda_out_in      * outside_ratio
-                     + lambda_rim_sil_in  * rim_sil_loss;
+    // [V3I] Pure-IoU mode: drop RMSE_W / outside / rim_sil entirely so the
+    //   inner objective is exactly (1 - IoU2D). Default path (pure_iou_mode
+    //   == false) is the unchanged V3RS blend.
+    const float cost = pure_iou_mode
+                     ? (1.0f - iou)
+                     : (rmse_w
+                        + lambda_sil         * (1.0f - iou)
+                        + lambda_out_in      * outside_ratio
+                        + lambda_rim_sil_in  * rim_sil_loss);
     if (timing_acc) {
         const auto t_pen_b = clk::now();
         timing_acc->eval_other_us +=
@@ -2986,7 +3042,7 @@ inline void run_one_bipop_v3rs(
     cmaes_t* evo = cmaes_init(DIM, xstart, rc.sigma0,
                               params.lambda, lb, ub);
     if (rc.cma_seed != 0) {
-        srand(rc.cma_seed);
+        cmaes_set_seed(evo, (unsigned int)rc.cma_seed);
         if (params.verbose) {
             std::cout << "[V3RS] Deterministic seed: " << rc.cma_seed
                       << std::endl;
@@ -3168,7 +3224,9 @@ inline void run_one_bipop_v3rs(
                     // by-pointer (.empty() check inside).
                     params.is_rim_anatomic_full.empty()
                         ? nullptr
-                        : &params.is_rim_anatomic_full);
+                        : &params.is_rim_anatomic_full,
+                    // [V3I] pure-IoU mode pass-through (default false).
+                    params.pure_iou_mode);
                 sil_eval_index++;
                 if (iou_computed) {
                     // sil_sum_loss_out accumulates (1 - IoU2D) so that
@@ -3685,28 +3743,23 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3RS(
         }
     }
 
+    // ===== [V3RS-PARALLEL] Pre-generate per-run jitter / sigma0 =======
+    // The outer RNG (rng, seeded by outer_seed) is consumed HERE in run
+    // order -- the exact 8-draw-per-run sequence (sigma0, tx,ty,tz,
+    // rx,ry,rz, scale) the legacy in-loop code used. Lifting it out of
+    // the loop makes the run body RNG-free, so runs can execute in any
+    // order (parallel) yet produce byte-identical jitter to the serial
+    // path. cma_seed is RNG-independent (cma_base + run). This block runs
+    // in BOTH modes, so legacy serial results are unchanged.
+    std::vector<double>      pre_sigma0(N_STARTS, 0.0);
+    std::vector<SRTParamsV3> pre_jitter(N_STARTS);
+    std::vector<bool>        pre_is_local(N_STARTS, false);
     for (int run = 0; run < N_STARTS; run++) {
-        const auto t_one_run_t0 = sess_now();
-        RunContext rc;
-        rc.run_index             = run;
-        rc.is_local_regime       = (run % 2 == 0);
-        rc.cma_seed              = cma_base + (uint32_t)run;
-        rc.rmse_before           = rmse_before;
-        rc.init_matched          = init_matched;
-        rc.max_dist_sq           = max_dist_sq_session;
-        rc.liver_full_positions  = &start_liver_verts;
-        rc.liver_full_normals    = &start_liver_normals;
-        rc.liver_voxel_positions = &session_voxel_liver;
-        rc.tgt_full_points       = &tgt_points;
-        rc.tgt_voxel_points      = &session_voxel_tgt;
-
-        // ----- Generate sigma0 + jitter (V1 d01 consumption order) ---
-        // [V3RS] IDENTICAL to V3: 8 d01 draws per Run, exact same order
-        // (sigma0, tx, ty, tz, rx, ry, rz, sc), so the rng state
-        // sequence matches V3 byte-for-byte.
+        const bool is_local = (run % 2 == 0);
+        pre_is_local[run] = is_local;
         SRTParamsV3 jitter;
-        if (rc.is_local_regime) {
-            rc.sigma0     = 0.3 + d01(rng) * 0.4;
+        if (is_local) {
+            pre_sigma0[run] = 0.3 + d01(rng) * 0.4;
             const float lt = params.jitter_local_t;
             jitter.tx     = (d01(rng) * 2.0f - 1.0f) * lt;
             jitter.ty     = (d01(rng) * 2.0f - 1.0f) * lt;
@@ -3716,7 +3769,7 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3RS(
             jitter.rz_deg = (d01(rng) * 2.0f - 1.0f) * 10.0f;
             jitter.scale  = 0.95f + d01(rng) * 0.10f;
         } else {
-            rc.sigma0     = 0.5 + d01(rng) * 0.5;
+            pre_sigma0[run] = 0.5 + d01(rng) * 0.5;
             const float gt = params.jitter_global_t;
             jitter.tx     = (d01(rng) * 2.0f - 1.0f) * gt;
             jitter.ty     = (d01(rng) * 2.0f - 1.0f) * gt;
@@ -3726,80 +3779,175 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3RS(
             jitter.rz_deg = (d01(rng) * 2.0f - 1.0f) * 30.0f;
             jitter.scale  = 0.90f + d01(rng) * 0.20f;
         }
+        pre_jitter[run] = (run == 0) ? SRTParamsV3{} : jitter;
+    }
 
-        if (run == 0) {
-            rc.jitter = SRTParamsV3{};
-        } else {
-            rc.jitter = jitter;
-        }
+    // Per-run result slots. Each run writes ONLY its own index, so the
+    // parallel path has no shared-write races; reductions are done
+    // serially after the loop in run order (identical to the legacy
+    // in-loop reduction, since argmin with strict '<' over runs 0..N-1
+    // keeps the first run achieving the min either way).
+    std::vector<float>       pr_full(N_STARTS, rmse_before);
+    std::vector<SRTParamsV3> pr_srt(N_STARTS);
+    std::vector<SRTParamsV3> pr_jitter_used(N_STARTS);
+    std::vector<std::string> pr_stop(N_STARTS);
+    std::vector<int>         pr_gens(N_STARTS, 0);
+    std::vector<double>      pr_sil_loss(N_STARTS, 0.0);
+    std::vector<long long>   pr_sil_vis(N_STARTS, 0);
+    std::vector<long long>   pr_sil_count(N_STARTS, 0);
+    std::vector<double>      pr_wall(N_STARTS, 0.0);
 
-        if (params.verbose) {
-            std::cout << "[V3RS] Run " << (run+1) << "/" << N_STARTS
-                      << "  " << (rc.is_local_regime ? "Local " : "Global")
-                      << "  sigma0=" << std::fixed << std::setprecision(4)
-                      << rc.sigma0
-                      << "  cma_seed=" << rc.cma_seed
-                      << std::defaultfloat << std::setprecision(6)
-                      << std::endl;
-        }
+    // Execute one run into slot `run`. run_params lets the parallel path
+    // pass a verbose=false copy so the per-run inner logs don't interleave
+    // across threads. All state touched here is either a fresh local
+    // (RunContext rc + the scratch_pool/timing built inside
+    // run_one_bipop_v3rs) or a disjoint pr_*[run] slot, so this is safe to
+    // call concurrently for distinct `run`.
+    auto exec_run = [&](int run, const ParamsV3RS& run_params) {
+        const auto t0 = sess_now();
+        RunContext rc;
+        rc.run_index             = run;
+        rc.is_local_regime       = pre_is_local[run];
+        rc.cma_seed              = cma_base + (uint32_t)run;
+        rc.rmse_before           = rmse_before;
+        rc.init_matched          = init_matched;
+        rc.max_dist_sq           = max_dist_sq_session;
+        rc.liver_full_positions  = &start_liver_verts;
+        rc.liver_full_normals    = &start_liver_normals;
+        rc.liver_voxel_positions = &session_voxel_liver;
+        rc.tgt_full_points       = &tgt_points;
+        rc.tgt_voxel_points      = &session_voxel_tgt;
+        rc.sigma0                = pre_sigma0[run];
+        rc.jitter                = pre_jitter[run];
 
-        // [V3RS-DIFF] Reset per-run sil aggregates so each Run's log is
-        // about that Run only (not cumulative across the session).
-        // sil_sum_vis is unused in Phase 1 (rim path deleted, all
-        // verts are rasterized) but kept for signature stability with
-        // run_one_bipop_v3rs. avg_iou = 1 - avg_sil_loss.
         double    sil_sum_loss   = 0.0;
         long long sil_sum_vis    = 0;
         long long sil_eval_count = 0;
+        run_one_bipop_v3rs(rc, run_params, sil_sum_loss, sil_sum_vis, sil_eval_count);
 
-        // ----- Execute one Run ([V3RS] dispatch target) ----------------
-        run_one_bipop_v3rs(rc, params, sil_sum_loss, sil_sum_vis, sil_eval_count);
+        pr_full[run]        = rc.best_rmse_full;
+        pr_srt[run]         = rc.best_srt;
+        pr_jitter_used[run] = rc.jitter;
+        pr_stop[run]        = rc.stop_reason;
+        pr_gens[run]        = rc.generations;
+        pr_sil_loss[run]    = sil_sum_loss;
+        pr_sil_vis[run]     = sil_sum_vis;
+        pr_sil_count[run]   = sil_eval_count;
+        pr_wall[run]        = sess_ms(sess_now() - t0).count();
+    };
 
-        // [V3RS-DIFF] Per-Run silhouette summary (Phase 1: avg IoU2D).
-        // Only emitted when at least one IoU2D fold fired this Run.
-        if (params.verbose && sil_eval_count > 0) {
-            const double avg_sil = sil_sum_loss / (double)sil_eval_count;
-            const double avg_iou = 1.0 - avg_sil;
+    // Serial reduction of one run's recorded slot into the session bests +
+    // selector arrays. Order-preserving: call for run=0..N-1.
+    auto reduce_run = [&](int run) {
+        if (pr_full[run] < best_rmse_full) {
+            best_rmse_full   = pr_full[run];
+            best_run_idx     = run;
+            best_jitter      = pr_jitter_used[run];
+            best_srt         = pr_srt[run];
+            best_stop_reason = pr_stop[run];
+        }
+        total_generations += pr_gens[run];
+        if (phase0_selector_on) {
+            per_run_jitter[run]      = pr_jitter_used[run];
+            per_run_srt[run]         = pr_srt[run];
+            per_run_full[run]        = pr_full[run];
+            per_run_stop_reason[run] = pr_stop[run];
+        }
+        t_run_outer_wall_sum += pr_wall[run];
+    };
+
+    auto print_run_summary = [&](int run) {
+        if (!params.verbose) return;
+        std::cout << std::fixed << std::setprecision(4)
+                  << "[V3RS] Run " << (run+1) << "/" << N_STARTS
+                  << "  " << (pre_is_local[run] ? "Local " : "Global")
+                  << "  sigma0=" << pre_sigma0[run]
+                  << "  cma_seed=" << (cma_base + (uint32_t)run)
+                  << "  full=" << pr_full[run]
+                  << "  gens=" << pr_gens[run]
+                  << "  (" << std::setprecision(1) << pr_wall[run] << " ms)"
+                  << std::defaultfloat << std::setprecision(6) << std::endl;
+        if (pr_sil_count[run] > 0) {
+            const double avg_sil = pr_sil_loss[run] / (double)pr_sil_count[run];
             std::cout << std::fixed << std::setprecision(4)
                       << "[V3RS/sil] Run " << (run+1)
-                      << "  iou_evals=" << sil_eval_count
-                      << "  avg_iou2d=" << avg_iou
+                      << "  iou_evals=" << pr_sil_count[run]
+                      << "  avg_iou2d=" << (1.0 - avg_sil)
                       << "  avg_sil_loss=" << avg_sil
                       << "  lambda=" << params.lambda_sil
-                      << std::defaultfloat << std::setprecision(6)
-                      << std::endl;
+                      << std::defaultfloat << std::setprecision(6) << std::endl;
         }
+    };
 
-        // ----- Track best Run by full-mesh screening RMSE -------------
-        if (rc.best_rmse_full < best_rmse_full) {
-            best_rmse_full     = rc.best_rmse_full;
-            best_run_idx       = run;
-            best_jitter        = rc.jitter;
-            best_srt           = rc.best_srt;
-            best_stop_reason   = rc.stop_reason;
+#ifdef _OPENMP
+    const int n_run_threads = g_v3rsParallelRuns
+        ? std::max(1, std::min(N_STARTS, omp_get_max_threads()))
+        : 1;
+#else
+    const int n_run_threads = 1;
+#endif
+    g_v3rsLastRunThreads = n_run_threads;
+
+    if (g_v3rsParallelRuns && n_run_threads > 1) {
+        // ---- PARALLEL run loop -------------------------------------
+        if (params.verbose) {
+            std::cout << "[V3RS] run loop mode: PARALLEL  ("
+                      << n_run_threads << " threads x " << N_STARTS
+                      << " runs; inner raster forced serial; per-run logs "
+                         "deferred to after the loop)" << std::endl;
         }
-        total_generations += rc.generations;
-
-        // [V3RS-DIFF] Phase 0 Run-selector: record this Run's result so
-        // the IoU2D callback can be replayed against it after the Run
-        // loop. Records every Run (not just improvements) — the whole
-        // point of the selector is to compare across all 10.
-        //
-        // Phase A (combo unification): also record stop_reason so the
-        // post-loop combo selector can override best_stop_reason when
-        // it picks a different winner than argmin(rmse_full).
-        if (phase0_selector_on) {
-            per_run_jitter[run]      = rc.jitter;
-            per_run_srt[run]         = rc.best_srt;
-            per_run_full[run]        = rc.best_rmse_full;
-            per_run_stop_reason[run] = rc.stop_reason;
+        // One shared, read-only quiet copy of params: silences the
+        // interleaving per-run verbose prints inside run_one_bipop_v3rs.
+        // Made AFTER the tolfun override above so it inherits that value.
+        ParamsV3RS params_quiet = params;
+        params_quiet.verbose = false;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(n_run_threads)
+#endif
+        for (int run = 0; run < N_STARTS; run++) {
+            exec_run(run, params_quiet);
         }
-
-        const auto t_one_run_t1 = sess_now();
-        t_run_outer_wall_sum   += sess_ms(t_one_run_t1 - t_one_run_t0).count();
+        // Serial post-pass: deferred verbose logs + order-preserving
+        // reductions. (Reductions MUST be serial so best_run_idx tie-break
+        // and per_run_* match the legacy path exactly.)
+        for (int run = 0; run < N_STARTS; run++) {
+            print_run_summary(run);
+            reduce_run(run);
+        }
+    } else {
+        // ---- SERIAL run loop (legacy; byte-identical results) ------
+        if (params.verbose && g_v3rsParallelRuns) {
+            std::cout << "[V3RS] run loop mode: SERIAL  (parallel requested "
+                         "but <=1 thread/run available)" << std::endl;
+        }
+        for (int run = 0; run < N_STARTS; run++) {
+            if (params.verbose) {
+                std::cout << "[V3RS] Run " << (run+1) << "/" << N_STARTS
+                          << "  " << (pre_is_local[run] ? "Local " : "Global")
+                          << "  sigma0=" << std::fixed << std::setprecision(4)
+                          << pre_sigma0[run]
+                          << "  cma_seed=" << (cma_base + (uint32_t)run)
+                          << std::defaultfloat << std::setprecision(6)
+                          << std::endl;
+            }
+            exec_run(run, params);   // verbose inner logs print live here
+            if (params.verbose && pr_sil_count[run] > 0) {
+                const double avg_sil = pr_sil_loss[run] / (double)pr_sil_count[run];
+                std::cout << std::fixed << std::setprecision(4)
+                          << "[V3RS/sil] Run " << (run+1)
+                          << "  iou_evals=" << pr_sil_count[run]
+                          << "  avg_iou2d=" << (1.0 - avg_sil)
+                          << "  avg_sil_loss=" << avg_sil
+                          << "  lambda=" << params.lambda_sil
+                          << std::defaultfloat << std::setprecision(6)
+                          << std::endl;
+            }
+            reduce_run(run);
+        }
     }
 
     auto t_sess_runs1 = sess_now();
+    g_v3rsLastRunLoopMs = sess_ms(t_sess_runs1 - t_sess_runs0).count();
     if (params.verbose) {
         std::cout << "[V3RS session/Time] runs loop wall-clock : "
                   << std::fixed << std::setprecision(1)
@@ -3807,6 +3955,8 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3RS(
                   << " ms"
                   << "  (sum of per-run outer = "
                   << t_run_outer_wall_sum << " ms)"
+                  << "  [" << (g_v3rsParallelRuns ? "PARALLEL x" : "SERIAL x")
+                  << g_v3rsLastRunThreads << "]"
                   << std::defaultfloat << std::endl;
     }
 
@@ -3966,12 +4116,32 @@ inline CmaesRefine::ResultV3 runBipopCmaesV3RS(
         const int  combo_decision_idx =
             combo_improves ? idx_combo : -1;
 
+        // [V3I] In pure-IoU mode the winner is chosen by IoU2D (idx_iou)
+        //   and accepted iff it beats the baseline IoU. RMSE is ignored
+        //   here (and the wrapper skips the RMSE cap), so an IoU gain that
+        //   happens to raise 3D RMSE is still applied. Default V3RS path
+        //   (pure_iou_mode == false) keeps the RMSE-blended combo logic
+        //   below byte-identically.
+        const bool   pure_iou      = params.pure_iou_mode;
+        const bool   iou_improves  = (max_iou > baseline_iou_occluded);
+        (void)combo_decision_idx;
+
         // The previous winner (set inside the Run loop) was picked by
         // argmin(rmse_full). Remember it for the log so the diff is
         // visible to the reader.
         const int prev_best_run_idx = best_run_idx;
 
-        if (combo_improves) {
+        if (pure_iou) {
+            if (iou_improves) {
+                best_run_idx     = idx_iou;
+                best_jitter      = per_run_jitter[idx_iou];
+                best_srt         = per_run_srt[idx_iou];
+                best_rmse_full   = per_run_full[idx_iou];
+                best_stop_reason = per_run_stop_reason[idx_iou];
+            } else {
+                best_run_idx     = -1;
+            }
+        } else if (combo_improves) {
             best_run_idx     = idx_combo;
             best_jitter      = per_run_jitter[idx_combo];
             best_srt         = per_run_srt[idx_combo];

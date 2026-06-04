@@ -678,6 +678,7 @@ inline void classify(
         float thrIn  = c.isSilhouette ? st.thrInlierSil  : st.thrInlierInt;
         float thrOut = c.isSilhouette ? st.thrOutlierSil : st.thrOutlierInt;
         float d = c.distProjected;
+
         if (d < thrIn) {
             c.category = CAT_INLIER;
             if (c.isSilhouette) st.nSilInlier++; else st.nIntInlier++;
@@ -854,7 +855,8 @@ inline void computeFieldOnVisMesh(
     float gaussianSigma = 0.0f,
     bool  useOnlyRatioOK = true,
     int   smoothIterations = 10,
-    float smoothAlpha = 0.5f)
+    float smoothAlpha = 0.5f,
+    bool  dropOutlier = false)  // 2-way 時のみ true: CAT_OUTLIER を field 寄与から除外
 {
     if (st.correspondences.empty()) {
         std::cerr << "[AutoDeform::Step3a] run Step1 first" << std::endl;
@@ -869,8 +871,17 @@ inline void computeFieldOnVisMesh(
     std::vector<float>     corrScores;
     corrSrcPts.reserve(st.correspondences.size());
     corrScores.reserve(st.correspondences.size());
+    int nDroppedOutlier = 0;
     for (const auto& c : st.correspondences) {
         if (useOnlyRatioOK && !c.ratioOK) continue;
+        // 2-way モード (dropOutlier=true) のときだけ、classify で OUTLIER 判定された
+        // 遠い対応点を field 計算から除外する。
+        //   3-way (dropOutlier=false, 既定) : 全 ratioOK 点で field を作る → handle は
+        //          フルセット由来 (green/red=68/73, move[0]=(-0.12108,...))。本来の3-way。
+        //   2-way (dropOutlier=true)        : OUTLIER を抜く → field が INLIER/MOVER のみで
+        //          構築され handle 配置が変わる (green/red=51/87, move[0]=(0.25352,...))。
+        //   classify 未実行時は category=CAT_NONE なのでここは発火せず全点が入る (後方互換)。
+        if (dropOutlier && c.category == CAT_OUTLIER) { nDroppedOutlier++; continue; }
         corrSrcPts.push_back(c.srcPos);
         corrScores.push_back(c.distProjected);
     }
@@ -952,7 +963,8 @@ inline void computeFieldOnVisMesh(
     std::cout << "  vis vertices       : " << Nvis << std::endl;
     std::cout << "    valid (visible)  : " << st.nVisMeshValid << std::endl;
     std::cout << "    masked (hidden)  : " << st.nVisMeshMasked << std::endl;
-    std::cout << "  valid corresp used : " << corrSrcPts.size() << std::endl;
+    std::cout << "  valid corresp used : " << corrSrcPts.size()
+              << "  (dropped outlier=" << nDroppedOutlier << ")" << std::endl;
     std::cout << "  bbox diag          : " << diag << std::endl;
     std::cout << "  gaussian sigma     : " << sigma << std::endl;
     std::cout << "  K nearest          : " << K << std::endl;
@@ -1261,7 +1273,7 @@ inline void draw(
         if (st.stage == 1 && !st.srcPosCache.empty()) {
             for (size_t i = 0; i < st.srcPosCache.size(); i++) {
                 if (st.srcVisibility[i] == VIS_VISIBLE)
-                    { pos = st.srcPosCache[i]; found = true; break; }
+                { pos = st.srcPosCache[i]; found = true; break; }
             }
             label = "Stage1(srcVis)";
         } else if ((st.stage == 2 || st.stage == 3) && !st.correspondences.empty()) {
@@ -1633,7 +1645,7 @@ inline int applySequential(
     int total = static_cast<int>(st.seqPinnedParticleIdx.size()) + nMove;
     if (verbose) {
         std::cout << "[Apply] pinned=" << st.seqPinnedParticleIdx.size()
-                  << " move=" << nMove << " total=" << total << std::endl;
+        << " move=" << nMove << " total=" << total << std::endl;
     }
     return total;
 }

@@ -16,12 +16,18 @@
 #include "RayCast.h"
 #include "Sphere.h"
 #include "FullSphereCameraWithTarget.h"
+#include "SoftPartition.h"   // Phase U-1
 
 // main.cpp グローバル（最小限の extern）
 extern int gWindowWidth, gWindowHeight;
 extern glm::mat4 view, projection;
 extern glm::vec3 objPos;
 extern float g_sceneDiag;   // for scene-scale-relative marker radius (sync with RegRatios)
+
+// Phase U-1: main.cpp で定義、execute() が書き込む
+extern SoftPartition::AnchorSet g_softAnchors;
+extern float                    g_softUmeyamaScale;
+extern bool                     g_softPartReady;
 
 // boardMesh3D: 右画面でテクスチャ付き板メッシュを screenMesh (target cloud)
 // と一緒に表示するために参照する。
@@ -85,9 +91,9 @@ struct UmeyamaController {
 
     // Umeyamaボタン押下時 — 2画面モード開始
     void start(RegistrationData& reg, const FullSphereCamera& mainCam,
-               int winW, int winH) {
+               int winW, int winH, int pointCount = 3) {
         reg.reset();
-        reg.targetPointCount = 5;
+        reg.targetPointCount = (pointCount < 3) ? 3 : (pointCount > 5 ? 5 : pointCount);
         reg.state = RegistrationData::SELECTING_BOARD_POINTS;
         reg.useRegistration = false;
 
@@ -141,6 +147,33 @@ struct UmeyamaController {
                  FullSphereCamera& mainCam, int winW, int winH) {
         if (!reg.canRegister()) return;
 
+        // ----- Phase U-1: Umeyama 実行前に anchor を捕捉 -----
+        // applyRegistrationToMesh が直後に objectPoints を world 座標へ
+        // in-place 書き換えするため、local 座標はここで保存する。
+        {
+            const int N = (int)reg.objectPoints.size();
+            if (N >= SoftPartition::MIN_GROUPS && N <= SoftPartition::MAX_GROUPS &&
+                (int)reg.objectVertIdx.size() == N &&
+                (int)reg.boardPoints.size()   == N) {
+                g_softAnchors.clear();
+                g_softAnchors.srcVertIdx = reg.objectVertIdx;
+                g_softAnchors.srcLocal   = reg.objectPoints;   // LOCAL (まだ未変換)
+                g_softAnchors.tgtWorld   = reg.boardPoints;     // world (固定)
+                glm::mat4 T_ume = Reg3D::UmeyamaRegistration(
+                    reg.objectPoints, reg.boardPoints);
+                g_softUmeyamaScale = SoftPartition::extractScaleFromUmeyama(T_ume);
+                g_softPartReady = false;   // Shift+U で遅延計算
+                std::cout << "[Umeyama] Soft anchor captured: N=" << N
+                          << "  s_ume=" << g_softUmeyamaScale << std::endl;
+            } else {
+                g_softAnchors.clear();
+                g_softPartReady = false;
+                std::cout << "[Umeyama] Soft anchor NOT captured "
+                          << "(N=" << N << ", vertIdx="
+                          << reg.objectVertIdx.size() << ")" << std::endl;
+            }
+        }
+
         performRegistrationUmeyama(reg, organs);
 
         // 2画面を閉じてメインカメラに復帰
@@ -162,6 +195,8 @@ struct UmeyamaController {
             reg.state == RegistrationData::SELECTING_OBJECT_POINTS) {
             if (!reg.objectPoints.empty()) {
                 reg.objectPoints.pop_back();
+                if (!reg.objectVertIdx.empty())          // Phase U-1
+                    reg.objectVertIdx.pop_back();
                 std::cout << "[Umeyama] Undo object point. Remaining: "
                           << reg.objectPoints.size() << std::endl;
                 if (reg.state == RegistrationData::READY_TO_REGISTER)
@@ -236,13 +271,15 @@ struct UmeyamaController {
                 std::cout << "[Umeyama] Object point: click on LEFT screen" << std::endl;
                 return true;
             }
-            glm::vec3 pt = pickOnMesh(x, y, liver, &camLeft, halfW, winH);
+            int hitVert = -1;
+            glm::vec3 pt = pickOnMesh(x, y, liver, &camLeft, halfW, winH, &hitVert);
             if (pt.x > -900.0f) {
                 reg.objectPoints.push_back(pt);
+                reg.objectVertIdx.push_back(hitVert);     // Phase U-1: 並行保存
                 int idx = (int)reg.objectPoints.size() - 1;
                 std::cout << "[Umeyama] Object #" << (idx+1)
                           << " at (" << pt.x << "," << pt.y << "," << pt.z << ")"
-                          << std::endl;
+                          << "  vertIdx=" << hitVert << std::endl;
                 if (reg.objectPoints.size() >= reg.boardPoints.size()) {
                     reg.state = RegistrationData::READY_TO_REGISTER;
                     std::cout << "[Umeyama] >> All points selected. Press Execute."
@@ -403,9 +440,14 @@ struct UmeyamaController {
 
 private:
     // レイキャストでメッシュ上のクリック位置を取得
+    // vertIdxOut (optional): ヒット頂点 index を返す。RayCast はグローバル
+    // hit_index にヒット三角形 (i/3) を書き込むので、その 3 頂点から hit.position
+    // に最も近い 1 頂点を選ぶ。三角形が取れなければ global nearest で fallback。
     glm::vec3 pickOnMesh(float sx, float sy, mCutMesh* mesh,
-                         FullSphereCamera* cam, int vpW, int vpH) {
+                         FullSphereCamera* cam, int vpW, int vpH,
+                         int* vertIdxOut = nullptr) {
         const glm::vec3 MISS(-999.0f);
+        if (vertIdxOut) *vertIdxOut = -1;
         if (!mesh || mesh->mVertices.empty()) return MISS;
 
         cam->UpdateCamera();
@@ -416,8 +458,25 @@ private:
             sx, sy, v, p, glm::vec4(0, 0, vpW, vpH));
         RayCast::RayHit hit = RayCast::intersectMesh(
             ray, mesh->mVertices, mesh->mIndices);
+        if (!hit.hit) return MISS;
 
-        return hit.hit ? hit.position : MISS;
+        if (vertIdxOut) {
+            int tri  = hit_index;                  // global, set by intersectMesh
+            int best = -1;
+            if (tri >= 0 && (size_t)(tri * 3 + 2) < mesh->mIndices.size()) {
+                float bd = 1e30f;
+                for (int k = 0; k < 3; ++k) {
+                    int vi = (int)mesh->mIndices[tri * 3 + k];
+                    glm::vec3 pv = SoftPartition::vertexAt(*mesh, vi);
+                    float d = glm::dot(pv - hit.position, pv - hit.position);
+                    if (d < bd) { bd = d; best = vi; }
+                }
+            }
+            if (best < 0)
+                best = SoftPartition::nearestVertexIdx(*mesh, hit.position);
+            *vertIdxOut = best;
+        }
+        return hit.position;
     }
 
     // 対応点の球マーカー描画

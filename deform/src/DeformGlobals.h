@@ -148,6 +148,24 @@ inline bool  gShowingAfter    = false;
 // ============================================================================
 inline bool  gInspectMode     = false;
 
+// Fine-tune モード (AUTO DEFORM 後の手動微調整)。
+//   サブパネルの "Fine-tune mode" チェックボックスでトグルし、main.cpp の
+//   マウス処理が参照する。ON のとき DEFORM_MODE の通常メッシュグラブを止め、
+//   AUTO move 球 (gAutoCtrl の move handle) を直接クリックして掴み、カメラ
+//   平面内でドラッグして manualOffset を更新できる。
+//   グラブの一時状態 (掴み中 idx・起点・深度) は main.cpp 側の static で保持。
+inline bool  gFineTuneMode    = false;
+
+// AUTO DEFORM の field/handle 構築モード (debug トグル)。
+//   classify() は常に 3 分割 (inlier/mover/outlier)。この flag は computeFieldOnVisMesh
+//   に渡され、field 計算で OUTLIER 点を使うかどうかだけを切り替える。
+//   false (既定 = 3-way) : 全 ratioOK 点 (OUTLIER 込み) で field を作る。
+//                          → green/red=68/73, move[0]=(-0.12108,...)。本来の3-way。
+//   true  (2-way)        : CAT_OUTLIER を field から除外する (遠い対応点を切り捨て)。
+//                          → green/red=51/87, move[0]=(0.25352,...)。handle 配置が変わる。
+//   サブパネルのチェックボックスでトグルし、Stage 4(/5) を押し直すと反映される。
+inline bool  gUseTwoWayClassify = false;
+
 // Pending RMSE 表示 (settled measurement after physics relaxation)
 inline float gPendingRmseImmediate = 0.0f;
 inline int   gPendingRmseFrames    = 0;

@@ -74,6 +74,16 @@ struct RegUIActions {
     //   キーボードの Ctrl+G dispatch (main.cpp GLFW_KEY_G case) と
     //   結果 byte-identical になることが期待される。
     std::function<void()> onCtrlG;
+    // ---- Ctrl+I : V3I pure squash-IoU (silhouette align via the V3RS engine) ----
+    //   main.cpp mirrors the keyboard Ctrl+I dispatch:
+    //   labels-guard -> poseAutoSave -> runBipopCmaesV3I(mask) ->
+    //   poseSaveToLibrary(EITHER, mask).
+    std::function<void()> onCtrlI;
+    // ---- Shift+I : silhouette-fixed dilation RMSE refine (depth post-step) ----
+    //   Runs after Ctrl+I / Alt+P. main.cpp mirrors the keyboard Shift+I:
+    //   needs-reg-guard -> poseAutoSave -> runDilationRmseRefine() ->
+    //   poseSaveToLibrary(RMSE, mask).  Save MUST be RMSE (IoU is invariant).
+    std::function<void()> onShiftI;
     // onCtrlgLockScaleChanged: Ctrl+G の 6-DoF/7-DoF チェックボックス変更時。
     //   true  → main.cpp が g_ctrlgSearchMode = SIX_DOF_RIGID に
     //   false → main.cpp が g_ctrlgSearchMode = SEVEN_DOF に
@@ -215,6 +225,7 @@ struct RegUIState {
     int  depthModelIdx = 0;
     bool depthModelAvail[3] = {false, false, false};
     int boardPtCount = 0, objPtCount = 0, targetPtCount = 5;
+    int umeyamaPtCount = 3;   // [3-of-5] slider value, read at start()
     bool splitScreen = false;
     bool depthSplitScreen = false;
 
@@ -565,7 +576,7 @@ private:
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(c.x*0.07f,c.y*0.07f,c.z*0.07f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(c.x*0.14f,c.y*0.14f,c.z*0.14f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(c.x*0.22f,c.y*0.22f,c.z*0.22f,1));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c.x*0.7f,c.y*0.7f,c.z*0.7f,1));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c.x*0.92f,c.y*0.92f,c.z*0.92f,1));
         }
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
         char paddedLabel[128];
@@ -1750,22 +1761,63 @@ private:
         //  使われないため REGISTRATION 末尾の Advanced CollapsingHeader
         //  に退避し、ここを Ctrl+G 専用とした。
         {
-            // 有効条件: registration phase 中で、quadrant ラベルが計算済み。
-            // useRegistration (= 既存 reg 完了済み) は問わない: Ctrl+G は
-            // Apply Init Pose 直後でも (refinement なしの状態から) 走らせる
-            // ことがある。
-            bool ctrlgDisabled = !state.quadLabelsReady
-                                 || state.activeQuadrantMask == 0x00;
+            // ============================================================
+            //  REFINE flow:  Ctrl+G -> Ctrl+I -> Alt+P -> Shift+I
+            // ------------------------------------------------------------
+            //  Two region-aware CMA-ES optimizers (top row) + a light
+            //  silhouette aligner & the depth post-step (bottom row). Each
+            //  button mirrors its keyboard shortcut via the matching
+            //  actions.* callback — the manager never touches the engine
+            //  globals, so the "Parallel runs" / "pure IoU" toggles (now
+            //  ON by default) live in the "Tuning & Advanced" header below.
+            //
+            //  Row 1 — runnable from the default state (region/LR labels are
+            //          auto-computed on first use; share the Parallel toggle):
+            //    Ctrl+G  3D Fit ......... region-aware BIPOP-CMA-ES, 3D RMSE_W
+            //    Ctrl+I  Silhouette ..... pure squash-IoU (V3I engine)
+            //  Row 2 — refine an existing pose:
+            //    Alt+P   Silhouette Fast  light V1 silhouette align (pure IoU)
+            //    Shift+I Depth Dilation   1-D dilation RMSE (silhouette fixed)
+            // ============================================================
+            ImGui::TextColored(colReg(), "Refine");
 
-            // AutoQCR と同じ 2/3 + 1/3 レイアウト: ボタン本体 (左) +
-            // 6-DoF チェックボックス (右)。
-            // [Phase 8] Ctrl+G full-width button (shorter label). The 6-DoF
-            // lock checkbox moved into the Advanced collapsing header below
-            // (the Debug Panel G tab covers the 4-DoF / search-dimension radio).
-            if (glowButton("Ctrl+G", colReg(), ctrlgDisabled, -1, 56))
-            {
-                state.regMethod = 3;   // BIPOP method (Shift+V/F/G と同じ slot)
+            const float gap    = 4.0f;
+            const float availW = ImGui::GetContentRegionAvail().x;
+            const float halfW  = (availW - gap) * 0.5f;
+
+            // ----- Row 1: Ctrl+G | Ctrl+I (region-aware CMA-ES) -----
+            // Pressable from the default state: the only requirement is at
+            // least one quadrant selected (mask default = QUAD_ALL). The
+            // region/LR labels are auto-computed on first use inside the
+            // action (no HemiAuto needed); useRegistration not required
+            // either, so these run straight after Apply Init Pose or after
+            // dragging the mesh by hand.
+            const bool refineLabelsDisabled =
+                state.activeQuadrantMask == 0x00;
+
+            if (glowButton("3D Fit (Ctrl+G)", colReg(),
+                           refineLabelsDisabled, halfW, 50)) {
+                state.regMethod = 3;   // BIPOP slot (same as Shift+V/F/G)
                 if (actions.onCtrlG) actions.onCtrlG();
+            }
+            ImGui::SameLine(0.0f, gap);
+            if (glowButton("Silhouette (Ctrl+I)", colReg(),
+                           refineLabelsDisabled, -1, 50)) {
+                state.regMethod = 3;
+                if (actions.onCtrlI) actions.onCtrlI();
+            }
+
+            // ----- Row 2: Alt+P | Shift+I (refine an existing pose) -----
+            const bool refineNeedsReg = !state.useRegistration;
+
+            if (glowButton("FullMesh Sil (Alt+P)", colReg(),
+                           refineNeedsReg, halfW, 46)) {
+                if (actions.onSilhouetteAlign) actions.onSilhouetteAlign();
+            }
+            ImGui::SameLine(0.0f, gap);
+            if (glowButton("3D Refine (Shift+I)", colReg(),
+                           refineNeedsReg, -1, 46)) {
+                if (actions.onShiftI) actions.onShiftI();
             }
         }
 
@@ -1788,6 +1840,37 @@ private:
         // --- Manual Registration: Umeyama ---
         if(methodButton("Umeyama Manual", "", state.regMethod==2, state.regState, anyP && state.regMethod!=2, state.btnIconTex[RegUIState::ICON_UMEYAMA])) {
             state.regMethod = 2; if(actions.onStartUmeyama) actions.onStartUmeyama();
+        }
+        // [3-of-5] point-count selector, placed BELOW the Umeyama Manual button.
+        // Read by onStartUmeyama -> start(). Locked while the 2-screen session is
+        // live so the count can't desync boardPoints mid-pick. Label is orange
+        // (colReg) by default to tie it into the Umeyama workflow. Dot preview =
+        // group palette: first N filled, the rest grey/hollow.
+        {
+            ImGui::TextColored(colReg(), "Umeyama points");
+            if (state.splitScreen) ImGui::BeginDisabled();
+            ImGui::SliderInt("##umepts", &state.umeyamaPtCount, 3, 5);
+            if (state.splitScreen) ImGui::EndDisabled();
+
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 pp = ImGui::GetCursorScreenPos();
+            const float r = 7.0f, gap = 9.0f;
+            const float cy = pp.y + r + 2.0f;
+            for (int i = 0; i < 5; ++i) {
+                const float cx = pp.x + r + i * (r * 2 + gap);
+                ImVec4 c = pointColor(i);
+                const bool on = (i < state.umeyamaPtCount);
+                if (on)
+                    dl->AddCircleFilled(ImVec2(cx, cy), r,
+                                        IM_COL32((int)(c.x*255),(int)(c.y*255),(int)(c.z*255),255));
+                else
+                    dl->AddCircle(ImVec2(cx, cy), r, IM_COL32(110,110,110,180), 0, 1.5f);
+                char num[4]; snprintf(num, sizeof(num), "%d", i + 1);
+                ImVec2 ts = ImGui::CalcTextSize(num);
+                dl->AddText(ImVec2(cx - ts.x*0.5f, cy - ts.y*0.5f),
+                            on ? IM_COL32(255,255,255,230) : IM_COL32(160,160,160,120), num);
+            }
+            ImGui::Dummy(ImVec2(0, r * 2 + 8.0f));
         }
         if (state.regMethod == 2 && state.regState >= 1 && state.regState <= 3 && !state.splitScreen) {
             ImGui::Spacing();

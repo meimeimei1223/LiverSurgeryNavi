@@ -16,8 +16,12 @@ inline std::string ONNX_MODELS_PATH = "../../../sam2_da3_lite/onnx_models/";
 
 #ifdef _WIN32
 inline std::string DEPTH_EXE_PATH   = "./sam2_da3_lite.exe";
+inline std::string REG_EXE_PATH     = "./lsn_registration.exe";
+inline std::string DEFORM_EXE_PATH  = "./lsn_deform.exe";
 #else
 inline std::string DEPTH_EXE_PATH   = "./sam2_da3_lite";
+inline std::string REG_EXE_PATH     = "./lsn_registration";
+inline std::string DEFORM_EXE_PATH  = "./lsn_deform";
 #endif
 
 // --- Depth Model Selector ---
@@ -218,6 +222,26 @@ inline void initPaths() {
 #endif
                                                });
 
+    REG_EXE_PATH = findExe("REG_EXE_PATH", {
+#ifdef _WIN32
+                                               "./lsn_registration.exe",
+                                               "lsn_registration.exe",
+#else
+                                               "./lsn_registration",
+                                               "lsn_registration",
+#endif
+                                           });
+
+    DEFORM_EXE_PATH = findExe("DEFORM_EXE_PATH", {
+#ifdef _WIN32
+                                                     "./lsn_deform.exe",
+                                                     "lsn_deform.exe",
+#else
+                                                     "./lsn_deform",
+                                                     "lsn_deform",
+#endif
+                                                 });
+
     std::cout << "========================================" << std::endl;
     std::cout << "Final paths:" << std::endl;
     std::cout << "  MODEL_PATH:       " << MODEL_PATH << std::endl;
@@ -227,6 +251,8 @@ inline void initPaths() {
     std::cout << "  DEPTH_OUTPUT_PATH:" << DEPTH_OUTPUT_PATH << std::endl;
     std::cout << "  ONNX_MODELS_PATH: " << ONNX_MODELS_PATH << std::endl;
     std::cout << "  DEPTH_EXE_PATH:   " << DEPTH_EXE_PATH << std::endl;
+    std::cout << "  REG_EXE_PATH:     " << REG_EXE_PATH << std::endl;
+    std::cout << "  DEFORM_EXE_PATH:  " << DEFORM_EXE_PATH << std::endl;
     std::cout << "========================================\n" << std::endl;
 }
 
@@ -237,21 +263,21 @@ inline void initFilePaths() {
     PORTAL_FILE_PATH  = MODEL_PATH + "portal.obj";
     VEIN_FILE_PATH    = MODEL_PATH + "vein.obj";
     TUMOR_FILE_PATH   = MODEL_PATH + "tumor.obj";
-    SEGMENT_FILE_PATH = MODEL_PATH + "res.obj";
+    SEGMENT_FILE_PATH = MODEL_PATH + "segment.obj";
     GB_FILE_PATH      = MODEL_PATH + "gb.obj";
 
     PreReg_TARGET_FILE_PATH  = REG_MODEL_PATH + "preReg_liver.obj";
     PreReg_PORTAL_FILE_PATH  = REG_MODEL_PATH + "preReg_portal.obj";
     PreReg_VEIN_FILE_PATH    = REG_MODEL_PATH + "preReg_vein.obj";
     PreReg_TUMOR_FILE_PATH   = REG_MODEL_PATH + "preReg_tumor.obj";
-    PreReg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "preReg_res.obj";
+    PreReg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "preReg_segment.obj";
     PreReg_GB_FILE_PATH      = REG_MODEL_PATH + "preReg_gb.obj";
 
     Reg_TARGET_FILE_PATH  = REG_MODEL_PATH + "reg_liver.obj";
     Reg_PORTAL_FILE_PATH  = REG_MODEL_PATH + "reg_portal.obj";
     Reg_VEIN_FILE_PATH    = REG_MODEL_PATH + "reg_vein.obj";
     Reg_TUMOR_FILE_PATH   = REG_MODEL_PATH + "reg_tumor.obj";
-    Reg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "reg_res.obj";
+    Reg_SEGMENT_FILE_PATH = REG_MODEL_PATH + "reg_segment.obj";
     Reg_GB_FILE_PATH      = REG_MODEL_PATH + "reg_gb.obj";
 
     gDepthInputImage = INPUT_IMAGE_PATH + "target.jpg";

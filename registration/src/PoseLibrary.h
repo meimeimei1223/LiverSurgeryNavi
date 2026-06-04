@@ -869,6 +869,41 @@ inline void poseStartNewSession() {
 }
 
 // =========================================================================
+//  poseSyncSessionBestToCurrent
+//  -----------------------------------------------------------------------
+//  Call this right AFTER a manual Revert (Revert ICP / Revert CPD). Those
+//  reverts move the mesh back to the pre-registration pose but do NOT touch
+//  the session-best, which still reflects the now-reverted registration. That
+//  leaves the best stale: re-running the SAME registration produces the same
+//  RMSE, ties the stale best, and gets wrongly rejected — and the reject path
+//  then disables the Revert button (the double-revert guard). Re-syncing the
+//  session-best to the current (reverted) pose fixes both: the next run is
+//  compared against the correct baseline and accepted, and Revert stays usable.
+//
+//  Correctness: the manual revert applies inverse(appliedT), returning the mesh
+//  to exactly the pose that was the session-best BEFORE that registration ran,
+//  so "best == current reverted pose" restores the prior best (RMSE-criterion
+//  bests are monotone, so the reverted pose is precisely the previous best).
+// =========================================================================
+inline void poseSyncSessionBestToCurrent() {
+    computeUnifiedMetrics();
+    g_bestSessionCompRmse = registrationHandle.compRmse;
+    g_bestSessionIoU2D    = registrationHandle.compIoU2D;
+    // IoU_occluded is only produced on the V3RS path; the ICP/CPD gate uses
+    // IoU_full, so leave g_bestSessionIoU2D_occluded untouched here.
+    auto organs = getOrganList();
+    g_bestSessionVertices.resize(organs.size());
+    g_bestSessionNormals.resize(organs.size());
+    for (size_t i = 0; i < organs.size(); ++i) {
+        g_bestSessionVertices[i] = organs[i]->mVertices;
+        g_bestSessionNormals[i]  = organs[i]->mNormals;
+    }
+    std::cout << "[Session] session-best re-synced to reverted pose: CompRMSE="
+              << g_bestSessionCompRmse << " IoU2D=" << g_bestSessionIoU2D
+              << std::endl;
+}
+
+// =========================================================================
 //  poseSaveToLibrary
 //  -----------------------------------------------------------------------
 //  HemiAuto / BIPOP / Umeyama / Shift+E (Silhouette) 完了直後に呼ばれる。
@@ -1123,6 +1158,14 @@ inline void poseSaveToLibrary(SaveCriterion crit = SaveCriterion::RMSE,
             computeUnifiedMetrics();
             std::cout << "[Session] Reverted. CompRMSE=" << registrationHandle.compRmse
                       << " IoU2D=" << registrationHandle.compIoU2D << std::endl;
+
+            // [Phase U fix] The session just restored the best-so-far snapshot,
+            // so whatever the last registration applied is no longer in effect.
+            // Clear the manual-revert flags so the U-tab "Revert ICP"/"Revert
+            // CPD" buttons do NOT apply inverse(T) on top of the already-
+            // restored pose (which would double-revert and corrupt it).
+            g_softIcpCanRevert = false;
+            g_cpdCanRevert     = false;
         }
     }
 }

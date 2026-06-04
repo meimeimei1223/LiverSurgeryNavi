@@ -84,16 +84,20 @@ else()
     message(STATUS "tinyfiledialogs not found - drag & drop only")
 endif()
 
-# c-cmaes (Apache 2.0). Prefer tls_wrapper for OpenMP Run-level parallelism.
+# c-cmaes (Apache 2.0). third_party/c-cmaes splits into upstream/ (Hansen
+# c-cmaes, vendored verbatim — original names) and wrapper/ (our thin
+# engine-facing adapter). The upstream per-instance RNG + adapter make
+# Run-level OpenMP parallelism deterministic, so the old cmaes_tls_wrapper.c
+# and the self-made cmaes.c are no longer needed.
 set(CMAES_DIR "${CMAKE_SOURCE_DIR}/third_party/c-cmaes")
-if(EXISTS "${CMAES_DIR}/cmaes_tls_wrapper.c" AND EXISTS "${CMAES_DIR}/cmaes.c")
-    list(APPEND LSN_TP_SOURCES "${CMAES_DIR}/cmaes_tls_wrapper.c")
-    message(STATUS "c-cmaes: ${CMAES_DIR} (via tls_wrapper)")
-elseif(EXISTS "${CMAES_DIR}/cmaes.c")
-    list(APPEND LSN_TP_SOURCES "${CMAES_DIR}/cmaes.c")
-    message(WARNING "c-cmaes: cmaes_tls_wrapper.c not found, using cmaes.c directly (Run parallelism disabled)")
+if(EXISTS "${CMAES_DIR}/wrapper/cmaes_adapter.cpp" AND EXISTS "${CMAES_DIR}/upstream/src/cmaes.c")
+    list(APPEND LSN_TP_SOURCES
+        "${CMAES_DIR}/wrapper/hansen_cmaes_renamed.c"         # upstream cmaes.c, HANSEN_-renamed (C)
+        "${CMAES_DIR}/upstream/src/boundary_transformation.c" # box-constraint transform (C)
+        "${CMAES_DIR}/wrapper/cmaes_adapter.cpp")             # engine-facing 6-arg API (C++)
+    message(STATUS "c-cmaes: upstream Hansen via wrapper (${CMAES_DIR})")
 else()
-    message(FATAL_ERROR "c-cmaes not found at ${CMAES_DIR}")
+    message(FATAL_ERROR "c-cmaes upstream/wrapper not found at ${CMAES_DIR}")
 endif()
 
 # Eigen include dir
