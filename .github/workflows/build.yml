@@ -25,12 +25,15 @@ jobs:
           python3 -c "
           from huggingface_hub import hf_hub_download
           from onnx.external_data_helper import load_external_data_for_model
-          import onnx, os
+          import onnx, os, shutil
           print('Downloading Depth Anything V3 Small (model + external data)...')
           p = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx')
-          hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
-          m = onnx.load(p, load_external_data=False)
-          load_external_data_for_model(m, os.path.dirname(p))
+          pd = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
+          os.makedirs('dl', exist_ok=True)
+          shutil.copy(p, 'dl/model.onnx')
+          shutil.copy(pd, 'dl/model.onnx_data')
+          m = onnx.load('dl/model.onnx', load_external_data=False)
+          load_external_data_for_model(m, 'dl')
           onnx.save_model(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
           chk = onnx.load('onnx_models/depth_anything_v3_small.onnx', load_external_data=False)
           ext = [t.name for t in chk.graph.initializer if t.HasField('data_location') and t.data_location == onnx.TensorProto.EXTERNAL]
@@ -93,12 +96,15 @@ jobs:
           python3 -c "
           from huggingface_hub import hf_hub_download
           from onnx.external_data_helper import load_external_data_for_model
-          import onnx, os
+          import onnx, os, shutil
           print('Downloading Depth Anything V3 Small (model + external data)...')
           p = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx')
-          hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
-          m = onnx.load(p, load_external_data=False)
-          load_external_data_for_model(m, os.path.dirname(p))
+          pd = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
+          os.makedirs('dl', exist_ok=True)
+          shutil.copy(p, 'dl/model.onnx')
+          shutil.copy(pd, 'dl/model.onnx_data')
+          m = onnx.load('dl/model.onnx', load_external_data=False)
+          load_external_data_for_model(m, 'dl')
           onnx.save_model(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
           chk = onnx.load('onnx_models/depth_anything_v3_small.onnx', load_external_data=False)
           ext = [t.name for t in chk.graph.initializer if t.HasField('data_location') and t.data_location == onnx.TensorProto.EXTERNAL]
