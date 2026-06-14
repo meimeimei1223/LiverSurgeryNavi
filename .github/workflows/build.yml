@@ -24,25 +24,27 @@ jobs:
           mkdir -p onnx_models
           python3 -c "
           from huggingface_hub import hf_hub_download
+          from onnx.external_data_helper import load_external_data_for_model
           import onnx, os
-          print('Downloading Depth Anything V3 Small...')
+          print('Downloading Depth Anything V3 Small (model + external data)...')
           p = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx')
-          try:
-              d = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
-              m = onnx.load(p)
-              onnx.save(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
-              print('  Converted to single file')
-          except Exception:
-              import shutil
-              shutil.copy(p, 'onnx_models/depth_anything_v3_small.onnx')
-              print('  Copied single file')
+          hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
+          m = onnx.load(p, load_external_data=False)
+          load_external_data_for_model(m, os.path.dirname(p))
+          onnx.save_model(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
+          chk = onnx.load('onnx_models/depth_anything_v3_small.onnx', load_external_data=False)
+          ext = [t.name for t in chk.graph.initializer if t.HasField('data_location') and t.data_location == onnx.TensorProto.EXTERNAL]
+          if ext:
+              raise SystemExit('FATAL: packaged model still references external .onnx_data: ' + str(ext))
+          print('  OK single self-contained file: %.1f MB' % (os.path.getsize('onnx_models/depth_anything_v3_small.onnx') / 1024 / 1024))
           print('Downloading SAM2 encoder...')
           hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.encoder.onnx', local_dir='onnx_models/')
           print('Downloading SAM2 decoder...')
           hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.decoder.onnx', local_dir='onnx_models/')
           for f in os.listdir('onnx_models'):
-              sz = os.path.getsize(os.path.join('onnx_models', f))
-              print(f'  {f}: {sz/1024/1024:.1f} MB')
+              full = os.path.join('onnx_models', f)
+              if os.path.isfile(full):
+                  print('  %s: %.1f MB' % (f, os.path.getsize(full) / 1024 / 1024))
           "
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=$PWD/onnxruntime-linux-x64-gpu-1.15.1 -DENABLE_CUDA=ON
@@ -86,29 +88,31 @@ jobs:
       - name: Download ONNX models
         shell: bash
         run: |
-          pip install huggingface_hub onnx
+          pip install huggingface_hub onnx protobuf
           mkdir -p onnx_models
           python3 -c "
           from huggingface_hub import hf_hub_download
+          from onnx.external_data_helper import load_external_data_for_model
           import onnx, os
-          print('Downloading Depth Anything V3 Small...')
+          print('Downloading Depth Anything V3 Small (model + external data)...')
           p = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx')
-          try:
-              d = hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
-              m = onnx.load(p)
-              onnx.save(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
-              print('  Converted to single file')
-          except Exception:
-              import shutil
-              shutil.copy(p, 'onnx_models/depth_anything_v3_small.onnx')
-              print('  Copied single file')
+          hf_hub_download(repo_id='onnx-community/depth-anything-v3-small', filename='onnx/model.onnx_data')
+          m = onnx.load(p, load_external_data=False)
+          load_external_data_for_model(m, os.path.dirname(p))
+          onnx.save_model(m, 'onnx_models/depth_anything_v3_small.onnx', save_as_external_data=False)
+          chk = onnx.load('onnx_models/depth_anything_v3_small.onnx', load_external_data=False)
+          ext = [t.name for t in chk.graph.initializer if t.HasField('data_location') and t.data_location == onnx.TensorProto.EXTERNAL]
+          if ext:
+              raise SystemExit('FATAL: packaged model still references external .onnx_data: ' + str(ext))
+          print('  OK single self-contained file: %.1f MB' % (os.path.getsize('onnx_models/depth_anything_v3_small.onnx') / 1024 / 1024))
           print('Downloading SAM2 encoder...')
           hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.encoder.onnx', local_dir='onnx_models/')
           print('Downloading SAM2 decoder...')
           hf_hub_download(repo_id='vietanhdev/segment-anything-2-onnx-models', filename='sam2_hiera_tiny.decoder.onnx', local_dir='onnx_models/')
           for f in os.listdir('onnx_models'):
-              sz = os.path.getsize(os.path.join('onnx_models', f))
-              print(f'  {f}: {sz/1024/1024:.1f} MB')
+              full = os.path.join('onnx_models', f)
+              if os.path.isfile(full):
+                  print('  %s: %.1f MB' % (f, os.path.getsize(full) / 1024 / 1024))
           "
       - name: Configure
         shell: bash
