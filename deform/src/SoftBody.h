@@ -148,7 +148,7 @@ private:
     std::vector<int> activeParticles;
     const int NUM_ACTIVE_PARTICLES = 100;
 
-    bool showTetMesh = true;
+    bool showTetMesh = false;   // [UI] wireframe(TetMesh) default OFF (toggle: Key 0)
     glm::mat4 modelMatrix = glm::mat4(1.0f);
     const MeshData meshData;
     size_t numParticles;
@@ -288,5 +288,8 @@ public:
     void rigidRotateAroundCenter(const glm::vec3& axis, float angle);
     glm::vec3 getRigidPosition() const { return rigidPosition; }
 
+public:
+    // SoftBody.h にメンバ追加
+    float floorY = -std::numeric_limits<float>::max();  // 既定: 床なし
 };
 #endif

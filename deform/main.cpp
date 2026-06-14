@@ -42,9 +42,9 @@
 // 変形関連
 #include "Grabber.h"          // Grabber クラス
 #include "DeformGlobals.h"    // multiBody, gGrabber, bunnyPos, deformHandlPlace 等
-                              // ↑ AutoDeform.h → NoOpen3DRegistration.h → DepthUtils.h →
-                              //   stb_image.h を transitively include するが、
-                              //   STB_IMAGE_IMPLEMENTATION は既に undef 済みなので安全
+// ↑ AutoDeform.h → NoOpen3DRegistration.h → DepthUtils.h →
+//   stb_image.h を transitively include するが、
+//   STB_IMAGE_IMPLEMENTATION は既に undef 済みなので安全
 #include "DeformPipeline.h"   // initFromRegistered, updateAndDraw, onMouse*
 #include "AR.h"               // AR::Background (KeyA で背景オーバーレイ)
 
@@ -88,10 +88,10 @@ static bool  g_rigidHitObject = false;
 static int       g_fineGrabIdx     = -1;      // 掴み中の move handle idx (-1=なし)
 static glm::vec3 g_fineGrabStartOffset(0.0f); // 掴んだ瞬間の manualOffset
 static glm::vec3 g_fineGrabAnchor(0.0f);      // 掴んだ瞬間のマウスレイ上の点 (depth 固定面上)
-                                              //   ドラッグ中はこの点からの移動量を offset に積む。
-                                              //   クリック位置と球中心のズレで飛ばないための基準点。
+    //   ドラッグ中はこの点からの移動量を offset に積む。
+    //   クリック位置と球中心のズレで飛ばないための基準点。
 static float     g_fineGrabDepth   = 1.0f;    // 掴んだ点のカメラからの距離 (射影距離)
-                                              //   (これを固定 = カメラ平面内ドラッグ)
+    //   (これを固定 = カメラ平面内ドラッグ)
 
 FullSphereCamera OrbitCam;
 
@@ -108,6 +108,51 @@ RegistrationImGuiManager gUI;
 // ============================================================================
 static AR::Background g_arBg;
 static bool           g_arMode = false;
+
+// ============================================================================
+// [REG-parity AR] レターボックス・シーンビューポート
+//   REG (compute3DViewport) と同じく calib アスペクトを保持した矩形にシーン
+//   (AR背景 + メッシュ) を描く。投影は intrinsics 固定(calib アスペクト)なので、
+//   ビューポートも同アスペクトにしないとウィンドウ変形で背景/メッシュが歪む。
+//   ImGui はフルウィンドウ座標で描く。
+//     g_sceneRect     : GL ビューポート矩形 (x,y は左下基準オフセット)
+//     g_sceneViewport : ピッキング用 (0,0,w,h)。Grabber / RayCast::screenToRay は
+//                       viewport のオフセットを無視するため、座標側を矩形ローカルへ
+//                       変換して渡す(windowToScene)。REG の Umeyama と同じ規約。
+// ============================================================================
+static struct { int x = 0, y = 0, w = 1280, h = 720; } g_sceneRect;
+glm::vec4 g_sceneViewport(0.0f, 0.0f, 1280.0f, 720.0f);   // Grabber.h で extern 宣言
+
+// 右側に確保する UI 幅 (REG と同じ 400)。0 にすれば全幅レターボックス。
+static const int kSidebarW = 400;
+
+// calib アスペクトを保持したレターボックス矩形を g_sceneRect / g_sceneViewport に反映
+static void updateSceneViewport() {
+    int availW = gWindowWidth - kSidebarW;
+    int availH = gWindowHeight;
+    int vx = 0, vy = 0;
+    int vw = (availW > 0) ? availW : gWindowWidth;
+    int vh = (availH > 0) ? availH : gWindowHeight;
+    int cw = OrbitCam.calibWidth, ch = OrbitCam.calibHeight;
+    if (availW > 0 && availH > 0 && cw > 0 && ch > 0) {
+        float ca = (float)cw / (float)ch;
+        float aa = (float)availW / (float)availH;
+        if (aa > ca) { vh = availH; vw = (int)(vh * ca); vx = (availW - vw) / 2; vy = 0; }
+        else         { vw = availW; vh = (int)(vw / ca); vx = 0; vy = (availH - vh) / 2; }
+    }
+    g_sceneRect.x = vx; g_sceneRect.y = vy; g_sceneRect.w = vw; g_sceneRect.h = vh;
+    g_sceneViewport = glm::vec4(0.0f, 0.0f, (float)vw, (float)vh);
+}
+
+// ウィンドウ座標 (左上原点, px) → シーンビューポート・ローカル座標。
+//   g_sceneViewport=(0,0,w,h) と組み合わせて screenToRay に渡すと、レターボックス
+//   の中央寄せオフセットを正しく考慮したレイになる。GL ビューポートの y は左下基準
+//   なので、ウィンドウ上端からの矩形上端を引いて top-down ローカルへ直す。
+static void windowToScene(double winX, double winY, double& sx, double& sy) {
+    sx = winX - (double)g_sceneRect.x;
+    double vpTopFromWindowTop = (double)gWindowHeight - (double)(g_sceneRect.y + g_sceneRect.h);
+    sy = winY - vpTopFromWindowTop;
+}
 
 // AR Save Image 用: メインループ内のローカル shaderProgram / shaderProgramCube を
 // onSaveAR ラムダから参照するためのポインタ。main() の shader 初期化直後にセットする。
@@ -143,6 +188,68 @@ static void syncUIState();
 //   - 背景: original.jpg を必ず合成 (AR 画像として意味があるのは背景つき)。
 //
 // 戻り値: 保存成功なら true。
+// ============================================================================
+// [CT-handoff AR] DEFORM の臓器は CT 空間(固定 mm)にある。AR オーバーレイ / Save
+//   は「原点→+Z 固定 view + depth intrinsics 投影 + original.jpg 背景」で描くので、
+//   CT スケール(肝 diag≈8.6)のまま描くと巨大・ズレ位置になり写真に乗らない。
+//   そこで AR パスだけ、臓器を実カメラ frame へ戻してから投影する:
+//       CT --T--> registered --un-mirror--> camera/photo
+//   (REG/DEFORM は depth target を X ミラーするので、写真(未ミラー)に重ねるには
+//    registered を X 反転で戻す。)updateAndDraw の model は単位、カリングは無効なので
+//   view に反射行列を掛けても面が消えたり裏返ったりしない。
+//   reg_transform.txt が無ければ arView をそのまま返す(従来挙動)。
+//   T は実行中不変なので初回だけ読み、以降はキャッシュ(毎フレーム I/O / ログ抑止)。
+//
+//   ※ 反転軸は経験則(DEFORM の mirror は X のみ)。実 RGB に左右/上下が合わない
+//     場合は kArFlip を 1 行変えるだけで調整できる。
+// ============================================================================
+static glm::mat4 arViewForCtOrgans(const glm::mat4& arView, glm::vec3& outCamPos) {
+    // [CT-handoff AR] CT 空間の臓器/ターゲット/ボードを「実カメラ(写真)フレーム」へ
+    //   戻して intrinsics 投影に乗せるための合成行列 M = flip · T (T=CT->registered)。
+    //   臓器・ターゲット・ボードは updateAndDraw で同一 model/view/proj で描かれるため、
+    //   M が正しければ3者は必ず一緒に写真へ乗る(個別にズレることはない)。
+    //
+    //   ★ flip は IDENTITY (1,1,1)。これが正しい理由 —
+    //     depth cloud の X ミラー(mirrorMeshAndCloudX)は「registered フレームを
+    //     lookAt(原点→+Z)+intrinsics で描くと元写真にピタリ一致する」ようにするための
+    //     ミラーで、registered 空間に *既に焼き込まれている*。REG 側 Key A(ARSave)が
+    //     registered の臓器を origin→+Z + intrinsics + flip 無し で原写真に正しく重ねて
+    //     成立しているのがその証拠。DEFORM は臓器を T^-1 で CT へ移しただけなので、AR では
+    //     T で registered へ戻せば REG と完全同一フレームになる(= M = T、追加 flip 不要)。
+    //     ここに更に Xflip を掛けると「二重ミラー」となり、メッシュが左右反転して
+    //     裏返って見える(= これまでの症状の正体。カメラ位置ではなくハンドネスの問題)。
+    //     観測との整合: (-1,1,1)=Xのみ→1回余分にミラー→反転 / (-1,1,-1)=X+Z→ミラー+Z反転
+    //     で物体がカメラ背面へ→消失 / (1,1,1)=ミラー無し→REG と一致→正しい、で全て説明可。
+    //   ※ Z は厳禁(反転すると消える)。万一 RGB に乗らない時の調整は下の1行のみだが、
+    //     まず Board ON + Key A で「ボードの写真が背景写真に重なるか」を見て確定する:
+    //     (1,1,1)=flip 無し=REG と同一(既定/本命) / (-1,1,1)=X のみ(旧・二重ミラー)
+    static const glm::vec3 kArFlip(1.0f, 1.0f, 1.0f);   // identity: REG Key A と同一フレーム
+
+    static bool      s_init  = false;
+    static bool      s_haveT = false;
+    static glm::mat4 s_M(1.0f);
+    static glm::mat4 s_Minv(1.0f);
+    if (!s_init) {
+        s_init = true;
+        const glm::mat4 Tinv = DeformPipeline::loadRegToCtInverse(&s_haveT); // registered->CT
+        if (s_haveT) {
+            const glm::mat4 T     = glm::inverse(Tinv);                      // CT->registered
+            const glm::mat4 Xflip = glm::scale(glm::mat4(1.0f), kArFlip);    // registered->camera
+            s_M    = Xflip * T;                                             // CT -> camera/photo
+            s_Minv = glm::inverse(s_M);
+            std::cout << "[CT-handoff AR] organs will be rendered in camera frame "
+                         "for AR (flip=(" << kArFlip.x << "," << kArFlip.y << ","
+                      << kArFlip.z << "))." << std::endl;
+        } else {
+            std::cout << "[CT-handoff AR] no reg_transform.txt -> AR uses organs as-is."
+                      << std::endl;
+        }
+    }
+    if (!s_haveT) { outCamPos = glm::vec3(0.0f); return arView; }
+    outCamPos = glm::vec3(s_Minv * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)); // eye in CT space (lighting)
+    return arView * s_M;
+}
+
 static bool saveDeformARImage() {
     if (!g_shaderPtr || !g_shaderCubePtr) {
         std::cerr << "[ARSave/DEFORM] shaders not ready" << std::endl;
@@ -150,8 +257,13 @@ static bool saveDeformARImage() {
     }
 
     // --- 画像サイズ決定 ---
-    int imgW = (g_arBg.texW > 0) ? g_arBg.texW : gWindowWidth;
-    int imgH = (g_arBg.texH > 0) ? g_arBg.texH : gWindowHeight;
+    //   REG の ARSave::capture と同じく calib 解像度を基準にする(intrinsics の
+    //   fx/fy/cx/cy と一致させ、投影が狂わないようにする)。未設定時は背景テクスチャ
+    //   → ウィンドウの順でフォールバック。
+    int imgW = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth
+               : (g_arBg.texW > 0) ? g_arBg.texW : gWindowWidth;
+    int imgH = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight
+               : (g_arBg.texH > 0) ? g_arBg.texH : gWindowHeight;
     if (imgW <= 0 || imgH <= 0) {
         std::cerr << "[ARSave/DEFORM] invalid image size " << imgW << "x" << imgH << std::endl;
         return false;
@@ -194,16 +306,21 @@ static bool saveDeformARImage() {
                                        glm::vec3(0.0f, 1.0f, 0.0f));
 
         // --- intrinsics projection (入力画像サイズ基準) ---
+        //   [black-screen fix] AR は arViewForCtOrgans が臓器を registered(メートル系,
+        //   z≈0.5m, diag≈数m)へ戻して描く。OrbitCam.near/far は CT 空間表示用に
+        //   sceneDiag 比例で r 倍(near≈2.4 等)されているため、これを AR に使うと
+        //   メートル系の臓器が near 面の手前に来て全クリップ → 真っ黒。AR は scale 非依存
+        //   の固定 metric near/far(REG Key A と同じ 0.1/100)で組む。intrinsics 項
+        //   (fx/fy/cx/cy) は比率なのでスケール非依存でそのまま使える。
+        const float kArNear = 0.1f, kArFar = 100.0f;
         glm::mat4 arProj(0.0f);
         arProj[0][0] =  2.0f * OrbitCam.fx / imgW;
         arProj[1][1] =  2.0f * OrbitCam.fy / imgH;
         arProj[2][0] =  1.0f - 2.0f * OrbitCam.cx / imgW;
         arProj[2][1] =  2.0f * OrbitCam.cy / imgH - 1.0f;
-        arProj[2][2] = -(OrbitCam.farPlane + OrbitCam.nearPlane)
-                       / (OrbitCam.farPlane - OrbitCam.nearPlane);
+        arProj[2][2] = -(kArFar + kArNear) / (kArFar - kArNear);
         arProj[2][3] = -1.0f;
-        arProj[3][2] = -2.0f * OrbitCam.farPlane * OrbitCam.nearPlane
-                       / (OrbitCam.farPlane - OrbitCam.nearPlane);
+        arProj[3][2] = -2.0f * kArFar * kArNear / (kArFar - kArNear);
 
         // 1) 背景画像
         g_arBg.draw();
@@ -219,9 +336,12 @@ static bool saveDeformARImage() {
         //      描画のみ実行され、物理状態は一切変化しない。
         const bool savedInspect = gInspectMode;
         gInspectMode = true;
+        // [CT-handoff AR] CT 臓器を実カメラ frame へ戻して投影(写真に重なるように)。
+        glm::vec3 arCamPos;
+        const glm::mat4 arViewOrgans = arViewForCtOrgans(arView, arCamPos);
         DeformPipeline::updateAndDraw(
             0.0f, *g_shaderPtr, *g_shaderCubePtr,
-            arView, arProj, glm::vec3(0.0f));
+            arViewOrgans, arProj, arCamPos);
         gInspectMode = savedInspect;
 
         // --- pixel 読み取り + 上下反転 ---
@@ -341,6 +461,9 @@ static void onKey(GLFWwindow* win, int key, int, int action, int mods) {
 static void onMouseButton(GLFWwindow* win, int button, int action, int) {
     if (ImGui::GetIO().WantCaptureMouse) return;
     double x, y; glfwGetCursorPos(win, &x, &y);
+    // [REG-parity AR] レターボックス・ビューポートのローカル座標へ変換してから
+    //   ピッキング(Grabber / fine-tune は g_sceneViewport=(0,0,w,h) を使う)。
+    windowToScene(x, y, x, y);
 
     using S = DeformHandlPlaceData;
 
@@ -378,7 +501,7 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int) {
         if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT) {
             RayCast::Ray ray = RayCast::screenToRay(
                 (float)x, (float)y, view, projection,
-                glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+                g_sceneViewport);
 
             // 全ハンドル (fix+move を通し番号で) について、レイ上の最近接点で当たり判定。
             //   レイ上で handle center に最も近い点を求め、球内かどうかで判定する。
@@ -432,6 +555,10 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int) {
 }
 
 static void onMouseMove(GLFWwindow* win, double x, double y) {
+    // [REG-parity AR] 以降の x,y はレターボックス・ビューポートのローカル座標。
+    //   Grabber / fine-tune は g_sceneViewport=(0,0,w,h) を使うため、座標側で
+    //   中央寄せオフセットと GL ビューポートの y(左下基準)を吸収する。
+    windowToScene(x, y, x, y);
     // Keep the last position fresh even while the UI captures the mouse,
     // otherwise the first frame back in the scene jumps by a large dx/dy.
     static glm::vec2 last(0.0f);
@@ -490,7 +617,7 @@ static void onMouseMove(GLFWwindow* win, double x, double y) {
         && multiBody && (L && !R)) {
         RayCast::Ray ray = RayCast::screenToRay(
             (float)x, (float)y, view, projection,
-            glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+            g_sceneViewport);
 
         // 掴んだ深度の点 = レイ起点 + 方向 * 固定距離。
         glm::vec3 targetCenter = ray.origin + ray.direction * g_fineGrabDepth;
@@ -711,6 +838,18 @@ static void setupUICallbacks() {
     a.onSwitchToDeformMode = []{
         std::cout << "[UI] Already in DEFORM mode" << std::endl;
     };
+
+    // [deform round-trip FIX] メインパネル Export セクションの
+    // 「Export Deformed (CT) -> ct_deformed/」ボタン。
+    // これまで未配線だったため、UI 側の `if (actions.onExportDeformedCT)`
+    // ガードに弾かれて無言で何もしなかった。AutoDeformDebugPanel の
+    // ボタン / キー E と同じ exportDeformedOrgans() に接続する。
+    a.onExportDeformedCT = []{
+        bool ok = DeformPipeline::exportDeformedOrgans();   // -> registration_model/ct_deformed/
+        std::cout << "[UI] Export Deformed (CT) "
+                  << (ok ? "OK -> registration_model/ct_deformed/" : "FAILED")
+                  << std::endl;
+    };
 }
 
 // ============================================================================
@@ -765,10 +904,17 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    // カメラ設定(現状の正しい K4A 720p)
+    // カメラ設定: intrinsics.txt から読み込んで REG と同じ K を使う(AR の重なりを
+    //   REG と一致させるため)。読めなければ従来の K4A 720p ハードコードにフォールバック。
     OrbitCam.setWindowSizePointers(&gWindowWidth, &gWindowHeight);
     OrbitCam.setGlobalMatrixPointers(&view, &projection, &model, &objPos);
-    OrbitCam.setIntrinsics(918.234f, 918.112f, 640.152f, 366.447f, 1280, 720);
+    {
+        Reg3DCustom::CameraIntrinsics K = DeformPipeline::loadDeformIntrinsics();
+        if (K.valid())
+            OrbitCam.setIntrinsics(K.fx, K.fy, K.cx, K.cy, K.width, K.height);
+        else
+            OrbitCam.setIntrinsics(918.234f, 918.112f, 640.152f, 366.447f, 1280, 720);
+    }
     OrbitCam.printCameraInfo();
 
     // DeformPipeline の Key 1 で OrbitCam.InitialRadius を参照するためのポインタ登録
@@ -864,6 +1010,11 @@ int main(int argc, char** argv) {
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+        // [REG-parity AR] シーンは calib アスペクト保持のレターボックス・ビュー
+        //   ポートに描く(REG の compute3DViewport と同じ)。ImGui の前に全幅へ戻す。
+        updateSceneViewport();
+        glViewport(g_sceneRect.x, g_sceneRect.y, g_sceneRect.w, g_sceneRect.h);
+
         // === AR モード（KeyA で切替）===
         //   レジストレーション側 main.cpp の描画パスと同一ロジック:
         //     1) view を「原点 → +Z 方向」固定で上書き
@@ -878,18 +1029,53 @@ int main(int argc, char** argv) {
         //     マウスでカメラを回した際に「視点は固定なのに光源だけ動く」
         //     → ライティングだけ変化する不具合になる。AR save 関数とも揃える。
         glm::vec3 renderCamPos = OrbitCam.cameraPos;
+        glm::mat4 renderProjection = projection;   // 既定: CT 空間表示用(orbit, r倍near/far)
         if (g_arMode) {
-            view = glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f),
-                               glm::vec3(0.0f, 0.0f, 1.0f),
-                               glm::vec3(0.0f, 1.0f, 0.0f));
-            renderCamPos = glm::vec3(0.0f, 0.0f, 0.0f);
+            // [CT-handoff AR] CT 臓器を実カメラ frame へ戻して描画(背景写真に重なる)。
+            const glm::mat4 arViewBase = glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f),
+                                                     glm::vec3(0.0f, 0.0f, 1.0f),
+                                                     glm::vec3(0.0f, 1.0f, 0.0f));
+            view = arViewForCtOrgans(arViewBase, renderCamPos);
+
+            // [black-screen fix] AR は臓器を registered(メートル系)へ戻すので、
+            //   CT 用に r 倍した projection(near≈2.4)では near クリップで全消し→真っ黒。
+            //   AR 専用に固定 metric near/far(0.1/100, REG Key A と同じ)で intrinsics
+            //   投影を組み直す。fx/fy/cx/cy は比率なのでスケール非依存。
+            const int   pw = (OrbitCam.calibWidth  > 0) ? OrbitCam.calibWidth  : gWindowWidth;
+            const int   ph = (OrbitCam.calibHeight > 0) ? OrbitCam.calibHeight : gWindowHeight;
+            const float kArNear = 0.1f, kArFar = 100.0f;
+            glm::mat4 p(0.0f);
+            p[0][0] =  2.0f * OrbitCam.fx / pw;
+            p[1][1] =  2.0f * OrbitCam.fy / ph;
+            p[2][0] =  1.0f - 2.0f * OrbitCam.cx / pw;
+            p[2][1] =  2.0f * OrbitCam.cy / ph - 1.0f;
+            p[2][2] = -(kArFar + kArNear) / (kArFar - kArNear);
+            p[2][3] = -1.0f;
+            p[3][2] = -2.0f * kArFar * kArNear / (kArFar - kArNear);
+            renderProjection = p;
+
+            // [AR pick fix] ピッキング(RayCast::screenToRay / Grabber)はグローバル
+            //   `projection` を参照する。AR 中は view だけ AR 用(registered メートル系
+            //   eye)に書き換わるのに projection が orbit 用(CT 用 r 倍 near≈2.4)の
+            //   ままだと、不整合ペアで unproject され ray.origin がシーン全体(~0.3m)
+            //   を通り過ぎた位置に置かれる。その結果 Fine-tune のヒットテスト
+            //   (t = dot(c - origin, dir) <= 0 で skip)が全ハンドルを外し、
+            //   「AR 中にハンドルが掴めない/動かない」症状になる。
+            //   描画に使う AR projection をグローバルにも書き戻し、view と同じ
+            //   「描画時に更新 → 次フレームのマウスイベントが参照」の規約に揃える。
+            //   (AR OFF 時は OrbitCam.UpdateCamera が毎フレーム orbit projection を
+            //    グローバルへ書き戻すので、ここでの上書きは自動的に元に戻る。)
+            projection = p;
+
             g_arBg.draw();
         }
 
         DeformPipeline::updateAndDraw(
             dt, shaderProgram, shaderProgramCube,
-            view, projection, renderCamPos);
+            view, renderProjection, renderCamPos);
 
+        // [REG-parity AR] ImGui はフルウィンドウ座標で描くのでビューポートを戻す。
+        glViewport(0, 0, gWindowWidth, gWindowHeight);
         gUI.draw(gWindowWidth, gWindowHeight);
         AutoDeformDebugPanel::draw();   // AutoDeform 専用デバッグサブパネル
 

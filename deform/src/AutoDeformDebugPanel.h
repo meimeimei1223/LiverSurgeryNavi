@@ -151,6 +151,31 @@ inline void draw() {
                         ImVec4(0.3f, 0.55f, 0.85f, 1), prereq))
         tapKey(GLFW_KEY_1, 0);
 
+    // [Step1 tuning] 「ターゲット面より奥」と判定して hidden に落とすしきい値。
+    //   実 tol = srcBboxDiag * behindTargetTol。大きいほど奥のソース頂点も残す。
+    //   変更後は [1] を押し直すと反映される (Step1 を再計算するため)。
+    ImGui::SliderFloat("behind-target tol (x diag)##behindtol",
+                       &gAutoDeform.behindTargetTol, 0.01f, 0.50f, "%.3f");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Step 1 depth filter. A source (liver) vertex is demoted to HIDDEN when it\n"
+            "sits behind the nearest target point by more than (srcBboxDiag * value).\n"
+            "Larger = keep vertices further behind the target (looser);\n"
+            "smaller = stricter. The target is a single-view depth cloud, so too loose\n"
+            "lets the liver's BACK half match the front-only target -> wrong-direction\n"
+            "pulls and noisier correspondences. Re-run [1] to apply.");
+    }
+    if (gAutoDeform.srcBboxDiag > 0.0f) {
+        ImGui::TextDisabled("  -> tol = %.3f   (diag %.3f x %.3f)   behind-target demoted: %d",
+                            gAutoDeform.srcBboxDiag * gAutoDeform.behindTargetTol,
+                            gAutoDeform.srcBboxDiag, gAutoDeform.behindTargetTol,
+                            gAutoDeform.nPostDemoted);
+    } else {
+        ImGui::TextDisabled("  (run [1] once to measure srcBboxDiag)");
+    }
+
     if (fullWidthButton("[2] Extract Correspondences",
                         ImVec4(0.3f, 0.55f, 0.85f, 1), prereq))
         tapKey(GLFW_KEY_2, 0);
@@ -356,7 +381,7 @@ inline void draw() {
         ImGui::Separator();
         ImGui::TextDisabled("Quality:");
         ImGui::SliderInt  ("Boost iter during auto",   &AutoDeformOpt::gAutoBoostIter,
-                           20, 200);
+                         20, 200);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
                 "Number of solver iterations per Key 6 / Bksp tap, while\n"
@@ -508,6 +533,23 @@ inline void draw() {
                     gAutoDeform.fixHandles.size(),
                     gAutoDeform.moveHandles.size());
     }
+
+    // ------------------------------------------------------------------------
+    // [CT-handoff round-trip] 変形結果(CT 空間)を OBJ 出力。
+    //   initFromRegistered が ct_input/(T^-1 適用済み)から SoftBody を作るので、
+    //   ここで出る organ は CT 空間。出力先は中立名 ct_deformed/。
+    //   REG 側にこのフォルダを「通常ドロップ」すると prealign で target に再フィット
+    //   され(register#2 の出発点)、ゼロ変形なら REG#1 と同じ位置に戻る。
+    //   ※ "deformed" 名は preserve-pose 判定で prealign を飛ばすため使わない。
+    // ------------------------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.55f, 1), "Round-trip (REG#2 handoff)");
+    if (fullWidthButton("Export Deformed (CT) -> ct_deformed/  [drop into REG]",
+                        ImVec4(0.18f, 0.55f, 0.32f, 1),
+                        (multiBody != nullptr))) {
+        DeformPipeline::exportDeformedOrgans();   // -> registration_model/ct_deformed/
+    }
+    ImGui::TextDisabled("then: drop ct_deformed/ into REG (normal drop) -> register #2 -> Shift+M");
 
     ImGui::End();
     ImGui::PopStyleColor(4);

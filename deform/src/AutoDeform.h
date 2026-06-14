@@ -94,6 +94,14 @@ struct State {
     Stats statsInterior;
 
     float silhouetteThreshold = 12.0f;
+
+    // [Step1 depth filter] ソース頂点が「ターゲット面より奥」と判定されて hidden に
+    //   降格されるしきい値。実 tol = srcBboxDiag * behindTargetTol。大きいほど奥の
+    //   ソース頂点も visible に残す(緩い)、小さいほど厳しい。単一視点 target なので
+    //   既定 0.05 はやや厳しめ。AutoDeform パネルのスライダから変更可(変更後 [1] 再実行)。
+    float behindTargetTol = 0.05f;
+    int   nPostDemoted    = 0;   // 直近 Step1 で behind-target depth filter が落とした数
+
     float thrInlierSil  = 0.0f;
     float thrOutlierSil = 0.0f;
     float thrInlierInt  = 0.0f;
@@ -302,7 +310,7 @@ inline void classifySrcVisibility(
             Reg3DCustom::NanoflannAdaptor adaptor(screenPts);
             auto tree = Reg3DCustom::buildKDTree(adaptor);
 
-            float depthTol = diag * 0.05f;
+            float depthTol = diag * st.behindTargetTol;   // [Step1 tuning] panel slider 連動
             for (size_t idx = 0; idx < Nsrc; idx++) {
                 if (st.srcVisibility[idx] != VIS_VISIBLE) continue;
                 glm::vec3 p = st.srcPosCache[idx];
@@ -321,6 +329,7 @@ inline void classifySrcVisibility(
             }
         }
     }
+    st.nPostDemoted = postDemoted;
 
     Reg3DCustom::NoOpen3DRegistration reg;
     auto targetCloud = reg.extractFrontFacePoints(*screenMesh, gridW, gridH, 0.05f);
@@ -339,7 +348,7 @@ inline void classifySrcVisibility(
     std::cout << "    raycast vis.  : " << vis.visibleCount << std::endl;
     std::cout << "    occluded      : " << vis.occludedCount << std::endl;
     std::cout << "    backface      : " << vis.backfaceCount << std::endl;
-    std::cout << "    post demoted  : " << postDemoted << " (depthTol=" << diag * 0.05f << ")" << std::endl;
+    std::cout << "    post demoted  : " << postDemoted << " (depthTol=" << diag * st.behindTargetTol << ")" << std::endl;
     std::cout << "  --- final ---" << std::endl;
     std::cout << "    visible  (G)  : " << st.nVisVisible
               << " (" << (Nsrc > 0 ? 100.0f * st.nVisVisible / Nsrc : 0.0f) << "%)" << std::endl;

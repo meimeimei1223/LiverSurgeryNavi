@@ -101,11 +101,21 @@ void SoftBody::preSolve(float dt, const glm::vec3& gravity) {
         VectorMath::vecCopy(prevPositions, i, positions, i);
         VectorMath::vecAdd(positions, i, velocities, i, dt);
 
-        if (positions[3 * i + 1] < -5.0f) {
+        // SoftBody.h にメンバ追加
+        float floorY = -std::numeric_limits<float>::max();  // 既定: 床なし
+
+        // preSolve 内
+        if (positions[3 * i + 1] < floorY) {
             VectorMath::vecCopy(positions, i, prevPositions, i);
-            positions[3 * i + 1] = -5.0f;
-            velocities[3 * i + 1] = -5.0f;
+            positions[3 * i + 1] = floorY;
+            velocities[3 * i + 1] = 0.0f;   // -5.0f は誤り
         }
+
+        // if (positions[3 * i + 1] < -5.0f) {
+        //     VectorMath::vecCopy(positions, i, prevPositions, i);
+        //     positions[3 * i + 1] = -5.0f;
+        //     velocities[3 * i + 1] = -5.0f;
+        // }
     }
 }
 
@@ -593,7 +603,7 @@ SoftBody::SoftBody(const MeshData& tetMesh,
     setupVisMeshes();
     setupTetMesh();
 
-    showTetMesh = true;
+    showTetMesh = false;   // [UI] wireframe(TetMesh)はデフォルトOFF。Key 0 / チェックボックスでON
     modelMatrix = glm::mat4(1.0f);
     std::cout << "=== Constructor Complete ===" << std::endl;
 
@@ -766,6 +776,17 @@ void SoftBody::computeSkinningInfoForMesh(const std::vector<float>& visVerts,
     size_t numMeshVerts = visVerts.size() / 3;
 
     std::cout << "Computing skinning for mesh with " << numMeshVerts << " vertices" << std::endl;
+
+    // [crash-fix] 空の臓器(例: segment.obj が 0 頂点 = セグメント無し)はスキニング
+    //   対象が無い。このまま進むと Hash(spacing, maxNumObjects=0) が tableSize=0 で
+    //   構築され、hashCoords の `% tableSize` で 0 除算(SIGFPE)クラッシュする
+    //   (スキニング内側ループは tet 数で回るため vis が空でも query が呼ばれる)。
+    //   skinningInfoOut は呼び出し側で既に 4*0 にリサイズ済みなので空にして返す。
+    if (numMeshVerts == 0) {
+        skinningInfoOut.clear();
+        std::cout << "  (skip skinning: empty vis mesh)" << std::endl;
+        return;
+    }
 
     glm::vec3 tetMin(std::numeric_limits<float>::max());
     glm::vec3 tetMax(std::numeric_limits<float>::lowest());

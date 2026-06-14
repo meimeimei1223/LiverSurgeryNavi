@@ -494,6 +494,11 @@ struct mCutMesh {
         }
         mesh.numFaces = faces.size();
         mesh.mColor = glm::vec3(0.7f, 0.7f, 0.7f);
+        // [debug-log FIX] 成功時もログを出す。従来は open 失敗時しか出力が
+        // 無く、REG 側で organ をロードしても何も表示されず分かりにくかった。
+        std::cout << "[MeshLoad] " << filePath
+                  << "  V:" << vertices.size()
+                  << " F:" << faces.size() << std::endl;
         return mesh;
     }
     void generateGridPlaneWithSides(int gridWidth, int gridHeight, float thickness = 0.05f) {

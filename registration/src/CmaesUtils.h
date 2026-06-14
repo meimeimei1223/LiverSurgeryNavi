@@ -22,6 +22,7 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <cstdio>     /* printf / fflush — used by the one-shot [Sil2D/omp] diagnostic */
 #include <iomanip>
 #include <cmath>
 #include <algorithm>
@@ -54,6 +55,19 @@ extern int stbi_write_png(const char*, int, int, int, const void*, int);
 extern "C" {
 #include "third_party/c-cmaes/wrapper/cmaes.h"
 }
+
+/* Portable 64-bit popcount: GCC/Clang have __builtin_popcountll, MSVC does not.
+   Used by the bit-path silhouette IoU in computeSilhouetteIoU2D(). */
+#if defined(_MSC_VER)
+#include <intrin.h>
+static inline int lsn_popcountll(unsigned long long v) {
+    return (int)__popcnt64(v);
+}
+#else
+static inline int lsn_popcountll(unsigned long long v) {
+    return __builtin_popcountll(v);
+}
+#endif
 
 /* RegistrationData forward declaration - defined in RegistrationUI.h */
 struct RegistrationData;
@@ -441,6 +455,136 @@ inline void silProfReset() {
 inline bool  g_silAcceptIgnoreRmse = false;
 inline float g_silAcceptRmseCap    = 1.2f;
 
+// ===========================================================================
+// [PERF/Downsample] Alt+P 内側 RMSE ゲート用の探索ターゲット雲を voxel 間引きする。
+//   この間引きは CMA-ES 内側ループ (fastComputeRMSE / 10世代ごとの updateCorrespondences)
+//   だけに効く。RUN ごとの computeUnifiedMetrics(外側=権威メトリクス) はフル雲のまま走る
+//   ので、最終 IoU/RMSE/PoseLibrary は間引きの影響を受けない。
+//   ⇒ 「OFF=フル317k で探索」と「ON=間引きで探索」の最終 full-IoU を直接比較してデバッグ可能。
+//   sil モードでは fval は IoU 目的関数なので、間引きは RMSE 値そのものではなく
+//   bad ゲート(matched 比) と探索速度にのみ影響する(=近似。ビット厳密ではない)。
+//   間引き本体は既存 Reg3DCustom::voxelDownSample を再利用 (車輪の再開発をしない)。
+inline bool  g_silDownsampleEnable     = true;    // 既定 ON (検証済: 8.69s→2.29s, 最終IoU 0.8740→0.8749)
+    // OFF=フル雲(レガシー基準・比較デバッグ用)
+inline float g_silDownsampleVoxelRatio = 0.01f;   // voxel_size = ratio * g_sceneDiag
+inline long  g_silDownsampleFullCount  = 0;       // 直近 Alt+P の間引き前点数 (UI 表示用)
+inline long  g_silDownsampleDownCount  = 0;       // 直近 Alt+P の間引き後点数 (UI 表示用)
+
+// ---------------------------------------------------------------------------
+// [PERF TOGGLE / 厳密] g_silExactPerf — 外側の冗長コスト削減 (結果不変)
+//   ON のとき (sil モード限定で発火):
+//   (1) run() 内で「戻り値が一切使われない」computeUnifiedMetrics 3箇所
+//       (snapshot 復元直後 / revert 後 x2) を、エントリ時に退避した
+//       registrationHandle 値の復元で置き換える。復元時の pose はエントリ時と
+//       バイト同一 (snap_v を書き戻した直後) であり、computeUnifiedMetrics は
+//       決定的なので、再計算した場合とビット一致。accept 判定が値を読む 2箇所
+//       (エントリ測定 / 候補測定) は従来どおり必ず走る。
+//   (2) voxel ダウンサンプル結果をセッション越しにキャッシュ。キーは
+//       「ソース全点列の完全一致 (~1ms) + voxel 値の完全一致」なので厳密
+//       (ハッシュ衝突の余地なし)。一致しなければ普通に再計算。
+//   OFF = 従来どおり毎回再計算 (A/B 比較デバッグ用レガシー基準)。
+//   検証: OFF/ON で最終 IoU・最終姿勢・PoseLibrary エントリがビット一致するはず。
+inline bool g_silExactPerf = true;    // 既定 ON (検証済: OFF/ON で全Run・最終IoU/RMSE/PoseLibrary ビット一致)
+    // OFF = 毎回再計算 (レガシー基準・比較デバッグ用)
+
+// ---------------------------------------------------------------------------
+// [QUAD-SIL] Alt+P quadrant-aware silhouette — session-scoped triangle
+//   override for computeSilhouette2DObjectiveFast.
+//
+//   When non-null and non-empty, the rasterizer uses THESE triangle indices
+//   instead of liver->mIndices. The indices are full-mesh vertex ids, so the
+//   per-vertex screen[] / inside[] arrays (built over ALL vertices) remain
+//   valid; only the set of triangles splatted into the hitmap shrinks.
+//
+//   Why a session global (and not a parameter): the V1 engine measures the
+//   silhouette objective at FOUR points that must all agree for the accept
+//   gate to be coherent — (a) best_rmse init, (b) every CMA-ES inner eval,
+//   (c) initial_fval re-measure, (d) iou_after accept measure — plus
+//   runShiftE's own measureIoU before/after. All of them funnel through
+//   computeSilhouette2DObjectiveFast, so one switch here covers every
+//   measurement point on the same yardstick. This mirrors how V3I flips
+//   g_ctrlgsPureIoUMode around one runBipopCmaesV3RS call.
+//
+//   Set/cleared ONLY by runShiftE (RegistrationActions.h). runShiftE clears
+//   it BEFORE its final computeUnifiedMetrics so the app-wide reported
+//   metrics (registrationHandle.compIoU2D etc.) stay full-mesh — the same
+//   convention Ctrl+I follows (its PoseLibrary Layer-4 IoU is also the
+//   full-mesh computeUnifiedMetrics value).
+//
+//   nullptr (default) = byte-identical legacy behaviour for every caller.
+//   NOTE: the non-fast raycast variant (computeSilhouette2DObjective) does
+//   NOT honour this override; runShiftE always runs with
+//   use_silhouette_2d_fast = true, so that path never sees a filter.
+// ---------------------------------------------------------------------------
+inline const std::vector<GLuint>* g_silTriOverride = nullptr;
+
+// ---------------------------------------------------------------------------
+// [QUAD-SIL PIVOT] Alt+P quadrant-aware silhouette — session-scoped rotation
+//   pivot override for applyIncrementalSRT.
+//
+//   PROBLEM this fixes: applyIncrementalSRT builds its rotate/scale transform
+//   around the FULL-mesh centroid. When the silhouette objective only scores
+//   a quadrant SUBSET (left-anterior, say), that subset sits off-centre from
+//   the full-mesh centroid, so every CMA-ES rotation swings the subset on a
+//   long lever arm — a tiny rotation throws the subset far off the target,
+//   and the optimiser's rotation DOFs become almost unusable. Ctrl+G (V3R)
+//   never has this problem because build_srt_matrix_v3 rotates around the
+//   SUBSET centroid (S.centroid = compute_centroid_v3 of the subset cloud).
+//
+//   FIX: when this pointer is set, applyIncrementalSRT rotates/scales about
+//   the centroid of the SUBSET VERTICES (computed from the CURRENT mesh pose
+//   each call, exactly as the full-mesh path recomputes its centroid every
+//   call) instead of the full-mesh centroid — the 2D analogue of what Ctrl+G
+//   does in 3D. The subset then turns about its own centre, matching the
+//   geometry the IoU objective actually scores.
+//
+//   Stored as a VERTEX-INDEX list (not a frozen coordinate) so the pivot
+//   tracks the mesh as CMA-ES moves it — same semantics as the legacy
+//   "recompute the centroid from the current vertices every call" behaviour.
+//
+//   Set/cleared ONLY by runShiftE, in lockstep with g_silTriOverride (both
+//   armed together for a quadrant session, both disarmed before the final
+//   metrics). At QUAD_ALL the subset == full mesh, so the subset centroid
+//   equals the full-mesh centroid; runShiftE leaves this null in that case
+//   anyway, so the default path is byte-identical for every caller.
+//
+//   nullptr (default) = legacy full-mesh-centroid pivot. Honoured ONLY by
+//   applyIncrementalSRT (the per-Run jitter used by runShiftE). Other SRT
+//   builders (build_srt_matrix_v3 etc.) are untouched.
+// ---------------------------------------------------------------------------
+inline const std::vector<int>* g_silPivotVertIdx = nullptr;
+
+// ---------------------------------------------------------------------------
+// [QUAD-SIL BRAKE] Alt+P quadrant-aware silhouette — mask-expansion brake.
+//
+//   PROBLEM this fixes: the V1 silhouette objective is the SYMMETRIC IoU
+//   (inter / union). With a quadrant SUBSET as the source, the subset is
+//   small, so the optimiser can score a higher IoU by INFLATING the subset
+//   (scale up, rotate to the frustum-rotation cap) to blanket the target
+//   than by aligning it precisely — "just cover everything" wins. Observed
+//   in logs as scale pinned at 1.1, rotation pinned at the 20-deg cap, and
+//   F9 showing the source ballooned over the whole target (precision 0.68,
+//   recall 0.97). Ctrl+I (V3RS) doesn't have this because it carries the
+//   asymmetric outside_ratio penalty (g_ctrlgsLambdaOut) that V1 lacked.
+//
+//   FIX (port of V3RS's outside_ratio brake): when g_silOutsideLambda > 0,
+//   computeSilhouette2DObjectiveFast adds  lambda * outside_ratio  to the
+//   returned cost, where
+//       outside_ratio = (source cells outside the target mask)
+//                       / (source cells)         in [0,1]
+//   This is exactly CmaesRefineV3RS's outside_ratio (source ⊄ target). It
+//   directly penalises inflation: a source that balloons past the target
+//   pays in proportion to how much sticks out, so precise alignment beats
+//   blanket-cover.
+//
+//   Set/cleared ONLY by runShiftE, in lockstep with the other QUAD-SIL
+//   overrides (armed for a quadrant session, disarmed before final metrics).
+//   0.0 (default) = byte-identical legacy behaviour: the brake term is
+//   skipped entirely, so every existing caller (and Q:ALL Alt+P) is
+//   unchanged. Honoured ONLY by computeSilhouette2DObjectiveFast.
+// ---------------------------------------------------------------------------
+inline float g_silOutsideLambda = 0.0f;
+
 // ---------------------------------------------------------------------------
 // [PERF] buildSilhouetteTargetMaskFast
 //   computeSilhouette2DObjectiveFast の Step 3 (ターゲット mask 構築) を
@@ -493,7 +637,12 @@ inline float computeSilhouette2DObjectiveFast(
     float* outHausdorff2D = nullptr,
     // [PERF] 事前構築済みターゲット mask (size==gw*gh のとき Step 3 を skip)。
     //   nullptr (既定) のとき従来どおり内部で構築 → 既存呼び出しはバイト一致。
-    const std::vector<uint8_t>* precomputedTargetMask = nullptr)
+    const std::vector<uint8_t>* precomputedTargetMask = nullptr,
+    // [PERF/bit] ターゲット mask の 1bit/cell パック版 (size==(gw*gh+63)/64)。
+    //   g_silFastPath ON かつ outHausdorff2D==nullptr のとき bit 経路 (word merge +
+    //   popcount IoU) を選択。nullptr のとき byte 経路にフォールバック (= 従来動作)。
+    //   OR/AND/popcount は厳密なので byte 経路と inter/uni がビット一致 → 結果不変。
+    const std::vector<uint64_t>* precomputedTargetMaskBits = nullptr)
 {
     if (!liver || !g_boundaryDistMap.valid) return 9.9f;
 
@@ -504,7 +653,13 @@ inline float computeSilhouette2DObjectiveFast(
     const int gh   = (imgH+step-1)/step;
 
     const auto& V = liver->mVertices;
-    const auto& I = liver->mIndices;
+    // [QUAD-SIL] Triangle source: quadrant-filtered override when active
+    // (Alt+P with a partial quadrant mask), else the full mesh. Both are
+    // std::vector<GLuint>; indices are full-mesh vertex ids either way, so
+    // everything below (screen[] / inside[] sized to nVerts) is unchanged.
+    const auto& I = (g_silTriOverride && !g_silTriOverride->empty())
+                        ? *g_silTriOverride
+                        : liver->mIndices;
     const int nVerts = (int)(V.size()/3);
     const int nTris  = (int)(I.size()/3);
     if (nVerts == 0 || nTris == 0) return 9.9f;
@@ -548,78 +703,175 @@ inline float computeSilhouette2DObjectiveFast(
     /* Step 2: 三角形ラスタライズで hitmap を構築
        前面判定: スクリーン空間で 3頂点が CCW (signed area > 0) のものだけ描画。
        これは back-face culling と同等(view 依存は MVP 変換内で処理済み)。 */
-    std::vector<uint8_t> hitmap(gw*gh, 0);
+    const int nCells = gw*gh;
+    int inter = 0, uni = 0;
+    std::vector<uint8_t>  hitmap;    // byte 経路で確保。bit 経路では空のまま (Step5 用に関数スコープへ退避)
+    std::vector<uint64_t> hitBits;   // bit 経路の 1bit/cell hitmap
 
+    bool tookBit = false;
 #ifdef _OPENMP
-    /* 三角形ごとの並列化: 書き込み先が共通のため、各スレッドがローカル hitmap
-       を持ち、最後にマージする。hitmap は 0/1 のみなので OR でマージ。 */
-    int nThreads = omp_get_max_threads();
-    std::vector<std::vector<uint8_t>> local(nThreads, std::vector<uint8_t>(gw*gh, 0));
-    // [PROFILE] hitmap + per-thread local の確保/ゼロ初期化を alloc に積む。
-    auto _tAlloc = std::chrono::steady_clock::now();
-    g_silProf_alloc += _msP(_tS2, _tAlloc);
+    const int nWords = (nCells + 63) >> 6;
+    /* bit 経路の発火条件: fast path ON / Hausdorff 不要 / bit ターゲット mask 提供かつ語数一致。
+       Hausdorff(Step5) は byte hitmap を使うので、要求時(outHausdorff2D!=null)は byte 経路へ倒す。 */
+    tookBit = (g_silFastPath && !outHausdorff2D &&
+               precomputedTargetMaskBits &&
+               (int)precomputedTargetMaskBits->size() == nWords);
+    if (tookBit) {
+        /* ===== bit 経路: 各スレッド bit-local にラスタライズ → word OR で統合 =====
+           per-thread なので書き込み競合なし。merge は 1bit/cell でデータ量 1/8 + 64cell/word、
+           225 語の直列 OR なので fork/join 不要。raster の被覆判定は byte 経路と完全同一。 */
+        int nThreads = omp_get_max_threads();
+        std::vector<std::vector<uint64_t>> localBits(nThreads, std::vector<uint64_t>(nWords, 0ULL));
+        hitBits.assign(nWords, 0ULL);
+        // [PROFILE] bit-local 確保/ゼロ初期化を alloc に積む。
+        auto _tAllocB = std::chrono::steady_clock::now();
+        g_silProf_alloc += _msP(_tS2, _tAllocB);
+        static bool _ompDiagOnceB = false;
+        if (!_ompDiagOnceB) { _ompDiagOnceB = true;
+            printf("[Sil2D/omp] DEFINED(bit)  in_parallel=%d  max=%d  gw=%d gh=%d nCells=%d nWords=%d nTris=%d\n",
+                   omp_in_parallel(), omp_get_max_threads(), gw, gh, nCells, nWords, nTris);
+            fflush(stdout); }
 #pragma omp parallel for schedule(dynamic, 64)
-    for (int ti = 0; ti < nTris; ti++) {
-        int tid = omp_get_thread_num();
-        auto& hm = local[tid];
-#else
-    {
-        auto& hm = hitmap;
         for (int ti = 0; ti < nTris; ti++) {
-#endif
-        int i0 = I[ti*3+0], i1 = I[ti*3+1], i2 = I[ti*3+2];
-        if (!inside[i0] && !inside[i1] && !inside[i2]) continue;
-        const glm::vec3& s0 = screen[i0];
-        const glm::vec3& s1 = screen[i1];
-        const glm::vec3& s2 = screen[i2];
-        /* スクリーン空間 signed area (backface culling) */
-        float area2 = (s1.x - s0.x) * (s2.y - s0.y) -
-                      (s2.x - s0.x) * (s1.y - s0.y);
-        if (area2 <= 0.0f) continue;  /* 裏向き or 縮退 */
-
-        /* バウンディング矩形 (grid 座標、整数に丸め) */
-        float minX = std::min({s0.x, s1.x, s2.x});
-        float maxX = std::max({s0.x, s1.x, s2.x});
-        float minY = std::min({s0.y, s1.y, s2.y});
-        float maxY = std::max({s0.y, s1.y, s2.y});
-        int x0 = std::max(0,  (int)std::floor(minX));
-        int x1 = std::min(gw-1, (int)std::ceil(maxX));
-        int y0 = std::max(0,  (int)std::floor(minY));
-        int y1 = std::min(gh-1, (int)std::ceil(maxY));
-        if (x0 > x1 || y0 > y1) continue;
-
-        /* 重心座標でポイント-イン-トライアングル */
-        float invArea = 1.0f / area2;
-        for (int y = y0; y <= y1; y++) {
-            float py = (float)y + 0.5f;
-            for (int x = x0; x <= x1; x++) {
-                float px = (float)x + 0.5f;
-                float w0 = ((s1.x - px) * (s2.y - py) - (s2.x - px) * (s1.y - py)) * invArea;
-                float w1 = ((s2.x - px) * (s0.y - py) - (s0.x - px) * (s2.y - py)) * invArea;
-                float w2 = 1.0f - w0 - w1;
-                if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f)
-                    hm[y*gw + x] = 1;
+            int i0 = I[ti*3+0], i1 = I[ti*3+1], i2 = I[ti*3+2];
+            if (!inside[i0] && !inside[i1] && !inside[i2]) continue;
+            const glm::vec3& s0 = screen[i0];
+            const glm::vec3& s1 = screen[i1];
+            const glm::vec3& s2 = screen[i2];
+            float area2 = (s1.x - s0.x) * (s2.y - s0.y) -
+                          (s2.x - s0.x) * (s1.y - s0.y);
+            if (area2 <= 0.0f) continue;
+            float minX = std::min({s0.x, s1.x, s2.x});
+            float maxX = std::max({s0.x, s1.x, s2.x});
+            float minY = std::min({s0.y, s1.y, s2.y});
+            float maxY = std::max({s0.y, s1.y, s2.y});
+            int x0 = std::max(0,  (int)std::floor(minX));
+            int x1 = std::min(gw-1, (int)std::ceil(maxX));
+            int y0 = std::max(0,  (int)std::floor(minY));
+            int y1 = std::min(gh-1, (int)std::ceil(maxY));
+            if (x0 > x1 || y0 > y1) continue;
+            float invArea = 1.0f / area2;
+            uint64_t* hm = localBits[omp_get_thread_num()].data();
+            for (int y = y0; y <= y1; y++) {
+                float py = (float)y + 0.5f;
+                for (int x = x0; x <= x1; x++) {
+                    float px = (float)x + 0.5f;
+                    float w0 = ((s1.x - px) * (s2.y - py) - (s2.x - px) * (s1.y - py)) * invArea;
+                    float w1 = ((s2.x - px) * (s0.y - py) - (s0.x - px) * (s2.y - py)) * invArea;
+                    float w2 = 1.0f - w0 - w1;
+                    if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                        int idx = y*gw + x;          // byte 版 hitmap[y*gw+x] と同一 layout
+                        hm[idx >> 6] |= (1ULL << (idx & 63));
+                    }
+                }
             }
         }
-#ifdef _OPENMP
-    }
-    // [PROFILE] 並列ラスタライズ実コストを rast に積む。
-    auto _tRast = std::chrono::steady_clock::now();
-    g_silProf_rast += _msP(_tAlloc, _tRast);
-    /* マージ: OR 結合 */
-    for (int t = 0; t < nThreads; t++) {
-        const auto& src = local[t];
-        for (int i = 0; i < gw*gh; i++) hitmap[i] |= src[i];
-    }
-    // [PROFILE] per-thread → hitmap 直列マージを merge に積む。
-    auto _tMerge = std::chrono::steady_clock::now();
-    g_silProf_merge += _msP(_tRast, _tMerge);
-#else
-            }
-    }
-    // [PROFILE] 非OMP ビルドは Step 2 全体 (alloc 含む) を rast に積む。
-    g_silProf_rast += _msP(_tS2, std::chrono::steady_clock::now());
+        // [PROFILE] bit ラスタライズ実コストを rast に積む。
+        auto _tRastB = std::chrono::steady_clock::now();
+        g_silProf_rast += _msP(_tAllocB, _tRastB);
+        for (int w = 0; w < nWords; w++) {           // word OR merge（決定的・順序非依存）
+            uint64_t acc = 0;
+            for (int t = 0; t < nThreads; t++) acc |= localBits[t][w];
+            hitBits[w] = acc;
+        }
+        // [PROFILE] word OR マージを merge に積む。
+        auto _tMergeB = std::chrono::steady_clock::now();
+        g_silProf_merge += _msP(_tRastB, _tMergeB);
+    } else
 #endif
+    {   /* ===== byte 経路 (従来実装・OFF 基準。以下ブロック内は元のまま) ===== */
+        hitmap.assign(nCells, 0);
+#ifdef _OPENMP
+        /* 三角形ごとの並列化: 書き込み先が共通のため、各スレッドがローカル hitmap
+       を持ち、最後にマージする。hitmap は 0/1 のみなので OR でマージ。 */
+        int nThreads = omp_get_max_threads();
+        std::vector<std::vector<uint8_t>> local(nThreads, std::vector<uint8_t>(gw*gh, 0));
+        // [PROFILE] hitmap + per-thread local の確保/ゼロ初期化を alloc に積む。
+        auto _tAlloc = std::chrono::steady_clock::now();
+        g_silProf_alloc += _msP(_tS2, _tAlloc);
+
+        // [OMP-DIAG] Alt+P 経路でこの関数が実際に並列で走っているかを1回だけ報告。
+        //   NOT DEFINED が出たら -fopenmp 抜け、max=1 ならスレッド未取得、
+        //   in_parallel=1 なら nested(外側が既に parallel)。nCells/nTris は処理量確認用。
+        static bool _ompDiagOnce = false;
+        if (!_ompDiagOnce) {
+            _ompDiagOnce = true;
+            printf("[Sil2D/omp] DEFINED  in_parallel=%d  max=%d  num=%d  gw=%d gh=%d nCells=%d  nTris=%d\n",
+                   omp_in_parallel(), omp_get_max_threads(), omp_get_num_threads(),
+                   gw, gh, gw*gh, nTris);
+            fflush(stdout);
+        }
+#pragma omp parallel for schedule(dynamic, 64)
+        for (int ti = 0; ti < nTris; ti++) {
+            int tid = omp_get_thread_num();
+            auto& hm = local[tid];
+#else
+        {
+            // [OMP-DIAG] -fopenmp が付いていない (serial build) と1回だけ報告。
+            static bool _ompDiagOnce = false;
+            if (!_ompDiagOnce) {
+                _ompDiagOnce = true;
+                printf("[Sil2D/omp] NOT DEFINED (serial build, -fopenmp missing)  gw=%d gh=%d nCells=%d nTris=%d\n",
+                       gw, gh, gw*gh, nTris);
+                fflush(stdout);
+            }
+            auto& hm = hitmap;
+            for (int ti = 0; ti < nTris; ti++) {
+#endif
+            int i0 = I[ti*3+0], i1 = I[ti*3+1], i2 = I[ti*3+2];
+            if (!inside[i0] && !inside[i1] && !inside[i2]) continue;
+            const glm::vec3& s0 = screen[i0];
+            const glm::vec3& s1 = screen[i1];
+            const glm::vec3& s2 = screen[i2];
+            /* スクリーン空間 signed area (backface culling) */
+            float area2 = (s1.x - s0.x) * (s2.y - s0.y) -
+                          (s2.x - s0.x) * (s1.y - s0.y);
+            if (area2 <= 0.0f) continue;  /* 裏向き or 縮退 */
+
+            /* バウンディング矩形 (grid 座標、整数に丸め) */
+            float minX = std::min({s0.x, s1.x, s2.x});
+            float maxX = std::max({s0.x, s1.x, s2.x});
+            float minY = std::min({s0.y, s1.y, s2.y});
+            float maxY = std::max({s0.y, s1.y, s2.y});
+            int x0 = std::max(0,  (int)std::floor(minX));
+            int x1 = std::min(gw-1, (int)std::ceil(maxX));
+            int y0 = std::max(0,  (int)std::floor(minY));
+            int y1 = std::min(gh-1, (int)std::ceil(maxY));
+            if (x0 > x1 || y0 > y1) continue;
+
+            /* 重心座標でポイント-イン-トライアングル */
+            float invArea = 1.0f / area2;
+            for (int y = y0; y <= y1; y++) {
+                float py = (float)y + 0.5f;
+                for (int x = x0; x <= x1; x++) {
+                    float px = (float)x + 0.5f;
+                    float w0 = ((s1.x - px) * (s2.y - py) - (s2.x - px) * (s1.y - py)) * invArea;
+                    float w1 = ((s2.x - px) * (s0.y - py) - (s0.x - px) * (s2.y - py)) * invArea;
+                    float w2 = 1.0f - w0 - w1;
+                    if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f)
+                        hm[y*gw + x] = 1;
+                }
+            }
+#ifdef _OPENMP
+        }
+        // [PROFILE] 並列ラスタライズ実コストを rast に積む。
+        auto _tRast = std::chrono::steady_clock::now();
+        g_silProf_rast += _msP(_tAlloc, _tRast);
+        /* マージ: OR 結合 */
+        for (int t = 0; t < nThreads; t++) {
+            const auto& src = local[t];
+            for (int i = 0; i < gw*gh; i++) hitmap[i] |= src[i];
+        }
+        // [PROFILE] per-thread → hitmap 直列マージを merge に積む。
+        auto _tMerge = std::chrono::steady_clock::now();
+        g_silProf_merge += _msP(_tRast, _tMerge);
+#else
+                }
+        }
+        // [PROFILE] 非OMP ビルドは Step 2 全体 (alloc 含む) を rast に積む。
+        g_silProf_rast += _msP(_tS2, std::chrono::steady_clock::now());
+#endif
+    }   /* ===== byte 経路 ここまで ===== */
 
     /* Step 3: Target mask を構築。
        優先: g_projectedLiverMask が valid (= Shift+E 冒頭で buildProjectedLiverMask
@@ -646,19 +898,28 @@ inline float computeSilhouette2DObjectiveFast(
     const std::vector<uint8_t>& targetMask = *targetMaskPtr;
 
     /* Step 4: IoU
-       [PERF] g_silFastPath ON のときだけ整数リダクション並列化。
-       inter/uni は順序非依存なので並列でも結果はビット一致。
-       OFF (既定) は従来の直列ループ。 */
-    int inter=0, uni=0;
-    const int nCells = gw*gh;
+       bit 経路: hitBits と tgtBits の popcount(AND)/popcount(OR) を語ごとに集計。
+                 末尾語の padding ビットは hit/target 双方 0 なので inter/uni に寄与せず、
+                 byte 経路のセル単位集計と inter/uni がビット一致する (= 結果不変)。
+       byte 経路: 14,400 セルの直列ループ (Change B: fork/join が勝つ規模なので並列化しない)。 */
     auto _tIoU = std::chrono::steady_clock::now();   // [PROFILE]
+    // [QUAD-SIL BRAKE] When the brake is armed, also count how many source
+    // cells fall OUTSIDE the target mask. brake_want gates all the extra
+    // work so the default path (lambda==0) is byte-identical.
+    const bool brake_want = (g_silOutsideLambda > 0.0f);
+    long long src_total_cells   = 0;
+    long long src_outside_cells = 0;
 #ifdef _OPENMP
-    if (g_silFastPath) {
-#pragma omp parallel for reduction(+:inter,uni) schedule(static)
-        for (int i=0;i<nCells;i++){
-            bool s=hitmap[i], t=targetMask[i];
-            if(s||t) uni++;
-            if(s&&t) inter++;
+    if (tookBit) {
+        const std::vector<uint64_t>& tgtBits = *precomputedTargetMaskBits;
+        for (int w = 0; w < nWords; w++) {
+            uint64_t hv = hitBits[w], tv = tgtBits[w];
+            inter += lsn_popcountll(hv & tv);
+            uni   += lsn_popcountll(hv | tv);
+            if (brake_want) {
+                src_total_cells   += lsn_popcountll(hv);
+                src_outside_cells += lsn_popcountll(hv & ~tv);
+            }
         }
     } else
 #endif
@@ -667,6 +928,10 @@ inline float computeSilhouette2DObjectiveFast(
             bool s=hitmap[i], t=targetMask[i];
             if(s||t) uni++;
             if(s&&t) inter++;
+            if (brake_want && s) {
+                ++src_total_cells;
+                if (!t) ++src_outside_cells;
+            }
         }
     }
     // [PROFILE] Step 4 IoU を iou に積み、計算した eval をカウント。
@@ -828,7 +1093,19 @@ inline float computeSilhouette2DObjectiveFast(
                   << std::endl;
     }
 
-    return (uni==0) ? 9.9f : 1.0f - (float)inter/uni;
+    // [QUAD-SIL BRAKE] cost = (1 - IoU) + lambda * outside_ratio.
+    // outside_ratio = src_outside / src_total (source cells sticking out of
+    // the target mask). Adds nothing when the brake is off (lambda==0) or
+    // when the source projected to no cells. Mirrors CmaesRefineV3RS's
+    // outside_ratio term so Alt+P quadrant mode resists the "inflate to
+    // blanket the target" degenerate the symmetric IoU otherwise rewards.
+    const float base_cost = (uni==0) ? 9.9f : 1.0f - (float)inter/uni;
+    if (brake_want && uni != 0 && src_total_cells > 0) {
+        const float outside_ratio =
+            (float)src_outside_cells / (float)src_total_cells;
+        return base_cost + g_silOutsideLambda * outside_ratio;
+    }
+    return base_cost;
 }
 
 /* レイキャスト版と高速版を両方実行し、IoU の差分と速度比を出力する比較関数。
@@ -1215,15 +1492,36 @@ inline void applyIncrementalSRT(
     float scale)
 {
     /* Build transform around centroid of liver (organs[0]) */
+    // [QUAD-SIL PIVOT] When g_silPivotVertIdx is armed (Alt+P quadrant
+    // session), rotate/scale about the centroid of the SUBSET vertices —
+    // computed from the CURRENT pose each call, just like the full-mesh
+    // path recomputes its centroid every call. The subset then turns about
+    // its own centre, the 2D analogue of Ctrl+G's subset-centroid pivot.
+    // When null (default, incl. Q:ALL), fall through to the full-mesh
+    // centroid exactly as before (byte-identical).
     glm::vec3 centroid(0.0f);
-    int cnt = 0;
-    if (!organs.empty() && organs[0]) {
+    if (g_silPivotVertIdx && !g_silPivotVertIdx->empty()
+        && !organs.empty() && organs[0]) {
         const auto& verts = organs[0]->mVertices;
-        for (size_t i = 0; i + 2 < verts.size(); i += 3) {
-            centroid += glm::vec3(verts[i], verts[i+1], verts[i+2]);
-            cnt++;
+        const size_t nV = verts.size() / 3;
+        long long cnt = 0;
+        for (int vi : *g_silPivotVertIdx) {
+            if (vi < 0 || (size_t)vi >= nV) continue;
+            const size_t b = (size_t)vi * 3;
+            centroid += glm::vec3(verts[b], verts[b+1], verts[b+2]);
+            ++cnt;
         }
         if (cnt > 0) centroid /= (float)cnt;
+    } else {
+        int cnt = 0;
+        if (!organs.empty() && organs[0]) {
+            const auto& verts = organs[0]->mVertices;
+            for (size_t i = 0; i + 2 < verts.size(); i += 3) {
+                centroid += glm::vec3(verts[i], verts[i+1], verts[i+2]);
+                cnt++;
+            }
+            if (cnt > 0) centroid /= (float)cnt;
+        }
     }
 
     const float deg2rad = (float)(M_PI / 180.0);
@@ -1355,6 +1653,27 @@ inline Result run(
     result.rmse_before = registrationHandle.compRmse;
     int   init_matched = registrationHandle.compCount;
 
+    /* [g_silExactPerf] (1) エントリ時の registrationHandle を退避。
+       後段の「値が使われない computeUnifiedMetrics」(snapshot 復元直後 /
+       revert 後) をこの復元で置換する。復元時の pose は snap_v 書き戻し直後
+       = 今この瞬間の pose とバイト同一で、computeUnifiedMetrics は決定的
+       なので、復元値は再計算値とビット一致する。 */
+    const float entryM_rmse  = registrationHandle.compRmse;
+    const float entryM_avg   = registrationHandle.compAvgError;
+    const float entryM_max   = registrationHandle.compMaxError;
+    const int   entryM_count = registrationHandle.compCount;
+    const float entryM_h2d   = registrationHandle.sil2DHausdorff;
+    const float entryM_iou   = registrationHandle.compIoU2D;
+    const bool  skipAuxMetrics = g_silExactPerf && params.use_silhouette_2d;
+    auto restoreEntryMetrics = [&]() {
+        registrationHandle.compRmse       = entryM_rmse;
+        registrationHandle.compAvgError   = entryM_avg;
+        registrationHandle.compMaxError   = entryM_max;
+        registrationHandle.compCount      = entryM_count;
+        registrationHandle.sil2DHausdorff = entryM_h2d;
+        registrationHandle.compIoU2D      = entryM_iou;
+    };
+
     /* 2b. Silhouette debug: before */
     if (params.verbose && params.save_debug_jpg && !organs.empty() && organs[0]) {
         std::string tag;
@@ -1472,6 +1791,57 @@ inline Result run(
     float zThresh_cache = std::max(0.001f, depthScale);
     auto targetCloud_cache = reg_cache.extractFrontFacePoints(
         *screenMesh, gridWidth, gridHeight, zThresh_cache);
+
+    /* [PERF/Downsample] 内側 CMA-ES の RMSE ゲート雲だけを voxel 間引き (ON のときのみ)。
+       外側 computeUnifiedMetrics は別途フル雲で走るので最終 IoU/RMSE は不変。
+       間引き本体は既存 Reg3DCustom::voxelDownSample を再利用 (reg_cache は同型)。 */
+    g_silDownsampleFullCount = (long)targetCloud_cache->size();
+    g_silDownsampleDownCount = g_silDownsampleFullCount;
+    if (g_silDownsampleEnable && g_silDownsampleVoxelRatio > 0.0f && g_sceneDiag > 0.0f) {
+        const float voxel = g_silDownsampleVoxelRatio * g_sceneDiag;
+        /* [g_silExactPerf] (2) ダウンサンプル結果のキャッシュ。
+           キー = ソース全点列の完全一致 (vector==, ~1ms) + voxel 完全一致。
+           voxelDownSample+ソートは決定的なので、キー一致なら出力もビット一致
+           → 再利用は厳密。inline 関数の static は全TUで単一実体 (C++17)。 */
+        static std::vector<glm::vec3> s_dsKeyPoints;
+        static float s_dsKeyVoxel = -1.0f;
+        static std::shared_ptr<Reg3DCustom::PointCloud> s_dsOut;
+        const bool dsCacheHit =
+            g_silExactPerf && s_dsOut && s_dsKeyVoxel == voxel &&
+            s_dsKeyPoints == targetCloud_cache->points;
+        std::shared_ptr<Reg3DCustom::PointCloud> ds;
+        if (dsCacheHit) {
+            ds = s_dsOut;
+        } else {
+            ds = reg_cache.voxelDownSample(targetCloud_cache, voxel);
+            /* 決定的順序 (voxel_downsample_v3 と同じ辞書順ソート) で再現性を確保。
+               sil モードでは値・matched とも順序非依存だが、A/B 比較の安定のため揃える。 */
+            if (ds && ds->points.size() > 1) {
+                std::sort(ds->points.begin(), ds->points.end(),
+                          [](const glm::vec3& a, const glm::vec3& b){
+                              if (a.x != b.x) return a.x < b.x;
+                              if (a.y != b.y) return a.y < b.y;
+                              return a.z < b.z; });
+            }
+            if (g_silExactPerf && ds && !ds->points.empty()) {
+                s_dsKeyPoints = targetCloud_cache->points;
+                s_dsKeyVoxel  = voxel;
+                s_dsOut       = ds;
+            }
+        }
+        if (ds && !ds->points.empty()) {
+            targetCloud_cache = ds;
+            g_silDownsampleDownCount = (long)targetCloud_cache->size();
+            std::cout << "[Sil/Downsample] inner search cloud "
+                      << g_silDownsampleFullCount << " -> " << g_silDownsampleDownCount
+                      << " pts  (voxel=" << voxel
+                      << ", ratio=" << g_silDownsampleVoxelRatio
+                      << (dsCacheHit ? ", CACHED" : "")
+                      << ")  [inner RMSE gate only; outer metrics stay full]"
+                      << std::endl;
+        }
+    }
+
     // Scale-invariant: was hardcoded max_dist=1.0 at sceneDiag≈7.36.
     // Reference ratio = 1.0 / 7.36 ≈ 0.1359
     constexpr float kRefSceneDiag_cache = 7.36f;
@@ -1492,7 +1862,9 @@ inline Result run(
 
     /* KDTreeで対応点を（再）計算 */
     auto updateCorrespondences = [&]() {
-        const auto& verts = liverMesh3D->mVertices;
+        // 1516行 / 1538行 両方とも
+        const auto& verts = organs[0]->mVertices;
+        //const auto& verts = liverMesh3D->mVertices;
         std::vector<glm::vec3> srcPts;
         srcPts.reserve(verts.size() / 3);
         for (size_t i = 0; i + 2 < verts.size(); i += 3)
@@ -1512,9 +1884,24 @@ inline Result run(
     /* 初回対応点計算 */
     updateCorrespondences();
 
+    /* [PERF/Downsample] 間引き ON のときは bad ゲートの基準 init_matched を内側(間引き後)雲に
+       合わせ直す。さもないと min_ok = init_matched(フル) * min_match_ratio に対し毎 eval の
+       matched(間引き後・小) が常に届かず、全 eval が bad → penalty となり CMA-ES が進まない。
+       OFF のときは触らない (= レガシー基準・ビット一致を維持)。 */
+    if (g_silDownsampleEnable) {
+        int inner_init = 0;
+        for (int v : corr_idx) if (v >= 0) inner_init++;
+        init_matched = inner_init;
+        if (params.verbose)
+            std::cout << "[Sil/Downsample] init_matched rescaled to inner cloud: "
+                      << inner_init << std::endl;
+    }
+
     /* 高速RMSE: キャッシュ済み対応インデックスで距離だけ再計算 O(tgt_size) */
     auto fastComputeRMSE = [&]() -> float {
-        const auto& verts = liverMesh3D->mVertices;
+        // 1516行 / 1538行 両方とも
+        const auto& verts = organs[0]->mVertices;
+        //・const auto& verts = liverMesh3D->mVertices;
         const size_t vsz  = verts.size();
         float sumSq = 0.0f;
         int   count = 0;
@@ -1568,11 +1955,21 @@ inline Result run(
        内部で従来どおり Step 3 を構築する (レガシー基準)。 */
     std::vector<uint8_t> precompTargetMask;
     const std::vector<uint8_t>* precompTargetPtr = nullptr;
+    // [PERF/bit] 同じターゲット mask を 1bit/cell にパックしておく (ループ中不変なので 1 回)。
+    //   bit hitmap と同 layout (idx=row*gw+col → word=idx>>6, bit=idx&63)。
+    //   bit 経路の popcount IoU 用。空のままなら objective は byte 経路にフォールバック。
+    std::vector<uint64_t> precompTargetMaskBits;
+    const std::vector<uint64_t>* precompTargetBitsPtr = nullptr;
     if (params.use_silhouette_2d && g_silFastPath) {
         buildSilhouetteTargetMaskFast(precompTargetMask,
                                       gWindowWidth, gWindowHeight,
                                       params.silhouette_step);
         precompTargetPtr = &precompTargetMask;
+        const size_t nT = precompTargetMask.size();
+        precompTargetMaskBits.assign((nT + 63) >> 6, 0ULL);
+        for (size_t i = 0; i < nT; i++)
+            if (precompTargetMask[i]) precompTargetMaskBits[i >> 6] |= (1ULL << (i & 63));
+        precompTargetBitsPtr = &precompTargetMaskBits;
     }
 
 
@@ -1632,7 +2029,7 @@ inline Result run(
                                         organs[0], view, projection,
                                         params.silhouette_step,
                                         nullptr, nullptr, nullptr, nullptr,
-                                        precompTargetPtr)
+                                        precompTargetPtr, precompTargetBitsPtr)
                                   : (double)computeSilhouette2DObjective(
                                         organs[0], g_sed, view, projection,
                                         params.silhouette_step);
@@ -1769,7 +2166,12 @@ inline Result run(
             organs[m]->mNormals  = snap_n[m];
         }
     }
-    computeUnifiedMetrics();
+    /* [g_silExactPerf] この時点で pose は snap_v (=エントリ時) に戻っている。
+       この computeUnifiedMetrics は戻り値が一切使われない (rmse_before は
+       退避済み、initial_fval は sil 関数で別計算) ので、ON なら退避値の
+       復元で置換 (再計算とビット一致)。 */
+    if (skipAuxMetrics) restoreEntryMetrics();
+    else                computeUnifiedMetrics();
     g_quietMetrics = false;
 
     float initial_fval;
@@ -1885,7 +2287,9 @@ inline Result run(
                     organs[m]->mNormals  = snap_n[m];
                 }
             }
-            computeUnifiedMetrics();
+            /* [g_silExactPerf] revert 直後: pose はエントリ時とバイト同一。 */
+            if (skipAuxMetrics) restoreEntryMetrics();
+            else                computeUnifiedMetrics();
             if (params.verbose)
                 std::cout << "[CMA-ES] No improvement (compRMSE "
                           << result.rmse_before << " -> " << rmse_after_uniform
@@ -1900,7 +2304,9 @@ inline Result run(
                 organs[m]->mNormals  = snap_n[m];
             }
         }
-        computeUnifiedMetrics();
+        /* [g_silExactPerf] revert 直後: pose はエントリ時とバイト同一。 */
+        if (skipAuxMetrics) restoreEntryMetrics();
+        else                computeUnifiedMetrics();
         if (params.verbose)
             std::cout << "[CMA-ES] No improvement ("
                       << result.rmse_before << " -> best_tried=" << best_rmse

@@ -62,6 +62,10 @@ DatasetEchoLiver/
 # ImGui runtime state
 imgui.ini
 
+# Registration run outputs (rigid / non-rigid result dumps)
+ResultsRigid/
+ResultsNonRigid/
+
 # Deform AR screenshots + runtime log
 depth_output/deform_screenshots/
 log.txt

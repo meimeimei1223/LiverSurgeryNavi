@@ -9119,6 +9119,32 @@ inline int g_shiftE_RasterStep = 8;
 // restores the legacy alpha_3d = 0.3 blend.
 inline bool g_shiftE_pureIoU   = true;
 
+// [QUAD-SIL] Alt+P quadrant-aware silhouette (default ON).
+//   ON  : when the Ctrl+G Quadrant Selector (g_activeQuadrantMask) is NOT
+//         QUAD_ALL, runShiftE rasterizes only the triangles whose 3 vertices
+//         all belong to the active quadrants (same Phase-2c rule the V3RS
+//         wrapper applies for Ctrl+Shift+G / Ctrl+I). The CMA-ES inner
+//         objective, the V1 accept gate, and the before/after IoU printout
+//         all use this filtered raster (one switch — see
+//         CmaesRefine::g_silTriOverride). Intended for the occlusion
+//         scenario: partial SAM2 mask vs the matching liver quadrant(s).
+//   OFF : legacy full-mesh raster regardless of the quadrant selection
+//         (A/B comparison baseline).
+//   At QUAD_ALL the filter is bypassed entirely (override stays null), so
+//   the default state is byte-identical to the pre-feature build in BOTH
+//   toggle positions.
+inline bool g_shiftE_quadrantAware = true;
+
+// [QUAD-SIL BRAKE] Mask-expansion brake weight for Alt+P quadrant mode.
+//   Added to the V1 silhouette cost as lambda * outside_ratio (the share of
+//   source cells lying outside the target mask). Mirrors the V3RS
+//   g_ctrlgsLambdaOut default of 0.5. Only consulted in quadrant mode
+//   (runShiftE arms CmaesRefine::g_silOutsideLambda from this); the legacy
+//   full-mesh path never sets the brake, so it stays byte-identical.
+//   Raise to penalise inflation harder; 0 disables the brake (back to raw
+//   symmetric IoU, i.e. the "blanket the target" failure mode).
+inline float g_shiftE_outsideLambda = 0.5f;
+
 // [Alt+P found-pose viz] ON -> runShiftE captures EACH run's inner-loop best
 // (found) pose into an F9 Run slot BEFORE the V1 accept gate reverts it, plus
 // the applied pose into Final. Lets F9 show the IoU-0.96 poses the gate throws
@@ -9128,7 +9154,10 @@ inline bool g_shiftE_pureIoU   = true;
 inline bool g_shiftECaptureFound = false;
 inline int  g_shiftECaptureStep  = 16;
 
-inline void runShiftE() {
+// [QUAD-SIL] quadrant_mask: the Ctrl+G Quadrant Selector bitmask
+// (caller passes g_activeQuadrantMask). Default QUAD_ALL keeps every
+// legacy call site (SilComparePanel etc.) byte-identical.
+inline void runShiftE(uint8_t quadrant_mask = LiverLeftRightLabel::QUAD_ALL) {
     std::cout << "\n=== 2D Silhouette BIPOP-CMA-ES (Shift+E) ===" << std::endl;
 
     if (!registrationHandle.useRegistration) {
@@ -9141,6 +9170,99 @@ inline void runShiftE() {
     }
 
     auto organs = getOrganList();
+
+    // ----------------------------------------------------------------
+    // [QUAD-SIL] Build the quadrant-filtered triangle list and arm the
+    // session override. Same selection rule as the V3RS Phase 2c filter
+    // (Ctrl+Shift+G / Ctrl+I): a triangle is kept iff ALL 3 of its
+    // vertices belong to the active quadrants per makeQuadrantSubsetIdx;
+    // original triangle order is preserved. quadTris must outlive the
+    // whole optimisation (the override holds a pointer to it), hence
+    // function scope.
+    //
+    // Engagement conditions (all must hold, otherwise legacy full-mesh):
+    //   - g_shiftE_quadrantAware toggle ON
+    //   - quadrant_mask != QUAD_ALL  (ALL == full mesh by definition;
+    //     skipping the override keeps the default path bit-identical)
+    //   - region/LR labels valid and sized to the liver vertex count
+    //     (the dispatch auto-computes them; this is a belt-and-braces
+    //     fallback for callers that don't)
+    // ----------------------------------------------------------------
+    std::vector<GLuint> quadTris;
+    std::vector<int>     quadPivotIdx;   // subset vertex ids for the SRT pivot
+    bool quadFilterActive = false;
+    if (g_shiftE_quadrantAware
+        && quadrant_mask != LiverLeftRightLabel::QUAD_ALL
+        && liverMesh3D)
+    {
+        const size_t nV = liverMesh3D->mVertices.size() / 3;
+        const bool labelsOk =
+            g_liverRegion.valid() && g_liverLR.valid() &&
+            g_liverRegion.labels.size() == nV &&
+            g_liverLR.labels.size()     == nV;
+        if (!labelsOk) {
+            std::cerr << "[Shift+E/quad] labels unavailable or size "
+                         "mismatch; falling back to FULL mesh."
+                      << std::endl;
+        } else {
+            const std::vector<int> quad_vert_ids =
+                LiverLeftRightLabel::makeQuadrantSubsetIdx(
+                    g_liverRegion.labels, g_liverLR.labels, quadrant_mask);
+            std::vector<uint8_t> in_quad(nV, 0);
+            for (int idx : quad_vert_ids) {
+                if (idx >= 0 && (size_t)idx < nV) in_quad[(size_t)idx] = 1;
+            }
+            const auto& src_idx = liverMesh3D->mIndices;
+            quadTris.reserve(src_idx.size());
+            int n_tris_total = 0;
+            int n_tris_kept  = 0;
+            for (size_t t = 0; t + 2 < src_idx.size(); t += 3) {
+                ++n_tris_total;
+                const GLuint i0 = src_idx[t + 0];
+                const GLuint i1 = src_idx[t + 1];
+                const GLuint i2 = src_idx[t + 2];
+                if (i0 >= nV || i1 >= nV || i2 >= nV) continue;
+                if (in_quad[i0] && in_quad[i1] && in_quad[i2]) {
+                    quadTris.push_back(i0);
+                    quadTris.push_back(i1);
+                    quadTris.push_back(i2);
+                    ++n_tris_kept;
+                }
+            }
+            if (quadTris.empty()) {
+                std::cerr << "[Shift+E/quad] quadrant subset has no whole "
+                             "triangles (Q="
+                          << LiverLeftRightLabel::quadrantMaskString(
+                                 quadrant_mask)
+                          << "); falling back to FULL mesh." << std::endl;
+            } else {
+                CmaesRefine::g_silTriOverride = &quadTris;
+                // [QUAD-SIL PIVOT] Rotate/scale about the subset's own
+                // centroid (Ctrl+G parity). Use the makeQuadrantSubsetIdx
+                // vertex set — the same subset Ctrl+G's S.centroid is built
+                // from. applyIncrementalSRT recomputes the centroid from
+                // these vertices at the CURRENT pose every call, so the
+                // pivot tracks the mesh as CMA-ES moves it.
+                quadPivotIdx = quad_vert_ids;
+                CmaesRefine::g_silPivotVertIdx = &quadPivotIdx;
+                // [QUAD-SIL BRAKE] Arm the mask-expansion brake (port of
+                // V3RS outside_ratio). Without it the symmetric IoU lets the
+                // optimiser "win" by inflating the subset to blanket the
+                // target instead of aligning it. Default weight matches the
+                // V3RS Ctrl+Shift+G default (g_ctrlgsLambdaOut = 0.5).
+                CmaesRefine::g_silOutsideLambda = g_shiftE_outsideLambda;
+                quadFilterActive = true;
+                std::cout << "[Shift+E/quad] quad-filter tris: "
+                          << n_tris_kept << " / " << n_tris_total
+                          << "  (Q="
+                          << LiverLeftRightLabel::quadrantMaskString(
+                                 quadrant_mask)
+                          << ")  — objective/gate/IoU + SRT pivot use this "
+                             "subset; expansion brake lambda="
+                          << g_shiftE_outsideLambda << std::endl;
+            }
+        }
+    }
 
     // --- AR固定カメラ行列を構築（OrbitCamに依存しない） ---
     glm::mat4 silView = buildSilhouetteView();
@@ -9231,16 +9353,43 @@ inline void runShiftE() {
                 const int ch = g_boundaryDistMap.height;
                 const glm::mat4 cv = buildSilhouetteView();
                 const glm::mat4 cp = buildSilhouetteProj();
-                std::vector<uint32_t> ctris(liverMesh3D->mIndices.begin(),
-                                            liverMesh3D->mIndices.end());
+                // [QUAD-SIL] Show what the optimiser actually rasterized:
+                // when the session override is armed, capture the filtered
+                // triangle list; otherwise the full mesh (legacy).
+                std::vector<uint32_t> ctris;
+                std::vector<uint32_t> full_for_viz;   // yellow overlay source
+                if (CmaesRefine::g_silTriOverride
+                    && !CmaesRefine::g_silTriOverride->empty()) {
+                    ctris.assign(CmaesRefine::g_silTriOverride->begin(),
+                                 CmaesRefine::g_silTriOverride->end());
+                    // Full mesh so buildComposite can paint the discarded
+                    // (non-subset) quadrants yellow in the Source panel.
+                    full_for_viz.assign(liverMesh3D->mIndices.begin(),
+                                        liverMesh3D->mIndices.end());
+                } else {
+                    ctris.assign(liverMesh3D->mIndices.begin(),
+                                 liverMesh3D->mIndices.end());
+                    // No subset → no yellow overlay (leave full_for_viz empty;
+                    // captureImpl no-ops when full==filtered size).
+                }
                 const float iou = SilOverlay::capture(
                     SilOverlay::g_silOverlay, run_slot,
                     liverMesh3D, ctris, cv, cp,
                     g_boundaryDistMap.data, cw, ch,
-                    g_shiftECaptureStep, /*scale_value=*/1.0f);
+                    g_shiftECaptureStep, /*scale_value=*/1.0f,
+                    /*instrument_dist_map=*/nullptr,
+                    /*instrument_thresh_px=*/0.0f,
+                    /*rim_sil_max_px=*/0.0f,
+                    /*is_rim_anatomic_per_vertex=*/nullptr,
+                    /*full_indices (yellow discarded overlay)=*/&full_for_viz);
                 std::cout << "[Shift+E/found] Run " << (run_slot + 1)
                           << " found-pose -> F9 Run " << (run_slot + 1)
-                          << "  (squash IoU=" << iou << ")" << std::endl;
+                          << "  (squash IoU=" << iou
+                          << ", capture tris=" << (ctris.size() / 3)
+                          << (CmaesRefine::g_silTriOverride
+                              && !CmaesRefine::g_silTriOverride->empty()
+                                  ? ", QUAD" : ", full")
+                          << ")" << std::endl;
             };
         }
 
@@ -9314,22 +9463,73 @@ inline void runShiftE() {
             organs[i]->mNormals  = best_n[i];
             setUp(*organs[i]);
         }
+
+    // [QUAD-SIL] Disarm the override BEFORE the final computeUnifiedMetrics
+    // so the app-wide reported metrics (registrationHandle.compIoU2D, the
+    // Hausdorff readout, and the PoseLibrary Layer-4 IoU series) stay on the
+    // full-mesh yardstick — the same convention Ctrl+I follows. Intermediate
+    // registrationHandle values written during the loop (engine-internal
+    // computeUnifiedMetrics calls saw the subset) are overwritten here.
+    if (quadFilterActive) {
+        CmaesRefine::g_silTriOverride  = nullptr;
+        CmaesRefine::g_silPivotVertIdx = nullptr;   // [QUAD-SIL PIVOT] disarm
+        CmaesRefine::g_silOutsideLambda = 0.0f;     // [QUAD-SIL BRAKE] disarm
+        std::cout << "[Shift+E/quad] override disarmed; final metrics below "
+                     "are FULL-mesh (session IoU printout above was subset)"
+                  << std::endl;
+    }
+
     computeUnifiedMetrics();
     g_metricsValid = true;
+
+    // [QUAD-SIL ACCEPT] In quadrant mode, publish the occluded-IoU /
+    // RIM / containment diagnostics at the final pose (exactly what
+    // Ctrl+G / Ctrl+I / AutoQCR publish via this same helper). This sets
+    // g_lastSilOccludedIoU2D so the following poseSaveToLibrary gate can
+    // judge on the occluded IoU — the SAME criterion Ctrl+I uses — instead
+    // of the full-mesh IoU2D, which a subset alignment necessarily lowers.
+    // Only in quadrant mode: the legacy full-mesh Alt+P path (Q:ALL /
+    // toggle OFF) leaves this untouched and keeps its byte-identical
+    // compIoU2D-based gate.
+    if (quadFilterActive) {
+        publishCtrlGStyleDiagnostics();
+        std::cout << "[Shift+E/quad] published occluded-IoU diagnostics "
+                     "(IoU_occ=" << g_lastSilOccludedIoU2D
+                  << ") for the accept gate — Ctrl+I parity" << std::endl;
+    }
 
     // [Alt+P found-pose viz] capture the applied (kept) pose into Final.
     if (g_shiftECaptureFound && g_boundaryDistMap.valid && liverMesh3D) {
         const glm::mat4 cv = buildSilhouetteView();
         const glm::mat4 cp = buildSilhouetteProj();
-        std::vector<uint32_t> ctris(liverMesh3D->mIndices.begin(),
-                                    liverMesh3D->mIndices.end());
+        // [QUAD-SIL] Final capture mirrors what the optimiser saw: the
+        // filtered list when the quadrant filter was active this session
+        // (quadTris is still alive — function scope), else the full mesh.
+        std::vector<uint32_t> ctris;
+        std::vector<uint32_t> full_for_viz;   // yellow discarded-quadrant overlay
+        if (quadFilterActive) {
+            ctris.assign(quadTris.begin(), quadTris.end());
+            full_for_viz.assign(liverMesh3D->mIndices.begin(),
+                                liverMesh3D->mIndices.end());
+        } else {
+            ctris.assign(liverMesh3D->mIndices.begin(),
+                         liverMesh3D->mIndices.end());
+        }
         SilOverlay::captureFinal(
             SilOverlay::g_silOverlay, /*best_run_idx=*/-1,
             liverMesh3D, ctris, cv, cp,
             g_boundaryDistMap.data, g_boundaryDistMap.width,
-            g_boundaryDistMap.height, g_shiftECaptureStep, /*scale_value=*/1.0f);
+            g_boundaryDistMap.height, g_shiftECaptureStep, /*scale_value=*/1.0f,
+            /*instrument_dist_map=*/nullptr,
+            /*instrument_thresh_px=*/0.0f,
+            /*rim_sil_max_px=*/0.0f,
+            /*is_rim_anatomic_per_vertex=*/nullptr,
+            /*full_indices (yellow overlay)=*/&full_for_viz);
         SilOverlay::g_silOverlay.showWindow = true;
-        std::cout << "[Shift+E/found] applied (kept) pose -> F9 Final" << std::endl;
+        std::cout << "[Shift+E/found] applied (kept) pose -> F9 Final"
+                  << "  (capture tris=" << (ctris.size() / 3)
+                  << (quadFilterActive ? ", QUAD-FILTERED" : ", full-mesh")
+                  << ", step=" << g_shiftECaptureStep << ")" << std::endl;
     }
 
     std::cout << std::defaultfloat << std::setprecision(6);

@@ -8,11 +8,13 @@
 #include <string>
 #include <cmath>
 #include <filesystem>
-
+#include <fstream>          // [deform round-trip] 変形 organ の OBJ 書き出し
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>      // [CT-handoff] glm::make_mat4
+#include <sstream>                   // [CT-handoff] reg_transform.txt parsing
 
 #include "DeformGlobals.h"
 #include "PathConfig.h"
@@ -220,7 +222,15 @@ inline glm::vec4 computeBoardUV(mCutMesh& board, const Reg3DCustom::CameraIntrin
         float x = V[i*3], y = V[i*3+1], z = V[i*3+2];
         if (std::abs(z) < 1e-6f) z = 1e-6f;
         float u = (fx * x / z + cx) / (float)W;
-        float v = (fy * y / z + cy) / (float)H;
+        // [board-UV fix] V は REG 側(main.cpp の Board UV 生成)と同一式にする。
+        //   REG は texture upload-flip(texture.png は上下反転でアップロードされる)
+        //   と flipY を考慮して v = 1 - (2*cy - py)/H としている。DEFORM はここが
+        //   raw な v = py/H のままだったため、ボードの写真テクスチャの V がずれて
+        //   折り返って表示されていた(REG は正常、DEFORM だけ異常だった理由)。
+        //   U は flipY 非依存なので従来どおり(REG も U は無補正)。
+        const float py      = fy * y / z + cy;
+        const float y_pixel = 2.0f * cy - py;
+        float v = 1.0f - y_pixel / (float)H;
         board.mTexCoords[i*2]     = u;
         board.mTexCoords[i*2 + 1] = v;
         uMin = std::min(uMin, u); uMax = std::max(uMax, u);
@@ -253,6 +263,11 @@ inline void dryRunStep1() {
               << " v=[" << uv.z << "," << uv.w << "]" << std::endl;
 }
 
+// ============================================================================
+// [CT-handoff] forward decl (defined later in this file): reads reg_transform.txt
+//   and returns its inverse (registered -> CT). Used below to move the whole
+//   DEFORM scene into CT space before sceneDiag / camera setup.
+glm::mat4 loadRegToCtInverse(bool* outFound);
 // ============================================================================
 inline bool loadReferenceMeshes() {
     // mirror-only 版(registration 側 mirrorMeshAndCloudX と等価, mesh 専用):
@@ -296,7 +311,7 @@ inline bool loadReferenceMeshes() {
     // ---- Target (= screenMesh) + cache 注入 ----
     {
         const std::string p = resolveDeformObjPath("pc_metric_pinhole_masked.obj",
-                                                    "pc_metric_pinhole_masked_k4a.obj");
+                                                   "pc_metric_pinhole_masked_k4a.obj");
         if (!p.empty()) {
             if (gTargetMesh) { gTargetMesh->cleanup(); delete gTargetMesh; }
             gTargetMesh = new mCutMesh(mCutMesh().loadMeshFromFile(p.c_str()));
@@ -330,7 +345,7 @@ inline bool loadReferenceMeshes() {
     // ---- Board (= boardMesh3D, テクスチャ付き) ----
     {
         const std::string objPath = resolveDeformObjPath("pc_metric_pinhole_full_light.obj",
-                                                          "pc_metric_pinhole_full_k4a_light.obj");
+                                                         "pc_metric_pinhole_full_k4a_light.obj");
         const std::string texPath = DEPTH_OUTPUT_PATH + "texture.png";
         if (!objPath.empty()) {
             if (gBoardMesh) { gBoardMesh->cleanup(); delete gBoardMesh; }
@@ -352,6 +367,52 @@ inline bool loadReferenceMeshes() {
             setUp(*gBoardMesh);
         } else {
             std::cout << "[Deform] (skip) Board not found: " << objPath << std::endl;
+        }
+    }
+
+    // ============================================================================
+    // [CT-handoff] DEFORM シーン全体を CT 空間(固定 mm)へ移す。
+    //   SoftBody は initFromRegistered で ct_input/(= T^-1 適用済み)から作られて
+    //   いるので既に CT。ここで同じ T^-1 を AutoDeform 参照 (gLiverStaticMesh)、
+    //   変形ターゲット (gTargetMesh + キャッシュ cloud)、board に適用して、
+    //   correspondence / sceneDiag / カメラを全て CT mm に揃える。これで
+    //   「臓器(CT)を target(CT) へ寄せる」変形が正しいスケールで成立する。
+    //   reg_transform.txt が無ければ no-op(従来の registered フレーム挙動)。
+    //   ・直後の sceneDiag 計測が変換後 gTargetMesh を読む → sceneDiag が CT に
+    //     なり applySceneScaleToCamera(deform/main.cpp) が自動追従する。
+    //   ・boundaryDist は画素距離(2D)なのでスケールしない(points/normals のみ)。
+    //   ・AR 背景(2D 写真)はスケールしないので CT モードではオーバーレイがズレる
+    //     が、表示のみで変形にも CT OBJ 出力にも影響しない。
+    // ============================================================================
+    {
+        bool haveT = false;
+        const glm::mat4 Tinv = loadRegToCtInverse(&haveT);
+        if (haveT) {
+            const glm::mat3 Rn = glm::mat3(Tinv);
+            auto ctMesh = [&](mCutMesh* m) {
+                if (!m || m->mVertices.empty()) return;
+                for (size_t i = 0; i + 2 < m->mVertices.size(); i += 3) {
+                    const glm::vec4 v = Tinv * glm::vec4(
+                                            m->mVertices[i], m->mVertices[i + 1], m->mVertices[i + 2], 1.0f);
+                    m->mVertices[i] = v.x; m->mVertices[i + 1] = v.y; m->mVertices[i + 2] = v.z;
+                }
+                m->mNormals.clear();   // setUp が変換後ジオメトリから法線を再計算する
+                setUp(*m);             // GL バッファ再構築(既存リソースは内部で解放)
+            };
+            ctMesh(gLiverStaticMesh);
+            ctMesh(gTargetMesh);
+            ctMesh(gBoardMesh);
+
+            // 変形ターゲットの点群(AutoDeform Stage 2-5 / RMSE が使用)も CT へ。
+            if (auto pc = Reg3DCustom::getCachedTargetCloud()) {
+                for (auto& p : pc->points) {
+                    const glm::vec4 v = Tinv * glm::vec4(p, 1.0f);
+                    p = glm::vec3(v);
+                }
+                for (auto& n : pc->normals) n = glm::normalize(Rn * n);
+            }
+            std::cout << "[CT-handoff] DEFORM scene moved to CT space "
+                         "(liver / target / board + target cloud)." << std::endl;
         }
     }
 
@@ -481,11 +542,11 @@ inline bool loadReferenceMeshes() {
         glm::vec3 lC = (lMn + lMx) * 0.5f, lS = lMx - lMn;
         std::cout << "\n[Deform] === alignment diagnostics ===" << std::endl;
         if (haveT) std::cout << "  target  center=(" << tC.x << "," << tC.y << "," << tC.z
-                             << ")  size=(" << tS.x << "," << tS.y << "," << tS.z
-                             << ")  diag=" << glm::length(tS) << std::endl;
+                      << ")  size=(" << tS.x << "," << tS.y << "," << tS.z
+                      << ")  diag=" << glm::length(tS) << std::endl;
         if (haveL) std::cout << "  liver   center=(" << lC.x << "," << lC.y << "," << lC.z
-                             << ")  size=(" << lS.x << "," << lS.y << "," << lS.z
-                             << ")  diag=" << glm::length(lS) << std::endl;
+                      << ")  size=(" << lS.x << "," << lS.y << "," << lS.z
+                      << ")  diag=" << glm::length(lS) << std::endl;
         if (haveT && haveL) {
             float dCenter = glm::length(tC - lC);
             float diagRef = glm::length(tS);
@@ -557,6 +618,16 @@ inline void applySceneScaleToCamera(FullSphereCamera& cam, float sceneDiag) {
     cam.minRadius               = 2.0f   * r;
     cam.maxRadius               = 80.0f  * r;
 
+    // クリップ面 — [black-screen fix] near/far も距離なので r で比例させる。
+    //   CT-handoff 後、DEFORM のシーンは CT-mm(約62倍, sceneDiag~167)になり、
+    //   カメラは InitialRadius≈257 の距離に置かれる。near/far が固定 0.1/100 の
+    //   ままだと被写体(距離 ~100〜410)が far=100 の外に出て全クリップ → 画面が
+    //   真っ黒になっていた。r 比例なら far≈100*r がカメラ距離+シーン半径を常に
+    //   上回る(maxRadius=80*r < far=100*r)。メートル系では r≈1 で従来 0.1/100。
+    //   projection は UpdateCamera が毎フレーム near/far から作り直すので即反映。
+    cam.nearPlane               = 0.1f   * r;
+    cam.farPlane                = 100.0f * r;
+
     // 移動感度系
     cam.LIGHT_MOUSE_SENSITIVITY = 0.01f  * r;
     cam.ZOOM_SENSITIVITY        = -1.0   * (double)r;
@@ -570,6 +641,8 @@ inline void applySceneScaleToCamera(FullSphereCamera& cam, float sceneDiag) {
               << "  InitialRadius=" << cam.InitialRadius
               << "  minR="      << cam.minRadius
               << "  maxR="      << cam.maxRadius
+              << "  near="      << cam.nearPlane
+              << "  far="       << cam.farPlane
               << "  panSens="   << cam.LIGHT_MOUSE_SENSITIVITY
               << "  zoomSens="  << cam.ZOOM_SENSITIVITY
               << std::endl;
@@ -600,7 +673,70 @@ inline float scaledMaxDist(float refValue = 1.0f) {
 // カメラを「レジストレーション側 setupObjScene 末尾」と同じ向き・対象にする
 // ============================================================================
 inline void applyRegistrationCameraPose(FullSphereCamera& cam) {
-    cam.rotation = glm::angleAxis(glm::radians(180.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    // [CT-handoff] Cam Init はターゲット中心(TARGET_TEXTURE=gTargetMesh 中心、CT 済)
+    //   を見る。基本姿勢の 180°Y は registered フレーム用に調整された向き。CT 化で
+    //   シーンは T の回転ぶん回っているので、その回転(T^-1 の回転 R^-1)を合成して
+    //   「回転後ターゲットの正面」を向かせる。reg_transform.txt が無ければ従来どおり
+    //   素の 180°Y。
+    //   ※ もし正面でなく裏/横を向く場合の調整候補(1行入れ替え):
+    //       ・合成順: cam.rotation = glm::normalize(base * qRinv);
+    //       ・逆回転: qRinv を glm::conjugate(qRinv) に置換(= R を使う)。
+    const glm::quat base = glm::angleAxis(glm::radians(180.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+
+    bool haveT = false;
+    const glm::mat4 Tinv = loadRegToCtInverse(&haveT);   // registered -> CT
+    if (haveT) {
+        glm::mat3 lin = glm::mat3(Tinv);                 // (1/s) * R^-1
+        const float colLen = glm::length(lin[0]);
+        if (colLen > 1e-8f) { lin[0] /= colLen; lin[1] /= colLen; lin[2] /= colLen; } // -> R^-1
+        const glm::quat qRinv = glm::quat_cast(lin);
+        // rotMatrix(cam.rotation) = R^-1 * rotMatrix(base) になるよう左から合成。
+        cam.rotation = glm::normalize(qRinv * base);
+        std::cout << "[CT-handoff] Cam Init pose composed with T^-1 rotation "
+                     "(faces the rotated target)." << std::endl;
+
+        // ------------------------------------------------------------------
+        // [CamDiag] 「実カメラ姿勢(CT)」と「orbit カメラが実際に作る姿勢」を比較。
+        //   REG の AR は実 metric カメラ(registered では原点→+Z)で重なる。CT 化後
+        //   それに相当するのは eye=T^-1·原点 / 視線=T^-1·(0,0,1)。orbit カメラは
+        //   target(=点群重心)まわりに gRadius で回す方式なので、両者の eye が一致
+        //   しなければ AR オーバーレイが REG とズレる。差(eyeDelta)が大きければ
+        //   「向きは合っているが eye 位置がずれている(=この方式では実カメラを再現
+        //   できていない)」ことの数値的な証拠になる。
+        const glm::vec3 eyeReal = glm::vec3(Tinv * glm::vec4(0, 0, 0, 1));
+        const glm::vec3 lookReal = glm::vec3(Tinv * glm::vec4(0, 0, 1, 1));
+        const glm::vec3 fwdReal = glm::normalize(lookReal - eyeReal);
+        glm::vec3 upReal = glm::normalize(glm::mat3(qRinv) * glm::vec3(0, 1, 0));
+
+        const glm::vec3 tgtTex = gTargetMesh ? computeMeshCenter(*gTargetMesh)
+                                             : glm::vec3(0.0f);
+        const glm::mat3 Rcam = glm::mat3_cast(cam.rotation);
+        const glm::vec3 eyeOrbit = tgtTex + Rcam * glm::vec3(0, 0, cam.gRadius);
+        const glm::vec3 fwdOrbit = glm::normalize(tgtTex - eyeOrbit);
+        const glm::vec3 upOrbit  = glm::normalize(Rcam * glm::vec3(0, 1, 0));
+        const float eyeDelta = glm::length(eyeReal - eyeOrbit);
+        const float fwdDot   = glm::dot(fwdReal, fwdOrbit);   // 1 なら向き一致
+
+        std::cout << "[CamDiag] intrinsics  fx=" << cam.fx << " fy=" << cam.fy
+                  << " cx=" << cam.cx << " cy=" << cam.cy
+                  << " calib=" << cam.calibWidth << "x" << cam.calibHeight
+                  << " near=" << cam.nearPlane << " far=" << cam.farPlane
+                  << " gRadius=" << cam.gRadius << std::endl;
+        std::cout << "[CamDiag] REAL  eye=(" << eyeReal.x << "," << eyeReal.y << "," << eyeReal.z
+                  << ")  fwd=(" << fwdReal.x << "," << fwdReal.y << "," << fwdReal.z
+                  << ")  up=(" << upReal.x << "," << upReal.y << "," << upReal.z << ")" << std::endl;
+        std::cout << "[CamDiag] ORBIT eye=(" << eyeOrbit.x << "," << eyeOrbit.y << "," << eyeOrbit.z
+                  << ")  fwd=(" << fwdOrbit.x << "," << fwdOrbit.y << "," << fwdOrbit.z
+                  << ")  up=(" << upOrbit.x << "," << upOrbit.y << "," << upOrbit.z << ")" << std::endl;
+        std::cout << "[CamDiag] eyeDelta=" << eyeDelta
+                  << "  (= " << (cam.gRadius > 1e-6f ? 100.0f * eyeDelta / cam.gRadius : 0.0f)
+                  << "% of gRadius)   fwd.dot=" << fwdDot
+                  << "  (1.0=向き一致)" << std::endl;
+        std::cout << "[CamDiag] tgtTex(point-cloud center)=(" << tgtTex.x << ","
+                  << tgtTex.y << "," << tgtTex.z << ")" << std::endl;
+    } else {
+        cam.rotation = base;
+    }
     cam.currentTarget = TARGET_TEXTURE;
 }
 
@@ -611,8 +747,8 @@ inline void updateCameraTargets(FullSphereCamera& cam) {
         liverCenter = bunnyPos + computeMeshCenter(multiBody->getVisPositions(0));
     }
     glm::vec3 textureCenter = gTargetMesh
-        ? computeMeshCenter(*gTargetMesh)
-        : bunnyPos;
+                                  ? computeMeshCenter(*gTargetMesh)
+                                  : bunnyPos;
     cam.updateTargetPositions(liverCenter, textureCenter);
 }
 
@@ -698,7 +834,7 @@ inline void drawAutoHandlesPhysical(
         glm::vec3 centerCol;
         if (isActive)                centerCol = colActive;     // 橙: 編集中
         else if (h.progress > 1e-5f || glm::dot(h.manualOffset, h.manualOffset) > 1e-10f)
-                                     centerCol = colEdit;        // 緑: 編集済み(progress or 手動)
+            centerCol = colEdit;        // 緑: 編集済み(progress or 手動)
         else                         centerCol = colUnt;         // 黄: 未編集
 
         // メイン中心球: 物理半径そのまま
@@ -720,6 +856,73 @@ inline void drawAutoHandlesPhysical(
 // ============================================================================
 // reg_*.obj から四面体化＆SoftBody を作る
 // ============================================================================
+// =============================================================================
+// [CT-handoff] DEFORM-side: bring reg_*.obj back to CT space before physics.
+//   reg_transform.txt (written by REG) holds T = CT -> registered (column-major
+//   4x4 glm). We load its inverse and materialize T^-1 copies of reg_*.obj into
+//   ct_input/ (canonical names), because the tetrahedralizer and the vis loader
+//   read OBJ files from disk -- so the cheapest, least-invasive way to make the
+//   SoftBody live in CT mm is to feed it CT-space files. With no reg_transform.txt
+//   present we fall back to the legacy registered-frame inputs (identity).
+//
+//   NOTE: this file (DeformPipeline.h) is the DEFORM app's; deform/main.cpp is
+//   not in this tree, so the round-trip can be validated REG-only first (REG
+//   writes ct_roundtrip/ directly). Build-check these helpers in the DEFORM app.
+// =============================================================================
+inline glm::mat4 loadRegToCtInverse(bool* outFound = nullptr) {
+    if (outFound) *outFound = false;
+    const std::string tp = REG_MODEL_PATH + "reg_transform.txt";
+    std::ifstream ifs(tp);
+    if (!ifs.is_open()) {
+        std::cout << "[CT-handoff] no " << tp
+                  << " -> using registered-frame inputs (identity)." << std::endl;
+        return glm::mat4(1.0f);
+    }
+    std::vector<float> vals; std::string line;
+    while (std::getline(ifs, line)) {
+        if (!line.empty() && line[0] == '#') continue;   // skip header
+        std::istringstream iss(line); float f;
+        while (iss >> f) vals.push_back(f);
+    }
+    if (vals.size() < 16) {
+        std::cerr << "[CT-handoff] " << tp << " has <16 floats; ignoring." << std::endl;
+        return glm::mat4(1.0f);
+    }
+    const glm::mat4 T = glm::make_mat4(vals.data());     // column-major
+    if (outFound) *outFound = true;
+    std::cout << "[CT-handoff] loaded reg_transform.txt; applying T^-1 (registered->CT)."
+              << std::endl;
+    return glm::inverse(T);
+}
+
+// Write T^-1 copies of the reg_*.obj organ set into ctDir (canonical names).
+inline bool materializeCtInputs(const glm::mat4& Tinv, const std::string& ctDir) {
+    namespace fs = std::filesystem; std::error_code ec;
+    fs::create_directories(ctDir, ec);
+    struct Pair { std::string src; const char* name; };
+    const Pair ps[6] = {
+                        { Reg_TARGET_FILE_PATH,  "liver.obj"   }, { Reg_PORTAL_FILE_PATH,  "portal.obj"  },
+                        { Reg_VEIN_FILE_PATH,    "vein.obj"    }, { Reg_TUMOR_FILE_PATH,   "tumor.obj"   },
+                        { Reg_SEGMENT_FILE_PATH, "segment.obj" }, { Reg_GB_FILE_PATH,      "gb.obj"      },
+                        };
+    int n = 0;
+    for (const auto& p : ps) {
+        if (!fs::exists(p.src)) continue;
+        mCutMesh m = mCutMesh().loadMeshFromFile(p.src.c_str());
+        for (size_t i = 0; i + 2 < m.mVertices.size(); i += 3) {
+            const glm::vec4 v = Tinv * glm::vec4(
+                                    m.mVertices[i], m.mVertices[i+1], m.mVertices[i+2], 1.0f);
+            m.mVertices[i] = v.x; m.mVertices[i+1] = v.y; m.mVertices[i+2] = v.z;
+        }
+        m.mNormals.clear();
+        m.exportObjFile((fs::path(ctDir) / p.name).string());
+        ++n;
+    }
+    std::cout << "[CT-handoff] materialized " << n << " CT-space organ(s) into "
+              << ctDir << std::endl;
+    return n > 0;
+}
+
 inline bool initFromRegistered() {
     if (deformInit) return true;
 
@@ -729,10 +932,28 @@ inline bool initFromRegistered() {
         return false;
     }
 
+    // [CT-handoff] If reg_transform.txt exists, materialize CT-space copies of
+    //   reg_*.obj into ct_input/ and feed THOSE to the tetrahedralizer / vis
+    //   loader so the SoftBody (and its exported output) live in CT mm. With no
+    //   transform present, srcXxx stay the registered-frame reg_* paths.
+    bool haveT = false;
+    const glm::mat4 Tinv = loadRegToCtInverse(&haveT);
+    const std::string ctDir = REG_MODEL_PATH + "ct_input/";
+    if (haveT) materializeCtInputs(Tinv, ctDir);
+    auto pick = [&](const std::string& regPath, const char* name) -> std::string {
+        return haveT ? (ctDir + name) : regPath;
+    };
+    const std::string srcLiver   = pick(Reg_TARGET_FILE_PATH,  "liver.obj");
+    const std::string srcPortal  = pick(Reg_PORTAL_FILE_PATH,  "portal.obj");
+    const std::string srcVein    = pick(Reg_VEIN_FILE_PATH,    "vein.obj");
+    const std::string srcTumor   = pick(Reg_TUMOR_FILE_PATH,   "tumor.obj");
+    const std::string srcSegment = pick(Reg_SEGMENT_FILE_PATH, "segment.obj");
+    const std::string srcGb      = pick(Reg_GB_FILE_PATH,      "gb.obj");
+
     // 1) liver を四面体化(20分割HYBRIDモード、スムージング無効=元コード準拠)
     {
         CentVoxTetrahedralizerHybrid tet(
-            20, Reg_TARGET_FILE_PATH, OUTPUT_TET_FILE,
+            20, srcLiver, OUTPUT_TET_FILE,
             CentVoxTetrahedralizerHybrid::DetectionMode::HYBRID, 1, 1);
         CentVoxTetrahedralizerHybrid::SmoothingSettings ss;
         ss.enabled = false; ss.iterations = 0; ss.smoothFactor = 0.0f;
@@ -752,12 +973,12 @@ inline bool initFromRegistered() {
     };
 
     std::vector<SoftBody::MeshData> visMeshes;
-    visMeshes.push_back(loadVis(Reg_TARGET_FILE_PATH));   // liver  (必須)
-    visMeshes.push_back(loadVis(Reg_PORTAL_FILE_PATH));   // portal
-    visMeshes.push_back(loadVis(Reg_VEIN_FILE_PATH));     // vein
-    visMeshes.push_back(loadVis(Reg_TUMOR_FILE_PATH));    // tumor
-    visMeshes.push_back(loadVis(Reg_SEGMENT_FILE_PATH));  // segment
-    visMeshes.push_back(loadVis(Reg_GB_FILE_PATH));       // gb
+    visMeshes.push_back(loadVis(srcLiver));    // liver  (必須)
+    visMeshes.push_back(loadVis(srcPortal));   // portal
+    visMeshes.push_back(loadVis(srcVein));     // vein
+    visMeshes.push_back(loadVis(srcTumor));    // tumor
+    visMeshes.push_back(loadVis(srcSegment));  // segment
+    visMeshes.push_back(loadVis(srcGb));       // gb
 
     // 3) SoftBody 生成
     multiBody = new SoftBody(tetmesh, visMeshes, /*edgeComp=*/0.001f, /*volComp=*/0.0f);
@@ -984,6 +1205,66 @@ inline void onMouseMove(double xpos, double ypos, float dt)
 }
 
 // ============================================================================
+// [deform round-trip] 変形後の organ メッシュを canonical 名で書き出す。
+//   - getVisPositions(i) は変形後頂点そのもの。[CT-handoff] 後は initFromRegistered
+//     が ct_input/(= T^-1 適用済み)から SoftBody を作るので、これらは CT 空間
+//     (固定 mm)。model 行列(bunnyPos)は今は単位だが将来安全のため掛ける。
+//   - 出力先は中立名 registration_model/ct_deformed/。CT 空間なので REG 側は
+//     これを「通常ドロップ」(prealign で target に再フィット → register#2)で受ける。
+//     ※ "deformed" という名前だと REG が preserve-pose 判定で prealign を飛ばし、
+//       CT スケール(肝 diag≈8.6mm)のまま置かれてズレるため、名前を分けている。
+//   - vis index 0..5 = liver/portal/vein/tumor/segment/gb
+//     (initFromRegistered の push 順 = REG の kOrganCanonical 順)。空はスキップ。
+// ============================================================================
+inline bool exportDeformedOrgans(const std::string& outDir = REG_MODEL_PATH + "ct_deformed/") {
+    if (!multiBody) {
+        std::cerr << "[DeformExport] SoftBody 未生成。出力できません。" << std::endl;
+        return false;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(outDir, ec);
+
+    static const char* kNames[6] = {
+        "liver.obj", "portal.obj", "vein.obj",
+        "tumor.obj", "segment.obj", "gb.obj"
+    };
+    const glm::mat4 M = multiBody->getModelMatrix();   // 今は単位(bunnyPos=0)
+
+    int written = 0;
+    for (int i = 0; i < 6; ++i) {                       // vis 配列は常に6枠
+        const std::vector<float>& V = multiBody->getVisPositions(i);
+        const std::vector<int>&   F = multiBody->getVisSurfaceTriIds(i);
+        if (V.empty() || F.empty()) continue;           // 空 organ はスキップ
+
+        const std::string path = (fs::path(outDir) / kNames[i]).string();
+        std::ofstream ofs(path);
+        if (!ofs.is_open()) {
+            std::cerr << "[DeformExport] open 失敗: " << path << std::endl;
+            continue;
+        }
+        ofs << "# deformed organ from DEFORM (REG#1 registered frame)\n";
+        ofs << "# verts=" << (V.size() / 3) << " tris=" << (F.size() / 3) << "\n";
+        for (size_t k = 0; k + 2 < V.size(); k += 3) {
+            glm::vec4 p = M * glm::vec4(V[k], V[k + 1], V[k + 2], 1.0f);
+            ofs << "v " << p.x << " " << p.y << " " << p.z << "\n";
+        }
+        for (size_t t = 0; t + 2 < F.size(); t += 3) {
+            ofs << "f " << (F[t] + 1) << " " << (F[t + 1] + 1) << " "
+                << (F[t + 2] + 1) << "\n";
+        }
+        ++written;
+        std::cout << "[DeformExport] " << kNames[i]
+                  << "  V:" << (V.size() / 3) << " F:" << (F.size() / 3)
+                  << "  -> " << path << std::endl;
+    }
+    std::cout << "[DeformExport] " << written << " organ(s) を " << outDir
+              << " に出力。REG にこのフォルダを通常ドロップしてください"
+                 "(prealign で target に合わせ → register#2)。" << std::endl;
+    return written > 0;
+}
+
+// ============================================================================
 // キーボード(統合 main.cpp 用に独立化)
 //   DEFORM_MODE のとき呼ぶ想定。GLFW の key / mods をそのまま渡す。
 //   ※ 1〜0 は AutoDeform 用に予約済み(段階2 以降で接続)
@@ -992,6 +1273,10 @@ inline void onKey(int key, int mods)
 {
     using S = DeformHandlPlaceData;
     switch (key) {
+    case GLFW_KEY_E:
+        // [deform round-trip] 変形後 organ を registration_model/ct_deformed/ に出力
+        exportDeformedOrgans();
+        break;
     case GLFW_KEY_R:
         deformHandlPlace.state = S::RIGID_MODE;
         if (multiBody) multiBody->setRigidMode(true);
@@ -1022,13 +1307,13 @@ inline void onKey(int key, int mods)
         std::cout << "[Toggle] Board  = " << alphaLabel(gBoardAlpha) << std::endl;
         break;
 
-    // ========================================================================
-    // === AUTO Step 1〜4 (元の長いmain.cpp の Key 1〜4 と同等) ===
-    //   1: classifySrcVisibility (src 頂点の visible/hidden 分類)
-    //   2: extractCorrespondences (src↔tgt 対応点)
-    //   3: classify (INLIER/MOVER/OUTLIER 分類, 必要なら 2 を先に呼ぶ)
-    //   4: computeFieldOnVisMesh (変形フィールド,   必要なら 2 を先に呼ぶ)
-    // ========================================================================
+        // ========================================================================
+        // === AUTO Step 1〜4 (元の長いmain.cpp の Key 1〜4 と同等) ===
+        //   1: classifySrcVisibility (src 頂点の visible/hidden 分類)
+        //   2: extractCorrespondences (src↔tgt 対応点)
+        //   3: classify (INLIER/MOVER/OUTLIER 分類, 必要なら 2 を先に呼ぶ)
+        //   4: computeFieldOnVisMesh (変形フィールド,   必要なら 2 を先に呼ぶ)
+        // ========================================================================
     case GLFW_KEY_1:
         if (currentMainMode == DEFORM_MODE && gLiverStaticMesh && gTargetMesh) {
             if (mods & GLFW_MOD_SHIFT) {
@@ -1039,15 +1324,31 @@ inline void onKey(int key, int mods)
                 break;
             }
             gAutoDeform.debugMaxPoints = 0;
-            // KeyA (AR モード) と同一の固定カメラポーズを使用:
-            //   - cameraPos    = 原点 (= original.jpg を撮ったカメラ位置)
-            //   - cameraTarget = +Z 方向
-            //   AR で見えている面と Step1 visibility 判定を一致させるため、
-            //   OrbitCam の現在/初期ポーズではなく AR の固定ポーズで raycast する。
-            //   レジストレーション側 main.cpp の KeyA と同一の (origin, +Z) ペア。
+            // [CT-handoff] Step1 visibility は「original.jpg を撮った実カメラから
+            //   見えている src 面」を判定する。実カメラは *registered フレーム* では
+            //   原点→+Z だが、シーンは loadReferenceMeshes() で T^-1 により CT 空間へ
+            //   移動済み。カメラだけ registered のまま (0,0,0)->(0,0,1) で raycast すると、
+            //   CT 化で T ぶん回ったメッシュを別角度から見てしまい、ほとんどが
+            //   backface/occluded に落ちて visible がごく僅か(→ Step5 で move handle が
+            //   0 個 → 変形が一切起きない)になる。これが「探索点が固定されたまま
+            //   CT スケールに移行したので AutoDeform が機能しない」症状の正体。
+            //   修正: AR オーバーレイ(M=T)と同じく、カメラも T^-1 で CT 空間へ持ち込む。
+            //   eye = T^-1·原点、target = T^-1·(0,0,1)。viewDir は両端点の差から再計算
+            //   されるので、T のスケールが入っても向き・原点とも正しく CT に乗る。
+            //   reg_transform.txt が無ければ従来どおり原点→+Z(registered フレーム)。
             glm::vec3 arCamPos(0.0f, 0.0f, 0.0f);
             glm::vec3 arCamTgt(0.0f, 0.0f, 1.0f);
-            std::cout << "[AutoDeform Step1] using AR camera pose (0,0,0) -> (0,0,1)"
+            {
+                bool haveT = false;
+                const glm::mat4 Tinv = loadRegToCtInverse(&haveT);   // registered -> CT
+                if (haveT) {
+                    arCamPos = glm::vec3(Tinv * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    arCamTgt = glm::vec3(Tinv * glm::vec4(0.0f, 0.0f, 1.0f, 1.0f));
+                }
+            }
+            std::cout << "[AutoDeform Step1] camera pose (CT) ("
+                      << arCamPos.x << "," << arCamPos.y << "," << arCamPos.z << ") -> ("
+                      << arCamTgt.x << "," << arCamTgt.y << "," << arCamTgt.z << ")"
                       << std::endl;
             DeformPipeline::autoClassifyVisibility(
                 gLiverStaticMesh, gTargetMesh, arCamPos, arCamTgt);
@@ -1102,13 +1403,13 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // ========================================================================
-    // === AUTO Step 5: ハンドル自動生成 + DEFORM_MODE 自動切替 ===
-    //   - 必要なら Step 2/4 を先に呼ぶ(extractCorrespondences / computeFieldOnVisMesh)
-    //   - generateHandles でプリセットに従って fix/move ハンドル配置
-    //   - gAutoCtrl.initialize で SoftBody にハンドル登録
-    //   - setRigidMode(false) + state=DEFORM_MODE で物理駆動開始
-    // ========================================================================
+        // ========================================================================
+        // === AUTO Step 5: ハンドル自動生成 + DEFORM_MODE 自動切替 ===
+        //   - 必要なら Step 2/4 を先に呼ぶ(extractCorrespondences / computeFieldOnVisMesh)
+        //   - generateHandles でプリセットに従って fix/move ハンドル配置
+        //   - gAutoCtrl.initialize で SoftBody にハンドル登録
+        //   - setRigidMode(false) + state=DEFORM_MODE で物理駆動開始
+        // ========================================================================
     case GLFW_KEY_5:
         if (currentMainMode == DEFORM_MODE && multiBody && gLiverStaticMesh && gTargetMesh) {
             // 元コード踏襲: フィールド未計算なら Step 2/4 相当を先に呼ぶ
@@ -1160,14 +1461,14 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // ========================================================================
-    // === HEMI 駆動 (Keys 6, A, Backspace, -, =) ===
-    //   Key 5 で生成・配置されたハンドルを、人がキー押すたびに 1 ステップずつ駆動
-    //   元の長いmain.cpp の Key 6 / Bksp / A / -/= と完全一致(レジストレーションの
-    //   HemiAuto とは無関係。あちらは FGR+ICP の自動位置合わせ)
-    // ========================================================================
+        // ========================================================================
+        // === HEMI 駆動 (Keys 6, A, Backspace, -, =) ===
+        //   Key 5 で生成・配置されたハンドルを、人がキー押すたびに 1 ステップずつ駆動
+        //   元の長いmain.cpp の Key 6 / Bksp / A / -/= と完全一致(レジストレーションの
+        //   HemiAuto とは無関係。あちらは FGR+ICP の自動位置合わせ)
+        // ========================================================================
 
-    // Key 6: アクティブな move ハンドルを +gMoveScale 進める
+        // Key 6: アクティブな move ハンドルを +gMoveScale 進める
     case GLFW_KEY_6:
         if (currentMainMode == DEFORM_MODE && multiBody && gTargetMesh) {
             if (gAutoDeform.stage < 5 || gAutoCtrl.numMove() == 0) {
@@ -1234,7 +1535,7 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // Backspace: アクティブ move ハンドルを -gMoveScale 戻す
+        // Backspace: アクティブ move ハンドルを -gMoveScale 戻す
     case GLFW_KEY_BACKSPACE:
         if (currentMainMode == DEFORM_MODE && multiBody && gTargetMesh) {
             if (gAutoCtrl.activeMoveIdx() < 0) {
@@ -1278,9 +1579,9 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // Key N: 次の move ハンドルへアクティブ切替
-    //   旧 Key A から移動（A は main.cpp 側で AR 背景オーバーレイ切替に使うため）。
-    //   "N" = Next move handle のニーモニック。
+        // Key N: 次の move ハンドルへアクティブ切替
+        //   旧 Key A から移動（A は main.cpp 側で AR 背景オーバーレイ切替に使うため）。
+        //   "N" = Next move handle のニーモニック。
     case GLFW_KEY_N:
         if (currentMainMode == DEFORM_MODE && multiBody) {
             if (gAutoCtrl.numMove() == 0) {
@@ -1296,7 +1597,7 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // Key -: gMoveScale -= 0.1 (clamp 0.1〜2.0)
+        // Key -: gMoveScale -= 0.1 (clamp 0.1〜2.0)
     case GLFW_KEY_MINUS:
         if (currentMainMode == DEFORM_MODE) {
             gMoveScale = std::max(0.1f, gMoveScale - 0.1f);
@@ -1306,7 +1607,7 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // Key =: gMoveScale += 0.1
+        // Key =: gMoveScale += 0.1
     case GLFW_KEY_EQUAL:
         if (currentMainMode == DEFORM_MODE) {
             gMoveScale = std::min(2.0f, gMoveScale + 0.1f);
@@ -1316,17 +1617,17 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // ========================================================================
-    // === Key 7: BEFORE/AFTER スナップショット toggle ===
-    //   Key 6 で baseline (BEFORE) は既にキャプチャ済み
-    //
-    //   状態遷移:
-    //     editing  (rigid=false) → 7 押下: 現在の状態を AFTER として再 capture + AFTER 表示
-    //     inspect  (rigid=true)  → 7 押下: BEFORE/AFTER 切替のみ
-    //
-    //   これにより「編集 → 7 で確認 → 編集再開 → 7 で再確認」のサイクルで、
-    //   AFTER が常に最新の編集状態を反映する。
-    // ========================================================================
+        // ========================================================================
+        // === Key 7: BEFORE/AFTER スナップショット toggle ===
+        //   Key 6 で baseline (BEFORE) は既にキャプチャ済み
+        //
+        //   状態遷移:
+        //     editing  (rigid=false) → 7 押下: 現在の状態を AFTER として再 capture + AFTER 表示
+        //     inspect  (rigid=true)  → 7 押下: BEFORE/AFTER 切替のみ
+        //
+        //   これにより「編集 → 7 で確認 → 編集再開 → 7 で再確認」のサイクルで、
+        //   AFTER が常に最新の編集状態を反映する。
+        // ========================================================================
     case GLFW_KEY_7:
         if (currentMainMode == DEFORM_MODE && multiBody && gTargetMesh) {
             if (!gSnapBeforeValid) {
@@ -1404,11 +1705,11 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // ========================================================================
-    // === Key P: プリセット切替 (P0..P4 サイクル) ===
-    //   Key 5 の前に押すと次回 Key 5 で新プリセットでハンドル生成。
-    //   既にハンドル生成済みの場合は描画半径のみ更新(物理は次回再生成まで旧プリセット)。
-    // ========================================================================
+        // ========================================================================
+        // === Key P: プリセット切替 (P0..P4 サイクル) ===
+        //   Key 5 の前に押すと次回 Key 5 で新プリセットでハンドル生成。
+        //   既にハンドル生成済みの場合は描画半径のみ更新(物理は次回再生成まで旧プリセット)。
+        // ========================================================================
     case GLFW_KEY_P:
         if (currentMainMode == DEFORM_MODE) {
             const auto& presets = AutoDeform::getPresets();
@@ -1426,9 +1727,9 @@ inline void onKey(int key, int mods)
         }
         break;
 
-    // ========================================================================
-    // === Key 0: TetMesh wireframe toggle ===
-    // ========================================================================
+        // ========================================================================
+        // === Key 0: TetMesh wireframe toggle ===
+        // ========================================================================
     case GLFW_KEY_0:
         if (multiBody) {
             multiBody->toggleTetMeshVisible();

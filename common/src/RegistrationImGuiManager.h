@@ -60,6 +60,8 @@ struct RegUIActions {
     std::function<void()> onResetCamera;
     std::function<void()> onExportStl;         // [key-reorg P12] was M (export registered OBJs)
     std::function<void()> onExportStlFlipped;  // [key-reorg P12] was Shift+M (cam-mm STL + snapshot)
+    std::function<void()> onLoadDeformedCT;    // [deform round-trip] load registration_model/ct_deformed/ (REG#2 入力)
+    std::function<void()> onExportDeformedCT;  // [deform round-trip] DEFORM: export deformed organs -> registration_model/ct_deformed/
     std::function<void()> onRefine;
     std::function<void()> onSilhouetteAlign;
     // ---- Ctrl+G : V3-R BIPOP-CMA-ES (Region-aware, main refinement) ----
@@ -140,6 +142,7 @@ struct RegUIActions {
     // ---- Reconstruct from BIN (FEATURE Task 5) ----
     std::function<void()> onReconstruct;       // run exportDepthArtifacts on dropped data
     std::function<void()> onReconstructClear;  // clear all reconstruct slots
+    std::function<void()> onRebuildFromCurrentDepth;  // re-unproject depth_output/ depth with the active K (no DA3/SAM2)
     std::function<void(float)> onInstrumentPxThreshChanged;   // ★追加
     // Vignette auto-detection toggle. Called when the checkbox in the
     // DEPTH GENERATION section is toggled. main.cpp side updates
@@ -721,7 +724,7 @@ public:
         if (ImGui::Begin("##RegSidebar", nullptr, flags)) {
             drawWorkflowStepper();
             drawDepthSection();
-            drawReconstructSection();
+            if (state.mainMode == 0) drawReconstructSection();  // DEFORM: hide BIN-reconstruct
             drawRegistrationSection();
             drawDeformSection();
             drawExport();
@@ -811,7 +814,14 @@ private:
         int phase = currentPhase();
         drawSectionWithBar("DEPTH GENERATION", colDepth(), state.depthDone, phase==0, state.depthRunning);
 
-        if (regPhaseActive_ || state.mainMode == 1) {
+        // DEFORM mode: depth source / camera-calibration UI is irrelevant here.
+        //   Show only the "DEPTH GENERATION  DONE" bar (drawn above), then bail.
+        if (state.mainMode == 1) {
+            ImGui::Spacing(); ImGui::Separator();
+            return;
+        }
+
+        if (regPhaseActive_) {
             ImGui::Indent(16);
             if (state.depthDone) {
                 drawIntrinsicsSource("reg");
@@ -2520,7 +2530,20 @@ private:
     void drawReconstructSection() {
         if (!ImGui::CollapsingHeader("Reconstruct from depth (BIN)")) return;
         ImGui::Indent(16); ImGui::Spacing();
-        ImGui::TextWrapped("Drop depth_metric.bin + segmentation_mask.png "
+
+        // One-click: re-unproject the CURRENT session depth (depth_output/) with
+        // the active K, no DA3/SAM2. Use right after changing the intrinsics
+        // source (drop a custom K, or Run Calibration) so the cloud matches the
+        // new K and the AR overlay lines up with the photo again.
+        if (colorButton("Rebuild cloud from current depth (new K)", colGreen(),
+                        false, false, -1)) {
+            if (actions.onRebuildFromCurrentDepth) actions.onRebuildFromCurrentDepth();
+        }
+        ImGui::TextColored(colDim(), "Uses depth_output/ depth_metric.bin + mask; "
+                                     "no DA3/SAM2 rerun. Run after drop/calibrate.");
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+        ImGui::TextWrapped("Or drop depth_metric.bin + segmentation_mask.png "
                            "(+ original.jpg) or a depth_output/ folder.");
         ImGui::Spacing();
 
@@ -2579,6 +2602,22 @@ private:
     void drawExport() {
         if (!ImGui::CollapsingHeader("Export")) return;
         ImGui::Indent(16); ImGui::Spacing();
+
+        // ----- DEFORM mode: export the DEFORMED organs (not the REG meshes) -----
+        //   DeformPipeline::exportDeformedOrgans() -> registration_model/ct_deformed/
+        //   (same action as the AutoDeform panel button / key E). The REG
+        //   "Export Reg OBJs" / "cam-mm STL" buttons are meaningless here.
+        if (state.mainMode == 1) {
+            if (colorButton("Export Deformed (CT) -> ct_deformed/",
+                            colDeform(), false, false, -1)) {
+                if (actions.onExportDeformedCT) actions.onExportDeformedCT();
+            }
+            ImGui::TextDisabled("  writes registration_model/ct_deformed/  (then Load/drop into REG)");
+            ImGui::Spacing(); ImGui::Unindent(16); ImGui::Separator();
+            return;
+        }
+
+        // ----- REGISTRATION mode: registered-mesh export + REG#2 load-back -----
         float halfW = (ImGui::GetContentRegionAvail().x - 6) / 2.0f;
         if (colorButton("Export Reg OBJs", colReg(), false, false, halfW)) {
             if (actions.onExportStl) actions.onExportStl();
@@ -2587,6 +2626,15 @@ private:
         if (colorButton("Export cam-mm STL", colYellow(), false, false, halfW)) {
             if (actions.onExportStlFlipped) actions.onExportStlFlipped();
         }
+
+        // [deform round-trip] DEFORM が書き出した変形モデル ct_deformed/ を読み込む(REG#2 入力)。
+        ImGui::Spacing();
+        if (colorButton("Load Deformed (ct_deformed/)  [REG #2]",
+                        colDeform(), false, false, -1)) {
+            if (actions.onLoadDeformedCT) actions.onLoadDeformedCT();
+        }
+        ImGui::TextDisabled("  loads registration_model/ct_deformed/ as organ set");
+
         ImGui::Spacing(); ImGui::Unindent(16); ImGui::Separator();
     }
 

@@ -21,14 +21,19 @@ extern glm::vec3 bunnyPos;
 // シーンスケール(DeformGlobals.h で定義, handle 無し時の grabThreshold 用)
 extern float gSceneDiag;
 
+// [REG-parity AR] シーン(レターボックス)ビューポート (0,0,w,h)。main.cpp で定義。
+//   screenToRay はオフセットを見ないので、呼び出し側がウィンドウ座標を矩形ローカル
+//   に変換して渡す前提 (REG の compute3DViewport 運用と同じ)。
+extern glm::vec4 g_sceneViewport;
+
 class Grabber {
 public:
     Grabber()
         : physicsObject(nullptr),
-          grabDistance(0.0f),
-          prevPosition(0.0f),
-          velocity(0.0f),
-          time(0.0f) {}
+        grabDistance(0.0f),
+        prevPosition(0.0f),
+        velocity(0.0f),
+        time(0.0f) {}
 
     void setPhysicsObject(SoftBody* object) { physicsObject = object; }
 
@@ -40,7 +45,7 @@ public:
 
         RayCast::Ray worldRay = RayCast::screenToRay(
             screenX, screenY, view, projection,
-            glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+            g_sceneViewport);
 
         glm::mat4 modelMatrix    = glm::translate(glm::mat4(1.0f), bunnyPos);
         glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
@@ -71,7 +76,7 @@ public:
         if (!physicsObject) return false;
         RayCast::Ray worldRay = RayCast::screenToRay(
             screenX, screenY, view, projection,
-            glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+            g_sceneViewport);
 
         glm::mat4 modelMatrix    = glm::translate(glm::mat4(1.0f), bunnyPos);
         glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
@@ -89,7 +94,7 @@ public:
 
         RayCast::Ray worldRay = RayCast::screenToRay(
             screenX, screenY, view, projection,
-            glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+            g_sceneViewport);
 
         glm::mat4 modelMatrix    = glm::translate(glm::mat4(1.0f), bunnyPos);
         glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
@@ -113,8 +118,8 @@ public:
             // 同じ比率を gSceneDiag からスケールして求める。
             // (gSceneDiag 未初期化時は 1.0f にフォールバック)
             float grabThreshold = (gSceneDiag > 1e-6f)
-                ? (1.0f * gSceneDiag / 7.36f)   // kRefSceneDiag に揃える
-                : 1.0f;
+                                      ? (1.0f * gSceneDiag / 7.36f)   // kRefSceneDiag に揃える
+                                      : 1.0f;
             for (const auto& g : physicsObject->handleGroups)
                 grabThreshold = std::max(grabThreshold, g.radius);
 
@@ -128,7 +133,7 @@ public:
 
         RayCast::Ray worldRay = RayCast::screenToRay(
             screenX, screenY, view, projection,
-            glm::vec4(0, 0, gWindowWidth, gWindowHeight));
+            g_sceneViewport);
 
         glm::vec3 newPosition = worldRay.origin + worldRay.direction * grabDistance;
         if (time > 0.0f) velocity = (newPosition - prevPosition) / time;

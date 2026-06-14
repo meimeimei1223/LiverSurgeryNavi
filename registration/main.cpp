@@ -276,6 +276,30 @@ glm::mat4   g_lastOrganTransform = glm::mat4(1.0f);  // similarity transform app
 bool        g_hasLastOrganTransform = false;
 
 // =========================================================
+//  [CT-handoff] Source .obj of the CURRENT liverMesh3D in its raw
+//  (pre-registration / pre-prealign) coordinates.
+// ---------------------------------------------------------
+//  CT-handoff (StlExport::exportRegisteredObjs) recovers the
+//  CT->registered similarity T via Umeyama, which needs a 1:1 vertex
+//  correspondence between the registered liverMesh3D and the raw CT
+//  liver it came from. It used to assume that raw CT is always
+//  MODEL_PATH + "liver.obj" (the startup model). That breaks when a
+//  different organ set is dropped in mid-session via
+//  swapOrganSetFromDrop: the dropped liver may have a different vertex
+//  count, the counts mismatch, and reg_transform.txt / ct_roundtrip get
+//  skipped (the REG->DEFORM handoff silently does not happen).
+//
+//  We therefore record where the current liver actually came from:
+//    - startup / setupObjScene load  -> MODEL_PATH + "liver.obj"
+//    - NEW CT organ-set drop          -> the dropped liver.obj path
+//    - preserve-pose (deform round-trip) drop -> NOT updated: that mesh
+//      is in registered coords, not raw CT, so the previous CT source
+//      stays valid.
+//  Empty string -> fall back to MODEL_PATH + "liver.obj".
+// =========================================================
+std::string g_liverCtSourcePath;   // raw-CT source of current liverMesh3D ("" = fallback)
+
+// =========================================================
 //  Original CT-mm diagonals of liver/tumor as loaded from model/*.obj
 // ---------------------------------------------------------
 //  Captured ONCE at startup, immediately after the .obj files are
@@ -297,6 +321,21 @@ bool        g_hasLastOrganTransform = false;
 float       g_originalLiverDiagMm = 0.0f;  // diag(liver.obj) in CT mm, set once at startup
 float       g_originalTumorDiagMm = 0.0f;  // diag(tumor.obj) in CT mm, set once at startup
 bool        g_hasOriginalDiags    = false;
+
+// =========================================================
+//  [deform round-trip] reg -> CT-mm 固定スケール
+// ---------------------------------------------------------
+//  上の SCALE_RESTORE = g_originalLiverDiagMm / current_liver_diag は
+//  「現在の liver が CT の相似変換である」前提(rigid-similarity family)で
+//  のみ正しい。DEFORM で非剛体変形した liver を戻すとこの前提が崩れ、
+//  current_liver_diag に変形分が混ざって Shift+M の mm スケールがずれる。
+//  そこで「まだ未変形(=相似変換)の段階」で reg->mm スケールを一度だけ
+//  捕捉して固定し、以降の Shift+M はこれを使う。捕捉は最初の「Deform >>」
+//  (exportRegisteredObjs) で行い、生CTモデルを新規ドロップしたらリセットする。
+//  pure REG 運用(Deform >> を押さない)では未捕捉のまま従来式にフォールバック。
+// =========================================================
+float       g_regToMmScale    = 0.0f;
+bool        g_hasRegToMmScale = false;
 
 // =========================================================
 //  Target subset AABB (Phase 2 拡張: 重心 Position に応じた initial scale)
@@ -715,6 +754,44 @@ extern mCutMesh* liverMesh3D;
 #include "SilComparePanel.h"   // G tab: silhouette method A/B/C compare (reuses runShiftE / runBipopCmaesV3RS / SilOverlay F9)
     // (inline computeUnifiedMetrics の宣言が必要なため)
 
+// ----------------------------------------------------------------------
+// [QUAD-SIL ACCEPT] Save an Alt+P (runShiftE) result to the Pose Library
+// with the SAME accept criterion Ctrl+I uses, when in quadrant mode.
+// Defined here (after PoseLibrary.h) because it calls poseSaveToLibrary
+// and g_poseLibraryUseOccludedForAccept, both declared in PoseLibrary.h.
+//
+//   Legacy Alt+P (full mesh, Q:ALL or toggle OFF):
+//     poseSaveToLibrary(IOU) — gate on full-mesh IoU2D, byte-identical
+//     to the pre-feature behaviour.
+//
+//   Quadrant Alt+P:
+//     A subset alignment necessarily lowers the FULL-mesh IoU (only the
+//     selected quadrant matches; the rest drifts), so a full-mesh-IoU
+//     gate would reject every good result. Ctrl+I avoids this by judging
+//     on the OCCLUDED IoU. runShiftE already published g_lastSilOccludedIoU2D
+//     via publishCtrlGStyleDiagnostics, so here we just flip the gate to
+//     the occluded series for this one save (restored immediately after),
+//     mirroring Ctrl+I exactly. EITHER (RMSE-or-IoU), same as Ctrl+I.
+//
+//   The toggle flip is local and reverted, so the user's Pose-Library
+//   panel setting is untouched after the call.
+// ----------------------------------------------------------------------
+inline void saveSilAlignToLibrary() {
+    const bool quadMode =
+        g_shiftE_quadrantAware &&
+        g_activeQuadrantMask != LiverLeftRightLabel::QUAD_ALL;
+    if (!quadMode) {
+        // Legacy path — unchanged.
+        poseSaveToLibrary(SaveCriterion::IOU);
+        return;
+    }
+    // Quadrant path — judge on occluded IoU like Ctrl+I.
+    const bool prevOcc = g_poseLibraryUseOccludedForAccept;
+    g_poseLibraryUseOccludedForAccept = true;
+    poseSaveToLibrary(SaveCriterion::EITHER, g_activeQuadrantMask);
+    g_poseLibraryUseOccludedForAccept = prevOcc;
+}
+
 // SimpleCameraPreview は CameraPreview.h に移動
 
 static SimpleCameraPreview gCamera;
@@ -1087,6 +1164,55 @@ inline void clearLiverLabelVizCaches() {
 //  Ctrl+G 実行時にのみ参照される。
 // ----------------------------------------------------------------------
 uint8_t g_activeQuadrantMask = LiverLeftRightLabel::QUAD_ALL;  // 0x0F
+
+// ----------------------------------------------------------------------
+// [QUAD-SIL] Alt+P dispatch boilerplate — mirrors the Ctrl+I preamble.
+//   Shared by all three Alt+P entry points (GLFW key branch, G-tab
+//   button, sidebar onSilhouetteAlign lambda) so the guard logic can't
+//   drift between them.
+//   - Always logs the active quadrant mask (parity with Ctrl+I logging).
+//   - When the quadrant filter will actually engage
+//     (g_shiftE_quadrantAware && mask != QUAD_ALL):
+//       * auto-computes region/LR labels on demand (no HemiAuto needed),
+//       * aborts (returns false) when labels fail or the subset is empty
+//         — same hard-abort semantics as the Ctrl+I dispatch.
+//   - When the filter is bypassed (toggle OFF or QUAD_ALL), returns true
+//     without touching labels: legacy Alt+P never required them, and we
+//     keep that robustness.
+// ----------------------------------------------------------------------
+inline bool prepareQuadrantForSilAlign(const char* tag) {
+    const auto maskStr =
+        LiverLeftRightLabel::quadrantMaskString(g_activeQuadrantMask);
+    std::cout << "[" << tag << "] quadrant_mask = " << maskStr
+              << "  (0x" << std::hex << (unsigned)g_activeQuadrantMask
+              << std::dec << ")"
+              << (g_shiftE_quadrantAware ? "" : "  [quad-aware OFF]")
+              << std::endl;
+
+    const bool willEngage =
+        g_shiftE_quadrantAware &&
+        g_activeQuadrantMask != LiverLeftRightLabel::QUAD_ALL;
+    if (!willEngage) return true;
+
+    if (!g_liverRegion.valid()) recomputeLiverRegion();
+    if (!g_liverLR.valid())     recomputeLiverLR();
+    if (!g_liverRegion.valid() || !g_liverLR.valid()) {
+        std::cerr << "[" << tag << "] ERROR: label computation failed "
+                     "(is the liver mesh loaded?)." << std::endl;
+        return false;
+    }
+    const auto subset = LiverLeftRightLabel::makeQuadrantSubsetIdx(
+        g_liverRegion.labels, g_liverLR.labels, g_activeQuadrantMask);
+    if (subset.empty()) {
+        std::cerr << "[" << tag << "] ERROR: quadrant subset is empty."
+                  << std::endl;
+        return false;
+    }
+    return true;
+}
+// NOTE: saveSilAlignToLibrary() is defined AFTER the PoseLibrary.h include
+// (it calls poseSaveToLibrary / g_poseLibraryUseOccludedForAccept, both from
+// PoseLibrary.h which is included further down). See its definition there.
 
 // H キー初回 ON で呼ばれる。Shift+R / Y のラベルを利用して
 // 4象限の subsample 配列を構築する。
@@ -1503,6 +1629,99 @@ static void rebuildOBJWithCurrentThreshold() {
     std::cout << "=== Rebuild done ===" << std::endl;
 }
 
+// =============================================================================
+// [CT-handoff] REG -> DEFORM -> REG round-trip plumbing (ideas (1) and (5)).
+//   (1) Recover T (CT model/*.obj  ->  registered reg_*.obj) EMPIRICALLY via
+//       Umeyama on corresponding vertices, instead of composing the transform
+//       chain. organ meshes are never remeshed during registration (cleanupOBJMesh
+//       runs only on screenMesh), so re-loading model/liver.obj from disk gives a
+//       1:1 vertex correspondence with the current registered liverMesh3D. Umeyama
+//       then yields the exact similarity, det(R) detects any reflection for free,
+//       and the residual tells us whether every stage really was a similarity.
+//   (5) Zero-deform CT round-trip: write T^-1(reg_<organ>.obj) to ct_roundtrip/
+//       (== what DEFORM would output with zero deformation). Dropping that folder
+//       back into REG (NORMAL drop -> prealign + register#2) lets us verify the
+//       coordinate plumbing in one app, isolated from any physics.
+// =============================================================================
+namespace CtHandoff {
+
+// When true, exportRegisteredObjs() also writes ct_roundtrip/ (the zero-deform
+// stand-in). Flip to false to disable the test scaffold (reg_transform.txt is
+// always written; it is part of the real handoff).
+inline bool g_writeZeroDeformRoundtrip = true;
+
+// Umeyama (1991) similarity. Solves q ~= s*R*p + t for corresponding flat xyz
+// arrays src(p) and dst(q) of equal length. Returns column-major glm::mat4 and
+// reports scale, det(R) (should be +1, no reflection), RMSE and max residual in
+// dst units, and the pair count.
+inline glm::mat4 umeyamaSimilarity(const std::vector<GLfloat>& src,
+                                   const std::vector<GLfloat>& dst,
+                                   double& outScale, double& outDetR,
+                                   double& outRmse,  double& outMaxResid,
+                                   int& outN) {
+    outScale = 1.0; outDetR = 1.0; outRmse = -1.0; outMaxResid = -1.0; outN = 0;
+    if (src.size() != dst.size() || src.size() < 9) return glm::mat4(1.0f);
+    const int N = static_cast<int>(src.size() / 3);
+    outN = N;
+
+    Eigen::Vector3d mp = Eigen::Vector3d::Zero(), mq = Eigen::Vector3d::Zero();
+    for (int i = 0; i < N; ++i) {
+        mp += Eigen::Vector3d(src[3*i], src[3*i+1], src[3*i+2]);
+        mq += Eigen::Vector3d(dst[3*i], dst[3*i+1], dst[3*i+2]);
+    }
+    mp /= N; mq /= N;
+
+    Eigen::Matrix3d Sigma = Eigen::Matrix3d::Zero();
+    double varP = 0.0;
+    for (int i = 0; i < N; ++i) {
+        Eigen::Vector3d pc(src[3*i]-mp.x(), src[3*i+1]-mp.y(), src[3*i+2]-mp.z());
+        Eigen::Vector3d qc(dst[3*i]-mq.x(), dst[3*i+1]-mq.y(), dst[3*i+2]-mq.z());
+        Sigma += qc * pc.transpose();
+        varP  += pc.squaredNorm();
+    }
+    Sigma /= N; varP /= N;
+
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+        Sigma, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d U = svd.matrixU(), V = svd.matrixV();
+    Eigen::Vector3d D = svd.singularValues();
+    Eigen::Matrix3d S = Eigen::Matrix3d::Identity();
+    if (U.determinant() * V.determinant() < 0.0) S(2, 2) = -1.0;
+    Eigen::Matrix3d R = U * S * V.transpose();
+    const double trDS = D(0)*S(0,0) + D(1)*S(1,1) + D(2)*S(2,2);
+    const double s = (varP > 1e-20) ? trDS / varP : 1.0;
+    Eigen::Vector3d t = mq - s * R * mp;
+
+    outScale = s; outDetR = R.determinant();
+    double se = 0.0, mx = 0.0;
+    for (int i = 0; i < N; ++i) {
+        Eigen::Vector3d p(src[3*i], src[3*i+1], src[3*i+2]);
+        Eigen::Vector3d q(dst[3*i], dst[3*i+1], dst[3*i+2]);
+        const double e = (s * R * p + t - q).norm();
+        se += e * e; mx = std::max(mx, e);
+    }
+    outRmse = std::sqrt(se / std::max(1, N)); outMaxResid = mx;
+
+    glm::mat4 T(1.0f);                       // glm is column-major: T[col][row]
+    for (int c = 0; c < 3; ++c)
+        for (int r = 0; r < 3; ++r)
+            T[c][r] = static_cast<float>(s * R(r, c));
+    T[3][0] = static_cast<float>(t.x());
+    T[3][1] = static_cast<float>(t.y());
+    T[3][2] = static_cast<float>(t.z());
+    return T;
+}
+
+// Apply a 4x4 to a flat xyz vertex array in place.
+inline void applyMat4(std::vector<GLfloat>& verts, const glm::mat4& M) {
+    for (size_t i = 0; i + 2 < verts.size(); i += 3) {
+        const glm::vec4 p = M * glm::vec4(verts[i], verts[i+1], verts[i+2], 1.0f);
+        verts[i] = p.x; verts[i+1] = p.y; verts[i+2] = p.z;
+    }
+}
+
+} // namespace CtHandoff
+
 // [key-reorg Phase 12] STL/OBJ export, moved verbatim out of the old
 // GLFW_KEY_M switch case. Declared in StlExport.h; called by the sidebar
 // Export buttons (onExportStl / onExportStlFlipped).
@@ -1519,8 +1738,130 @@ void StlExport::exportRegisteredObjs() {
     if (segmentMesh3D) segmentMesh3D->exportObjFile(Reg_SEGMENT_FILE_PATH);
     if (gbMesh3D)      gbMesh3D->exportObjFile(Reg_GB_FILE_PATH);
     std::cout << "[ExportObj] Registered OBJs exported to " << REG_MODEL_PATH << std::endl;
-}
 
+    // -------------------------------------------------------------------------
+    // [CT-handoff] (1) write reg_transform.txt = Umeyama( model/liver.obj raw CT
+    //   -> current registered liverMesh3D ). Same vertex order/count because
+    //   organ meshes are not remeshed during registration.
+    //   (5) write ct_roundtrip/<organ>.obj = T^-1(reg_<organ>.obj), the
+    //   zero-deform CT-space stand-in for DEFORM. NOTE: the folder is named
+    //   "ct_roundtrip" (NOT "deformed") on purpose so that dropping it back into
+    //   REG takes the NORMAL drop path (prealign + register#2), per the new
+    //   design -- a "deformed" folder would trigger preserve-pose and skip both.
+    // -------------------------------------------------------------------------
+    if (liverMesh3D && !liverMesh3D->mVertices.empty()) {
+        // [CT-handoff] Umeyama needs the raw-CT liver that the CURRENT
+        // liverMesh3D actually came from -- not the startup model when a
+        // different organ set was dropped mid-session. Use the tracked
+        // source path; fall back to model/liver.obj only if unset.
+        const std::string ctSrc = g_liverCtSourcePath.empty()
+            ? (MODEL_PATH + "liver.obj") : g_liverCtSourcePath;
+        mCutMesh rawCt = mCutMesh().loadMeshFromFile(ctSrc.c_str());
+        if (rawCt.mVertices.size() != liverMesh3D->mVertices.size() ||
+            rawCt.mVertices.empty()) {
+            std::cerr << "[CT-handoff] vertex-count mismatch: " << ctSrc << "("
+                      << rawCt.mVertices.size() / 3 << ") vs registered liver("
+                      << liverMesh3D->mVertices.size() / 3
+                      << "). Skipping reg_transform.txt / ct_roundtrip." << std::endl;
+        } else {
+            double s, detR, rmse, maxResid; int npair;
+            const glm::mat4 T = CtHandoff::umeyamaSimilarity(
+                rawCt.mVertices, liverMesh3D->mVertices,
+                s, detR, rmse, maxResid, npair);
+            const glm::mat4 Tinv = glm::inverse(T);
+
+            // reg_transform.txt (self-describing header + 16 floats column-major)
+            const std::string tp = REG_MODEL_PATH + "reg_transform.txt";
+            std::ofstream tf(tp);
+            if (tf.is_open()) {
+                tf << "# reg_transform.txt : CT(model/*.obj) -> registered(reg_*.obj) similarity\n";
+                tf << "# layout: column-major 4x4 (glm). 16 floats below, 4 per line.\n";
+                tf << "# scale_s=" << s << " det_R=" << detR
+                   << " umeyama_rmse=" << rmse << " max_resid=" << maxResid
+                   << " npairs=" << npair << " src=liver.obj\n";
+                const float* P = glm::value_ptr(T);
+                tf << std::setprecision(10);
+                for (int i = 0; i < 16; ++i) tf << P[i] << ((i % 4 == 3) ? '\n' : ' ');
+                tf.close();
+                std::cout << "[CT-handoff] wrote " << tp
+                          << "  s=" << s << " det(R)=" << detR
+                          << " rmse=" << rmse << " maxResid=" << maxResid
+                          << " (N=" << npair << ")" << std::endl;
+                if (detR < 0.0)
+                    std::cerr << "[CT-handoff] WARNING: det(R)<0 -> reflection baked "
+                                 "into reg_*.obj. Mirror handling needs review." << std::endl;
+            } else {
+                std::cerr << "[CT-handoff] cannot open " << tp << " for write" << std::endl;
+            }
+
+            // ct_roundtrip/<organ>.obj = T^-1(reg organ)  (zero-deform CT stand-in)
+            if (CtHandoff::g_writeZeroDeformRoundtrip) {
+                const std::string dDir = REG_MODEL_PATH + "ct_roundtrip/";
+                std::filesystem::create_directories(dDir);
+                struct OrganOut { mCutMesh* m; const char* name; };
+                const OrganOut outs[6] = {
+                    { liverMesh3D,   "liver.obj"   }, { portalMesh3D,  "portal.obj"  },
+                    { veinMesh3D,    "vein.obj"    }, { tumorMesh3D,   "tumor.obj"   },
+                    { segmentMesh3D, "segment.obj" }, { gbMesh3D,      "gb.obj"      },
+                };
+                int wrote = 0;
+                for (const auto& o : outs) {
+                    if (!o.m || o.m->mVertices.empty()) continue;
+                    mCutMesh cp = *o.m;          // keep faces/texcoords
+                    cp.mNormals.clear();         // drop stale post-transform normals
+                    CtHandoff::applyMat4(cp.mVertices, Tinv);  // registered -> CT
+                    cp.exportObjFile(dDir + o.name);
+                    ++wrote;
+                }
+
+                // self-check: T^-1(reg_liver) should reproduce model/liver.obj raw CT.
+                double devMax = 0.0, devSum = 0.0;
+                std::vector<GLfloat> chk = liverMesh3D->mVertices;
+                CtHandoff::applyMat4(chk, Tinv);
+                for (size_t i = 0; i + 2 < chk.size() && i + 2 < rawCt.mVertices.size(); i += 3) {
+                    const double dx = chk[i]   - rawCt.mVertices[i];
+                    const double dy = chk[i+1] - rawCt.mVertices[i+1];
+                    const double dz = chk[i+2] - rawCt.mVertices[i+2];
+                    const double d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+                    devMax = std::max(devMax, d); devSum += d;
+                }
+                const double devMean = devSum / std::max<size_t>(1, chk.size() / 3);
+                std::cout << "[CT-handoff] ct_roundtrip/: wrote " << wrote
+                          << " organ(s) to " << dDir << std::endl;
+                std::cout << "[CT-handoff] self-check T^-1(reg_liver) vs model/liver.obj (CT mm): "
+                          << "maxDev=" << devMax << " meanDev=" << devMean
+                          << "  (should be ~0; equals Umeyama residual / scale)" << std::endl;
+                std::cout << "[CT-handoff] NEXT: drop the ct_roundtrip/ folder into REG "
+                             "(normal drop), then run registration #2 and Shift+M; the tumor "
+                             "should land where cycle #1 did." << std::endl;
+            }
+        }
+    } else {
+        std::cerr << "[CT-handoff] no registered liver mesh; skipping T export." << std::endl;
+    }
+
+    // [deform round-trip] 最初の「Deform >>」時(= liver はまだ未変形の相似変換)に
+    //   reg->CT-mm スケールを一度だけ固定する。以降の反復では reg_liver.obj が
+    //   変形済みになるため再捕捉しない(2回目以降は rigid refine 前提でスケール不変)。
+    //   Shift+M はこの値を使い、変形に依らず CT-mm スケールを保つ。
+    if (!g_hasRegToMmScale && g_hasOriginalDiags && liverMesh3D &&
+        !liverMesh3D->mVertices.empty()) {
+        glm::vec3 mn(liverMesh3D->mVertices[0], liverMesh3D->mVertices[1],
+                     liverMesh3D->mVertices[2]), mx = mn;
+        for (size_t i = 0; i + 2 < liverMesh3D->mVertices.size(); i += 3) {
+            glm::vec3 v(liverMesh3D->mVertices[i], liverMesh3D->mVertices[i + 1],
+                        liverMesh3D->mVertices[i + 2]);
+            mn = glm::min(mn, v); mx = glm::max(mx, v);
+        }
+        float curDiag = glm::length(mx - mn);
+        if (curDiag > 1e-9f) {
+            g_regToMmScale    = g_originalLiverDiagMm / curDiag;
+            g_hasRegToMmScale = true;
+            std::cout << "[ExportObj] captured reg->mm scale = " << g_regToMmScale
+                      << " (frozen for Shift+M across the deform round-trip)" << std::endl;
+        }
+    }
+}
 void StlExport::exportCamMmStlWithSnapshot() {
     if (gApp.mode != AppMode::kRegistration) {
         std::cout << "[ExportSTL] only valid in Registration mode" << std::endl;
@@ -1540,7 +1881,15 @@ void StlExport::exportCamMmStlWithSnapshot() {
     };
 
     float SCALE_RESTORE = 1.0f;
-    if (g_hasOriginalDiags && liverMesh3D) {
+    // [deform round-trip] 変形に依らない固定 reg->mm スケールがあれば最優先で使う。
+    //   無い(pure REG 運用 / 未捕捉)ときだけ従来の対角長比にフォールバックする。
+    //   従来式は「現在 liver が CT の相似変換」前提なので、変形後の liver では
+    //   bbox 対角に変形が混ざり mm スケールがずれる(固定スケールならこれを回避)。
+    if (g_hasRegToMmScale) {
+        SCALE_RESTORE = g_regToMmScale;
+        std::cout << "[Shift+M] using frozen reg->mm scale = " << SCALE_RESTORE
+                  << " (deformation-independent)" << std::endl;
+    } else if (g_hasOriginalDiags && liverMesh3D) {
         float current_liver_diag = bboxDiag(liverMesh3D);
         if (current_liver_diag < 1e-9f) {
             std::cerr << "[Shift+M] current liver diag near zero -- using 1.0 fallback"
@@ -1556,7 +1905,6 @@ void StlExport::exportCamMmStlWithSnapshot() {
               << "  current_liver_diag=" << (liverMesh3D ? bboxDiag(liverMesh3D) : 0.0f)
               << "  SCALE_RESTORE=" << SCALE_RESTORE
               << "  (CT-truth based, X+Z flip)" << std::endl;
-
     auto exportCamMmStl =
         [&](const mCutMesh* src, const std::string& outPath, const char* label) {
             if (!src || src->mVertices.empty()) {
@@ -2689,13 +3037,18 @@ static void glfw_onKey(GLFWwindow* win, int key, int scancode, int action, int m
             // [key-reorg Phase 9] Alt+P : Silhouette Align (was Shift+E).
             // byte-identical to the old GLFW_KEY_E Shift branch. Placed after
             // the Ctrl* branches and before Shift+P / Plain P (mod precedence).
+            // [QUAD-SIL] Now quadrant-aware: mask logging + label guard via
+            // prepareQuadrantForSilAlign (Ctrl+I parity), mask handed to
+            // runShiftE (triangle filter) and poseSaveToLibrary (entry
+            // metadata). At QUAD_ALL this is byte-identical to before.
             std::cout << "[Alt+P] dispatching Silhouette Align..." << std::endl;
+            if (!prepareQuadrantForSilAlign("Alt+P")) break;
             g_stepStartTime = std::chrono::steady_clock::now();
             poseAutoSaveBeforeRegistration();
-            runShiftE();
+            runShiftE(g_activeQuadrantMask);
             g_sessionSilhouetteN++;
             gUI.state.regMethod = 5;
-            poseSaveToLibrary(SaveCriterion::IOU);
+            saveSilAlignToLibrary();   // [QUAD-SIL ACCEPT] Ctrl+I-parity gate
         } else if (mods & GLFW_MOD_SHIFT) {
             // Shift+P: Cyclic Boundary Registration
             //  Key P と同じ前処理 (source silhouette + target boundary) を使うが、
@@ -2915,6 +3268,58 @@ static void maybeImportSidecarIntrinsics(const std::string& imagePath) {
     loadIntrinsicsFromCurrentSource();                     // load the imported 4K K
 }
 
+// Drag-and-drop import of a camera-intrinsics (内部パラメータ) file: install it as
+// the Custom source and apply immediately. This is the drop-driven sibling of
+// maybeImportSidecarIntrinsics() above -- instead of auto-detecting an
+// intrinsics_custom.txt sitting next to the image being loaded, it is triggered
+// by the file itself being dropped onto the window. Reuses the exact same
+// loader / destination / source enum as the rest of the intrinsics system.
+//
+// Returns true iff the path was recognised as a valid intrinsics file (and thus
+// consumed). A non-.txt, or a .txt that does not parse to a valid K, returns
+// false so handleFileDrop() can fall through to its other routes / rejection.
+static bool maybeImportDroppedIntrinsics(const std::string& path) {
+    namespace fs = std::filesystem;
+
+    // 拡張子チェック: 正準フォーマットは .txt。
+    // (画像 / .obj / .bin は別ルートで処理されるので奪わない)
+    size_t dot = path.find_last_of('.');
+    std::string ext = (dot == std::string::npos) ? "" : path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c){ return (char)std::tolower(c); });
+    if (ext != ".txt") return false;
+
+    // 中身チェック: アプリ本体と同じローダーで「有効な K」として読めるものだけ採用。
+    // ただのメモ .txt はここで弾かれ、下のフォールスルー/拒否に回る。
+    Reg3DCustom::CameraIntrinsics K;
+    if (!Reg3DCustom::loadCameraIntrinsics(path, K) || !K.valid()) return false;
+
+    std::error_code ec;
+    const std::string dst = DEPTH_OUTPUT_PATH + "intrinsics_custom.txt";
+    fs::path srcAbs = fs::weakly_canonical(fs::path(path), ec);
+    fs::path dstAbs = fs::weakly_canonical(fs::path(dst), ec);
+
+    if (srcAbs.empty() || srcAbs != dstAbs) {        // 自分自身へのコピーは回避
+        fs::create_directories(DEPTH_OUTPUT_PATH, ec);
+        fs::copy_file(path, dst, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::cerr << "[FileDrop/Intrinsics] copy failed ("
+                      << path << " -> " << dst << "): " << ec.message() << std::endl;
+            return true;   // 内部パラメータとは認識した(=画像扱いさせない)。設置のみ失敗
+        }
+    }
+
+    g_intrinsicsSource = IntrinsicsSource::Custom;
+    g_intrinsics_raw   = Reg3DCustom::CameraIntrinsics{};   // rectify-raw を破棄
+    loadIntrinsicsFromCurrentSource();                      // 即時適用 (g_intrinsics / OrbitCam)
+
+    std::cout << "[FileDrop/Intrinsics] imported " << path << " -> " << dst
+              << "  (Custom 選択)  K " << K.width << "x" << K.height
+              << " fx=" << K.fx << " fy=" << K.fy
+              << " cx=" << K.cx << " cy=" << K.cy << std::endl;
+    return true;
+}
+
 static bool loadImageRectifyAware(AppContext& ctx, const std::string& path) {
     maybeImportSidecarIntrinsics(path);
     if (g_intrinsics_raw.valid()) g_intrinsics = g_intrinsics_raw;
@@ -2958,6 +3363,9 @@ static const char* kOrganCanonical[6] = {
 struct OrganDropScan {
     bool                      anyOrgan = false;  // canonical臓器objを1つ以上検出
     std::array<std::string,6> path{};            // path[role]; 空=不在
+    bool preserveRegisteredPose = false;         // [deform round-trip] "deformed"
+                                                 // フォルダ由来なら prealign を
+                                                 // スキップし REG#1 姿勢を保つ
     bool hasLiver() const { return !path[0].empty(); }
 };
 
@@ -2969,19 +3377,28 @@ static OrganDropScan scanOrganDrop(int count, const char** paths) {
                        [](unsigned char c){ return (char)std::tolower(c); });
         return s;
     };
+    // [deform round-trip] このフォルダ名(大文字小文字無視)から来た organ は、
+    //   既に REG#1 の登録座標系にある変形モデルとみなし prealign をスキップする。
+    auto isDeformedDir = [&](const std::filesystem::path& dir) {
+        return lower(dir.filename().string()) == "deformed";
+    };
     std::error_code ec;
     for (int i = 0; i < count; ++i) {
         const std::string p = paths[i];
         if (std::filesystem::is_directory(p, ec)) {
             // フォルダドロップ（標準）: 中の各canonical名を探す
+            bool foundHere = false;
             for (int r = 0; r < 6; ++r) {
                 std::string cand =
                     (std::filesystem::path(p) / kOrganCanonical[r]).string();
                 if (std::filesystem::exists(cand, ec)) {
                     scan.path[r]  = cand;
                     scan.anyOrgan = true;
+                    foundHere     = true;
                 }
             }
+            if (foundHere && isDeformedDir(std::filesystem::path(p)))
+                scan.preserveRegisteredPose = true;
         } else {
             // 個別ファイル: basename を canonical名と照合
             const std::string fn =
@@ -2990,6 +3407,8 @@ static OrganDropScan scanOrganDrop(int count, const char** paths) {
                 if (fn == kOrganCanonical[r]) {
                     scan.path[r]  = p;   // 重複は後勝ち
                     scan.anyOrgan = true;
+                    if (isDeformedDir(std::filesystem::path(p).parent_path()))
+                        scan.preserveRegisteredPose = true;
                     break;
                 }
             }
@@ -2997,10 +3416,10 @@ static OrganDropScan scanOrganDrop(int count, const char** paths) {
     }
     return scan;
 }
-
 // 臓器セットを差し替え、既存ターゲットへ再 prealign する。
 // ターゲット未ロードなら false（ログ出力）。
-static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
+static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths,
+                                 bool preserveRegisteredPose = false) {
     if (!screenMesh || screenMesh->mVertices.empty()) {
         std::cerr << "[OrganDrop] REFUSED: no depth target loaded. "
                      "先に画像ロード / Run Depth(または bin から再構成)してから、"
@@ -3046,10 +3465,11 @@ static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
     }
 
     // 1b. Shift+M / Region ラベルの物理スケール基準を新しい raw メッシュから取り直す。
-    //     prealign 前（= 生CT座標）で測る。これを更新しないと Region のリム幅換算
-    //     (units/mm = meshDiag / origCTDiag) と Shift+M が旧症例のスケールのまま狂う。
-    //     起動時 4191- と同じ計算。
-    {
+    //     [deform round-trip] preserve-pose のドロップは登録スケール(~0.7m)であって
+    //     CT-mm ではないため、ここを更新すると Region リム幅換算と Shift+M が壊れる。
+    //     同セッションなら起動時の値が正しいので据え置く。新規CTドロップ時のみ更新し、
+    //     固定 reg->mm スケールもリセットして次の Deform >> で再捕捉させる。
+    if (!preserveRegisteredPose) {
         auto bboxDiag = [](const mCutMesh* m) -> float {
             if (!m || m->mVertices.size() < 3) return 0.0f;
             glm::vec3 mn(m->mVertices[0], m->mVertices[1], m->mVertices[2]), mx = mn;
@@ -3062,9 +3482,20 @@ static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
         g_originalLiverDiagMm = bboxDiag(liverMesh3D);
         g_originalTumorDiagMm = bboxDiag(tumorMesh3D);
         g_hasOriginalDiags    = (g_originalLiverDiagMm > 1e-6f);
+        g_hasRegToMmScale     = false;   // 新症例 → reg->mm を次の Deform >> で再捕捉
+        // [CT-handoff] この liver が由来する raw-CT .obj を記録。以後 Shift+M /
+        //   Reg->Deform の Umeyama は起動時 model/liver.obj ではなくこれと突き合わせる
+        //   (頂点数の違うモデルをドロップしても mismatch で skip されなくなる)。
+        g_liverCtSourcePath   = srcPaths[0];  // role 0 = liver (空ならフォールバック)
         std::cout << "[OrganDrop] CT-mm ref refreshed: liver=" << g_originalLiverDiagMm
                   << " tumor=" << g_originalTumorDiagMm
-                  << "  (Region rim scale + Shift+M)" << std::endl;
+                  << "  (Region rim scale + Shift+M; reg->mm scale reset)" << std::endl;
+        std::cout << "[OrganDrop] CT-handoff source set: " << g_liverCtSourcePath << std::endl;
+    } else {
+        // preserve-pose: ドロップは登録座標系のモデルで raw CT ではないため、
+        // CT-handoff source は更新しない(直前の新規CTドロップ/起動時の値が正しい)。
+        std::cout << "[OrganDrop] preserve-pose: CT-mm 基準 / reg->mm スケールを据え置き"
+                     "(dropは登録座標系のモデル)。" << std::endl;
     }
 
     // 2. AppContext / allMeshes の再ポイント（上で delete したため必須）
@@ -3094,20 +3525,27 @@ static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
     //  setupObjScene / rebuild はクリア直後に setupOBJTarget で必ず再構築するが、スワップは
     //  screenMesh を作り直さないので、クリアせずキャッシュを温存するのが正しい。
 
-    // 4. 新セットを既存ターゲットへ prealign。
-    //    スケール=肝臓(最初の非空、必須なので必ず肝臓)基準、中心=存在臓器の重心平均。
-    //    screenMesh は不変なので g_sceneDiag / voxel は変わらない。
+    // 4. prealign。
+    //    [deform round-trip] preserve-pose のときはスキップ。既に REG#1 の登録
+    //    座標系にあるので、2回目の register は「ゼロから当てはめ」ではなく REG#1
+    //    を出発点とした局所 refine になり、座標が暴れない。
     std::vector<mCutMesh*> organs = { liverMesh3D, portalMesh3D, veinMesh3D,
                                       tumorMesh3D, segmentMesh3D, gbMesh3D };
-    g_lastOrganTransform    = Reg3DCustom::prealignSourceToTarget(organs, *screenMesh);
-    g_hasLastOrganTransform = true;
+    if (preserveRegisteredPose) {
+        g_lastOrganTransform    = glm::mat4(1.0f);
+        g_hasLastOrganTransform = false;
+        std::cout << "[OrganDrop] preserve-pose: prealign SKIP "
+                     "(model は REG#1 登録座標系のまま)。" << std::endl;
+    } else {
+        g_lastOrganTransform    = Reg3DCustom::prealignSourceToTarget(organs, *screenMesh);
+        g_hasLastOrganTransform = true;
+    }
     for (auto* m : organs) if (m) setUp(*m);
 
     // 4b. 初期姿勢スナップショットを撮り直す（重要）。
     //     Apply Init Pose / Reset は g_initOrganVertices から頂点を復元するため、
     //     撮り直さないと旧トポロジ(頂点数)の snapshot を新メッシュに上書きし、
     //     "Index out of range" / "region.labels size mismatch" を起こす。
-    //     prealign 済みの現在姿勢を基準として保存（起動時 4486 と同じ）。
     snapshotInitialPose();
 
     // 5. 差し替えが見えるように: 現在ロード中の臓器が1つも表示されていなければ
@@ -3122,11 +3560,12 @@ static bool swapOrganSetFromDrop(const std::array<std::string,6>& srcPaths) {
 
     Reg3DCustom::printMeshBBox(*liverMesh3D, "liver (organ-drop, aligned)");
     std::cout << "[OrganDrop] swapped organ set (" << loaded
-              << " organ(s) loaded); prealigned to existing target. "
-                 "sceneDiag/voxel unchanged." << std::endl;
+              << " organ(s) loaded); "
+              << (preserveRegisteredPose ? "pose preserved (no prealign)."
+                                         : "prealigned to existing target.")
+              << " sceneDiag/voxel unchanged." << std::endl;
     return true;
 }
-
 // FileDropHandler.hのglfw_onFileDropを使用するように変更
 static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
     if (count <= 0 || !paths) return;
@@ -3156,11 +3595,12 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
                           << std::endl;
                 return;   // 無効なセット → 何もしない
             }
-            swapOrganSetFromDrop(organScan.path);
+            // [deform round-trip] "deformed" フォルダ由来なら preserve-pose で受ける
+            //   (prealign スキップ → REG#1 姿勢のまま 2回目 register の出発点にする)。
+            swapOrganSetFromDrop(organScan.path, organScan.preserveRegisteredPose);
             return;       // 処理済み(or ターゲット無しで拒否)。下に流さない
         }
     }
-
     // FEATURE Task 4: route Reconstruct-from-BIN inputs (depth_metric.bin /
     // segmentation_mask.png / original.jpg, or a depth_output/ folder) to the
     // reconstruct state machine instead of the normal image-load path. Each
@@ -3192,6 +3632,15 @@ static void handleFileDrop(GLFWwindow* win, int count, const char** paths) {
         if (consumed) return;   // handled by Reconstruct; do not fall through to image load
     }
 
+    // 内部パラメータ(.txt)のドロップ → Custom として取り込み即適用。
+    // 画像拡張子チェックの「前」に置くことで、キャリブファイル(intrinsics_custom.txt
+    // 等)をそのまま投げ込めば反映される。有効な K として読めない .txt はここを
+    // 素通りして下の通常ルート/拒否に回る。
+    if (maybeImportDroppedIntrinsics(filePath)) {
+        std::cout << "[FileDrop] handled as Custom intrinsics" << std::endl;
+        return;
+    }
+
     if (!ImageSession::isSupportedExtension(filePath)) {
         std::cerr << "[FileDrop] Unsupported format: " << filePath
                   << "  (expected .png .jpg .jpeg .bmp .ppm)" << std::endl;
@@ -3216,9 +3665,20 @@ static void mouse_button_callback(GLFWwindow* win, int button, int action, int m
     // ImGuiがマウスをキャプチャしている場合は処理しない
     if (ImGui::GetIO().WantCaptureMouse) return;
 
-    // AR モード中は観測専用 (3D シーン操作を無効化)
-    // — これがないと OrbitCam の cameraPos が更新され続けてライト方向が動く
-    if (gApp.arMode) return;
+    // AR モード中は 3D シーン操作 (カメラ回転 / メッシュドラッグ / ライト方向)
+    // のみ無効化する。
+    // — これがないと OrbitCam の cameraPos が更新され続けてライト方向が動く。
+    // ただし kMaskSelection / kImageOnly の 2D マスク点打ちは AR とは無関係なので
+    // ここでは止めずに通す。
+    //   旧コードはここで無条件に return しており、A キーで AR を ON にしたまま
+    //   LOAD IMAGE すると mode==kMaskSelection でも arMode==true が残るため、
+    //   セグメンテーションのクリックがこの行で全て握り潰され「マウスが反応しない」
+    //   状態になっていた (arMode は load/mode 変更でリセットされない)。
+    if (gApp.arMode &&
+        gApp.mode != AppMode::kMaskSelection &&
+        gApp.mode != AppMode::kImageOnly) {
+        return;
+    }
 
     // Umeyama 2画面モード
     if (gUmeyama.active && action == GLFW_PRESS) {
@@ -3434,6 +3894,10 @@ static bool setupObjScene() {
         g_lastOrganTransform    = glm::mat4(1.0f);
         g_hasLastOrganTransform = false;
         g_lastOrganOffset       = glm::vec3(0.0f);
+
+        // [CT-handoff] liver came straight from MODEL_PATH; reset the tracked
+        // raw-CT source so the Umeyama handoff uses the startup model again.
+        g_liverCtSourcePath     = MODEL_PATH + "liver.obj";
 
         // Geometry-derived labels were computed on the old pose; invalidate so
         // they auto-recompute (vertex indexing is identical after reload, so
@@ -4500,6 +4964,10 @@ int main(int argc, char** argv) {
         g_originalLiverDiagMm = bboxDiag(liverMesh3D);
         g_originalTumorDiagMm = bboxDiag(tumorMesh3D);
         g_hasOriginalDiags    = (g_originalLiverDiagMm > 1e-6f);
+        // [CT-handoff] startup liver came from MODEL_PATH; record it as the
+        // raw-CT source for the Umeyama handoff (overridden later if a
+        // different organ set is dropped in).
+        g_liverCtSourcePath   = MODEL_PATH + "liver.obj";
         std::cout << "[OriginalDiag] liver=" << g_originalLiverDiagMm
                   << " mm, tumor=" << g_originalTumorDiagMm
                   << " mm  (CT-mm reference for Shift+M scale restoration)"
@@ -5234,6 +5702,105 @@ int main(int argc, char** argv) {
                     "small 3D RMSE term into the silhouette objective).");
             }
 
+            // [QUAD-SIL] Alt+P quadrant-aware toggle. Shares the Ctrl+G
+            // Quadrant Selector above (g_activeQuadrantMask) — no separate
+            // quadrant UI. At Q:ALL the filter is bypassed either way.
+            ImGui::Checkbox("quadrant-aware (Alt+P)", &g_shiftE_quadrantAware);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "ON (default): when the Quadrant Selector above is not\n"
+                    "Q:ALL, Alt+P rasterizes ONLY the selected quadrant's\n"
+                    "triangles (3-vertex rule, same as Ctrl+I / Ctrl+Shift+G)\n"
+                    "and the objective + accept gate + IoU printout all use\n"
+                    "that partial silhouette. For occluded targets: select\n"
+                    "the visible quadrant(s) and register partial-vs-partial.\n"
+                    "OFF: legacy full-mesh raster regardless of selection\n"
+                    "(A/B baseline). At Q:ALL both positions are identical.");
+            }
+            if (g_shiftE_quadrantAware
+                && g_activeQuadrantMask != LiverLeftRightLabel::QUAD_ALL) {
+                ImGui::SameLine();
+                ImGui::TextColored(
+                    ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "(%s active)",
+                    LiverLeftRightLabel::quadrantMaskString(
+                        g_activeQuadrantMask).c_str());
+            }
+
+            // [QUAD-SIL BRAKE] Mask-expansion brake weight. Only matters in
+            // quadrant mode; mirrors V3RS outside_ratio (g_ctrlgsLambdaOut).
+            if (g_shiftE_quadrantAware) {
+                ImGui::SliderFloat("expansion brake (Alt+P quad)",
+                                   &g_shiftE_outsideLambda, 0.0f, 2.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Penalises the subset ballooning past the target mask\n"
+                        "(cost += lambda * outside_ratio). Port of Ctrl+I's\n"
+                        "V3RS outside_ratio brake. Without it the symmetric\n"
+                        "IoU rewards 'inflate to cover everything' instead of\n"
+                        "aligning. 0.5 = V3RS default. 0 = brake off (raw IoU).\n"
+                        "Only active in quadrant mode.");
+                }
+            }
+
+            // [PERF/APPROX] Alt+P: 内側探索雲の voxel ダウンサンプル。
+            //  OFF = フル雲 (レガシー基準)。ON = CMA-ES 内側の RMSE ゲート雲
+            //  だけ間引く (近似)。外側 computeUnifiedMetrics / 最終 IoU /
+            //  PoseLibrary は常にフル雲なので、OFF と ON の最終 full-IoU を
+            //  直接比較してデバッグできる。実体は CmaesUtils.h の
+            //  g_silDownsample* 群 (run() 内 extractFrontFacePoints 直後で発火)。
+            ImGui::Checkbox("downsample search cloud (Alt+P)",
+                            &CmaesRefine::g_silDownsampleEnable);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "OFF (default): full target cloud (~317k pts) for the\n"
+                    "inner CMA-ES gate -- legacy baseline.\n"
+                    "ON: voxel-downsample the inner search cloud only.\n"
+                    "Final IoU / PoseLibrary always use the FULL cloud,\n"
+                    "so compare final IoU OFF vs ON to validate.\n"
+                    "APPROXIMATE: can move the optimum. If final IoU\n"
+                    "degrades, lower the voxel (more points).");
+            }
+            if (CmaesRefine::g_silDownsampleEnable) {
+                ImGui::SliderFloat("ds voxel x sceneDiag (Alt+P)",
+                                   &CmaesRefine::g_silDownsampleVoxelRatio,
+                                   0.002f, 0.05f, "%.4f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "voxel_size = ratio * sceneDiag.\n"
+                        "Bigger = fewer points = faster / riskier.\n"
+                        "Start at 0.01 and tune so the count below lands\n"
+                        "in the low thousands.");
+                }
+                if (CmaesRefine::g_silDownsampleFullCount > 0) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(
+                        ImVec4(0.5f, 0.9f, 0.6f, 1.0f), "%ld -> %ld pts",
+                        CmaesRefine::g_silDownsampleFullCount,
+                        CmaesRefine::g_silDownsampleDownCount);
+                } else {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(run Alt+P to populate)");
+                }
+            }
+
+            // [PERF/EXACT] 1+3 厳密系: 値未使用の computeUnifiedMetrics を退避値
+            //  復元で置換 + voxel ダウンサンプル結果のセッション越しキャッシュ。
+            //  どちらも結果不変 (OFF/ON で最終 IoU・姿勢がビット一致するはず)。
+            ImGui::Checkbox("Alt+P: skip redundant metrics + cache ds (exact)",
+                            &CmaesRefine::g_silExactPerf);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "OFF (default): recompute outer metrics every time and\n"
+                    "re-downsample per run -- legacy baseline.\n"
+                    "ON: (1) skip the 3 computeUnifiedMetrics calls whose\n"
+                    "values are never read (restore entry snapshot instead;\n"
+                    "pose is byte-identical so values are bit-identical),\n"
+                    "(2) reuse the voxel-downsampled cloud across runs\n"
+                    "(key = full point-list + voxel equality -- exact).\n"
+                    "EXACT: final IoU / pose / PoseLibrary must bit-match\n"
+                    "OFF. If they ever differ, report it as a bug.");
+            }
+
             // --- occluded-gate trap (the Alt+P PoseLibrary rejection bug) ---
             //  runShiftE never fills g_lastSilOccludedIoU2D (only Ctrl+Shift+G
             //  Phase E does), so it stays 0. If the accept gate is set to use
@@ -5256,14 +5823,17 @@ int main(int argc, char** argv) {
 
             if (ImGui::Button("Run Silhouette Align (Alt+P)")) {
                 // byte-identical to the Alt+P branch in the GLFW_KEY_P case
+                // [QUAD-SIL] incl. the quadrant guard + mask pass-through.
                 std::cout << "[Alt+P] dispatching Silhouette Align (button)..."
                           << std::endl;
-                g_stepStartTime = std::chrono::steady_clock::now();
-                poseAutoSaveBeforeRegistration();
-                runShiftE();
-                g_sessionSilhouetteN++;
-                gUI.state.regMethod = 5;
-                poseSaveToLibrary(SaveCriterion::IOU);
+                if (prepareQuadrantForSilAlign("Alt+P")) {
+                    g_stepStartTime = std::chrono::steady_clock::now();
+                    poseAutoSaveBeforeRegistration();
+                    runShiftE(g_activeQuadrantMask);
+                    g_sessionSilhouetteN++;
+                    gUI.state.regMethod = 5;
+                    saveSilAlignToLibrary();   // [QUAD-SIL ACCEPT] Ctrl+I-parity gate
+                }
             }
 
             // [PERF TOGGLE] Alt+P fast path (default OFF = legacy baseline).
@@ -10286,6 +10856,57 @@ static void syncUIState() {
     if (s.arSavedTimer > 0) s.arSavedTimer -= ImGui::GetIO().DeltaTime;
 }
 
+// =========================================================================
+//  Rebuild the point cloud (OBJ) from the depth already loaded in
+//  g_reconstructState, using the CURRENTLY ACTIVE intrinsics -- WITHOUT
+//  re-running DA3/SAM2. Shared by:
+//    - a.onReconstruct            (slots filled by a bin/mask/rgb drop)
+//    - a.onRebuildFromCurrentDepth (slots auto-filled from depth_output/)
+//  Crucially, after the OBJ is rebuilt this reloads intrinsics.txt (the K just
+//  baked into the OBJ) into the display/OrbitCam K, so display K == OBJ K and
+//  the AR overlay lines up with the photo again.
+// =========================================================================
+static void reconstructFromLoadedDepthWithCurrentK() {
+    // K source-of-truth = current g_intrinsics; tag from the source enum.
+    Reg3DCustom::CameraIntrinsics K = g_intrinsics;
+    K.name = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
+    auto res = ReconstructFromBin::execute(g_reconstructState, DEPTH_OUTPUT_PATH, K);
+    if (!res.ok) {
+        std::cerr << "[Reconstruct] aborted: " << res.errorMessage << std::endl;
+        return;
+    }
+    // AR background = the (processed-resolution) original.jpg in depth_output/.
+    {
+        const std::string orig = DEPTH_OUTPUT_PATH + "original.jpg";
+        if (std::filesystem::exists(orig)) ImageSession::load(gApp, orig);
+    }
+    // Mask-derived caches depend on segmentation_mask.png.
+    g_boundaryDistMap.invalidate();
+    g_instrumentDistMap.invalidate();
+    g_projectedLiverMask.invalidate();
+    g_gnUnsignedBdyValid = false;
+
+    // Load the reconstructed canonical OBJ into the scene.
+    g_objSourcePath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
+    if (!setupObjScene()) {
+        std::cerr << "[Reconstruct] setupObjScene failed" << std::endl;
+        return;
+    }
+    // Sync display/OrbitCam K to the K actually baked into the OBJ
+    // (intrinsics.txt) so AR overlay == photo (no display-K vs OBJ-K mismatch).
+    Reg3DCustom::CameraIntrinsics Kc;
+    if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", Kc)
+        && Kc.valid()) {
+        g_intrinsics = Kc; gApp.intrinsics = Kc;
+        OrbitCam.setIntrinsics(Kc.fx, Kc.fy, Kc.cx, Kc.cy, Kc.width, Kc.height);
+    }
+    snapshotInitialPose();
+    computeTargetSubsetAabbs();
+    computeSourceLiverSubsetAabbs();
+    gApp.mode = AppMode::kRegistration;
+    std::cout << "[Reconstruct] scene updated; mode=Registration" << std::endl;
+}
+
 static void setupUICallbacks() {
     auto& a = gUI.actions;
 
@@ -10560,6 +11181,50 @@ static void setupUICallbacks() {
     a.onExportStl        = []() { StlExport::exportRegisteredObjs(); };
     a.onExportStlFlipped = []() { StlExport::exportCamMmStlWithSnapshot(); };
 
+    // [deform round-trip FIX] 「Load Deformed (ct_deformed/) [REG #2]」ボタン。
+    // これまで未配線だったため、UI 側の `if (actions.onLoadDeformedCT)` ガードに
+    // 弾かれて無言で何もしなかった（ログも出ない＝処理自体が走っていない）。
+    // DEFORM が書き出す registration_model/ct_deformed/ を走査し、手動の
+    // 「通常ドロップ」と完全に同じ経路 swapOrganSetFromDrop(..., false) で受ける。
+    //   - ct_deformed/ は CT 空間なので preserveRegisteredPose は必ず false
+    //     （prealign でターゲットに再フィット → register#2 の出発点）。
+    //     true にすると CT スケール(肝 diag≈8.6mm)のまま置かれてズレる。
+    //   - 深度ターゲット未ロード時は swapOrganSetFromDrop 側が [OrganDrop] REFUSED
+    //     を出して false を返す。
+    a.onLoadDeformedCT = []() {
+        const std::string dir = REG_MODEL_PATH + "ct_deformed/";
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) {
+            std::cerr << "[LoadDeformedCT] folder not found: " << dir
+                      << "  (DEFORM 側で Export Deformed (CT) を先に実行してください)"
+                      << std::endl;
+            return;
+        }
+        std::array<std::string, 6> paths{};
+        bool any = false;
+        for (int r = 0; r < 6; ++r) {
+            const std::string cand =
+                (std::filesystem::path(dir) / kOrganCanonical[r]).string();
+            if (std::filesystem::exists(cand, ec)) {
+                paths[r] = cand;
+                any = true;
+                std::cout << "[LoadDeformedCT] found: " << kOrganCanonical[r]
+                          << std::endl;
+            }
+        }
+        if (!any) {
+            std::cerr << "[LoadDeformedCT] no canonical organ obj "
+                         "(liver/portal/vein/tumor/segment/gb) in " << dir
+                      << std::endl;
+            return;
+        }
+        const bool ok = swapOrganSetFromDrop(paths, /*preserveRegisteredPose=*/false);
+        std::cout << "[LoadDeformedCT] " << (ok ? "loaded" : "FAILED")
+                  << " from " << dir
+                  << (ok ? "  -> prealigned to target. 続けて register#2 を実行" : "")
+                  << std::endl;
+    };
+
     a.onToggleClusterVis = []() {
         g_showClusterVisualization = !g_showClusterVisualization;
     };
@@ -10667,47 +11332,37 @@ static void setupUICallbacks() {
         g_reconstructState.clear();
         std::cout << "[Reconstruct] cleared all slots" << std::endl;
     };
-    a.onReconstruct = []() {
-        // K source-of-truth = current g_intrinsics; tag from the source enum.
-        Reg3DCustom::CameraIntrinsics K = g_intrinsics;
-        K.name = intrinsicsSourceToTag(g_intrinsicsSource, g_currentPresetKey);
-        auto res = ReconstructFromBin::execute(g_reconstructState, DEPTH_OUTPUT_PATH, K);
-        if (!res.ok) {
-            std::cerr << "[Reconstruct] aborted: " << res.errorMessage << std::endl;
-            return;
-        }
-        // AR background = the (processed-resolution) original.jpg just written.
-        // No re-rectify: the dropped bin/mask/rgb are a self-consistent set.
-        {
-            const std::string orig = DEPTH_OUTPUT_PATH + "original.jpg";
-            if (std::filesystem::exists(orig)) ImageSession::load(gApp, orig);
-        }
-        // Mask-derived caches depend on segmentation_mask.png (just replaced).
-        g_boundaryDistMap.invalidate();
-        g_instrumentDistMap.invalidate();
-        g_projectedLiverMask.invalidate();
-        g_gnUnsignedBdyValid = false;
+    a.onReconstruct = []() { reconstructFromLoadedDepthWithCurrentK(); };
 
-        // Load the reconstructed canonical OBJ into the scene.
-        g_objSourcePath = DEPTH_OUTPUT_PATH + "pc_metric_pinhole_masked.obj";
-        if (!setupObjScene()) {
-            std::cerr << "[Reconstruct] setupObjScene failed" << std::endl;
+    // One-click: rebuild the cloud from the CURRENT session depth
+    // (depth_output/depth_metric.bin + segmentation_mask.png [+ original.jpg])
+    // with the active K, no DA3/SAM2. Use after changing the intrinsics source
+    // (drop a custom K, or Run Calibration) so the point cloud is re-unprojected
+    // with the new K and the AR overlay lines up with the photo again.
+    a.onRebuildFromCurrentDepth = []() {
+        // main.cpp owns the stb_image implementation; provide it as the decoder.
+        ReconstructFromBin::ImageDecoder decode =
+            [](const std::string& p, int channels,
+               std::vector<uint8_t>& out, int& w, int& h) -> bool {
+            int c = 0;
+            unsigned char* px = stbi_load(p.c_str(), &w, &h, &c, channels);
+            if (!px) return false;
+            out.assign(px, px + (size_t)w * h * channels);
+            stbi_image_free(px);
+            return true;
+        };
+        // Auto-load depth_output/{depth_metric.bin, segmentation_mask.png,
+        // original.jpg} into the reconstruct slots (clear first so a stale prior
+        // drop can't leak in).
+        g_reconstructState.clear();
+        ReconstructFromBin::onFolderDropped(g_reconstructState, DEPTH_OUTPUT_PATH, decode);
+        if (!g_reconstructState.isReconstructReady()) {
+            std::cerr << "[Rebuild] depth_output/ has no usable depth_metric.bin + "
+                         "segmentation_mask.png pair. Run Depth first." << std::endl;
             return;
         }
-        // Reconstruct AR image is the processed-res original.jpg, so use the
-        // scaled canonical K (intrinsics.txt) for display/OrbitCam too -- matches
-        // the AR image AND the OBJ (avoids the 4K-display vs 1080p-image mismatch).
-        Reg3DCustom::CameraIntrinsics Kc;
-        if (Reg3DCustom::loadCameraIntrinsics(DEPTH_OUTPUT_PATH + "intrinsics.txt", Kc)
-            && Kc.valid()) {
-            g_intrinsics = Kc; gApp.intrinsics = Kc;
-            OrbitCam.setIntrinsics(Kc.fx, Kc.fy, Kc.cx, Kc.cy, Kc.width, Kc.height);
-        }
-        snapshotInitialPose();
-        computeTargetSubsetAabbs();
-        computeSourceLiverSubsetAabbs();
-        gApp.mode = AppMode::kRegistration;
-        std::cout << "[Reconstruct] scene updated from BIN; mode=Registration"
+        reconstructFromLoadedDepthWithCurrentK();
+        std::cout << "[Rebuild] cloud rebuilt from current depth with active K"
                   << std::endl;
     };
 
@@ -11461,13 +12116,24 @@ static void setupUICallbacks() {
     };
 
     a.onSwitchToDeformMode = []() {
-        // REG side stays an independent process. The button only exports the
-        // reg_*.obj snapshot that DeformPipeline::initFromRegistered() reads;
-        // launching lsn_deform is left to the user (Qt Creator, terminal, ...).
-        // Phase 3 unified binary will replace this with an in-process
-        // currentMainMode = DEFORM_MODE + initFromRegistered() call.
-        std::cout << "[Reg->Deform] Exporting reg_*.obj (you can now launch lsn_deform manually)" << std::endl;
+        // 1) DEFORM が読む reg_*.obj スナップショットを出力（同期。return 時点で
+        //    ディスクに出ているので、子プロセス側の読み込みと競合しない）。
+        std::cout << "[Reg->Deform] Exporting reg_*.obj..." << std::endl;
         StlExport::exportRegisteredObjs();
+
+        // 2) lsn_deform を detached 起動。DEFORM_EXE_PATH は initPaths() が
+        //    findExe で解決済み（bin/ の ./lsn_deform、env override は
+        //    AAA_DEFORM_EXE_PATH）。素の std::system は使わない
+        //    （Qt Creator 経由だと継承した stdout パイプの閉鎖で子が SIGPIPE 死する）。
+        //    platform_launch_detached は nohup + stdio を /dev/null に切り離す対策込み。
+        if (!std::filesystem::exists(DEFORM_EXE_PATH)) {
+            std::cerr << "[Reg->Deform] lsn_deform not found: '" << DEFORM_EXE_PATH
+                      << "'  -- build lsn_deform first (or set AAA_DEFORM_EXE_PATH)" << std::endl;
+            return;
+        }
+        std::cout << "[Reg->Deform] Launching: " << DEFORM_EXE_PATH << std::endl;
+        int rc = platform_launch_detached(DEFORM_EXE_PATH);
+        std::cout << "[Reg->Deform] launch rc=" << rc << std::endl;
     };
 
     a.onRefine = []() {
@@ -11477,12 +12143,15 @@ static void setupUICallbacks() {
     a.onSilhouetteAlign = []() {
         // 元コード line 2854 (runShiftE 内冒頭) と line 3073-3075
         // g_stepStartTime をリセットして各Shift+E呼出しごとの所要時間を記録
+        // [QUAD-SIL] quadrant guard + mask pass-through (keyboard parity).
+        std::cout << "[Alt+P/UI] dispatching Silhouette Align..." << std::endl;
+        if (!prepareQuadrantForSilAlign("Alt+P/UI")) return;
         g_stepStartTime = std::chrono::steady_clock::now();
         poseAutoSaveBeforeRegistration();
-        runShiftE();
+        runShiftE(g_activeQuadrantMask);
         g_sessionSilhouetteN++;
         gUI.state.regMethod = 5;
-        poseSaveToLibrary(SaveCriterion::IOU);
+        saveSilAlignToLibrary();   // [QUAD-SIL ACCEPT] Ctrl+I-parity gate
     };
 
     a.onPoseLibraryToggle = []() {

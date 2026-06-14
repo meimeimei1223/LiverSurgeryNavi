@@ -227,7 +227,16 @@ inline void buildComposite(const std::vector<uint8_t>& hitmap,
                            // RimSrc / RimAln panels are driven by this mask
                            // instead of the per-cell 4-neighbour boundary.
                            // When null, the legacy raster-boundary mode runs.
-                           const std::vector<uint8_t>* rim_cell_mask = nullptr)
+                           const std::vector<uint8_t>* rim_cell_mask = nullptr,
+                           // [QUAD-SIL VIZ] Optional full-mesh hitmap (size
+                           // gw*gh). When non-null and size-matched, the
+                           // Source panel additionally paints YELLOW every
+                           // cell that the FULL mesh would cover but the
+                           // quadrant SUBSET (hitmap) does NOT. White = subset
+                           // (what the optimiser used), Yellow = discarded
+                           // (other quadrants). When null (default), the
+                           // Source panel is the legacy white-only render.
+                           const std::vector<uint8_t>* full_hitmap = nullptr)
 {
     const int W = tripletWidth(gw);
     // Decide whether to draw the bottom row.
@@ -291,14 +300,27 @@ inline void buildComposite(const std::vector<uint8_t>& hitmap,
             const size_t i = (size_t)y * (size_t)gw + (size_t)x;
             const bool s = (i < hitmap.size()) ? (hitmap[i] != 0) : false;
             const bool t = (i < tmask.size())  ? (tmask[i]  != 0) : false;
+            // [QUAD-SIL VIZ] full-mesh coverage at this cell (when provided).
+            const bool f = (full_hitmap && i < full_hitmap->size())
+                               ? ((*full_hitmap)[i] != 0) : false;
 
-            // Source panel (white where source pixel exists).
+            // Source panel.
+            //   White  = subset cell (what the optimiser actually used).
+            //   Yellow = full-mesh cell NOT in the subset (discarded
+            //            quadrants) — only when a full_hitmap was supplied.
             if (s) {
                 const size_t off = ((size_t)y * (size_t)W +
                                     (size_t)(x_off_src + x)) * 3;
                 out_rgb[off + 0] = kFgWhite;
                 out_rgb[off + 1] = kFgWhite;
                 out_rgb[off + 2] = kFgWhite;
+            } else if (f) {
+                // full mesh covers it but the subset doesn't -> discarded.
+                const size_t off = ((size_t)y * (size_t)W +
+                                    (size_t)(x_off_src + x)) * 3;
+                out_rgb[off + 0] = 200;   // yellow
+                out_rgb[off + 1] = 180;
+                out_rgb[off + 2] = 0;
             }
             // Target panel (white where target pixel exists).
             if (t) {
@@ -604,7 +626,14 @@ inline float captureImpl(State& st,
                          // When null (default), the legacy raster-boundary
                          // mode runs. Forwarded from the wrapper's
                          // p.is_rim_anatomic_full.
-                         const std::vector<uint8_t>* is_rim_anatomic_per_vertex = nullptr)
+                         const std::vector<uint8_t>* is_rim_anatomic_per_vertex = nullptr,
+                         // [QUAD-SIL VIZ] Optional full-mesh triangle list.
+                         // When non-null and non-empty, captureImpl rasterizes
+                         // the FULL mesh once more (same pose / MVP / step) and
+                         // passes the resulting hitmap to buildComposite so the
+                         // Source panel paints discarded (non-subset) quadrant
+                         // cells YELLOW. Null (default) = legacy white-only.
+                         const std::vector<uint32_t>* full_indices = nullptr)
 {
     if (!liver || slot_idx < 0 || slot_idx >= kNumSlots) return 0.0f;
     if (liver->mVertices.empty() || liver_indices_filtered.empty()) return 0.0f;
@@ -648,6 +677,31 @@ inline float captureImpl(State& st,
     const bool has_inst_input =
         (instrument_dist_map != nullptr)
         && (instrument_dist_map->size() == (size_t)imgW * (size_t)imgH);
+
+    // [QUAD-SIL VIZ] Pre-rasterize the FULL mesh once (same pose / MVP /
+    // step / raster_mode) so buildComposite can paint discarded-quadrant
+    // cells yellow in the Source panel. Only done when the caller supplied
+    // a full_indices list that actually differs from the filtered list
+    // (i.e. a quadrant subset is in effect). The hitmap is the only output
+    // we need; IoU and the other diagnostics are ignored here.
+    std::vector<uint8_t> full_hitmap;
+    const std::vector<uint8_t>* full_hitmap_ptr = nullptr;
+    if (full_indices && !full_indices->empty()
+        && full_indices->size() != liver_indices_filtered.size()) {
+        std::vector<uint8_t> ftm; int fgw = 0, fgh = 0;
+        int fmatch = 0; float frmse = 0.0f, fiou = 0.0f; bool fcomp = false;
+        (void)fmatch; (void)frmse; (void)fiou; (void)fcomp;
+        CmaesRefineV3RS::rasterize_iou2d_v3rs(
+            positions, *full_indices, mvp,
+            dist_map, imgW, imgH, step,
+            &full_hitmap, &ftm, &fgw, &fgh,
+            nullptr, nullptr, nullptr,
+            raster_mode,
+            nullptr, 0.0f);
+        if (fgw > 0 && fgh > 0 && !full_hitmap.empty()) {
+            full_hitmap_ptr = &full_hitmap;
+        }
+    }
 
     RunSlot& slot = st.slots[slot_idx];
 
@@ -734,7 +788,8 @@ inline float captureImpl(State& st,
                        want_rim_row ? &dist_map : nullptr,
                        imgW, imgH, step, rim_sil_max_px,
                        /*inst_dist_map*/ nullptr, /*inst_thresh_px*/ 0.0f,
-                       want_rim_row ? &rim_mask_no : nullptr);
+                       want_rim_row ? &rim_mask_no : nullptr,
+                       /*full_hitmap*/ full_hitmap_ptr);
 
         uploadToSlot(slot, rgb_no, trip_w_no, trip_h_no);
         slot.iou       = iou_no;
@@ -832,7 +887,8 @@ inline float captureImpl(State& st,
                            want_rim_row ? &dist_map : nullptr,
                            imgW, imgH, step, rim_sil_max_px,
                            instrument_dist_map, instrument_thresh_px,
-                           want_rim_row ? &rim_mask_alt : nullptr);
+                           want_rim_row ? &rim_mask_alt : nullptr,
+                           /*full_hitmap*/ full_hitmap_ptr);
 
             uploadTextureRGB(slot.tex_alt, rgb_alt, trip_w_alt, trip_h_alt);
             slot.iou_alt              = iou_alt;
@@ -883,7 +939,11 @@ inline float capture(State& st, int run_idx,
                      // non-null and size-matched, switches the rim panels
                      // to ANATOMIC mode. Default null → legacy raster-
                      // boundary mode.
-                     const std::vector<uint8_t>* is_rim_anatomic_per_vertex = nullptr)
+                     const std::vector<uint8_t>* is_rim_anatomic_per_vertex = nullptr,
+                     // [QUAD-SIL VIZ] Optional full-mesh triangle list for the
+                     // yellow discarded-quadrant overlay. Forwarded to
+                     // captureImpl. Null (default) = legacy white-only Source.
+                     const std::vector<uint32_t>* full_indices = nullptr)
 {
     if (run_idx < 0 || run_idx >= kNumRuns) return 0.0f;
     return captureImpl(st, run_idx, liver, indices,
@@ -893,7 +953,8 @@ inline float capture(State& st, int run_idx,
                        instrument_dist_map,
                        instrument_thresh_px,
                        rim_sil_max_px,
-                       is_rim_anatomic_per_vertex);
+                       is_rim_anatomic_per_vertex,
+                       full_indices);
 }
 
 // -----------------------------------------------------------------------------
@@ -915,7 +976,9 @@ inline float captureFinal(State& st, int best_run_idx,
                           // [NEW V3RS-VIZ] See capture() for semantics.
                           float rim_sil_max_px = 0.0f,
                           // [NEW V3RS-RIM-ANAT] See capture() for semantics.
-                          const std::vector<uint8_t>* is_rim_anatomic_per_vertex = nullptr)
+                          const std::vector<uint8_t>* is_rim_anatomic_per_vertex = nullptr,
+                          // [QUAD-SIL VIZ] See capture() for semantics.
+                          const std::vector<uint32_t>* full_indices = nullptr)
 {
     st.bestRunIdx = best_run_idx;
     ++st.captureSessionId;
@@ -929,7 +992,8 @@ inline float captureFinal(State& st, int best_run_idx,
                        instrument_dist_map,
                        instrument_thresh_px,
                        rim_sil_max_px,
-                       is_rim_anatomic_per_vertex);
+                       is_rim_anatomic_per_vertex,
+                       full_indices);
 }
 
 // -----------------------------------------------------------------------------
@@ -1034,7 +1098,7 @@ inline void drawCompareRow(const RunSlot& slot, const char* title,
     // the single-slot view so the labels line up over each third.
     const float scale_disp = (slot.w > 0) ? (iw / (float)slot.w) : 1.0f;
     const float panel_px   = scale_disp *
-        (float)((slot.w - (kPanelCount + 1) * kPanelSep) / kPanelCount);
+                           (float)((slot.w - (kPanelCount + 1) * kPanelSep) / kPanelCount);
     const float sep_px     = scale_disp * (float)kPanelSep;
     const float region_x   = ImGui::GetCursorPosX() + off;
     auto drawHeader = [&](float left_local, const char* txt) {
@@ -1200,8 +1264,8 @@ inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                                on_diag
-                                 ? "No diagnostic data yet. Press F10 to capture."
-                                 : "No data for this slot yet. Run Ctrl+Shift+G to capture.");
+                                   ? "No diagnostic data yet. Press F10 to capture."
+                                   : "No data for this slot yet. Run Ctrl+Shift+G to capture.");
         } else {
             // [NEW V3RS-OCC-VIZ] Instrument occlusion display toggle.
             // Visible only when this slot was captured with both
@@ -1246,9 +1310,9 @@ inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
 
             // [NEW V3RS-CONTAIN] precision / recall, with 0-guard.
             const float precision_disp = (src_disp > 0)
-                ? (float)inter_disp / (float)src_disp : 0.0f;
+                                             ? (float)inter_disp / (float)src_disp : 0.0f;
             const float recall_disp    = (tgt_disp > 0)
-                ? (float)inter_disp / (float)tgt_disp : 0.0f;
+                                          ? (float)inter_disp / (float)tgt_disp : 0.0f;
             // [NEW V3RS-CONTAIN-RATIO] size_ratio = |source| / |target|.
             // Identical information to (recall / precision) but read off as
             // "source is N× the size of target": 1.0 = same size, >1 = src
@@ -1264,10 +1328,10 @@ inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
             // the target". 0 = no overshoot; can exceed 1 when source is
             // much bigger than target.
             const float size_ratio_disp = (tgt_disp > 0)
-                ? (float)src_disp / (float)tgt_disp : 0.0f;
+                                              ? (float)src_disp / (float)tgt_disp : 0.0f;
             const float overshoot_frac_disp = (tgt_disp > 0)
-                ? (float)std::max(0, src_disp - inter_disp) / (float)tgt_disp
-                : 0.0f;
+                                                  ? (float)std::max(0, src_disp - inter_disp) / (float)tgt_disp
+                                                  : 0.0f;
 
             // IoU label gets a short annotation so the user always
             // knows which variant they're looking at, even with the
@@ -1288,11 +1352,11 @@ inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
             const float dir = recall_disp - precision_disp;
             const char* contain_tag =
                 (std::fabs(dir) < 0.05f) ? "balanced"
-                    : (dir > 0.0f)       ? "overshoot (src > tgt)"
+                : (dir > 0.0f)       ? "overshoot (src > tgt)"
                                          : "undershoot (src < tgt)";
             ImVec4 contain_color =
                 (std::fabs(dir) < 0.05f) ? ImVec4(0.50f, 0.85f, 0.50f, 1.0f)
-                    : (dir > 0.0f)       ? ImVec4(0.85f, 0.55f, 0.45f, 1.0f)
+                : (dir > 0.0f)       ? ImVec4(0.85f, 0.55f, 0.45f, 1.0f)
                                          : ImVec4(0.55f, 0.65f, 0.95f, 1.0f);
             // [NEW V3RS-CONTAIN-RATIO] Headline row: size_ratio +
             // overshoot_fraction. These are the user-facing primary
@@ -1341,8 +1405,8 @@ inline void drawPreviewWindow(State& st, float viewportW, float windowH) {
             float region_h = std::max(48.0f, avail.y - legend_h - header_h);
             // Effective texture pixel height: 2*gh + sep when rim row on.
             const int tex_h_px = slot.has_rim_row
-                                 ? (2 * slot.h + kPanelSep)
-                                 : slot.h;
+                                     ? (2 * slot.h + kPanelSep)
+                                     : slot.h;
             float iw = avail.x;
             float ih = (slot.w > 0)
                            ? iw * (float)tex_h_px / (float)slot.w
