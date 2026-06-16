@@ -25,6 +25,18 @@ bool ShaderProgram::loadShaders(const char* vsFilename, const char* fsFilename) 
     // ファイルから文字列を読み込む
     string vsString = fileToString(vsFilename);
     string fsString = fileToString(fsFilename);
+
+    // ファイルが開けないと fileToString は空文字列を返す。空ソースから作られた
+    // 頂点シェーダーは gl_Position を書かないため、リンク時に
+    // "must write to gl_Position" で失敗し、何も描画されなくなる。
+    // 黙って空シェーダーを作る事故を防ぐため、ここで早期に検知して false を返す。
+    if (vsString.empty() || fsString.empty()) {
+        std::cerr << "Error! Failed to read shader source (empty). vs=\""
+                  << vsFilename << "\" fs=\"" << fsFilename
+                  << "\" -- check SHADERS_PATH / working directory." << std::endl;
+        return false;
+    }
+
     const GLchar* vsSourcePtr = vsString.c_str();
     const GLchar* fsSourcePtr = fsString.c_str();
 

@@ -4898,12 +4898,17 @@ int main(int argc, char** argv) {
     loadIntrinsicsFromCurrentSource();
     OrbitCam.printCameraInfo();
 
+    // シェーダーのパスは SHADERS_PATH 経由で解決する (deform/main.cpp と統一)。
+    // 旧来は "../../../shaders/..." をハードコードしていたが、これは作業ディレクトリが
+    // リポジトリ直下 build/.../bin の場合にしか当たらず、Windows 配布パッケージ
+    // (CWD が解凍フォルダ) では存在しないパスを指して空シェーダー → リンク失敗
+    // (must write to gl_Position) → 何も描画されない、という不具合を起こしていた。
     ShaderProgram shaderProgram;
-    shaderProgram.loadShaders("../../../shaders/basic.vert",
-                              "../../../shaders/basic.frag");
+    shaderProgram.loadShaders((SHADERS_PATH + "basic.vert").c_str(),
+                              (SHADERS_PATH + "basic.frag").c_str());
     ShaderProgram shaderProgramCube;
-    shaderProgramCube.loadShaders("../../../shaders/texture.vert",
-                                  "../../../shaders/texture.frag");
+    shaderProgramCube.loadShaders((SHADERS_PATH + "texture.vert").c_str(),
+                                  (SHADERS_PATH + "texture.frag").c_str());
     g_pShader     = &shaderProgram;
     g_pShaderCube = &shaderProgramCube;
 
